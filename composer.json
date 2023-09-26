@@ -1,0 +1,28 @@
+{
+    "name": "clarion-app/llm-client",
+    "description": "Handles interactions with Large Language Models",
+    "type": "library",
+    "require": {
+        "metaverse-systems/eloquent-multichain-bridge": "dev-main"
+    },
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "ClarionApp\\LlmClient\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Tim Schwartz",
+            "email": "tim@metaverse.systems"
+        }
+    ],
+    "extra": {
+        "laravel": {
+            "providers": [
+                "ClarionApp\\LlmClient\\LlmClientServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "dev"
+}
