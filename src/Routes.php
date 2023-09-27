@@ -6,5 +6,6 @@ use ClarionApp\LlmClient\Controllers\ServerGroupController;
 
 Route::group(['middleware'=>'api', 'prefix'=>'api' ], function () {
     Route::resource('conversation', ConversationController::class);
-    Route::resource('server-groups', ServerGroupController::class);
+    Route::resource('server-group', ServerGroupController::class);
+    Route::resource('server', ServerController::class);
 });

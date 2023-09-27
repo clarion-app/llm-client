@@ -13,7 +13,10 @@ class ConversationController extends Controller
      */
     public function index()
     {
-        return Conversation::all();
+        $conversations = Conversation::with(['messages' => function ($query) {
+            $query->latest()->limit(1);
+        }])->get();
+        return response()->json($conversations, 200);
     }
 
     /**
@@ -45,6 +48,7 @@ class ConversationController extends Controller
      */
     public function show(Conversation $conversation)
     {
+        $conversation->load('messages');
         return $conversation;
     }
 
