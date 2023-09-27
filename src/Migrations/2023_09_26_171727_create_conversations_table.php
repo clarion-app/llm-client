@@ -13,6 +13,8 @@ return new class extends Migration
     {
         Schema::create('conversations', function (Blueprint $table) {
             $table->uuid('id')->primary();
+            $table->uuid('server_group_id')->nullable();
+            $table->foreign('server_group_id')->references('id')->on('server_groups')->onDelete('set null');
             $table->timestamps();
             $table->softDeletes();
             $table->uuid('user_id')->nullable();
