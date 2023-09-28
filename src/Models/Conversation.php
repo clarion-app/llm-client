@@ -11,6 +11,8 @@ class Conversation extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
+    protected $fillable = ['server_group_id', 'title', 'model', 'character', 'user'];
+
     public function messages()
     {
         $this->hasMany(Message::class);

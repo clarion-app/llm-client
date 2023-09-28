@@ -13,7 +13,7 @@ class CreateServersTable extends Migration
     {
         Schema::create('servers', function (Blueprint $table) {
             $table->uuid('id')->primary();
-            $table->uuid('group');
+            $table->uuid('server_group_id');
             $table->string('server_url');
             $table->timestamps();
             $table->softDeletes();

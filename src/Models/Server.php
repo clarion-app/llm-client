@@ -11,5 +11,5 @@ class Server extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
-    protected $fillable = ['server_url', 'group'];
+    protected $fillable = ['server_url', 'server_group_id'];
 }

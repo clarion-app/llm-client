@@ -16,6 +16,7 @@ class CreateMessagesTable extends Migration
             $table->string('user');
             $table->unsignedInteger('responseTime')->nullable();
             $table->timestamps();
+            $table->softDeletes();
 
             $table->foreign('conversation_id')
                   ->references('id')
