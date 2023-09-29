@@ -3,7 +3,8 @@
     "description": "Handles interactions with Large Language Models",
     "type": "library",
     "require": {
-        "metaverse-systems/eloquent-multichain-bridge": "dev-main"
+        "metaverse-systems/eloquent-multichain-bridge": "dev-main",
+        "clarion-app/http-queue": "dev-main"
     },
     "license": "MIT",
     "autoload": {

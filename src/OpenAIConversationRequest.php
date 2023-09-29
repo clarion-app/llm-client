@@ -47,10 +47,15 @@ class OpenAIConversationRequest
             array_push($newConversation->messages, $m);
         }
 
+        $server = ServerGroup::find($this->conversation->server_group_id)->servers->random();
+
         $request = new HttpRequest();
-        $request->server_url = ServerGroup::find($this->conversation->server_group_id)->servers->random()->server_url;
-        $request->path = "/v1/chat/completions";
+        $request->url = $server->server_url."/v1/chat/completions";
         $request->method = "POST";
+        $request->headers = [
+            'Content-type'=>'application/json',
+            'Accept'=>'application/json'
+        ];
         $request->body = $newConversation;
         SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIConversationResponse", $this->conversation->id);
     }
