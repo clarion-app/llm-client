@@ -2,9 +2,16 @@
     "name": "clarion-app/llm-client",
     "description": "Handles interactions with Large Language Models",
     "type": "library",
+    "repositories": [
+        {   
+            "type": "path",
+            "url": "../http-queue"
+        }
+    ],
     "require": {
         "metaverse-systems/eloquent-multichain-bridge": "dev-main",
-        "clarion-app/http-queue": "dev-main"
+        "clarion-app/http-queue": "dev-main",
+        "php-webdriver/webdriver": "dev-main"
     },
     "license": "MIT",
     "autoload": {

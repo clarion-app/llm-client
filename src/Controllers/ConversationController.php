@@ -3,19 +3,37 @@
 namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
-use ClarionApp\LlmClient\Conversation;
+use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Message;
 use Illuminate\Http\Request;
+use Auth;
+use Illuminate\Support\Facades\Log;
 
 class ConversationController extends Controller
 {
     /**
      * Display a listing of the resource.
      */
-    public function index()
+    public function index(Request $request)
     {
-        $conversations = Conversation::with(['messages' => function ($query) {
-            $query->latest()->limit(1);
-        }])->get();
+        $userId = Auth::id();
+        $searchTerm = $request->query('search');
+        $query = Conversation::where('user_id', $userId);
+
+        if(strlen($searchTerm))
+        {
+            $query->whereHas('messages', function ($query) use ($searchTerm) {
+                $query->where('content', 'like', "%{$searchTerm}%");
+            })->with(['messages' => function ($query) use ($searchTerm) {
+                $query->where('content', 'like', "%{$searchTerm}%");
+            }]);
+        }
+        else
+        {
+            $query->with('latest_message');
+        }
+
+        $conversations = $query->orderBy('created_at', 'DESC')->get();
         return response()->json($conversations, 200);
     }
 
@@ -32,13 +50,22 @@ class ConversationController extends Controller
      */
     public function store(Request $request)
     {
-        $request->validate([
+        $validatedData = $request->validate([
             'title' => 'required|string',
             'model' => 'required|string',
-            'character' => 'required|string',
+            'server_group_id' => 'required|string',
         ]);
 
-        $conversation = Conversation::create($request->all());
+        $validatedData['user_id'] = Auth::id();
+        $validatedData['character'] = "Assistant";
+        $conversation = Conversation::create($validatedData);
+
+        Message::create([
+            'conversation_id'=>$conversation->id,
+            'role'=>"Assistant",
+            'user'=>"Assistant",
+            'content'=>"I answer any and all questions."
+        ]);
 
         return response()->json($conversation, 201);
     }
@@ -46,9 +73,10 @@ class ConversationController extends Controller
     /**
      * Display the specified resource.
      */
-    public function show(Conversation $conversation)
+    public function show($id)
     {
-        $conversation->load('messages');
+        $conversation = Conversation::find($id);
+        $conversation->messages = Message::where('conversation_id', $id)->orderBy('created_at', 'ASC')->get();
         return $conversation;
     }
 
@@ -63,14 +91,16 @@ class ConversationController extends Controller
     /**
      * Update the specified resource in storage.
      */
-    public function update(Request $request, Conversation $conversation)
+    public function update(Request $request, $id)
     {
         $request->validate([
             'title' => 'required|string',
             'model' => 'required|string',
-            'character' => 'required|string',
+            'server_group_id' => 'required|string'
         ]);
 
+        \Log::info(print_r($request->all(), 1));
+        $conversation = Conversation::find($id);
         $conversation->update($request->all());
 
         return response()->json($conversation, 200);
@@ -79,8 +109,9 @@ class ConversationController extends Controller
     /**
      * Remove the specified resource from storage.
      */
-    public function destroy(Conversation $conversation)
+    public function destroy($id)
     {
+        $conversation = Conversation::find($id);
         $conversation->delete();
 
         return response()->noContent();

@@ -5,18 +5,18 @@ namespace ClarionApp\LlmClient\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use ClarionApp\LlmClient\Models\Conversation;
-use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Models\ServerGroup;
 use MetaverseSystems\EloquentMultiChainBridge\EloquentMultiChainBridge;
 
-class ServerGroup extends Model
+class LanguageModel extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
-    protected $fillable = ['name', 'user_id', 'token', 'server_group_id'];
+    protected $fillable = ['name', 'server_group_id'];
 
-    public function servers()
+    public function server_group()
     {
-        return $this->hasMany(Server::class);
+        return $this->belongsTo(ServerGroup::class);
     }
 
     public function conversations()

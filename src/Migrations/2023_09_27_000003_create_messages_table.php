@@ -11,7 +11,7 @@ class CreateMessagesTable extends Migration
         Schema::create('messages', function (Blueprint $table) {
             $table->uuid('id')->primary();
             $table->uuid('conversation_id');
-            $table->text('content');
+            $table->longText('content');
             $table->enum('role', ['assistant', 'user', 'system']);
             $table->string('user');
             $table->unsignedInteger('responseTime')->nullable();

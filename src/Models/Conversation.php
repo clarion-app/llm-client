@@ -11,10 +11,15 @@ class Conversation extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
-    protected $fillable = ['server_group_id', 'title', 'model', 'character', 'user'];
+    protected $fillable = ['server_group_id', 'title', 'model', 'character', 'user_id'];
 
     public function messages()
     {
-        $this->hasMany(Message::class);
+        return $this->hasMany(Message::class, 'conversation_id');
+    }
+
+    public function latest_message()
+    {
+        return $this->hasOne(Message::class, 'conversation_id')->latest();
     }
 }

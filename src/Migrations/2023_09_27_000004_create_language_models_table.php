@@ -4,18 +4,17 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
-class CreateServerGroupsTable extends Migration
+class CreateLanguageModelsTable extends Migration
 {
     /**
      * Run the migrations.
      */
     public function up(): void
     {
-        Schema::create('server_groups', function (Blueprint $table) {
+        Schema::create('language_models', function (Blueprint $table) {
             $table->uuid('id')->primary();
-            $table->uuid('user_id');
+            $table->uuid('server_group_id');
             $table->string('name');
-            $table->string('token')->nullable();
             $table->timestamps();
             $table->softDeletes();
         });
@@ -26,6 +25,6 @@ class CreateServerGroupsTable extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('server_groups');
+        Schema::dropIfExists('language_models');
     }
 }

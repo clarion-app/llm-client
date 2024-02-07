@@ -3,14 +3,13 @@
 namespace ClarionApp\LlmClient;
 
 use Illuminate\Http\Client\Response;
-use ClarionApp\HttpQueue\Jobs\SendHttpRequest;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\ServerGroup;
 
-class OpenAIConversationRequest
+class OpenAIConversationStreamRequest
 {
     protected Conversation $conversation;
 
@@ -39,7 +38,7 @@ class OpenAIConversationRequest
 //        $newConversation->max_tokens = 4096; // add this field to conversation table
         $newConversation->temperature = 1.0;
         $newConversation->model = $this->conversation->model;
-        $newConversation->stream = false;
+        $newConversation->stream = true;
         $newConversation->messages = array();
         foreach($this->messages as $message)
         {
@@ -61,6 +60,6 @@ class OpenAIConversationRequest
             'Authorization'=>'Bearer '.$group->token
         ];
         $request->body = $newConversation;
-        SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIConversationResponse", $this->conversation->id);
+        SendHttpStreamRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIConversationStreamResponse", $this->conversation->id);
     }
 }

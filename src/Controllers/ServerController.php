@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Server;
 use Illuminate\Http\Request;
+use ClarionApp\LlmClient\OpenAIModelsRequest;
 
 class ServerController extends Controller
 {
@@ -17,10 +18,15 @@ class ServerController extends Controller
     public function store(Request $request)
     {
         $validatedData = $request->validate([
-            'name' => 'required|string|max:255',
+            'server_group_id' => 'required|string|max:36',
+            'server_url' => 'required|string|max:255'
         ]);
 
         $server = Server::create($validatedData);
+
+	$modelRequest = new OpenAIModelsRequest();
+        $modelRequest->getLanguageModels($server->server_group_id);
+
         return response()->json($server, 201);
     }
 
@@ -39,8 +45,9 @@ class ServerController extends Controller
         return response()->json($server, 200);
     }
 
-    public function destroy(Server $server)
+    public function destroy($id)
     {
+        $server = Server::find($id);
         $server->delete();
         return response()->json([], 204);
     }
