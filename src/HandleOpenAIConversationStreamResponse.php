@@ -3,7 +3,7 @@
 namespace ClarionApp\LlmClient;
 
 use Illuminate\Http\Client\Response;
-use ClarionApp\HttpQueue\HandleHttpResponse;
+use ClarionApp\HttpQueue\HandleHttpStreamResponse;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
@@ -11,9 +11,9 @@ use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use Illuminate\Support\Facades\Log;
 
-class HandleOpenAIConversationStreamResponse extends HandleHttpResponse
+class HandleOpenAIConversationStreamResponse extends HandleHttpStreamResponse
 {
-    public string $body = "";
+    public string $buffer = "";
     public string $reply = "";
     public ?Message $message = null;
 
@@ -35,12 +35,12 @@ class HandleOpenAIConversationStreamResponse extends HandleHttpResponse
             Log::info("Created message ".$this->message->id);
         }
 
-        $this->body .= $content;
-        $check = explode("\n\ndata: ", $this->body);
+        $this->buffer .= $content;
+        $check = explode("\n\ndata: ", $this->buffer);
         while(count($check) > 1)
         {
             $chunk = array_shift($check);
-            $this->body = implode("\n\ndata: ", $check);
+            $this->buffer = implode("\n\ndata: ", $check);
             $json = json_decode($chunk);
             if($json != null)
             {
@@ -54,9 +54,10 @@ class HandleOpenAIConversationStreamResponse extends HandleHttpResponse
         }
     }
 
-    public function finish($conversation_id)
+    public function finish($conversation_id, $seconds)
     {
         $this->message->content = $this->reply;
+        $this->message->responseTime = $seconds;
         $this->message->update();
         broadcast(new FinishOpenAIConversationResponseEvent($conversation_id, $this->reply));
     }
