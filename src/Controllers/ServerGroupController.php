@@ -17,6 +17,17 @@ class ServerGroupController extends Controller
         return response()->json($serverGroups, 200);
     }
 
+    public function userServerGroups($user_id)
+    {
+        if(!Auth::user()->can("list user conversations"))
+        {
+            return response()->json(["message"=>"No permission."], 403);
+        }
+
+        $groups = ServerGroup::where('user_id', $user_id)->orderBy('created_at', 'DESC')->get();
+        return response()->json($groups, 200);
+    }
+
     public function store(Request $request)
     {
         $validatedData = $request->validate([

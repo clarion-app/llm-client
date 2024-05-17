@@ -12,7 +12,9 @@ use ClarionApp\LlmClient\Controllers\FetchPageController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>'api' ], function () {
     Route::resource('conversation', ConversationController::class);
+    Route::get('user/{id}/conversation', [ConversationController::class, "userConversations"]);
     Route::resource('server-group', ServerGroupController::class);
+    Route::get('user/{id}/server-group', [ServerGroupController::class, "userServerGroups"]);
     Route::resource('server', ServerController::class);
     Route::resource('message', MessageController::class);
     Route::get('conversation/{conversation_id}/message', [MessageController::class, "index"]);

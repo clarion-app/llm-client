@@ -23,7 +23,7 @@ class MessageController extends Controller
         $conversation = Conversation::find($conversation_id);
         if($conversation->user_id != Auth::id())
         {
-            return response()->json([], 403);
+            if(!Auth::user()->can('list users')) return response()->json([], 403);
         }
 
         $messages = Message::where('conversation_id', $conversation_id)->orderBy('created_at')->get();

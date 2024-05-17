@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\Log;
 
 class HandleOpenAIConversationStreamResponse extends HandleHttpStreamResponse
 {
-    public string $buffer = "";
+    public string $buffer = "\n\n";
     public string $reply = "";
     public ?Message $message = null;
 
@@ -56,6 +56,8 @@ class HandleOpenAIConversationStreamResponse extends HandleHttpStreamResponse
 
     public function finish($conversation_id, $seconds)
     {
+        if($this->message == null) return;
+
         $this->message->content = $this->reply;
         $this->message->responseTime = $seconds;
         $this->message->update();

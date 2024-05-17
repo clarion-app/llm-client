@@ -37,6 +37,17 @@ class ConversationController extends Controller
         return response()->json($conversations, 200);
     }
 
+    public function userConversations($user_id)
+    {
+        if(!Auth::user()->can("list user conversations"))
+        {
+            return response()->json(["message"=>"No permission."], 403);
+        }
+
+        $conversations = Conversation::where('user_id', $user_id)->orderBy('created_at', 'DESC')->get();
+        return response()->json($conversations, 200);
+    }
+
     /**
      * Show the form for creating a new resource.
      */
