@@ -4,73 +4,38 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "3582b0237577580a0de41e67f9cb5b50",
+    "content-hash": "2db57910ccdb13207b422b5165938782",
     "packages": [
         {
-            "name": "clarion-app/http-queue",
-            "version": "dev-main",
-            "dist": {
-                "type": "path",
-                "url": "../http-queue",
-                "reference": "8150d1037165a775dffcb4f219c87c4a8d35abef"
-            },
-            "type": "library",
-            "extra": {
-                "laravel": {
-                    "providers": [
-                        "ClarionApp\\HttpQueue\\HttpQueueServiceProvider"
-                    ]
-                }
-            },
-            "autoload": {
-                "psr-4": {
-                    "ClarionApp\\HttpQueue\\": "src/"
-                }
-            },
-            "license": [
-                "MIT"
-            ],
-            "authors": [
-                {
-                    "name": "Tim Schwartz",
-                    "email": "tim@metaverse.systems"
-                }
-            ],
-            "description": "Job queue for HTTP requests",
-            "transport-options": {
-                "relative": true
-            }
-        },
-        {
-            "name": "metaverse-systems/eloquent-multichain-bridge",
+            "name": "clarion-app/eloquent-multichain-bridge",
             "version": "dev-main",
             "source": {
                 "type": "git",
-                "url": "https://github.com/metaverse-systems/eloquent-multichain-bridge.git",
-                "reference": "0f5f627f23803569e4d4b56c8a4c079ff5321523"
+                "url": "https://github.com/clarion-app/eloquent-multichain-bridge.git",
+                "reference": "ad895a6476cc4d5efecd22090ff4ac578afe114c"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/metaverse-systems/eloquent-multichain-bridge/zipball/0f5f627f23803569e4d4b56c8a4c079ff5321523",
-                "reference": "0f5f627f23803569e4d4b56c8a4c079ff5321523",
+                "url": "https://api.github.com/repos/clarion-app/eloquent-multichain-bridge/zipball/ad895a6476cc4d5efecd22090ff4ac578afe114c",
+                "reference": "ad895a6476cc4d5efecd22090ff4ac578afe114c",
                 "shasum": ""
             },
             "require": {
-                "metaverse-systems/multichain-php-client": "^1.0"
+                "clarion-app/multichain": "dev-main"
             },
             "default-branch": true,
             "type": "library",
             "extra": {
                 "laravel": {
                     "providers": [
-                        "MetaverseSystems\\EloquentMultiChainBridge\\EloquentMultiChainProvider"
+                        "ClarionApp\\EloquentMultiChainBridge\\EloquentMultiChainProvider"
                     ]
                 }
             },
             "autoload": {
                 "psr-4": {
                     "App\\": "app/",
-                    "MetaverseSystems\\EloquentMultiChainBridge\\": "src/"
+                    "ClarionApp\\EloquentMultiChainBridge\\": "src/"
                 }
             },
             "notification-url": "https://packagist.org/downloads/",
@@ -85,40 +50,37 @@
             ],
             "description": "Replicates models onto blockchain",
             "support": {
-                "issues": "https://github.com/metaverse-systems/eloquent-multichain-bridge/issues",
-                "source": "https://github.com/metaverse-systems/eloquent-multichain-bridge/tree/main"
+                "issues": "https://github.com/clarion-app/eloquent-multichain-bridge/issues",
+                "source": "https://github.com/clarion-app/eloquent-multichain-bridge/tree/main"
             },
-            "time": "2022-12-18T08:31:39+00:00"
+            "time": "2024-07-30T02:28:23+00:00"
         },
         {
-            "name": "metaverse-systems/multichain-php-client",
-            "version": "v1.0.0",
+            "name": "clarion-app/http-queue",
+            "version": "dev-main",
             "source": {
                 "type": "git",
-                "url": "https://github.com/metaverse-systems/multichain-php-client.git",
-                "reference": "a0736898f22ef4342ddbf4b843f60576ed68fbfe"
+                "url": "https://github.com/clarion-app/http-queue.git",
+                "reference": "1fe31d0109480df30506da0ffecf766e9dbc2c63"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/metaverse-systems/multichain-php-client/zipball/a0736898f22ef4342ddbf4b843f60576ed68fbfe",
-                "reference": "a0736898f22ef4342ddbf4b843f60576ed68fbfe",
+                "url": "https://api.github.com/repos/clarion-app/http-queue/zipball/1fe31d0109480df30506da0ffecf766e9dbc2c63",
+                "reference": "1fe31d0109480df30506da0ffecf766e9dbc2c63",
                 "shasum": ""
             },
+            "default-branch": true,
             "type": "library",
             "extra": {
                 "laravel": {
                     "providers": [
-                        "MetaverseSystems\\MultiChain\\MultiChainProvider"
-                    ],
-                    "aliases": {
-                        "MultiChain": "MetaverseSystems\\MultiChain\\Facades\\MultiChain"
-                    }
+                        "ClarionApp\\HttpQueue\\HttpQueueServiceProvider"
+                    ]
                 }
             },
             "autoload": {
                 "psr-4": {
-                    "App\\": "app/",
-                    "MetaverseSystems\\MultiChain\\": "src/"
+                    "ClarionApp\\HttpQueue\\": "src/"
                 }
             },
             "notification-url": "https://packagist.org/downloads/",
@@ -131,12 +93,61 @@
                     "email": "tim@metaverse.systems"
                 }
             ],
-            "description": "PHP package for communicating with MultiChain node",
+            "description": "Job queue for HTTP requests",
             "support": {
-                "issues": "https://github.com/metaverse-systems/multichain-php-client/issues",
-                "source": "https://github.com/metaverse-systems/multichain-php-client/tree/v1.0.0"
+                "issues": "https://github.com/clarion-app/http-queue/issues",
+                "source": "https://github.com/clarion-app/http-queue/tree/main"
             },
-            "time": "2022-12-18T07:28:18+00:00"
+            "time": "2024-02-07T23:16:20+00:00"
+        },
+        {
+            "name": "clarion-app/multichain",
+            "version": "dev-main",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/clarion-app/multichain.git",
+                "reference": "851e3feef7a048fbcd5d96e1bd9e127bd420e9da"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/clarion-app/multichain/zipball/851e3feef7a048fbcd5d96e1bd9e127bd420e9da",
+                "reference": "851e3feef7a048fbcd5d96e1bd9e127bd420e9da",
+                "shasum": ""
+            },
+            "default-branch": true,
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "ClarionApp\\MultiChain\\MultiChainProvider"
+                    ],
+                    "aliases": {
+                        "MultiChain": "ClarionApp\\MultiChain\\Facades\\MultiChain"
+                    }
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "App\\": "app/",
+                    "ClarionApp\\MultiChain\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Tim Schwartz",
+                    "email": "tim@metaverse.systems"
+                }
+            ],
+            "description": "PHP package for communicating with MultiChain RPC server",
+            "support": {
+                "issues": "https://github.com/clarion-app/multichain/issues",
+                "source": "https://github.com/clarion-app/multichain/tree/main"
+            },
+            "time": "2024-07-30T01:48:34+00:00"
         },
         {
             "name": "php-webdriver/webdriver",
@@ -144,12 +155,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/php-webdriver/php-webdriver.git",
-                "reference": "35a84708e33dcc2c1eeef47f9ae48f000cb94c89"
+                "reference": "11923b4ba312fc9d137266ae67438be65d4d500f"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/php-webdriver/php-webdriver/zipball/35a84708e33dcc2c1eeef47f9ae48f000cb94c89",
-                "reference": "35a84708e33dcc2c1eeef47f9ae48f000cb94c89",
+                "url": "https://api.github.com/repos/php-webdriver/php-webdriver/zipball/11923b4ba312fc9d137266ae67438be65d4d500f",
+                "reference": "11923b4ba312fc9d137266ae67438be65d4d500f",
                 "shasum": ""
             },
             "require": {
@@ -203,7 +214,7 @@
                 "issues": "https://github.com/php-webdriver/php-webdriver/issues",
                 "source": "https://github.com/php-webdriver/php-webdriver/tree/main"
             },
-            "time": "2023-11-06T17:28:23+00:00"
+            "time": "2024-04-26T16:49:05+00:00"
         },
         {
             "name": "symfony/polyfill-mbstring",
@@ -211,12 +222,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/symfony/polyfill-mbstring.git",
-                "reference": "42292d99c55abe617799667f454222c54c60e229"
+                "reference": "8740a072b86292957feb42703edde77fcfca84fb"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/symfony/polyfill-mbstring/zipball/42292d99c55abe617799667f454222c54c60e229",
-                "reference": "42292d99c55abe617799667f454222c54c60e229",
+                "url": "https://api.github.com/repos/symfony/polyfill-mbstring/zipball/8740a072b86292957feb42703edde77fcfca84fb",
+                "reference": "8740a072b86292957feb42703edde77fcfca84fb",
                 "shasum": ""
             },
             "require": {
@@ -231,9 +242,6 @@
             "default-branch": true,
             "type": "library",
             "extra": {
-                "branch-alias": {
-                    "dev-main": "1.28-dev"
-                },
                 "thanks": {
                     "name": "symfony/polyfill",
                     "url": "https://github.com/symfony/polyfill"
@@ -271,7 +279,7 @@
                 "shim"
             ],
             "support": {
-                "source": "https://github.com/symfony/polyfill-mbstring/tree/v1.28.0"
+                "source": "https://github.com/symfony/polyfill-mbstring/tree/1.x"
             },
             "funding": [
                 {
@@ -287,20 +295,20 @@
                     "type": "tidelift"
                 }
             ],
-            "time": "2023-07-28T09:04:16+00:00"
+            "time": "2024-06-20T08:18:00+00:00"
         },
         {
             "name": "symfony/process",
-            "version": "7.1.x-dev",
+            "version": "7.2.x-dev",
             "source": {
                 "type": "git",
                 "url": "https://github.com/symfony/process.git",
-                "reference": "4eec9df2bcc0e83fe002ffefcd8f9cb088691eda"
+                "reference": "bb0a8b7772610211c2cd7d6e4e36acfcbadcb613"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/symfony/process/zipball/4eec9df2bcc0e83fe002ffefcd8f9cb088691eda",
-                "reference": "4eec9df2bcc0e83fe002ffefcd8f9cb088691eda",
+                "url": "https://api.github.com/repos/symfony/process/zipball/bb0a8b7772610211c2cd7d6e4e36acfcbadcb613",
+                "reference": "bb0a8b7772610211c2cd7d6e4e36acfcbadcb613",
                 "shasum": ""
             },
             "require": {
@@ -332,7 +340,7 @@
             "description": "Executes commands in sub-processes",
             "homepage": "https://symfony.com",
             "support": {
-                "source": "https://github.com/symfony/process/tree/7.1"
+                "source": "https://github.com/symfony/process/tree/7.2"
             },
             "funding": [
                 {
@@ -348,15 +356,16 @@
                     "type": "tidelift"
                 }
             ],
-            "time": "2023-12-26T14:02:49+00:00"
+            "time": "2024-07-29T06:33:22+00:00"
         }
     ],
     "packages-dev": [],
     "aliases": [],
     "minimum-stability": "dev",
     "stability-flags": {
-        "metaverse-systems/eloquent-multichain-bridge": 20,
-        "clarion-app/http-queue": 20
+        "clarion-app/eloquent-multichain-bridge": 20,
+        "clarion-app/http-queue": 20,
+        "php-webdriver/webdriver": 20
     },
     "prefer-stable": false,
     "prefer-lowest": false,
