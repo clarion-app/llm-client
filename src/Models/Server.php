@@ -6,7 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ServerGroup;
-use MetaverseSystems\EloquentMultiChainBridge\EloquentMultiChainBridge;
+use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 
 class Server extends Model
 {

@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-use MetaverseSystems\EloquentMultiChainBridge\EloquentMultiChainBridge;
+use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 
 class Message extends Model
 {
