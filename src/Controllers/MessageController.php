@@ -6,7 +6,6 @@ use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ServerGroup;
-use ClarionApp\LlmClient\Models\Server;
 use Illuminate\Http\Request;
 use Auth;
 use ClarionApp\HttpQueue\HttpRequest;

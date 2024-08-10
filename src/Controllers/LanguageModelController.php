@@ -11,19 +11,19 @@ use ClarionApp\LlmClient\OpenAIModelsRequest;
 
 class LanguageModelController extends Controller
 {
-    public function refresh($server_group_id)
+    public function refresh($server_id)
     {
         $modelRequest = new OpenAIModelsRequest();
-        $modelRequest->getLanguageModels($server_group_id);
+        $modelRequest->getLanguageModels($server_id);
         return response()->json(['message'=>'Refreshing models'], 200);
     }
 
     /**
      * Display a listing of the resource.
      */
-    public function index($server_group_id)
+    public function index($server_id)
     {
-        $language_models = LanguageModel::where('server_group_id', $server_group_id)->orderBy('name')->get();
+        $language_models = LanguageModel::where('server_id', $server_id)->orderBy('name')->get();
         return response()->json($language_models, 200);
     }
 

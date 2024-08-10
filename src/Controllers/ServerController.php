@@ -18,14 +18,15 @@ class ServerController extends Controller
     public function store(Request $request)
     {
         $validatedData = $request->validate([
-            'server_group_id' => 'required|string|max:36',
-            'server_url' => 'required|string|max:255'
+            'name' => 'required|string|max:255',
+            'server_url' => 'required|string|max:255',
+            'token' => 'nullable|string|max:255',
         ]);
 
         $server = Server::create($validatedData);
 
-	$modelRequest = new OpenAIModelsRequest();
-        $modelRequest->getLanguageModels($server->server_group_id);
+	    $modelRequest = new OpenAIModelsRequest();
+        $modelRequest->getLanguageModels($server->id);
 
         return response()->json($server, 201);
     }
@@ -39,6 +40,8 @@ class ServerController extends Controller
     {
         $validatedData = $request->validate([
             'name' => 'required|string|max:255',
+            'server_url' => 'required|string|max:255',
+            'token' => 'nullable|string|max:255',
         ]);
 
         $server->update($validatedData);

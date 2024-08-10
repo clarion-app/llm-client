@@ -6,14 +6,13 @@ use Illuminate\Http\Client\Response;
 use ClarionApp\HttpQueue\Jobs\SendHttpRequest;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Models\LanguageModel;
-use ClarionApp\LlmClient\Models\ServerGroup;
+use ClarionApp\LlmClient\Models\Server;
 
 class OpenAIModelsRequest
 {
-    public function getLanguageModels($server_group_id)
+    public function getLanguageModels($server_id)
     {
-        $group = ServerGroup::find($server_group_id);
-        $server = $group->servers->random();
+        $server = Server::find($server_id);
 
         $request = new HttpRequest();
         $request->url = $server->server_url."/v1/models";
@@ -21,8 +20,8 @@ class OpenAIModelsRequest
         $request->headers = [
             'Content-type'=>'application/json',
             'Accept'=>'application/json',
-            'Authorization'=>'Bearer '.$group->token
+            'Authorization'=>'Bearer '.$server->token
         ];
-        SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIModelsResponse", $server_group_id);
+        SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIModelsResponse", $server_id);
     }
 }

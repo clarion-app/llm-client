@@ -13,7 +13,7 @@ class CreateLanguageModelsTable extends Migration
     {
         Schema::create('language_models', function (Blueprint $table) {
             $table->uuid('id')->primary();
-            $table->uuid('server_group_id');
+            $table->uuid('server_id');
             $table->string('name');
             $table->timestamps();
             $table->softDeletes();

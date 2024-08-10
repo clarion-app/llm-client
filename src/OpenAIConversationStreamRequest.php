@@ -7,7 +7,7 @@ use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
-use ClarionApp\LlmClient\Models\ServerGroup;
+use ClarionApp\LlmClient\Models\Server;
 
 class OpenAIConversationStreamRequest
 {
@@ -48,8 +48,7 @@ class OpenAIConversationStreamRequest
             array_push($newConversation->messages, $m);
         }
 
-        $group = ServerGroup::find($this->conversation->server_group_id);
-        $server = $group->servers->random();
+        $server = Server::find($this->conversation->server_id);
 
         $request = new HttpRequest();
         $request->url = $server->server_url."/v1/chat/completions";
@@ -57,7 +56,7 @@ class OpenAIConversationStreamRequest
         $request->headers = [
             'Content-type'=>'application/json',
             'Accept'=>'application/json',
-            'Authorization'=>'Bearer '.$group->token
+            'Authorization'=>'Bearer '.$server->token
         ];
         $request->body = $newConversation;
         SendHttpStreamRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIConversationStreamResponse", $this->conversation->id);

@@ -64,7 +64,7 @@ class ConversationController extends Controller
         $validatedData = $request->validate([
             'title' => 'required|string',
             'model' => 'required|string',
-            'server_group_id' => 'required|string',
+            'server_id' => 'required|string',
         ]);
 
         $validatedData['user_id'] = Auth::id();
@@ -107,7 +107,7 @@ class ConversationController extends Controller
         $request->validate([
             'title' => 'required|string',
             'model' => 'required|string',
-            'server_group_id' => 'required|string'
+            'server_id' => 'required|string'
         ]);
 
         \Log::info(print_r($request->all(), 1));

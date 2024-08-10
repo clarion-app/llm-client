@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Log;
 
 class HandleOpenAIModelsResponse extends HandleHttpResponse
 {
-    public function handle(Response $response, $server_group_id, $seconds)
+    public function handle(Response $response, $server_id, $seconds)
     {
         switch($response->status())
         {
@@ -21,15 +21,15 @@ class HandleOpenAIModelsResponse extends HandleHttpResponse
                 // Add new models
                 foreach($models as $model)
                 {
-                    if(LanguageModel::where("name", $model->id)->where("server_group_id", $server_group_id)->first()) continue;
+                    if(LanguageModel::where("name", $model->id)->where("server_id", $server_id)->first()) continue;
                     LanguageModel::create([
                       "name"=>$model->id,
-                      "server_group_id"=>$server_group_id
+                      "server_id"=>$server_id
                     ]);
                 }
 
                 // Delete removed models
-                $langModels = LanguageModel::where("server_group_id", $server_group_id)->get();
+                $langModels = LanguageModel::where("server_id", $server_id)->get();
                 foreach($langModels as $langModel)
                 {
                     $keep = false;
@@ -44,15 +44,15 @@ class HandleOpenAIModelsResponse extends HandleHttpResponse
 
                     if($keep) continue;
 
-                    Log::info("Deleting model ".$langModel->name." from server group $server_group_id");
+                    Log::info("Deleting model ".$langModel->name." from server $server_id");
                     $langModel->delete();
                 }
                 break;
             case 404:
-                if(LanguageModel::where("name", "Default")->where("server_group_id", $server_group_id)->first()) break;
+                if(LanguageModel::where("name", "Default")->where("server_id", $server_id)->first()) break;
                 LanguageModel::create([
                     "name"=>"Default",
-                    "server_group_id"=>$server_group_id
+                    "server_id"=>$server_id
                 ]);
                 break;
             default:
