@@ -11,11 +11,11 @@ class CreateServersTable extends Migration
      */
     public function up(): void
     {
-        Schema::create('servers', function (Blueprint $table) {
+        Schema::create('llm_servers', function (Blueprint $table) {
             $table->uuid('id')->primary();
-            $table->name('name');
+            $table->string('name');
             $table->string('server_url');
-            $table->string('token');
+            $table->string('token')->nullable();
             $table->timestamps();
             $table->softDeletes();
         });

@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Server;
 use Illuminate\Http\Request;
 use ClarionApp\LlmClient\OpenAIModelsRequest;
+use Illuminate\Support\Facades\Log;
 
 class ServerController extends Controller
 {
@@ -36,8 +37,9 @@ class ServerController extends Controller
         return response()->json($server, 200);
     }
 
-    public function update(Request $request, Server $server)
+    public function update(Request $request, $id)
     {
+        $server = Server::find($id);
         $validatedData = $request->validate([
             'name' => 'required|string|max:255',
             'server_url' => 'required|string|max:255',
@@ -45,6 +47,8 @@ class ServerController extends Controller
         ]);
 
         $server->update($validatedData);
+        $modelRequest = new OpenAIModelsRequest();
+        $modelRequest->getLanguageModels($server->id);
         return response()->json($server, 200);
     }
 

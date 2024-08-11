@@ -14,7 +14,7 @@ return new class extends Migration
         Schema::create('conversations', function (Blueprint $table) {
             $table->uuid('id')->primary();
             $table->uuid('server_id')->nullable();
-            $table->foreign('server_id')->references('id')->on('servers')->onDelete('set null');
+            $table->foreign('server_id')->references('id')->on('llm_servers')->onDelete('set null');
             $table->timestamps();
             $table->softDeletes();
             $table->uuid('user_id')->nullable();

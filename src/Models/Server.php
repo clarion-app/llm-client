@@ -11,5 +11,6 @@ class Server extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
-    protected $fillable = ['name', 'server_url'];
+    protected $fillable = ['name', 'server_url', 'token'];
+    protected $table = 'llm_servers';
 }
