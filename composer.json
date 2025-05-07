@@ -2,10 +2,17 @@
     "name": "clarion-app/llm-client",
     "description": "Handles interactions with Large Language Models",
     "type": "library",
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../backend"
+        }
+    ],
     "require": {
         "clarion-app/eloquent-multichain-bridge": "dev-main",
         "clarion-app/http-queue": "dev-main",
-        "php-webdriver/webdriver": "dev-main"
+        "php-webdriver/webdriver": "dev-main",
+        "clarion-app/backend": "dev-main"
     },
     "license": "MIT",
     "autoload": {
@@ -24,6 +31,10 @@
             "providers": [
                 "ClarionApp\\LlmClient\\LlmClientServiceProvider"
             ]
+        },
+        "clarion": {
+            "app-name": "@clarion-app/llm-client",
+            "description": "Provides a client for interacting with Large Language Models"
         }
     },
     "minimum-stability": "dev"

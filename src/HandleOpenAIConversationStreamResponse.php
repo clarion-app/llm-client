@@ -31,7 +31,7 @@ class HandleOpenAIConversationStreamResponse extends HandleHttpStreamResponse
                 "content"=>""
             ]);
 
-            broadcast(new NewConversationMessageEvent($conversation_id, $this->message->id));
+            event(new NewConversationMessageEvent($conversation_id, $this->message->id));
             Log::info("Created message ".$this->message->id);
         }
 
@@ -48,7 +48,7 @@ class HandleOpenAIConversationStreamResponse extends HandleHttpStreamResponse
                 {
                     if(!isset($choice->delta->content)) continue;
                     $this->reply .= $choice->delta->content;
-                    broadcast(new UpdateOpenAIConversationResponseEvent($conversation_id, $this->message->id, $this->reply));
+                    event(new UpdateOpenAIConversationResponseEvent($conversation_id, $this->message->id, $this->reply));
                 }
             }
         }
@@ -61,6 +61,6 @@ class HandleOpenAIConversationStreamResponse extends HandleHttpStreamResponse
         $this->message->content = $this->reply;
         $this->message->responseTime = $seconds;
         $this->message->update();
-        broadcast(new FinishOpenAIConversationResponseEvent($conversation_id, $this->reply));
+        event(new FinishOpenAIConversationResponseEvent($conversation_id, $this->reply));
     }
 }

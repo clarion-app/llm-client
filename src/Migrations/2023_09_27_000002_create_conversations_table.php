@@ -18,7 +18,7 @@ return new class extends Migration
             $table->timestamps();
             $table->softDeletes();
             $table->uuid('user_id')->nullable();
-            $table->string('title');
+            $table->string('title')->nullable();
             $table->string('model');
             $table->string('character');
         });

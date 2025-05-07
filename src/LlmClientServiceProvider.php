@@ -2,27 +2,26 @@
 
 namespace ClarionApp\LlmClient;
 
-use Illuminate\Support\ServiceProvider;
+use ClarionApp\Backend\ClarionPackageServiceProvider;
 
-class LlmClientServiceProvider extends ServiceProvider
+class LlmClientServiceProvider extends ClarionPackageServiceProvider
 {
-    /**
-     * Register services.
-     */
-    public function register(): void
-    {
-    }
-
-    /**
-     * Bootstrap services.
-     */
     public function boot(): void
     {
+        parent::boot();
+
         $this->loadMigrationsFrom(__DIR__.'/Migrations');
 
-        if(!$this->app->routesAreCached())
-        {
-            require __DIR__.'/Routes.php';
-        }
+        $this->app->booted(function () {
+            if(!$this->app->routesAreCached())
+            {
+                require __DIR__.'/Routes.php';
+            }
+        });
+    }
+
+    public function register(): void
+    {
+        parent::register();
     }
 }

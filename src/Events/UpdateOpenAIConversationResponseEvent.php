@@ -36,7 +36,7 @@ class UpdateOpenAIConversationResponseEvent implements ShouldBroadcastNow
     public function broadcastOn(): array
     {
         return [
-            new PrivateChannel("Conversation.".$this->conversation_id)
+            new Channel("Conversation.".$this->conversation_id)
         ];
     }
 }

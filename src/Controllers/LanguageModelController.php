@@ -21,9 +21,16 @@ class LanguageModelController extends Controller
     /**
      * Display a listing of the resource.
      */
-    public function index($server_id)
+    public function index($server_id = null)
     {
-        $language_models = LanguageModel::where('server_id', $server_id)->orderBy('name')->get();
+        if($server_id)
+        {
+            $language_models = LanguageModel::where('server_id', $server_id)->orderBy('name')->get();
+        }
+        else
+        {
+            $language_models = LanguageModel::orderBy('name')->get();
+        }
         return response()->json($language_models, 200);
     }
 

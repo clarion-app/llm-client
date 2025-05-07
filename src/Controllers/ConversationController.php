@@ -62,20 +62,21 @@ class ConversationController extends Controller
     public function store(Request $request)
     {
         $validatedData = $request->validate([
-            'title' => 'required|string',
+            'title' => 'nullable|string',
             'model' => 'required|string',
             'server_id' => 'required|string',
         ]);
 
         $validatedData['user_id'] = Auth::id();
-        $validatedData['character'] = "Assistant";
+        $validatedData['character'] = "Clarion";
         $conversation = Conversation::create($validatedData);
-
+        
         Message::create([
             'conversation_id'=>$conversation->id,
             'role'=>"Assistant",
-            'user'=>"Assistant",
-            'content'=>"I answer any and all questions."
+            'user'=>"Clarion",
+            'content'=>"How can I help you today?",
+            'responseTime'=>0
         ]);
 
         return response()->json($conversation, 201);
@@ -110,7 +111,6 @@ class ConversationController extends Controller
             'server_id' => 'required|string'
         ]);
 
-        \Log::info(print_r($request->all(), 1));
         $conversation = Conversation::find($id);
         $conversation->update($request->all());
 
