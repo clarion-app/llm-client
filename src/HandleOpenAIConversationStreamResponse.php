@@ -62,5 +62,12 @@ class HandleOpenAIConversationStreamResponse extends HandleHttpStreamResponse
         $this->message->responseTime = $seconds;
         $this->message->update();
         event(new FinishOpenAIConversationResponseEvent($conversation_id, $this->reply));
+
+        $conversation = Conversation::find($conversation_id);
+        if($conversation->title == null)
+        {
+            $titleRequest = new OpenAIGenerateConversationTitleRequest($conversation);
+            $titleRequest->sendGenerateConversationTitle();
+        }
     }
 }

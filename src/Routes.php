@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Controllers\FetchPageController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
+    Route::post('conversation/{id}/generate-title', [ConversationController::class, "generateTitle"]);
     Route::get('user/{id}/conversation', [ConversationController::class, "userConversations"]);
     Route::resource('server', ServerController::class);
     Route::resource('message', MessageController::class);

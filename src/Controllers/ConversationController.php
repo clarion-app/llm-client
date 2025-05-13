@@ -127,4 +127,11 @@ class ConversationController extends Controller
 
         return response()->noContent();
     }
+
+    public function generateTitle($id)
+    {
+        $conversation = Conversation::find($id);
+        $request = new \ClarionApp\LlmClient\OpenAIGenerateConversationTitleRequest($conversation);
+        $request->sendGenerateConversationTitle();
+    }
 }

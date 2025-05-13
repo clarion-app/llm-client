@@ -3,13 +3,14 @@
 namespace ClarionApp\LlmClient;
 
 use Illuminate\Http\Client\Response;
+use ClarionApp\HttpQueue\Jobs\SendHttpRequest;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
 
-class OpenAIConversationStreamRequest
+class OpenAIGenerateConversationTitleRequest
 {
     protected Conversation $conversation;
 
@@ -19,26 +20,27 @@ class OpenAIConversationStreamRequest
     {
         $this->conversation = $conversation;
         $this->messages = Message::where('conversation_id', $conversation->id)->orderBy('created_at')->get()->toArray();
+        $this->addMessage("Generate a title for this conversation. Only respond with a JSON object with a single field called title. The value of the title field should be a string that is a title for the conversation. The title should be short and descriptive, and should not include any personal information or sensitive data. The title should be in English. Do not return extra text or formatting information.");
     }
 
     public function addMessage($content)
     {
-        array_push($this->messages, Message::create([
+        array_push($this->messages, [
             "conversation_id"=>$this->conversation->id,
             "responseTime"=>0,
             "user"=>"User",
             "role"=>"user",
             "content"=>$content
-        ])->toArray());
+        ]);
     }
 
-    public function sendConversation()
+    public function sendGenerateConversationTitle()
     {
         $newConversation = new \stdClass();
 //        $newConversation->max_tokens = 4096; // add this field to conversation table
         $newConversation->temperature = 1.0;
         $newConversation->model = $this->conversation->model;
-        $newConversation->stream = true;
+        $newConversation->stream = false;
         $newConversation->messages = array();
         foreach($this->messages as $message)
         {
@@ -59,6 +61,6 @@ class OpenAIConversationStreamRequest
             'Authorization'=>'Bearer '.$server->token
         ];
         $request->body = $newConversation;
-        SendHttpStreamRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIConversationStreamResponse", $this->conversation->id);
+        SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIGenerateConversationTitleResponse", $this->conversation->id);
     }
 }

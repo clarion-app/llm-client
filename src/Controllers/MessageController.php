@@ -20,6 +20,8 @@ class MessageController extends Controller
     {
         //TODO: Implement Spatie permissions
         $conversation = Conversation::find($conversation_id);
+        if(!$conversation) return response()->json([], 404);
+        
         if($conversation->user_id != Auth::id())
         {
             if(!Auth::user()->can('list users')) return response()->json([], 403);

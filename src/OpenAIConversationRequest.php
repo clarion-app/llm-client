@@ -52,7 +52,7 @@ class OpenAIConversationRequest
         $server = Server::find($this->conversation->server_id);
 
         $request = new HttpRequest();
-        $request->url = $server->server_url."/v1/chat/completions";
+        $request->url = $server->server_url;
         $request->method = "POST";
         $request->headers = [
             'Content-type'=>'application/json',
