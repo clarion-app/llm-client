@@ -38,6 +38,7 @@ class GenerateApiCallsRequest
         $prompt.= "Please repond with a call to generate_api_call with the appropriate parameters. ";
         $prompt.= "If completing the user's command will take multiple API calls, return the first API ";
         $prompt.= "call with the 'continue' parameter set to true so that additional calls can be chained together.";
+        $prompt.= "Remember to replace {id} with the actual ID if required by the API call. ";
         $prompt.= "Return only the function call, nothing else. ";
         
         $this->addMessage($prompt);
