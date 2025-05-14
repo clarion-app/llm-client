@@ -55,7 +55,7 @@ class HandleGenerateApiCallsResponse extends HandleHttpResponse
                         "responseTime"=>$seconds,
                         "user"=>"Clarion",
                         "role"=>"assistant",
-                        "content"=>"```".json_encode(isset($message->tool_calls) ? $message->tool_calls : $result, JSON_PRETTY_PRINT)."```"
+                        "content"=>"```".json_encode($result, JSON_PRETTY_PRINT)."```"
                     ]);
 
                     usleep(1000000);
