@@ -5,9 +5,12 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\LanguageModel;
+use ClarionApp\LlmClient\Models\Server;
 use Illuminate\Http\Request;
 use Auth;
 use Illuminate\Support\Facades\Log;
+use ClarionApp\LlmClient\Requests\ChooseApiApplicationsRequest;
 
 class ConversationController extends Controller
 {
@@ -57,7 +60,7 @@ class ConversationController extends Controller
     }
 
     /**
-     * Store a newly created resource in storage.
+     * Store a newly created conversation in storage.
      */
     public function store(Request $request)
     {
@@ -69,6 +72,13 @@ class ConversationController extends Controller
 
         $validatedData['user_id'] = Auth::id();
         $validatedData['character'] = "Clarion";
+
+        $server = Server::where("name", "My computer")->first();
+        //$model = LanguageModel::where("name", "mistral-small-2503")->first();
+        $model = LanguageModel::where("server_id", $server->id)->first();
+        $validatedData['server_id'] = $model->server_id;
+        $validatedData['model'] = $model->name;
+
         $conversation = Conversation::create($validatedData);
         
         Message::create([
@@ -83,7 +93,22 @@ class ConversationController extends Controller
     }
 
     /**
-     * Display the specified resource.
+     * Store a newly created command conversation in storage.
+     */
+    public function storeCommand(Request $request)
+    {
+        $validatedData = $request->validate([
+            'command' => 'string',
+        ]);
+
+        $req = new ChooseApiApplicationsRequest($validatedData['command']);
+        $req->sendChooseApplications();
+
+        return response()->json($req->conversation, 201);
+    }
+
+    /**
+     * Display the specified conversation.
      */
     public function show($id)
     {

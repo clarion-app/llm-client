@@ -13,6 +13,8 @@ use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\GenerateToolFunction;
 use ClarionApp\Backend\ApiManager;
 use Illuminate\Support\Facades\Log;
+use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 
 class GenerateApiCallsRequest
 {
@@ -35,20 +37,22 @@ class GenerateApiCallsRequest
         $prompt.= json_encode($calls, JSON_PRETTY_PRINT);
         $prompt.= "\n```\n";
 
-        $prompt.= "Please repond with a call to generate_api_call with the appropriate parameters. ";
+        $prompt.= "Please repond with a tool call to generate_api_call with the appropriate parameters. ";
         $prompt.= "If completing the user's command will take multiple API calls, return the first API ";
         $prompt.= "call with the 'continue' parameter set to true so that additional calls can be chained together.";
         $prompt.= "Remember to replace {id} with the actual ID if required by the API call. ";
         $prompt.= "Return only the function call, nothing else. ";
         
         $this->addMessage($prompt);
-        Message::create([
+        $message = Message::create([
             "conversation_id"=>$this->conversation->id,
             "responseTime"=>0,
             "user"=>"User",
             "role"=>"user",
             "content"=>$prompt
         ]);
+        event(new NewConversationMessageEvent($this->conversation->id, $message->id));
+        event(new FinishOpenAIConversationResponseEvent($this->conversation->id, $prompt));
     }
 
     public function addMessage($content)
@@ -115,7 +119,7 @@ class GenerateApiCallsRequest
             'Authorization'=>'Bearer '.$server->token
         ];
         $request->body = $newConversation;
-        Log::info("ClarionApp\LlmClient\GenerateApiCallsRequest: Sending request to ".$request->url);
+        //Log::info("ClarionApp\LlmClient\GenerateApiCallsRequest: Sending request to ".$request->url);
         SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\Responses\HandleGenerateApiCallsResponse", $this->conversation->id);
     }
 }

@@ -8,19 +8,29 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use Illuminate\Support\Facades\Log;
 use ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest;
+use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 
 class HandleChooseApiApplicationsResponse extends HandleHttpResponse
 {
+    public ?Message $message = null;
+
     public function handle(Response $response, $conversation_id, $seconds)
     {
         switch($response->status())
         {
             case 200:
+                $this->message = Message::create([
+                    "conversation_id"=>$conversation_id,
+                    "responseTime"=>$seconds,
+                    "user"=>"Clarion",
+                    "role"=>"assistant",
+                    "content"=>""
+                ]);
+                event(new NewConversationMessageEvent($conversation_id, $this->message->id));
                 $conversation = Conversation::find($conversation_id);
                 foreach($response->object()->choices as $choice)
                 {
-                    Log::info("ClarionApp\LlmClient\HandleChooseApiApplicationsResponse: Received response from LLM");
-                    Log::info("    Body:".print_r($response->object(), 1));
                     $message = $choice->message;
                     if(isset($message->tool_calls))
                     {
@@ -45,14 +55,12 @@ class HandleChooseApiApplicationsResponse extends HandleHttpResponse
                         $result = json_decode($cleaned);
                         if(isset($result->arguments)) $result = $result->arguments;
                     }
-                    
-                    Message::create([
-                        "conversation_id"=>$conversation->id,
-                        "responseTime"=>$seconds,
-                        "user"=>"Clarion",
-                        "role"=>"assistant",
-                        "content"=>"```".json_encode($result, JSON_PRETTY_PRINT)."```"
-                    ]);
+
+                    $reply = "```".json_encode($result, JSON_PRETTY_PRINT)."```";
+                    $this->message->content = $reply;
+                    $this->message->save();
+                    event(new FinishOpenAIConversationResponseEvent($conversation_id, $reply));
+
                     usleep(1000000);
                     $next = new ChooseApiOperationsRequest($conversation_id, $result->packages);
                     $next->sendChooseOperations();                    

@@ -21,6 +21,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('model', [LanguageModelController::class, "index"]);
 
     Route::post('page/text', [FetchPageController::class, "getTextFromUrl"]);
+
+    Route::post('command-conversation', [ConversationController::class, "storeCommand"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

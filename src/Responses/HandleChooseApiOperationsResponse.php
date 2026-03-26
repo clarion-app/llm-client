@@ -8,6 +8,8 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use Illuminate\Support\Facades\Log;
 use ClarionApp\LlmClient\Requests\GenerateApiCallsRequest;
+use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 
 class HandleChooseApiOperationsResponse extends HandleHttpResponse
 {
@@ -19,10 +21,14 @@ class HandleChooseApiOperationsResponse extends HandleHttpResponse
                 $conversation = Conversation::find($conversation_id);
                 foreach($response->object()->choices as $choice)
                 {
-                    Log::info("ClarionApp\LlmClient\HandleGenerateApiCallsResponse: Received response from LLM");
-                    Log::info("    Body:".print_r($response->object(), 1));
                     $message = $choice->message;
-                    if(isset($message->tool_calls))
+                    if(isset($message->content))
+                    {
+                        $cleaned = str_replace("```json", "", $message->content);
+                        $cleaned = str_replace("```", "", $cleaned);
+                        $result = json_decode($cleaned);
+                    }
+                    else
                     {
                         foreach($message->tool_calls as $tool_call)
                         {
@@ -34,19 +40,18 @@ class HandleChooseApiOperationsResponse extends HandleHttpResponse
                             }
                         }
                     }
-                    else
-                    {
-                        $cleaned = str_replace("```json", "", $message->content);
-                        $cleaned = str_replace("```", "", $cleaned);
-                        $result = json_decode($cleaned);
-                    }
-                    Message::create([
+                    
+                    $reply = "```".json_encode(isset($message->tool_calls) ? $message->tool_calls : $message->content, JSON_PRETTY_PRINT)."```";
+                    $message = Message::create([
                         "conversation_id"=>$conversation->id,
                         "responseTime"=>$seconds,
                         "user"=>"Clarion",
                         "role"=>"assistant",
-                        "content"=>"```".json_encode(isset($message->tool_calls) ? $message->tool_calls : $message->content, JSON_PRETTY_PRINT)."```"
+                        "content"=>$reply
                     ]);
+                    event(new NewConversationMessageEvent($conversation->id, $message->id));
+                    event(new FinishOpenAIConversationResponseEvent($conversation->id, $reply));
+
                     usleep(500000);
                     $r = new GenerateApiCallsRequest($conversation->id, $result->packages);
                     $r->sendRequest();

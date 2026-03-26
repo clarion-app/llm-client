@@ -12,9 +12,12 @@ use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\GenerateToolFunction;
 use ClarionApp\Backend\ApiManager;
+use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\Backend\Models\AppPackage;
 use ClarionApp\Backend\Models\ComposerPackage;
 use Illuminate\Support\Facades\Log;
+use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 
 class ChooseApiOperationsRequest
 {
@@ -28,61 +31,41 @@ class ChooseApiOperationsRequest
         $operations = [];
         foreach($packages as $package)
         {
-            $operations[$package] = ApiManager::getOperations($package);
+            $operations[$package] = ClarionPackageServiceProvider::getPackageOperations($package);
         }
         $prompt = "Your task is to choose the most appropriate operation IDs for the command. The list of operations is:\n```";
         $prompt.= json_encode($operations, JSON_PRETTY_PRINT);
         $prompt.= "```\nPlease respond with a call to choose_api_operations with the appropriate parameters.";
         foreach($packages as $package)
         {
-            [$org, $name] = explode("/", $package);
-            Log::info("ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest: Looking for package $org $name");
-            $appPackage = AppPackage::where("organization", $org)
-                ->where("name", $name)
-                ->first();
-            if(!$appPackage)
-            {
-                continue;
-            }
-            Log::info("ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest: Found package ".print_r($appPackage->toArray(), 1));
-
-            $composerPackage = ComposerPackage::where("app_id", $appPackage->id)
-                ->first();
-
-            if(!$composerPackage)
-            {
-                continue;
-            }
-            Log::info("ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest: Found composer package ".print_r($composerPackage->toArray(), 1));
-            $backend = $composerPackage->organization."/".$composerPackage->name;
-            Log::info("ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest: Looking for backend $backend");
-            $customPrompts = ApiManager::getCustomPrompts($backend);
+            $customPrompts = ApiManager::getCustomPrompts($package);
             
             if(!$customPrompts)
             {
                 continue;
             }
-            Log::info("ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest: Found custom prompts ".print_r($customPrompts, 1));
             
-            if(isset($customPrompts->chooseOperations))
+            if(isset($customPrompts['chooseOperations']))
             {
-                $prompt.= "\nOperations instructions for $package:\n".$customPrompts->chooseOperations;
+                $prompt.= "\nOperations instructions for $package:\n".$customPrompts['chooseOperations'];
             }
             
-            if(isset($customPrompts->generateApiCall))
+            if(isset($customPrompts['generateApiCall']))
             {
-                $prompt.= "\nAPI call instructions for $package:\n".$customPrompts->generateApiCall;
+                $prompt.= "\nAPI call instructions for $package:\n".$customPrompts['generateApiCall'];
             }
         }
         $prompt.= "Return only the function call, nothing else. ";
         $this->addMessage($prompt);
-        Message::create([
+        $message = Message::create([
             "conversation_id"=>$this->conversation->id,
             "responseTime"=>0,
             "user"=>"System",
             "role"=>"user",
             "content"=>$prompt
         ]);
+        event(new NewConversationMessageEvent($this->conversation->id, $message->id));
+        event(new FinishOpenAIConversationResponseEvent($this->conversation->id, $prompt));
     }
 
     public function addMessage($content)
@@ -153,7 +136,7 @@ class ChooseApiOperationsRequest
             'Authorization'=>'Bearer '.$server->token
         ];
         $request->body = $newConversation;
-        Log::info("ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest: Sending request to ".$request->url);
+        //Log::info("ClarionApp\LlmClient\Requests\ChooseApiOperationsRequest: Sending request to ".$request->url);
         SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\Responses\HandleChooseApiOperationsResponse", $this->conversation->id);
     }
 }

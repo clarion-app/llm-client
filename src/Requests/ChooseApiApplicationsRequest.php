@@ -4,7 +4,6 @@ namespace ClarionApp\LlmClient\Requests;
 
 use Illuminate\Http\Client\Response;
 use ClarionApp\HttpQueue\Jobs\SendHttpRequest;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\LanguageModel;
@@ -17,13 +16,14 @@ use Illuminate\Support\Facades\Log;
 
 class ChooseApiApplicationsRequest
 {
-    protected Conversation $conversation;
+    public Conversation $conversation;
 
     protected $messages = [];
 
     public function __construct($user_command)
     {
         $model = LanguageModel::where("name", "mistral-small-2503")->first();
+        //$model = LanguageModel::where("name", "Default")->first();
         $this->conversation = Conversation::create([
             "user_id"=>User::first()->id, // TODO: get user from request
             "server_id"=>$model->server_id,

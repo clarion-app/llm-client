@@ -13,6 +13,8 @@ use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\GenerateToolFunction;
 use Illuminate\Support\Facades\Log;
 use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 
 class HandleGenerateApiCallsResponse extends HandleHttpResponse
 {
@@ -27,8 +29,6 @@ class HandleGenerateApiCallsResponse extends HandleHttpResponse
                 $this->conversation = Conversation::find($conversation_id);
                 foreach($response->object()->choices as $choice)
                 {
-                    Log::info("ClarionApp\LlmClient\HandleGenerateApiCallsResponse: Received response from LLM");
-                    Log::info("    Body:".print_r($response->object(), 1));
                     $message = $choice->message;
                     if(isset($message->tool_calls))
                     {
@@ -46,22 +46,26 @@ class HandleGenerateApiCallsResponse extends HandleHttpResponse
                     {
                         $cleaned = str_replace("```json", "", $message->content);
                         $cleaned = str_replace("```", "", $cleaned);
+                        $cleaned = str_replace("generate_api_call(", "", $cleaned);
+                        $cleaned = str_replace(")", "", $cleaned);
                         $result = json_decode($cleaned);
                         if(isset($result->function)) $result = $result->function;
                         if(isset($result->arguments)) $result = $result->arguments;
                     }
-                    Message::create([
+                    $reply = "```".json_encode($result, JSON_PRETTY_PRINT)."```";
+                    $message = Message::create([
                         "conversation_id"=>$this->conversation->id,
                         "responseTime"=>$seconds,
                         "user"=>"Clarion",
                         "role"=>"assistant",
-                        "content"=>"```".json_encode($result, JSON_PRETTY_PRINT)."```"
+                        "content"=>$reply
                     ]);
+                    event(new NewConversationMessageEvent($this->conversation->id, $message->id));
+                    event(new FinishOpenAIConversationResponseEvent($this->conversation->id, $reply));
 
                     usleep(1000000);
                     $user = User::find($this->conversation->user_id);
                     $accessToken = $user->createToken('CommandCall')->accessToken;
-                    Log::info("ClarionApp\LlmClient\HandleGenerateApiCallsResponse. Result: ".print_r($result, 1));
                     $parts = explode("/", stripslashes($result->path));
                     array_unshift($parts, "api");
                     array_unshift($parts, env("APP_URL"));
@@ -117,13 +121,15 @@ class HandleGenerateApiCallsResponse extends HandleHttpResponse
                         $prompt.= "together. You MUST include the body parameter.";
                     }
 
-                    Message::create([
+                    $message = Message::create([
                         "conversation_id"=>$this->conversation->id,
                         "responseTime"=>$seconds,
                         "user"=>"System",
                         "role"=>"user",
                         "content"=>$prompt
                     ]);
+                    event(new NewConversationMessageEvent($this->conversation->id, $message->id));
+                    event(new FinishOpenAIConversationResponseEvent($this->conversation->id, $prompt));
 
                     if($result->continue)
                     {
@@ -194,7 +200,6 @@ class HandleGenerateApiCallsResponse extends HandleHttpResponse
             'Authorization'=>'Bearer '.$server->token
         ];
         $request->body = $newConversation;
-        Log::info("ClarionApp\LlmClient\HandleGenerateApiCallsResponse: Sending request to ".$request->url);
         SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\Responses\HandleGenerateApiCallsResponse", $this->conversation->id);
     }
 }
