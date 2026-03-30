@@ -73,7 +73,7 @@ class ConversationController extends Controller
         $validatedData['user_id'] = Auth::id();
         $validatedData['character'] = "Clarion";
 
-        $server = Server::where("name", "My computer")->first();
+        $server = Server::where("name", "Az")->first();
         //$model = LanguageModel::where("name", "mistral-small-2503")->first();
         $model = LanguageModel::where("server_id", $server->id)->first();
         $validatedData['server_id'] = $model->server_id;
