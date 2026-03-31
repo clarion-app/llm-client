@@ -90,7 +90,7 @@ class ConversationController extends Controller
         }
 
         if (!$serverId || !$modelName) {
-            $model = LanguageModel::first();
+            $model = LanguageModel::whereHas('server')->first();
             if (!$model) {
                 return response()->json(['message' => 'No server or model available. Please configure a server first.'], 422);
             }

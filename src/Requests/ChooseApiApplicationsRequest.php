@@ -35,7 +35,7 @@ class ChooseApiApplicationsRequest
         }
 
         if (!$model) {
-            $model = LanguageModel::first();
+            $model = LanguageModel::whereHas('server')->first();
         }
 
         $this->conversation = Conversation::create([
