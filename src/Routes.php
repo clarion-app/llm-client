@@ -8,10 +8,12 @@ use ClarionApp\LlmClient\Controllers\MessageController;
 use ClarionApp\LlmClient\Controllers\LanguageModelController;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Controllers\FetchPageController;
+use ClarionApp\LlmClient\Controllers\UserSettingController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
     Route::post('conversation/{id}/generate-title', [ConversationController::class, "generateTitle"]);
+    Route::post('conversation/{id}/confirm-api-call', [ConversationController::class, "confirmApiCall"]);
     Route::get('user/{id}/conversation', [ConversationController::class, "userConversations"]);
     Route::resource('server', ServerController::class);
     Route::resource('message', MessageController::class);
@@ -23,6 +25,9 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('page/text', [FetchPageController::class, "getTextFromUrl"]);
 
     Route::post('command-conversation', [ConversationController::class, "storeCommand"]);
+
+    Route::get('user-setting', [UserSettingController::class, "show"]);
+    Route::put('user-setting', [UserSettingController::class, "update"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

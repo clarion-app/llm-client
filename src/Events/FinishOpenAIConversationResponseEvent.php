@@ -34,7 +34,7 @@ class FinishOpenAIConversationResponseEvent implements ShouldBroadcastNow
     public function broadcastOn(): array
     {
         return [
-            new Channel("Conversation.".$this->conversation_id)
+            new PrivateChannel("Conversation.".$this->conversation_id)
         ];
     }
 }

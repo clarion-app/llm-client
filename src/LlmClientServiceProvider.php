@@ -23,5 +23,9 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
     public function register(): void
     {
         parent::register();
+
+        $this->mergeConfigFrom(
+            __DIR__.'/../config/llm-client.php', 'llm-client'
+        );
     }
 }

@@ -39,7 +39,7 @@ class ServerController extends Controller
 
     public function update(Request $request, $id)
     {
-        $server = Server::find($id);
+        $server = Server::findOrFail($id);
         $validatedData = $request->validate([
             'name' => 'required|string|max:255',
             'server_url' => 'required|string|max:255',
@@ -54,7 +54,7 @@ class ServerController extends Controller
 
     public function destroy($id)
     {
-        $server = Server::find($id);
+        $server = Server::findOrFail($id);
         $server->delete();
         return response()->json([], 204);
     }

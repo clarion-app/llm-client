@@ -61,7 +61,6 @@ class HandleChooseApiApplicationsResponse extends HandleHttpResponse
                     $this->message->save();
                     event(new FinishOpenAIConversationResponseEvent($conversation_id, $reply));
 
-                    usleep(1000000);
                     $next = new ChooseApiOperationsRequest($conversation_id, $result->packages);
                     $next->sendChooseOperations();                    
                 }

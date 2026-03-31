@@ -65,7 +65,7 @@ class MessageController extends Controller
     {
         $validatedData = $request->validate([
             'content' => 'required|string',
-            'role' => 'required|enum:assistant,user,system',
+            'role' => 'required|in:assistant,user,system',
             'user' => 'required|string',
             'responseTime' => 'nullable|integer',
             'conversation_id' => 'required|exists:conversations,id'

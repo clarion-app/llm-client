@@ -10,9 +10,11 @@ use ClarionApp\LlmClient\Models\LanguageModel;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\GenerateToolFunction;
+use ClarionApp\LlmClient\Models\UserSetting;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Support\Facades\Log;
+use Auth;
 
 class ChooseApiApplicationsRequest
 {
@@ -22,16 +24,27 @@ class ChooseApiApplicationsRequest
 
     public function __construct($user_command)
     {
-        $model = LanguageModel::where("name", "mistral-small-2503")->first();
-        //$model = LanguageModel::where("name", "Default")->first();
+        $userId = Auth::id();
+
+        // Determine server and model from UserSetting, then fallback
+        $userSetting = UserSetting::where('user_id', $userId)->first();
+        $model = null;
+
+        if ($userSetting && $userSetting->model) {
+            $model = LanguageModel::where('name', $userSetting->model)->first();
+        }
+
+        if (!$model) {
+            $model = LanguageModel::first();
+        }
+
         $this->conversation = Conversation::create([
-            "user_id"=>User::first()->id, // TODO: get user from request
-            "server_id"=>$model->server_id,
-            "model"=>$model->name,
-            "character"=>"Clarion",
-            "title"=>"Interpret user command",
+            "user_id" => $userId,
+            "server_id" => $model->server_id,
+            "model" => $model->name,
+            "character" => "Clarion",
+            "title" => "Interpret user command",
         ]);
-        usleep(500000);
         $packages = json_encode(ApiManager::getPackageDescriptions(), JSON_PRETTY_PRINT);
         $prompt = "You are a helpful assistant. You will be given a command and a list of packages. ";
         $prompt.= "Your task is to choose the most appropriate package or packages for the command. ";

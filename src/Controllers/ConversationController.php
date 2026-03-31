@@ -7,10 +7,14 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\LanguageModel;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Models\UserSetting;
 use Illuminate\Http\Request;
 use Auth;
 use Illuminate\Support\Facades\Log;
 use ClarionApp\LlmClient\Requests\ChooseApiApplicationsRequest;
+use ClarionApp\LlmClient\Responses\HandleGenerateApiCallsResponse;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
+use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 
 class ConversationController extends Controller
 {
@@ -66,18 +70,36 @@ class ConversationController extends Controller
     {
         $validatedData = $request->validate([
             'title' => 'nullable|string',
-            'model' => 'required|string',
-            'server_id' => 'required|string',
+            'model' => 'nullable|string',
+            'server_id' => 'nullable|string',
         ]);
 
         $validatedData['user_id'] = Auth::id();
         $validatedData['character'] = "Clarion";
 
-        $server = Server::where("name", "Az")->first();
-        //$model = LanguageModel::where("name", "mistral-small-2503")->first();
-        $model = LanguageModel::where("server_id", $server->id)->first();
-        $validatedData['server_id'] = $model->server_id;
-        $validatedData['model'] = $model->name;
+        // Use validated server_id/model if provided, otherwise fall back to UserSetting, then first available
+        $serverId = $validatedData['server_id'] ?? null;
+        $modelName = $validatedData['model'] ?? null;
+
+        if (!$serverId || !$modelName) {
+            $userSetting = UserSetting::where('user_id', Auth::id())->first();
+            if ($userSetting) {
+                $serverId = $serverId ?: $userSetting->server_id;
+                $modelName = $modelName ?: $userSetting->model;
+            }
+        }
+
+        if (!$serverId || !$modelName) {
+            $model = LanguageModel::first();
+            if (!$model) {
+                return response()->json(['message' => 'No server or model available. Please configure a server first.'], 422);
+            }
+            $serverId = $serverId ?: $model->server_id;
+            $modelName = $modelName ?: $model->name;
+        }
+
+        $validatedData['server_id'] = $serverId;
+        $validatedData['model'] = $modelName;
 
         $conversation = Conversation::create($validatedData);
         
@@ -112,7 +134,12 @@ class ConversationController extends Controller
      */
     public function show($id)
     {
-        $conversation = Conversation::find($id);
+        $conversation = Conversation::findOrFail($id);
+
+        if ($conversation->user_id !== Auth::id()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
         $conversation->messages = Message::where('conversation_id', $id)->orderBy('created_at', 'ASC')->get();
         return $conversation;
     }
@@ -130,14 +157,19 @@ class ConversationController extends Controller
      */
     public function update(Request $request, $id)
     {
-        $request->validate([
+        $validatedData = $request->validate([
             'title' => 'required|string',
             'model' => 'required|string',
             'server_id' => 'required|string'
         ]);
 
-        $conversation = Conversation::find($id);
-        $conversation->update($request->all());
+        $conversation = Conversation::findOrFail($id);
+
+        if ($conversation->user_id !== Auth::id()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $conversation->update($validatedData);
 
         return response()->json($conversation, 200);
     }
@@ -147,7 +179,12 @@ class ConversationController extends Controller
      */
     public function destroy($id)
     {
-        $conversation = Conversation::find($id);
+        $conversation = Conversation::findOrFail($id);
+
+        if ($conversation->user_id !== Auth::id()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
         $conversation->delete();
 
         return response()->noContent();
@@ -155,8 +192,78 @@ class ConversationController extends Controller
 
     public function generateTitle($id)
     {
-        $conversation = Conversation::find($id);
+        $conversation = Conversation::findOrFail($id);
+
+        if ($conversation->user_id !== Auth::id()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
         $request = new \ClarionApp\LlmClient\OpenAIGenerateConversationTitleRequest($conversation);
         $request->sendGenerateConversationTitle();
+    }
+
+    public function confirmApiCall(Request $request, $id)
+    {
+        $conversation = Conversation::findOrFail($id);
+
+        if ($conversation->user_id !== Auth::id()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $validated = $request->validate([
+            'approved' => 'required|boolean',
+            'message_id' => 'required|string',
+        ]);
+
+        $message = Message::where('id', $validated['message_id'])
+            ->where('conversation_id', $conversation->id)
+            ->first();
+
+        if (!$message) {
+            return response()->json(['message' => 'Pending call not found'], 404);
+        }
+
+        $pendingData = json_decode($message->content, true);
+        if (!$pendingData || !isset($pendingData['__pending_api_call'])) {
+            return response()->json(['message' => 'No pending API call for this message'], 422);
+        }
+
+        if ($validated['approved']) {
+            // Execute the stored call
+            $result = (object) $pendingData;
+            $handler = new HandleGenerateApiCallsResponse();
+
+            // We need to set the conversation on the handler via reflection since it's protected
+            $reflection = new \ReflectionClass($handler);
+            $prop = $reflection->getProperty('conversation');
+            $prop->setAccessible(true);
+            $prop->setValue($handler, $conversation);
+
+            $handler->executeApiCall($result, 0);
+
+            // Mark message as executed
+            $pendingData['__executed'] = true;
+            $message->content = json_encode($pendingData);
+            $message->save();
+
+            return response()->json(['message' => 'API call executed'], 200);
+        } else {
+            // Mark as cancelled
+            $pendingData['__cancelled'] = true;
+            $message->content = json_encode($pendingData);
+            $message->save();
+
+            $cancelMsg = Message::create([
+                'conversation_id' => $conversation->id,
+                'role' => 'system',
+                'user' => 'System',
+                'content' => 'User denied the API call: ' . $pendingData['method'] . ' ' . $pendingData['path'],
+                'responseTime' => 0,
+            ]);
+            event(new NewConversationMessageEvent($conversation->id, $cancelMsg->id));
+            event(new FinishOpenAIConversationResponseEvent($conversation->id, $cancelMsg->content));
+
+            return response()->json(['message' => 'API call cancelled'], 200);
+        }
     }
 }

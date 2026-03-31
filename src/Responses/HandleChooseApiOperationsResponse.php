@@ -52,7 +52,6 @@ class HandleChooseApiOperationsResponse extends HandleHttpResponse
                     event(new NewConversationMessageEvent($conversation->id, $message->id));
                     event(new FinishOpenAIConversationResponseEvent($conversation->id, $reply));
 
-                    usleep(500000);
                     $r = new GenerateApiCallsRequest($conversation->id, $result->packages);
                     $r->sendRequest();
                 }

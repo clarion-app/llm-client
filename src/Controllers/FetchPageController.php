@@ -7,12 +7,22 @@ use Facebook\WebDriver\Chrome\ChromeDriver;
 use Facebook\WebDriver\Chrome\ChromeOptions;
 use Facebook\WebDriver\WebDriverBy;
 use App\Http\Controllers\Controller;
+use ClarionApp\LlmClient\Services\UrlValidator;
 
 class FetchPageController extends Controller
 {
     public function getTextFromUrl(Request $request)
     {
+        $request->validate([
+            'url' => 'required|url',
+        ]);
+
         $url = $request->input('url');
+
+        $validation = UrlValidator::validate($url);
+        if (!$validation['valid']) {
+            return response()->json(['message' => $validation['reason']], 403);
+        }
 
         $host = 'http://localhost:9515'; // ChromeDriver default URL
         $agent = "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/111.0";
