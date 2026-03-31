@@ -13,6 +13,5 @@ class Server extends Model
 
     protected $fillable = ['name', 'server_url', 'token'];
     protected $hidden = ['token'];
-    protected $casts = ['token' => 'encrypted'];
     protected $table = 'llm_servers';
 }
