@@ -14,4 +14,19 @@ return [
     'ssrf' => [
         'max_redirects' => 5,
     ],
+
+    // MCP Server configuration
+    'mcp' => [
+        // Supported MCP protocol versions
+        'supported_versions' => ['2025-03-26'],
+
+        // Session time-to-live in minutes (sessions inactive longer than this may be expired)
+        'session_ttl' => 60,
+
+        // Default page size for tools/list pagination
+        'page_size' => 50,
+
+        // Confirmation token expiry in seconds
+        'confirmation_token_expiry' => 300,
+    ],
 ];

@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Controllers\LanguageModelController;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Controllers\FetchPageController;
 use ClarionApp\LlmClient\Controllers\UserSettingController;
+use ClarionApp\LlmClient\Controllers\McpServerController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -28,6 +29,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     Route::get('user-setting', [UserSettingController::class, "show"]);
     Route::put('user-setting', [UserSettingController::class, "update"]);
+
+    Route::post('mcp', [McpServerController::class, "handle"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
