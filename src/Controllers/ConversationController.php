@@ -71,10 +71,12 @@ class ConversationController extends Controller
             'title' => 'nullable|string',
             'model' => 'nullable|string',
             'server_id' => 'nullable|string',
+            'channel' => 'nullable|string|max:50|regex:/^[a-z0-9_-]+$/',
         ]);
 
         $validatedData['user_id'] = Auth::id();
         $validatedData['character'] = "Clarion";
+        $validatedData['channel'] = $validatedData['channel'] ?? 'web';
 
         // Use validated server_id/model if provided, otherwise fall back to UserSetting, then first available
         $serverId = $validatedData['server_id'] ?? null;

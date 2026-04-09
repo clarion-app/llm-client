@@ -9,7 +9,7 @@ return [
     ],
 
     // HTTP methods that require user confirmation before execution
-    'confirm_methods' => ['PUT', 'PATCH', 'DELETE'],
+    'confirm_methods' => ['DELETE'],
 
     'ssrf' => [
         'max_redirects' => 5,
@@ -20,6 +20,11 @@ return [
         'max_iterations' => 20,
         'confirmation_timeout' => 300,
         'max_tools' => 128,
+    ],
+
+    // Conversation settings
+    'conversation' => [
+        'inactivity_threshold_hours' => 4,
     ],
 
     // MCP Server configuration

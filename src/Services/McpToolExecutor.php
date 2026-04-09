@@ -143,7 +143,9 @@ class McpToolExecutor
         $accessToken = $user->createToken('McpToolCall')->accessToken;
 
         $baseUrl = rtrim(env('APP_URL'), '/');
-        $url = $baseUrl . $path;
+        $url = $baseUrl . '/api' . $path;
+
+        \Log::info("Executing tool call: {$method} {$url}", ['query' => $query, 'body' => $body]);
 
         if (!empty($query)) {
             $url .= '?' . http_build_query($query);

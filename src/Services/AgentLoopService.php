@@ -12,6 +12,7 @@ use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
+use GuzzleHttp\Client;
 
 class AgentLoopService
 {
@@ -79,6 +80,335 @@ class AgentLoopService
         $tools = $this->buildToolsPayload();
         $messages = $this->buildMessagesPayload($conversation);
         $this->dispatchStreamRequest($conversation, $messages, $tools, $iteration);
+    }
+
+    /**
+     * Synchronous agent loop execution for external channel integrations.
+     * Returns the final response array or a confirmation-required structure.
+     */
+    public function run(Conversation $conversation, string $message): array
+    {
+        $conversation->update(['is_processing' => true]);
+
+        // Create the user message
+        $userMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $message,
+            'role' => 'user',
+            'user' => 'User',
+            'responseTime' => 0,
+        ]);
+
+        $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
+        $tools = $this->buildToolsPayload();
+
+        try {
+            for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
+                $messages = $this->buildMessagesPayload($conversation);
+                $response = $this->callLlmSync($conversation, $messages, $tools);
+
+                $choice = $response['choices'][0] ?? null;
+                if (!$choice) {
+                    $conversation->update(['is_processing' => false]);
+                    return ['status' => 'error', 'content' => 'No response from LLM', 'message_id' => null];
+                }
+
+                $responseMessage = $choice['message'] ?? [];
+                $content = $responseMessage['content'] ?? '';
+                $toolCalls = $responseMessage['tool_calls'] ?? [];
+
+                // No tool calls — plain text response
+                if (empty($toolCalls)) {
+                    $assistantMessage = Message::create([
+                        'conversation_id' => $conversation->id,
+                        'content' => $content,
+                        'role' => 'assistant',
+                        'user' => $conversation->character,
+                        'responseTime' => 0,
+                    ]);
+
+                    $conversation->update(['is_processing' => false]);
+
+                    // Generate title on first exchange
+                    if ($conversation->title === null) {
+                        $titleRequest = new \ClarionApp\LlmClient\OpenAIGenerateConversationTitleRequest($conversation);
+                        $titleRequest->sendGenerateConversationTitle();
+                    }
+
+                    return [
+                        'status' => 'completed',
+                        'content' => $content,
+                        'message_id' => $assistantMessage->id,
+                    ];
+                }
+
+                // Handle tool calls
+                $toolResults = [];
+                $pendingConfirmation = null;
+
+                foreach ($toolCalls as $toolCall) {
+                    $toolName = $toolCall['function']['name'] ?? '';
+                    $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+                    $toolCallId = $toolCall['id'] ?? '';
+
+                    $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                    $decoded = json_decode($result, true);
+
+                    if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
+                        $pendingConfirmation = [
+                            'tool_name' => 'execute_operation',
+                            'operationId' => $decoded['operationId'],
+                            'method' => $decoded['method'],
+                            'path' => $decoded['path'],
+                            'arguments' => $decoded['parameters'] ?? [],
+                            'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                        ];
+
+                        // Store message with pending confirmation
+                        $assistantMessage = Message::create([
+                            'conversation_id' => $conversation->id,
+                            'content' => $content ?: '',
+                            'role' => 'assistant',
+                            'user' => $conversation->character,
+                            'responseTime' => 0,
+                            'tool_data' => [
+                                'tool_calls' => $toolCalls,
+                                'tool_results' => null,
+                                'iteration' => $iteration,
+                                'pending_confirmation' => $pendingConfirmation,
+                            ],
+                        ]);
+
+                        return [
+                            'status' => 'confirmation_required',
+                            'content' => $content ?: '',
+                            'message_id' => $assistantMessage->id,
+                            'confirmation' => [
+                                'operationId' => $decoded['operationId'],
+                                'method' => $decoded['method'],
+                                'path' => $decoded['path'],
+                                'arguments' => $decoded['parameters'] ?? [],
+                                'expires_at' => $pendingConfirmation['expires_at'],
+                            ],
+                        ];
+                    }
+
+                    $toolResults[] = [
+                        'tool_call_id' => $toolCallId,
+                        'content' => $result,
+                    ];
+                }
+
+                // Store the assistant message with tool data and continue loop
+                Message::create([
+                    'conversation_id' => $conversation->id,
+                    'content' => $content ?: '',
+                    'role' => 'assistant',
+                    'user' => $conversation->character,
+                    'responseTime' => 0,
+                    'tool_data' => [
+                        'tool_calls' => $toolCalls,
+                        'tool_results' => $toolResults,
+                        'iteration' => $iteration,
+                        'pending_confirmation' => null,
+                    ],
+                ]);
+            }
+
+            // Max iterations exceeded
+            $conversation->update(['is_processing' => false]);
+            return [
+                'status' => 'error',
+                'content' => 'Maximum iterations reached',
+                'message_id' => null,
+                'code' => 'max_iterations',
+            ];
+        } catch (\Throwable $e) {
+            $conversation->update(['is_processing' => false]);
+            throw $e;
+        }
+    }
+
+    /**
+     * Synchronous confirmation resolution for external channel integrations.
+     */
+    public function resumeSync(Conversation $conversation, Message $message, bool $approved): array
+    {
+        $toolData = $message->tool_data;
+        $pending = $toolData['pending_confirmation'] ?? null;
+
+        if (!$pending) {
+            throw new \RuntimeException('No pending confirmation found on this message.');
+        }
+
+        $expiresAt = Carbon::parse($pending['expires_at']);
+        if ($expiresAt->isPast()) {
+            $conversation->update(['is_processing' => false]);
+            throw new \RuntimeException('Confirmation has expired.');
+        }
+
+        $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
+
+        if ($approved) {
+            $resultContent = $this->executeApiCall(
+                $pending['operationId'],
+                $pending['method'],
+                $pending['path'],
+                $pending['arguments'] ?? [],
+                $conversation
+            );
+            $toolData['tool_results'] = [
+                ['tool_call_id' => $toolCallId, 'content' => $resultContent],
+            ];
+        } else {
+            $toolData['tool_results'] = [
+                ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'],
+            ];
+        }
+
+        $toolData['pending_confirmation'] = null;
+        $message->update(['tool_data' => $toolData]);
+
+        // Continue with synchronous loop
+        $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
+        $tools = $this->buildToolsPayload();
+        $iteration = ($toolData['iteration'] ?? 1) + 1;
+
+        for (; $iteration <= $maxIterations; $iteration++) {
+            $messages = $this->buildMessagesPayload($conversation);
+            $response = $this->callLlmSync($conversation, $messages, $tools);
+
+            $choice = $response['choices'][0] ?? null;
+            if (!$choice) {
+                $conversation->update(['is_processing' => false]);
+                return ['status' => 'error', 'content' => 'No response from LLM', 'message_id' => null];
+            }
+
+            $responseMessage = $choice['message'] ?? [];
+            $content = $responseMessage['content'] ?? '';
+            $toolCalls = $responseMessage['tool_calls'] ?? [];
+
+            if (empty($toolCalls)) {
+                $assistantMessage = Message::create([
+                    'conversation_id' => $conversation->id,
+                    'content' => $content,
+                    'role' => 'assistant',
+                    'user' => $conversation->character,
+                    'responseTime' => 0,
+                ]);
+
+                $conversation->update(['is_processing' => false]);
+                return [
+                    'status' => 'completed',
+                    'content' => $content,
+                    'message_id' => $assistantMessage->id,
+                ];
+            }
+
+            // Handle tool calls in the continuation
+            $toolResults = [];
+            foreach ($toolCalls as $toolCall) {
+                $toolName = $toolCall['function']['name'] ?? '';
+                $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+                $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                $decoded = json_decode($result, true);
+
+                if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
+                    $pendingConfirmation = [
+                        'tool_name' => 'execute_operation',
+                        'operationId' => $decoded['operationId'],
+                        'method' => $decoded['method'],
+                        'path' => $decoded['path'],
+                        'arguments' => $decoded['parameters'] ?? [],
+                        'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                    ];
+
+                    $assistantMessage = Message::create([
+                        'conversation_id' => $conversation->id,
+                        'content' => $content ?: '',
+                        'role' => 'assistant',
+                        'user' => $conversation->character,
+                        'responseTime' => 0,
+                        'tool_data' => [
+                            'tool_calls' => $toolCalls,
+                            'tool_results' => null,
+                            'iteration' => $iteration,
+                            'pending_confirmation' => $pendingConfirmation,
+                        ],
+                    ]);
+
+                    return [
+                        'status' => 'confirmation_required',
+                        'content' => $content ?: '',
+                        'message_id' => $assistantMessage->id,
+                        'confirmation' => [
+                            'operationId' => $decoded['operationId'],
+                            'method' => $decoded['method'],
+                            'path' => $decoded['path'],
+                            'arguments' => $decoded['parameters'] ?? [],
+                            'expires_at' => $pendingConfirmation['expires_at'],
+                        ],
+                    ];
+                }
+
+                $toolResults[] = [
+                    'tool_call_id' => $toolCall['id'] ?? '',
+                    'content' => $result,
+                ];
+            }
+
+            Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $content ?: '',
+                'role' => 'assistant',
+                'user' => $conversation->character,
+                'responseTime' => 0,
+                'tool_data' => [
+                    'tool_calls' => $toolCalls,
+                    'tool_results' => $toolResults,
+                    'iteration' => $iteration,
+                    'pending_confirmation' => null,
+                ],
+            ]);
+        }
+
+        $conversation->update(['is_processing' => false]);
+        return ['status' => 'error', 'content' => 'Maximum iterations reached', 'message_id' => null];
+    }
+
+    /**
+     * Make a synchronous (non-streaming) LLM API call.
+     */
+    private function callLlmSync(Conversation $conversation, array $messages, array $tools): array
+    {
+        $server = Server::find($conversation->server_id);
+        if (!$server) {
+            throw new \RuntimeException('No LLM server configured');
+        }
+
+        $body = [
+            'temperature' => 1.0,
+            'model' => $conversation->model,
+            'stream' => false,
+            'messages' => $messages,
+        ];
+
+        if (!empty($tools)) {
+            $body['tools'] = $tools;
+        }
+
+        $client = new Client(['timeout' => 120]);
+
+        $response = $client->post($server->server_url, [
+            'headers' => [
+                'Content-type' => 'application/json',
+                'Accept' => 'application/json',
+                'Authorization' => 'Bearer ' . $server->token,
+            ],
+            'json' => $body,
+        ]);
+
+        return json_decode($response->getBody()->getContents(), true);
     }
 
     public function buildToolsPayload(): array

@@ -12,11 +12,16 @@ class Conversation extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
-    protected $fillable = ['server_id', 'title', 'model', 'character', 'user_id', 'is_processing'];
+    protected $fillable = ['server_id', 'title', 'model', 'character', 'user_id', 'is_processing', 'channel'];
 
     protected $casts = [
         'is_processing' => 'boolean',
     ];
+
+    public function getChannelAttribute(): string
+    {
+        return $this->attributes['channel'] ?? 'web';
+    }
 
     protected static function newFactory()
     {
