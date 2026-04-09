@@ -38,6 +38,9 @@ return [
         // Default page size for tools/list pagination
         'page_size' => 50,
 
+        // Default page size for messages in resources/read responses
+        'messages_page_size' => 100,
+
         // Confirmation token expiry in seconds
         'confirmation_token_expiry' => 300,
     ],

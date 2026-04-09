@@ -6,6 +6,8 @@ use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
+use ClarionApp\LlmClient\Services\McpPromptRegistry;
+use ClarionApp\LlmClient\Services\McpResourceHandler;
 
 class LlmClientServiceProvider extends ClarionPackageServiceProvider
 {
@@ -36,6 +38,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(McpToolRegistry::class),
                 $app->make(McpToolExecutor::class)
             );
+        });
+
+        $this->app->singleton(McpPromptRegistry::class, function ($app) {
+            return new McpPromptRegistry();
+        });
+
+        $this->app->singleton(McpResourceHandler::class, function ($app) {
+            return new McpResourceHandler();
         });
     }
 }

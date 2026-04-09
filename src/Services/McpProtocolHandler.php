@@ -59,6 +59,16 @@ class McpProtocolHandler
                 return $this->handleToolsList($params, $id, $session);
             case 'tools/call':
                 return $this->handleToolsCall($params, $id, $session);
+            case 'prompts/list':
+                return $this->handlePromptsList($params, $id);
+            case 'prompts/get':
+                return $this->handlePromptsGet($params, $id);
+            case 'resources/list':
+                return $this->handleResourcesList($params, $id, $session);
+            case 'resources/templates/list':
+                return $this->handleResourcesTemplatesList($params, $id);
+            case 'resources/read':
+                return $this->handleResourcesRead($params, $id, $session);
             default:
                 return $this->errorResponse($id, -32601, "Method not found: {$method}");
         }
@@ -91,6 +101,13 @@ class McpProtocolHandler
                 'protocolVersion' => $protocolVersion,
                 'capabilities' => [
                     'tools' => [
+                        'listChanged' => false,
+                    ],
+                    'prompts' => [
+                        'listChanged' => false,
+                    ],
+                    'resources' => [
+                        'subscribe' => false,
                         'listChanged' => false,
                     ],
                 ],
@@ -162,6 +179,93 @@ class McpProtocolHandler
         }
 
         return $this->sessionManager->validateSession($sessionId, $userId);
+    }
+
+    public function handlePromptsList(array $params, ?int $id): array
+    {
+        $promptRegistry = app(McpPromptRegistry::class);
+        $cursor = $params['cursor'] ?? null;
+
+        $result = $promptRegistry->getPrompts($cursor);
+
+        return [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => $result,
+        ];
+    }
+
+    public function handlePromptsGet(array $params, ?int $id): array
+    {
+        $promptRegistry = app(McpPromptRegistry::class);
+        $name = $params['name'] ?? null;
+
+        if (!$name) {
+            return $this->errorResponse($id, -32602, 'Invalid params: Missing prompt name');
+        }
+
+        $arguments = $params['arguments'] ?? [];
+        $result = $promptRegistry->getPrompt($name, $arguments);
+
+        if ($result === null) {
+            return $this->errorResponse($id, -32602, "Prompt not found: {$name}");
+        }
+
+        return [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => $result,
+        ];
+    }
+
+    public function handleResourcesList(array $params, ?int $id, $session): array
+    {
+        $resourceHandler = app(McpResourceHandler::class);
+        $cursor = $params['cursor'] ?? null;
+
+        $result = $resourceHandler->listResources($session->user_id, $cursor);
+
+        return [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => $result,
+        ];
+    }
+
+    public function handleResourcesTemplatesList(array $params, ?int $id): array
+    {
+        $resourceHandler = app(McpResourceHandler::class);
+        $cursor = $params['cursor'] ?? null;
+
+        $result = $resourceHandler->listResourceTemplates($cursor);
+
+        return [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => $result,
+        ];
+    }
+
+    public function handleResourcesRead(array $params, ?int $id, $session): array
+    {
+        $resourceHandler = app(McpResourceHandler::class);
+        $uri = $params['uri'] ?? null;
+
+        if (!$uri) {
+            return $this->errorResponse($id, -32602, 'Invalid params: Missing resource URI');
+        }
+
+        $result = $resourceHandler->readResource($session->user_id, $uri);
+
+        if (isset($result['error'])) {
+            return $this->errorResponse($id, $result['error']['code'], $result['error']['message'], $result['error']['data'] ?? null);
+        }
+
+        return [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => $result,
+        ];
     }
 
     private function errorResponse(?int $id, int $code, string $message, $data = null): array
