@@ -11,10 +11,9 @@ use ClarionApp\LlmClient\Models\UserSetting;
 use Illuminate\Http\Request;
 use Auth;
 use Illuminate\Support\Facades\Log;
-use ClarionApp\LlmClient\Requests\ChooseApiApplicationsRequest;
-use ClarionApp\LlmClient\Responses\HandleGenerateApiCallsResponse;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Services\AgentLoopService;
 
 class ConversationController extends Controller
 {
@@ -115,21 +114,6 @@ class ConversationController extends Controller
     }
 
     /**
-     * Store a newly created command conversation in storage.
-     */
-    public function storeCommand(Request $request)
-    {
-        $validatedData = $request->validate([
-            'command' => 'string',
-        ]);
-
-        $req = new ChooseApiApplicationsRequest($validatedData['command']);
-        $req->sendChooseApplications();
-
-        return response()->json($req->conversation, 201);
-    }
-
-    /**
      * Display the specified conversation.
      */
     public function show($id)
@@ -223,46 +207,24 @@ class ConversationController extends Controller
             return response()->json(['message' => 'Pending call not found'], 404);
         }
 
-        $pendingData = json_decode($message->content, true);
-        if (!$pendingData || !isset($pendingData['__pending_api_call'])) {
+        $toolData = $message->tool_data;
+        if (!$toolData || !isset($toolData['pending_confirmation'])) {
             return response()->json(['message' => 'No pending API call for this message'], 422);
         }
 
+        try {
+            $agentLoopService = app(AgentLoopService::class);
+            $agentLoopService->resume($conversation, $message, $validated['approved']);
+        } catch (\RuntimeException $e) {
+            if (str_contains($e->getMessage(), 'expired')) {
+                return response()->json(['message' => 'Confirmation has expired'], 422);
+            }
+            throw $e;
+        }
+
         if ($validated['approved']) {
-            // Execute the stored call
-            $result = (object) $pendingData;
-            $handler = new HandleGenerateApiCallsResponse();
-
-            // We need to set the conversation on the handler via reflection since it's protected
-            $reflection = new \ReflectionClass($handler);
-            $prop = $reflection->getProperty('conversation');
-            $prop->setAccessible(true);
-            $prop->setValue($handler, $conversation);
-
-            $handler->executeApiCall($result, 0);
-
-            // Mark message as executed
-            $pendingData['__executed'] = true;
-            $message->content = json_encode($pendingData);
-            $message->save();
-
             return response()->json(['message' => 'API call executed'], 200);
         } else {
-            // Mark as cancelled
-            $pendingData['__cancelled'] = true;
-            $message->content = json_encode($pendingData);
-            $message->save();
-
-            $cancelMsg = Message::create([
-                'conversation_id' => $conversation->id,
-                'role' => 'system',
-                'user' => 'System',
-                'content' => 'User denied the API call: ' . $pendingData['method'] . ' ' . $pendingData['path'],
-                'responseTime' => 0,
-            ]);
-            event(new NewConversationMessageEvent($conversation->id, $cancelMsg->id));
-            event(new FinishOpenAIConversationResponseEvent($conversation->id, $cancelMsg->content));
-
             return response()->json(['message' => 'API call cancelled'], 200);
         }
     }

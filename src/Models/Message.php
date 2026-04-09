@@ -15,7 +15,12 @@ class Message extends Model
         'role',
         'user',
         'responseTime',
-        'conversation_id'
+        'conversation_id',
+        'tool_data',
+    ];
+
+    protected $casts = [
+        'tool_data' => 'array',
     ];
 
     public function conversation()

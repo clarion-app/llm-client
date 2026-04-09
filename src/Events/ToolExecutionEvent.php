@@ -8,25 +8,19 @@ use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
-class ApiCallConfirmationRequiredEvent implements ShouldBroadcastNow
+class ToolExecutionEvent implements ShouldBroadcastNow
 {
     use Dispatchable, InteractsWithSockets, SerializesModels;
 
     public string $conversation_id;
-    public string $message_id;
-    public string $method;
-    public string $path;
-    public $body;
     public string $tool_name;
+    public string $status;
 
-    public function __construct(string $conversation_id, string $message_id, string $method, string $path, $body = null, string $tool_name = '')
+    public function __construct(string $conversation_id, string $tool_name, string $status)
     {
         $this->conversation_id = $conversation_id;
-        $this->message_id = $message_id;
-        $this->method = $method;
-        $this->path = $path;
-        $this->body = $body;
         $this->tool_name = $tool_name;
+        $this->status = $status;
     }
 
     public function broadcastOn(): array

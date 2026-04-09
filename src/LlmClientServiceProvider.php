@@ -3,6 +3,9 @@
 namespace ClarionApp\LlmClient;
 
 use ClarionApp\Backend\ClarionPackageServiceProvider;
+use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\McpToolRegistry;
+use ClarionApp\LlmClient\Services\McpToolExecutor;
 
 class LlmClientServiceProvider extends ClarionPackageServiceProvider
 {
@@ -27,5 +30,12 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->mergeConfigFrom(
             __DIR__.'/../config/llm-client.php', 'llm-client'
         );
+
+        $this->app->singleton(AgentLoopService::class, function ($app) {
+            return new AgentLoopService(
+                $app->make(McpToolRegistry::class),
+                $app->make(McpToolExecutor::class)
+            );
+        });
     }
 }

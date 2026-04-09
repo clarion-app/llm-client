@@ -25,8 +25,6 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     Route::post('page/text', [FetchPageController::class, "getTextFromUrl"]);
 
-    Route::post('command-conversation', [ConversationController::class, "storeCommand"]);
-
     Route::get('user-setting', [UserSettingController::class, "show"]);
     Route::put('user-setting', [UserSettingController::class, "update"]);
 

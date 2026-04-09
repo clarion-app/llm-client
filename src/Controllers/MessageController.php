@@ -13,6 +13,7 @@ use ClarionApp\HttpQueue\SendHttpRequest;
 use Illuminate\Support\Facades\Log;
 use ClarionApp\LlmClient\OpenAIConversationRequest;
 use ClarionApp\LlmClient\OpenAIConversationStreamRequest;
+use ClarionApp\LlmClient\Services\AgentLoopService;
 
 class MessageController extends Controller
 {
@@ -50,8 +51,10 @@ class MessageController extends Controller
 
         $message = Message::create($validatedData);
 
-        $r = new OpenAIConversationStreamRequest($conversation);
-        $r->sendConversation();
+        if (!$conversation->is_processing) {
+            $agentLoopService = app(AgentLoopService::class);
+            $agentLoopService->start($conversation);
+        }
 
         return response()->json($message, 201);
     }

@@ -32,7 +32,7 @@ class OpenAIConversationStreamRequest
         ])->toArray());
     }
 
-    public function sendConversation()
+    public function sendConversation(array $tools = [], string $callbackClass = null)
     {
         $newConversation = new \stdClass();
 //        $newConversation->max_tokens = 4096; // add this field to conversation table
@@ -48,6 +48,10 @@ class OpenAIConversationStreamRequest
             array_push($newConversation->messages, $m);
         }
 
+        if (!empty($tools)) {
+            $newConversation->tools = $tools;
+        }
+
         $server = Server::find($this->conversation->server_id);
 
         $request = new HttpRequest();
@@ -59,6 +63,8 @@ class OpenAIConversationStreamRequest
             'Authorization'=>'Bearer '.$server->token
         ];
         $request->body = $newConversation;
-        SendHttpStreamRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIConversationStreamResponse", $this->conversation->id);
+
+        $callback = $callbackClass ?? "ClarionApp\LlmClient\HandleOpenAIConversationStreamResponse";
+        SendHttpStreamRequest::dispatch($request, $callback, $this->conversation->id);
     }
 }

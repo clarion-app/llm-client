@@ -15,6 +15,12 @@ return [
         'max_redirects' => 5,
     ],
 
+    // Agent Loop configuration
+    'agent_loop' => [
+        'max_iterations' => 20,
+        'confirmation_timeout' => 300,
+    ],
+
     // MCP Server configuration
     'mcp' => [
         // Supported MCP protocol versions

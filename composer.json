@@ -17,7 +17,8 @@
     "license": "MIT",
     "autoload": {
         "psr-4": {
-            "ClarionApp\\LlmClient\\": "src/"
+            "ClarionApp\\LlmClient\\": "src/",
+            "ClarionApp\\LlmClient\\Database\\Factories\\": "database/factories/"
         }
     },
     "authors": [
