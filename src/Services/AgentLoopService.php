@@ -6,8 +6,11 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\Backend\ApiManager;
+use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
 
 class AgentLoopService
@@ -51,15 +54,14 @@ class AgentLoopService
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
         if ($approved) {
-            // Execute the tool
-            $session = $this->getOrCreateSession($conversation);
-            $result = $this->toolExecutor->executeTool(
-                $pending['tool_name'],
-                $pending['arguments'],
-                $session
+            // Execute the confirmed operation
+            $resultContent = $this->executeApiCall(
+                $pending['operationId'],
+                $pending['method'],
+                $pending['path'],
+                $pending['arguments'] ?? [],
+                $conversation
             );
-
-            $resultContent = $this->extractResultContent($result);
 
             $toolData['tool_results'] = [
                 ['tool_call_id' => $toolCallId, 'content' => $resultContent],
@@ -81,25 +83,196 @@ class AgentLoopService
 
     public function buildToolsPayload(): array
     {
-        $allTools = [];
-        $cursor = null;
-
-        do {
-            $result = $this->toolRegistry->getTools($cursor);
-            foreach ($result['tools'] as $tool) {
-                $allTools[] = [
-                    'type' => 'function',
-                    'function' => [
-                        'name' => $tool['name'],
-                        'description' => $tool['description'],
-                        'parameters' => $tool['inputSchema'],
+        return [
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'list_applications',
+                    'description' => 'List all available API applications/packages that can be interacted with. Call this first to discover what applications are available.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => new \stdClass(),
                     ],
-                ];
-            }
-            $cursor = $result['nextCursor'];
-        } while ($cursor !== null);
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'list_operations',
+                    'description' => 'List the available API operations for a specific application. Returns operation IDs, summaries, HTTP methods, and paths. Call this after list_applications to see what you can do with a specific app.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'application' => [
+                                'type' => 'string',
+                                'description' => 'The application package name as returned by list_applications (e.g. "clarion-app/contacts")',
+                            ],
+                        ],
+                        'required' => ['application'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'execute_operation',
+                    'description' => 'Execute an API operation. Pass the operationId from list_operations and any required parameters. Path parameters should be prefixed with "path_", query parameters with "query_", and request body parameters with "body_".',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'operationId' => [
+                                'type' => 'string',
+                                'description' => 'The operationId from list_operations',
+                            ],
+                            'parameters' => [
+                                'type' => 'object',
+                                'description' => 'Operation parameters. Use "path_" prefix for path params, "query_" for query params, "body_" for request body fields.',
+                            ],
+                        ],
+                        'required' => ['operationId'],
+                    ],
+                ],
+            ],
+        ];
+    }
 
-        return $allTools;
+    public function executeMetaTool(string $toolName, array $arguments, Conversation $conversation): string
+    {
+        return match ($toolName) {
+            'list_applications' => $this->handleListApplications(),
+            'list_operations' => $this->handleListOperations($arguments),
+            'execute_operation' => $this->handleExecuteOperation($arguments, $conversation),
+            default => json_encode(['error' => "Unknown tool: {$toolName}"]),
+        };
+    }
+
+    private function handleListApplications(): string
+    {
+        $packages = ClarionPackageServiceProvider::getPackageDescriptions();
+        $apps = [];
+        foreach ($packages as $name => $meta) {
+            $apps[] = [
+                'name' => $name,
+                'description' => $meta['description'] ?? $name,
+            ];
+        }
+        return json_encode($apps);
+    }
+
+    private function handleListOperations(array $arguments): string
+    {
+        $appName = $arguments['application'] ?? '';
+        if (empty($appName)) {
+            return json_encode(['error' => 'application parameter is required']);
+        }
+
+        $operations = ClarionPackageServiceProvider::getPackageOperations($appName);
+
+        // Enrich with method and path from API docs
+        $enriched = [];
+        foreach ($operations as $op) {
+            $operationId = $op['operationId'] ?? null;
+            if (!$operationId) continue;
+
+            $details = ApiManager::getOperationDetails($operationId);
+            if (empty((array) $details)) continue;
+
+            $opDetails = $details['details'] ?? [];
+            $enriched[] = [
+                'operationId' => $operationId,
+                'summary' => $op['summary'] ?? $operationId,
+                'method' => strtoupper($details['method'] ?? 'GET'),
+                'path' => $details['path'] ?? '',
+                'parameters' => $this->summarizeParameters($opDetails),
+            ];
+        }
+
+        return json_encode($enriched);
+    }
+
+    private function summarizeParameters(array $opDetails): array
+    {
+        $params = [];
+
+        foreach ($opDetails['parameters'] ?? [] as $param) {
+            $name = $param['name'] ?? null;
+            if (!$name) continue;
+            $in = $param['in'] ?? 'query';
+            $prefix = $in === 'path' ? 'path_' : 'query_';
+            $params[] = [
+                'name' => $prefix . $name,
+                'type' => $param['schema']['type'] ?? 'string',
+                'required' => !empty($param['required']),
+                'description' => $param['description'] ?? '',
+            ];
+        }
+
+        $requestBody = $opDetails['requestBody'] ?? null;
+        if ($requestBody) {
+            $content = $requestBody['content'] ?? [];
+            $jsonSchema = $content['application/json']['schema'] ?? null;
+            if ($jsonSchema && isset($jsonSchema['properties'])) {
+                $bodyRequired = $jsonSchema['required'] ?? [];
+                foreach ($jsonSchema['properties'] as $propName => $propSchema) {
+                    $params[] = [
+                        'name' => 'body_' . $propName,
+                        'type' => $propSchema['type'] ?? 'string',
+                        'required' => in_array($propName, $bodyRequired),
+                        'description' => $propSchema['description'] ?? '',
+                    ];
+                }
+            }
+        }
+
+        return $params;
+    }
+
+    private function handleExecuteOperation(array $arguments, Conversation $conversation): string
+    {
+        $operationId = $arguments['operationId'] ?? '';
+        if (empty($operationId)) {
+            return json_encode(['error' => 'operationId is required']);
+        }
+
+        $params = $arguments['parameters'] ?? [];
+
+        $details = ApiManager::getOperationDetails($operationId);
+        if (empty((array) $details)) {
+            return json_encode(['error' => "Unknown operation: {$operationId}"]);
+        }
+
+        $method = strtoupper($details['method'] ?? 'GET');
+        $pathTemplate = $details['path'] ?? '';
+
+        // Check confirmation/rejection
+        $validation = ApiCallValidator::validate($operationId, $method, $pathTemplate);
+
+        if ($validation['status'] === ApiCallValidator::STATUS_REJECT) {
+            return json_encode(['error' => $validation['reason'] ?? 'Operation rejected']);
+        }
+
+        if ($validation['status'] === ApiCallValidator::STATUS_CONFIRM) {
+            // Return a special marker — the stream handler will detect this and suspend
+            return json_encode([
+                '__requires_confirmation' => true,
+                'operationId' => $operationId,
+                'method' => $method,
+                'path' => $pathTemplate,
+                'parameters' => $params,
+            ]);
+        }
+
+        // Execute directly
+        return $this->executeApiCall($operationId, $method, $pathTemplate, $params, $conversation);
+    }
+
+    public function executeApiCall(string $operationId, string $method, string $pathTemplate, array $params, Conversation $conversation): string
+    {
+        $session = $this->getOrCreateSession($conversation);
+        $resolved = $this->toolExecutor->unflattenArguments($params, $pathTemplate);
+        $result = $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
+
+        return $this->extractResultContent($result);
     }
 
     public function buildMessagesPayload(Conversation $conversation): array
@@ -165,6 +338,15 @@ class AgentLoopService
             'Authorization' => 'Bearer ' . $server->token,
         ];
         $request->body = $body;
+
+        Log::info('AgentLoopService: sending request to LLM', [
+            'url' => $request->url,
+            'model' => $body->model,
+            'iteration' => $iteration,
+            'tools_count' => count($tools),
+            'messages_count' => count($messages),
+            'body' => json_encode($body, JSON_PRETTY_PRINT),
+        ]);
 
         $data = json_encode([
             'conversation_id' => $conversation->id,

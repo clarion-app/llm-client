@@ -98,7 +98,7 @@ class McpToolRegistry
         $annotations = $this->buildAnnotations($method, $operation['summary'] ?? $operationId);
 
         return [
-            'name' => "{$packageShortName}.{$operationId}",
+            'name' => "{$packageShortName}_{$operationId}",
             'description' => $operation['summary'] ?? $operationId,
             'inputSchema' => $inputSchema,
             'annotations' => $annotations,

@@ -6,10 +6,6 @@ use ClarionApp\HttpQueue\HandleHttpStreamResponse;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
-use ClarionApp\LlmClient\Services\McpToolRegistry;
-use ClarionApp\LlmClient\Services\McpToolExecutor;
-use ClarionApp\LlmClient\Services\ApiCallValidator;
-use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
@@ -33,6 +29,10 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         if (!$conversation) return;
 
         $this->buffer .= $content;
+
+        // Log raw chunks for debugging
+        // Log::debug('AgentLoopStreamHandler: raw chunk', ['content' => $content]);
+
         $check = explode("\n\ndata: ", $this->buffer);
 
         while (count($check) > 1) {
@@ -122,6 +122,14 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             return;
         }
 
+        Log::info('AgentLoopStreamHandler: finish called', [
+            'conversation_id' => $conversationId,
+            'iteration' => $iteration,
+            'has_tool_calls' => !empty($this->toolCalls),
+            'tool_calls_count' => count($this->toolCalls),
+            'reply_length' => strlen($this->reply),
+        ]);
+
         // Plain text response — save and finish
         if ($this->message === null) return;
 
@@ -146,8 +154,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
     private function handleToolCalls(Conversation $conversation, int $iteration): void
     {
         $conversationId = $conversation->id;
-        $toolRegistry = app(McpToolRegistry::class);
-        $toolExecutor = app(McpToolExecutor::class);
+        $agentLoopService = app(AgentLoopService::class);
 
         // Create or reuse the assistant message for this tool call turn
         if ($this->message === null) {
@@ -162,44 +169,31 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         }
 
         $toolResults = [];
-        $hasPendingConfirmation = false;
-        $pendingConfirmation = null;
-
-        $session = $this->getOrCreateSession($conversation);
 
         foreach ($this->toolCalls as $toolCall) {
             $toolName = $toolCall['function']['name'] ?? '';
             $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
             $toolCallId = $toolCall['id'] ?? '';
 
+            Log::info('AgentLoopStreamHandler: executing meta-tool', [
+                'tool' => $toolName,
+                'arguments' => $arguments,
+                'iteration' => $iteration,
+            ]);
+
             event(new ToolExecutionEvent($conversationId, $toolName, 'executing'));
 
-            $tool = $toolRegistry->findTool($toolName);
+            $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation);
 
-            if (!$tool) {
-                // Unknown tool — return error result for LLM to handle
-                $toolResults[] = [
-                    'tool_call_id' => $toolCallId,
-                    'content' => json_encode(['error' => "Unknown tool: {$toolName}"]),
-                ];
-                event(new ToolExecutionEvent($conversationId, $toolName, 'completed'));
-                continue;
-            }
-
-            // Validate whether this needs confirmation
-            $meta = $tool['_meta'] ?? [];
-            $method = strtoupper($meta['method'] ?? 'GET');
-            $validation = ApiCallValidator::validate($meta['operationId'] ?? '', $method, $meta['path'] ?? '');
-
-            if ($validation['status'] === ApiCallValidator::STATUS_CONFIRM) {
-                // Suspend the loop for confirmation
-                $hasPendingConfirmation = true;
+            // Check if execute_operation needs confirmation
+            $decoded = json_decode($result, true);
+            if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
                 $pendingConfirmation = [
-                    'tool_name' => $toolName,
-                    'method' => $method,
-                    'path' => $meta['path'] ?? '',
-                    'arguments' => $arguments,
-                    'conversation_history_snapshot' => [],
+                    'tool_name' => 'execute_operation',
+                    'operationId' => $decoded['operationId'],
+                    'method' => $decoded['method'],
+                    'path' => $decoded['path'],
+                    'arguments' => $decoded['parameters'] ?? [],
                     'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
                 ];
 
@@ -218,31 +212,18 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 event(new ApiCallConfirmationRequiredEvent(
                     $conversationId,
                     $this->message->id,
-                    $method,
-                    $meta['path'] ?? '',
-                    $arguments,
-                    $toolName
+                    $decoded['method'],
+                    $decoded['path'],
+                    $decoded['parameters'] ?? [],
+                    'execute_operation'
                 ));
 
-                return; // Stop — wait for user confirmation
+                return; // Suspend for confirmation
             }
-
-            if ($validation['status'] === ApiCallValidator::STATUS_REJECT) {
-                $toolResults[] = [
-                    'tool_call_id' => $toolCallId,
-                    'content' => json_encode(['error' => $validation['reason'] ?? 'Request rejected']),
-                ];
-                event(new ToolExecutionEvent($conversationId, $toolName, 'completed'));
-                continue;
-            }
-
-            // Execute the tool
-            $result = $toolExecutor->executeTool($toolName, $arguments, $session);
-            $resultContent = $this->extractResultContent($result);
 
             $toolResults[] = [
                 'tool_call_id' => $toolCallId,
-                'content' => $resultContent,
+                'content' => $result,
             ];
 
             event(new ToolExecutionEvent($conversationId, $toolName, 'completed'));
@@ -306,25 +287,5 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             $agentLoopService = app(AgentLoopService::class);
             $agentLoopService->start($conversation);
         }
-    }
-
-    private function getOrCreateSession(Conversation $conversation): McpSession
-    {
-        $session = McpSession::where('user_id', $conversation->user_id)->first();
-        if (!$session) {
-            $session = McpSession::create([
-                'user_id' => $conversation->user_id,
-                'protocol_version' => '2025-03-26',
-            ]);
-        }
-        return $session;
-    }
-
-    private function extractResultContent(array $result): string
-    {
-        if (!empty($result['content'])) {
-            return $result['content'][0]['text'] ?? json_encode($result['content']);
-        }
-        return json_encode($result);
     }
 }

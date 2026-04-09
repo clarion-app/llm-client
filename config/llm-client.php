@@ -19,6 +19,7 @@ return [
     'agent_loop' => [
         'max_iterations' => 20,
         'confirmation_timeout' => 300,
+        'max_tools' => 128,
     ],
 
     // MCP Server configuration

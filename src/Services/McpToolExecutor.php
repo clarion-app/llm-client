@@ -133,7 +133,7 @@ class McpToolExecutor
         ];
     }
 
-    private function executeHttpCall(string $method, string $path, array $query, array $body, McpSession $session): array
+    public function executeHttpCall(string $method, string $path, array $query, array $body, McpSession $session): array
     {
         $user = User::find($session->user_id);
         if (!$user) {
@@ -152,7 +152,7 @@ class McpToolExecutor
         $httpClient = Http::withHeaders([
             'Authorization' => 'Bearer ' . $accessToken,
             'Accept' => 'application/json',
-        ]);
+        ])->withoutVerifying();
 
         try {
             $response = match ($method) {
@@ -188,7 +188,7 @@ class McpToolExecutor
         }
     }
 
-    private function unflattenArguments(array $arguments, string $pathTemplate): array
+    public function unflattenArguments(array $arguments, string $pathTemplate): array
     {
         $path = $pathTemplate;
         $query = [];
