@@ -213,6 +213,17 @@ class AgentLoopService
                         'pending_confirmation' => null,
                     ],
                 ]);
+
+                // If all tool calls were successful execute_operation calls,
+                // stop the loop — no need for a summary response from the LLM.
+                if ($this->allExecuteOperationsSucceeded($toolCalls, $toolResults)) {
+                    $conversation->update(['is_processing' => false]);
+                    return [
+                        'status' => 'completed',
+                        'content' => '',
+                        'message_id' => null,
+                    ];
+                }
             }
 
             // Max iterations exceeded
@@ -566,6 +577,12 @@ class AgentLoopService
 
         $params = $arguments['parameters'] ?? [];
 
+        // LLMs sometimes flatten nested parameters to the top level
+        // (e.g. path_id, body_state alongside operationId instead of inside "parameters")
+        if (empty($params)) {
+            $params = array_diff_key($arguments, array_flip(['operationId', 'parameters']));
+        }
+
         $details = ApiManager::getOperationDetails($operationId);
         if (empty((array) $details)) {
             return json_encode(['error' => "Unknown operation: {$operationId}"]);
@@ -605,6 +622,32 @@ class AgentLoopService
         return $this->extractResultContent($result);
     }
 
+    /**
+     * Check if all tool calls in this turn were successful execute_operation calls.
+     * When true, the agent loop can stop without asking the LLM for a summary.
+     */
+    public function allExecuteOperationsSucceeded(array $toolCalls, array $toolResults): bool
+    {
+        if (empty($toolCalls) || empty($toolResults)) {
+            return false;
+        }
+
+        foreach ($toolCalls as $toolCall) {
+            if (($toolCall['function']['name'] ?? '') !== 'execute_operation') {
+                return false;
+            }
+        }
+
+        foreach ($toolResults as $result) {
+            $decoded = json_decode($result['content'] ?? '', true);
+            if (is_array($decoded) && isset($decoded['error'])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     public function buildMessagesPayload(Conversation $conversation): array
     {
         $dbMessages = Message::where('conversation_id', $conversation->id)
@@ -612,6 +655,14 @@ class AgentLoopService
             ->get();
 
         $payload = [];
+
+        $systemPrompt = config('llm-client.agent_loop.system_prompt', '');
+        if (!empty($systemPrompt)) {
+            $payload[] = [
+                'role' => 'system',
+                'content' => $systemPrompt,
+            ];
+        }
 
         foreach ($dbMessages as $msg) {
             if ($msg->tool_data && !empty($msg->tool_data['tool_calls'])) {

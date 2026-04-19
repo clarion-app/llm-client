@@ -242,8 +242,17 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             'tool_data' => $toolData,
         ]);
 
-        // Dispatch next iteration
+        // If all tool calls were successful execute_operation calls,
+        // finish the conversation — no need for a summary response from the LLM.
         $agentLoopService = app(AgentLoopService::class);
+        if ($agentLoopService->allExecuteOperationsSucceeded($this->toolCalls, $toolResults)) {
+            event(new FinishOpenAIConversationResponseEvent($conversationId, ''));
+            $conversation->update(['is_processing' => false]);
+            $this->checkForUnprocessedMessages($conversation);
+            return;
+        }
+
+        // Dispatch next iteration
         $agentLoopService->start($conversation, $iteration + 1);
     }
 
