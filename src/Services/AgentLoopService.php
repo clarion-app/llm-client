@@ -408,7 +408,7 @@ class AgentLoopService
             $body['tools'] = $tools;
         }
 
-        $client = new Client(['timeout' => 120]);
+        $client = new Client(['timeout' => 240]);
 
         $response = $client->post($server->server_url, [
             'headers' => [
