@@ -45,4 +45,9 @@ return [
         // Confirmation token expiry in seconds
         'confirmation_token_expiry' => 300,
     ],
+
+    // Operations Search configuration
+    'operations_search' => [
+        'default_limit' => 10,    // Maximum results returned by search
+    ],
 ];

@@ -474,6 +474,23 @@ class AgentLoopService
                     ],
                 ],
             ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'search_operations',
+                    'description' => 'Search API operations by natural language intent. Returns ranked results with operation IDs, summaries, methods, paths, and parameter schemas.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'query' => [
+                                'type' => 'string',
+                                'description' => 'Natural language description of what you want to do (e.g., "create a contact", "list tasks")',
+                            ],
+                        ],
+                        'required' => ['query'],
+                    ],
+                ],
+            ],
         ];
     }
 
@@ -483,6 +500,7 @@ class AgentLoopService
             'list_applications' => $this->handleListApplications(),
             'list_operations' => $this->handleListOperations($arguments),
             'execute_operation' => $this->handleExecuteOperation($arguments, $conversation),
+            'search_operations' => $this->handleSearchOperations($arguments),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -566,6 +584,40 @@ class AgentLoopService
         }
 
         return $params;
+    }
+
+    private function handleSearchOperations(array $arguments): string
+    {
+        $query = $arguments['query'] ?? '';
+        if (empty($query)) {
+            return json_encode(['error' => 'query parameter is required']);
+        }
+
+        $searchService = app(OperationsSearchService::class);
+        $results = $searchService->search($query);
+
+        if (empty($results)) {
+            // Check if the table exists but is empty vs no matches
+            $count = \Illuminate\Support\Facades\DB::table('operation_search_index')->count();
+            if ($count === 0) {
+                return json_encode(['error' => "Search index is empty. Run 'php artisan llm-client:reindex' first."]);
+            }
+            return json_encode([]);
+        }
+
+        // Format results - decode paramSchema from JSON string to array
+        $formatted = [];
+        foreach ($results as $row) {
+            $formatted[] = [
+                'operationId' => $row->operationId,
+                'summary' => $row->summary,
+                'method' => $row->method,
+                'path' => $row->path,
+                'paramSchema' => $row->paramSchema ? json_decode($row->paramSchema, true) : null,
+            ];
+        }
+
+        return json_encode($formatted);
     }
 
     private function handleExecuteOperation(array $arguments, Conversation $conversation): string
