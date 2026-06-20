@@ -38,5 +38,10 @@
             "description": "Provides a client for interacting with Large Language Models"
         }
     },
-    "minimum-stability": "dev"
+    "minimum-stability": "dev",
+    "config": {
+        "allow-plugins": {
+            "php-http/discovery": true
+        }
+    }
 }
