@@ -439,31 +439,14 @@ class AgentLoopService
             [
                 'type' => 'function',
                 'function' => [
-                    'name' => 'list_operations',
-                    'description' => 'List the available API operations for a specific application. Returns operation IDs, summaries, HTTP methods, and paths. Call this after list_applications to see what you can do with a specific app.',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'application' => [
-                                'type' => 'string',
-                                'description' => 'The application package name as returned by list_applications (e.g. "clarion-app/contacts")',
-                            ],
-                        ],
-                        'required' => ['application'],
-                    ],
-                ],
-            ],
-            [
-                'type' => 'function',
-                'function' => [
                     'name' => 'execute_operation',
-                    'description' => 'Execute an API operation. Pass the operationId from list_operations and any required parameters. Path parameters should be prefixed with "path_", query parameters with "query_", and request body parameters with "body_".',
+                    'description' => 'Execute an API operation. Pass the operationId from search_operations and any required parameters. Path parameters should be prefixed with "path_", query parameters with "query_", and request body parameters with "body_".',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
                             'operationId' => [
                                 'type' => 'string',
-                                'description' => 'The operationId from list_operations',
+                                'description' => 'The operationId from search_operations',
                             ],
                             'parameters' => [
                                 'type' => 'object',
@@ -498,7 +481,6 @@ class AgentLoopService
     {
         return match ($toolName) {
             'list_applications' => $this->handleListApplications(),
-            'list_operations' => $this->handleListOperations($arguments),
             'execute_operation' => $this->handleExecuteOperation($arguments, $conversation),
             'search_operations' => $this->handleSearchOperations($arguments),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
@@ -516,74 +498,6 @@ class AgentLoopService
             ];
         }
         return json_encode($apps);
-    }
-
-    private function handleListOperations(array $arguments): string
-    {
-        $appName = $arguments['application'] ?? '';
-        if (empty($appName)) {
-            return json_encode(['error' => 'application parameter is required']);
-        }
-
-        $operations = ClarionPackageServiceProvider::getPackageOperations($appName);
-
-        // Enrich with method and path from API docs
-        $enriched = [];
-        foreach ($operations as $op) {
-            $operationId = $op['operationId'] ?? null;
-            if (!$operationId) continue;
-
-            $details = ApiManager::getOperationDetails($operationId);
-            if (empty((array) $details)) continue;
-
-            $opDetails = $details['details'] ?? [];
-            $enriched[] = [
-                'operationId' => $operationId,
-                'summary' => $op['summary'] ?? $operationId,
-                'method' => strtoupper($details['method'] ?? 'GET'),
-                'path' => $details['path'] ?? '',
-                'parameters' => $this->summarizeParameters($opDetails),
-            ];
-        }
-
-        return json_encode($enriched);
-    }
-
-    private function summarizeParameters(array $opDetails): array
-    {
-        $params = [];
-
-        foreach ($opDetails['parameters'] ?? [] as $param) {
-            $name = $param['name'] ?? null;
-            if (!$name) continue;
-            $in = $param['in'] ?? 'query';
-            $prefix = $in === 'path' ? 'path_' : 'query_';
-            $params[] = [
-                'name' => $prefix . $name,
-                'type' => $param['schema']['type'] ?? 'string',
-                'required' => !empty($param['required']),
-                'description' => $param['description'] ?? '',
-            ];
-        }
-
-        $requestBody = $opDetails['requestBody'] ?? null;
-        if ($requestBody) {
-            $content = $requestBody['content'] ?? [];
-            $jsonSchema = $content['application/json']['schema'] ?? null;
-            if ($jsonSchema && isset($jsonSchema['properties'])) {
-                $bodyRequired = $jsonSchema['required'] ?? [];
-                foreach ($jsonSchema['properties'] as $propName => $propSchema) {
-                    $params[] = [
-                        'name' => 'body_' . $propName,
-                        'type' => $propSchema['type'] ?? 'string',
-                        'required' => in_array($propName, $bodyRequired),
-                        'description' => $propSchema['description'] ?? '',
-                    ];
-                }
-            }
-        }
-
-        return $params;
     }
 
     private function handleSearchOperations(array $arguments): string
