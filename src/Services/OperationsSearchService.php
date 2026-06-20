@@ -41,8 +41,8 @@ class OperationsSearchService
                 'param_schema as paramSchema',
                 'prompt_content as promptContent'
             )
-            ->whereRaw('MATCH(searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE)', [$query])
-            ->orderByRaw('MATCH(searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE) DESC', [$query])
+            ->whereRaw('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE)', [$query])
+            ->orderByRaw('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE) DESC', [$query])
             ->limit($limit)
             ->get()
             ->toArray();

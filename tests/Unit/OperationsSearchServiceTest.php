@@ -51,8 +51,8 @@ class OperationsSearchServiceTest extends TestCase
             'param_schema as paramSchema',
             'prompt_content as promptContent'
         )->once()->andReturnSelf();
-        $queryMock->shouldReceive('whereRaw')->with('MATCH(searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE)', ['create a contact'])->once()->andReturnSelf();
-        $queryMock->shouldReceive('orderByRaw')->with('MATCH(searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE) DESC', ['create a contact'])->once()->andReturnSelf();
+        $queryMock->shouldReceive('whereRaw')->with('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE)', ['create a contact'])->once()->andReturnSelf();
+        $queryMock->shouldReceive('orderByRaw')->with('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE) DESC', ['create a contact'])->once()->andReturnSelf();
         $queryMock->shouldReceive('limit')->with(10)->once()->andReturnSelf();
         $queryMock->shouldReceive('get')->once()->andReturn($collectionMock);
 
