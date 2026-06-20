@@ -20,17 +20,21 @@ class OperationsSearchServiceTest extends TestCase
     {
         $mockRow1 = (object) [
             'operationId' => 'contacts.store',
+            'type' => 'operation',
             'summary' => 'Store a new contact',
             'method' => 'POST',
             'path' => '/api/contacts',
             'paramSchema' => json_encode(['body_name' => ['type' => 'string', 'in' => 'body', 'required' => true]]),
+            'promptContent' => null,
         ];
         $mockRow2 = (object) [
             'operationId' => 'contacts.index',
+            'type' => 'operation',
             'summary' => 'List all contacts',
             'method' => 'GET',
             'path' => '/api/contacts',
             'paramSchema' => null,
+            'promptContent' => null,
         ];
 
         $collectionMock = Mockery::mock();
@@ -39,10 +43,13 @@ class OperationsSearchServiceTest extends TestCase
         $queryMock = Mockery::mock();
         $queryMock->shouldReceive('select')->with(
             'operation_id as operationId',
+            'package_name',
+            'type',
             'summary',
             'method',
             'path',
-            'param_schema as paramSchema'
+            'param_schema as paramSchema',
+            'prompt_content as promptContent'
         )->once()->andReturnSelf();
         $queryMock->shouldReceive('whereRaw')->with('MATCH(searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE)', ['create a contact'])->once()->andReturnSelf();
         $queryMock->shouldReceive('orderByRaw')->with('MATCH(searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE) DESC', ['create a contact'])->once()->andReturnSelf();
@@ -150,5 +157,82 @@ class OperationsSearchServiceTest extends TestCase
         $results = $service->search('test');
 
         $this->assertIsArray($results);
+    }
+
+    /** @test */
+    public function table_exists_returns_true_when_table_is_present()
+    {
+        $schemaBuilderMock = Mockery::mock();
+        $schemaBuilderMock->shouldReceive('hasTable')
+            ->with('operation_search_index')
+            ->once()
+            ->andReturn(true);
+
+        $dbMock = Mockery::mock(ConnectionInterface::class);
+        $dbMock->shouldReceive('getSchemaBuilder')->once()->andReturn($schemaBuilderMock);
+
+        $service = new OperationsSearchService($dbMock, 10);
+        $this->assertTrue($service->tableExists());
+    }
+
+    /** @test */
+    public function table_exists_returns_false_when_table_is_absent()
+    {
+        $schemaBuilderMock = Mockery::mock();
+        $schemaBuilderMock->shouldReceive('hasTable')
+            ->with('operation_search_index')
+            ->once()
+            ->andReturn(false);
+
+        $dbMock = Mockery::mock(ConnectionInterface::class);
+        $dbMock->shouldReceive('getSchemaBuilder')->once()->andReturn($schemaBuilderMock);
+
+        $service = new OperationsSearchService($dbMock, 10);
+        $this->assertFalse($service->tableExists());
+    }
+
+    /** @test */
+    public function safe_decode_param_schema_returns_array_for_valid_json()
+    {
+        $json = json_encode(['path' => [['name' => 'id', 'type' => 'string']]]);
+        $result = OperationsSearchService::safeDecodeParamSchema($json);
+
+        $this->assertIsArray($result);
+        $this->assertArrayHasKey('path', $result);
+        $this->assertEquals('id', $result['path'][0]['name']);
+    }
+
+    /** @test */
+    public function safe_decode_param_schema_returns_null_for_malformed_json()
+    {
+        $result = OperationsSearchService::safeDecodeParamSchema('{invalid json');
+
+        $this->assertNull($result);
+    }
+
+    /** @test */
+    public function safe_decode_param_schema_returns_null_for_null_input()
+    {
+        $result = OperationsSearchService::safeDecodeParamSchema(null);
+
+        $this->assertNull($result);
+    }
+
+    /** @test */
+    public function safe_decode_param_schema_returns_null_for_empty_string()
+    {
+        $result = OperationsSearchService::safeDecodeParamSchema('');
+
+        $this->assertNull($result);
+    }
+
+    /** @test */
+    public function safe_decode_param_schema_returns_array_when_input_is_already_array()
+    {
+        $input = ['body' => [['name' => 'name', 'type' => 'string']]];
+        $result = OperationsSearchService::safeDecodeParamSchema($input);
+
+        $this->assertIsArray($result);
+        $this->assertEquals($input, $result);
     }
 }

@@ -27,6 +27,12 @@ class ReindexOperationsJob implements ShouldQueue
         foreach ($packages as $packageName => $meta) {
             $packageDescription = $meta['description'] ?? '';
 
+            // Get short name for this package (e.g., "wizlights" from "@clarion-app/wizlights")
+            $shortName = $this->getShortName($packageName);
+
+            // Index custom prompts for this package
+            $this->indexCustomPrompts($shortName, $packageDescription, $packageDescription);
+
             // Get operations for this package
             $operations = ClarionPackageServiceProvider::getPackageOperations($packageName);
 
@@ -124,5 +130,60 @@ class ReindexOperationsJob implements ShouldQueue
         }
 
         Log::info('Operations search index rebuilt successfully');
+    }
+
+    /**
+     * Index custom prompts from all packages into the search index.
+     */
+    private function indexCustomPrompts(): void
+    {
+        $packages = ClarionPackageServiceProvider::getPackageDescriptions();
+
+        foreach ($packages as $packageName => $meta) {
+            $packageDescription = $meta['description'] ?? '';
+            $shortName = $this->getShortName($packageName);
+            $customPrompts = ClarionPackageServiceProvider::getCustomPrompts($packageName);
+
+            if (empty($customPrompts)) {
+                continue;
+            }
+
+            foreach ($customPrompts as $promptKey => $promptContent) {
+                $operationId = "{$shortName}_{$promptKey}";
+
+                // Build searchable text from prompt content + package description
+                $searchableText = trim("{$promptContent} {$packageDescription}");
+
+                if (empty($searchableText)) {
+                    Log::warning("Skipping prompt {$operationId} - searchable_text would be empty");
+                    continue;
+                }
+
+                DB::table('operation_search_index')->updateOrInsert(
+                    ['operation_id' => $operationId],
+                    [
+                        'package_name' => $packageName,
+                        'type' => 'prompt',
+                        'summary' => trim("{$shortName}: {$promptKey}"),
+                        'method' => null,
+                        'path' => null,
+                        'searchable_text' => $searchableText,
+                        'param_schema' => null,
+                        'prompt_content' => $promptContent,
+                        'updated_at' => now(),
+                    ]
+                );
+            }
+        }
+    }
+
+    /**
+     * Extract short name from package name.
+     * E.g., "@clarion-app/wizlights" -> "wizlights"
+     */
+    private function getShortName(string $packageName): string
+    {
+        $parts = explode('/', $packageName);
+        return end($parts);
     }
 }

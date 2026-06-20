@@ -181,4 +181,126 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertIsArray($results);
         $this->assertEmpty($results);
     }
+
+    /** @test T021 - Integration: complete flow with valid query returns correct format */
+    public function search_operations_complete_flow_returns_formatted_results()
+    {
+        $paramSchema = json_encode([
+            'path' => [['name' => 'id', 'type' => 'integer', 'required' => true]],
+            'body' => [['name' => 'name', 'type' => 'string', 'required' => true]],
+        ]);
+        $mockRow = (object) [
+            'operationId' => 'contacts.update',
+            'summary' => 'Update a contact by ID',
+            'method' => 'PUT',
+            'path' => '/api/contacts/{id}',
+            'paramSchema' => $paramSchema,
+        ];
+
+        $collectionMock = Mockery::mock();
+        $collectionMock->shouldReceive('toArray')->once()->andReturn([$mockRow]);
+
+        $queryMock = Mockery::mock();
+        $queryMock->shouldReceive('select')->once()->andReturnSelf();
+        $queryMock->shouldReceive('whereRaw')->once()->andReturnSelf();
+        $queryMock->shouldReceive('orderByRaw')->once()->andReturnSelf();
+        $queryMock->shouldReceive('limit')->with(10)->once()->andReturnSelf();
+        $queryMock->shouldReceive('get')->once()->andReturn($collectionMock);
+
+        $dbMock = Mockery::mock(\Illuminate\Database\ConnectionInterface::class);
+        $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
+
+        $service = new OperationsSearchService($dbMock, 10);
+        $results = $service->search('update contact');
+
+        $this->assertCount(1, $results);
+        $result = $results[0];
+        $this->assertEquals('contacts.update', $result->operationId);
+        $this->assertEquals('PUT', $result->method);
+        $this->assertEquals('/api/contacts/{id}', $result->path);
+
+        // Verify safeDecodeParamSchema preserves structure
+        $decoded = OperationsSearchService::safeDecodeParamSchema($result->paramSchema);
+        $this->assertArrayHasKey('path', $decoded);
+        $this->assertArrayHasKey('body', $decoded);
+        $this->assertEquals('id', $decoded['path'][0]['name']);
+        $this->assertEquals('name', $decoded['body'][0]['name']);
+    }
+
+    /** @test T022 - Integration: malformed paramSchema in DB row returns null without error */
+    public function search_operations_handles_malformed_paramSchema_in_db_row()
+    {
+        $mockRow1 = (object) [
+            'operationId' => 'good.op',
+            'summary' => 'Good operation',
+            'method' => 'GET',
+            'path' => '/api/good',
+            'paramSchema' => json_encode(['query' => [['name' => 'page', 'type' => 'integer']]]),
+        ];
+        $mockRow2 = (object) [
+            'operationId' => 'bad.op',
+            'summary' => 'Bad paramSchema',
+            'method' => 'GET',
+            'path' => '/api/bad',
+            'paramSchema' => '{malformed json',
+        ];
+
+        $collectionMock = Mockery::mock();
+        $collectionMock->shouldReceive('toArray')->once()->andReturn([$mockRow1, $mockRow2]);
+
+        $queryMock = Mockery::mock();
+        $queryMock->shouldReceive('select')->once()->andReturnSelf();
+        $queryMock->shouldReceive('whereRaw')->once()->andReturnSelf();
+        $queryMock->shouldReceive('orderByRaw')->once()->andReturnSelf();
+        $queryMock->shouldReceive('limit')->with(10)->once()->andReturnSelf();
+        $queryMock->shouldReceive('get')->once()->andReturn($collectionMock);
+
+        $dbMock = Mockery::mock(\Illuminate\Database\ConnectionInterface::class);
+        $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
+
+        $service = new OperationsSearchService($dbMock, 10);
+        $results = $service->search('test');
+
+        $this->assertCount(2, $results);
+
+        // Good row decodes properly
+        $decoded1 = OperationsSearchService::safeDecodeParamSchema($results[0]->paramSchema);
+        $this->assertArrayHasKey('query', $decoded1);
+
+        // Bad row decodes to null without error
+        $decoded2 = OperationsSearchService::safeDecodeParamSchema($results[1]->paramSchema);
+        $this->assertNull($decoded2);
+    }
+
+    /** @test T023 - Integration: operations with no parameters returns paramSchema null */
+    public function search_operations_handles_operations_with_no_parameters()
+    {
+        $mockRow = (object) [
+            'operationId' => 'health.check',
+            'summary' => 'Health check endpoint',
+            'method' => 'GET',
+            'path' => '/api/health',
+            'paramSchema' => null,
+        ];
+
+        $collectionMock = Mockery::mock();
+        $collectionMock->shouldReceive('toArray')->once()->andReturn([$mockRow]);
+
+        $queryMock = Mockery::mock();
+        $queryMock->shouldReceive('select')->once()->andReturnSelf();
+        $queryMock->shouldReceive('whereRaw')->once()->andReturnSelf();
+        $queryMock->shouldReceive('orderByRaw')->once()->andReturnSelf();
+        $queryMock->shouldReceive('limit')->with(10)->once()->andReturnSelf();
+        $queryMock->shouldReceive('get')->once()->andReturn($collectionMock);
+
+        $dbMock = Mockery::mock(\Illuminate\Database\ConnectionInterface::class);
+        $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
+
+        $service = new OperationsSearchService($dbMock, 10);
+        $results = $service->search('health');
+
+        $this->assertCount(1, $results);
+        $decoded = OperationsSearchService::safeDecodeParamSchema($results[0]->paramSchema);
+        $this->assertNull($decoded);
+    }
 }

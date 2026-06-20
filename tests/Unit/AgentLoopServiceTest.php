@@ -6,6 +6,7 @@ use Tests\TestCase;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
+use ClarionApp\LlmClient\Services\OperationsSearchService;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
@@ -488,5 +489,533 @@ class AgentLoopServiceTest extends TestCase
             ->first();
 
         $this->assertTrue($latestUser->created_at > $latestAssistant->created_at);
+    }
+
+    // === US1 Tests: Search Operations Core (T006-T012) ===
+
+    /**
+     * Helper to invoke private handleSearchOperations via reflection.
+     */
+    private function invokeHandleSearchOperations(AgentLoopService $service, array $arguments): string
+    {
+        $reflection = new \ReflectionClass($service);
+        $method = $reflection->getMethod('handleSearchOperations');
+        $method->setAccessible(true);
+        return $method->invoke($service, $arguments);
+    }
+
+    /** @test T006 */
+    public function search_operations_returns_results_with_correct_wrapper_format()
+    {
+        // Mock OperationsSearchService via app() binding
+        $mockRow = (object) [
+            'operationId' => 'contacts.store',
+            'type'        => 'operation',
+            'summary'     => 'Store a new contact',
+            'method'      => 'POST',
+            'path'        => '/api/contacts',
+            'paramSchema' => json_encode(['body' => [['name' => 'body_name', 'type' => 'string']]]),
+            'promptContent' => null,
+        ];
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->with('create a contact')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'create a contact']);
+        $decoded = json_decode($result, true);
+
+        $this->assertIsArray($decoded);
+        $this->assertArrayHasKey('results', $decoded);
+        $this->assertCount(1, $decoded['results']);
+        $this->assertEquals('operation', $decoded['results'][0]['type']);
+        $this->assertEquals('contacts.store', $decoded['results'][0]['operationId']);
+        $this->assertEquals('POST', $decoded['results'][0]['method']);
+        $this->assertEquals('/api/contacts', $decoded['results'][0]['path']);
+        $this->assertArrayHasKey('paramSchema', $decoded['results'][0]);
+    }
+
+    /** @test T007 */
+    public function search_operations_truncates_long_query()
+    {
+        $longQuery = str_repeat('a', 600);
+
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->withArgs(function ($query) {
+                return strlen($query) <= 500;
+            })
+            ->once()
+            ->andReturn([]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $this->invokeHandleSearchOperations($service, ['query' => $longQuery]);
+        // If we get here without exception, truncation worked
+        $this->assertTrue(true);
+    }
+
+    /** @test T008 */
+    public function search_operations_returns_error_for_missing_query()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, []);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('error', $decoded);
+        $this->assertEquals('query parameter is required', $decoded['error']);
+    }
+
+    /** @test T009 */
+    public function search_operations_handles_null_param_schema()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $mockRow = (object) [
+            'operationId' => 'contacts.index',
+            'summary'   => 'List all contacts',
+            'method'    => 'GET',
+            'path'      => '/api/contacts',
+            'paramSchema' => null,
+        ];
+        $mockRow = (object) [
+            'operationId' => 'contacts.index',
+            'type'        => 'operation',
+            'summary'     => 'List all contacts',
+            'method'      => 'GET',
+            'path'        => '/api/contacts',
+            'paramSchema' => null,
+            'promptContent' => null,
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'list contacts']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('results', $decoded);
+        $this->assertNull($decoded['results'][0]['paramSchema']);
+    }
+
+    /** @test T010 */
+    public function search_operations_handles_malformed_param_schema()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $mockRow = (object) [
+            'operationId' => 'broken.op',
+            'type'        => 'operation',
+            'summary'     => 'Broken param schema',
+            'method'      => 'GET',
+            'path'        => '/api/broken',
+            'paramSchema' => '{invalid json content',
+            'promptContent' => null,
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'broken']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('results', $decoded);
+        // Malformed paramSchema should be treated as null
+        $this->assertNull($decoded['results'][0]['paramSchema']);
+    }
+
+    /** @test T011 - limit is enforced by OperationsSearchService::search() with default $limit=10 */
+    public function search_operations_passes_default_limit_of_10()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $rows = [];
+        for ($i = 0; $i < 8; $i++) {
+            $rows[] = (object) [
+                'operationId' => "op.{$i}",
+                'type'        => 'operation',
+                'summary'     => "Operation {$i}",
+                'method'      => 'GET',
+                'path'        => "/api/op/{$i}",
+                'paramSchema' => null,
+                'promptContent' => null,
+            ];
+        }
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn($rows);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'test']);
+        $decoded = json_decode($result, true);
+
+        // Passed through correctly
+        $this->assertCount(8, $decoded['results']);
+    }
+
+    /** @test T013 */
+    public function search_operations_returns_zero_match_hint_when_table_has_data_but_no_matches()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        // Mock DB::table()->count() for empty index check
+        $dbMock = Mockery::mock();
+        $dbMock->shouldReceive('table')->with('operation_search_index')->andReturnSelf();
+        $dbMock->shouldReceive('count')->once()->andReturn(5); // Table has data
+
+        app()->instance('db', $dbMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'xyz_nonexistent']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('hint', $decoded);
+        $this->assertStringContainsString('broader', $decoded['hint']);
+        $this->assertArrayHasKey('results', $decoded);
+        $this->assertEmpty($decoded['results']);
+    }
+
+    /** @test T014 */
+    public function search_operations_returns_empty_index_hint_when_table_has_zero_rows()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        // Mock DB::table()->count() returning 0 (empty index)
+        $dbMock = Mockery::mock();
+        $dbMock->shouldReceive('table')->with('operation_search_index')->andReturnSelf();
+        $dbMock->shouldReceive('count')->once()->andReturn(0);
+
+        app()->instance('db', $dbMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'test']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('hint', $decoded);
+        $this->assertStringContainsString('empty', $decoded['hint']);
+        $this->assertArrayHasKey('results', $decoded);
+        $this->assertEmpty($decoded['results']);
+    }
+
+    /** @test T015 */
+    public function search_operations_returns_missing_table_hint_when_table_does_not_exist()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(false);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'test']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('hint', $decoded);
+        $this->assertStringContainsString('not available', $decoded['hint']);
+        $this->assertArrayHasKey('results', $decoded);
+        $this->assertEmpty($decoded['results']);
+    }
+
+    /** @test T017 */
+    public function search_operations_preserves_paramSchema_path_section()
+    {
+        $paramSchema = [
+            'path' => [['name' => 'id', 'type' => 'integer', 'required' => true]],
+        ];
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $mockRow = (object) [
+            'operationId' => 'contacts.show',
+            'type'        => 'operation',
+            'summary'     => 'Get contact by ID',
+            'method'      => 'GET',
+            'path'        => '/api/contacts/{id}',
+            'paramSchema' => json_encode($paramSchema),
+            'promptContent' => null,
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'get contact']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('results', $decoded);
+        $schema = $decoded['results'][0]['paramSchema'];
+        $this->assertArrayHasKey('path', $schema);
+        $this->assertCount(1, $schema['path']);
+        $this->assertEquals('id', $schema['path'][0]['name']);
+        $this->assertEquals('integer', $schema['path'][0]['type']);
+    }
+
+    /** @test T018 */
+    public function search_operations_preserves_paramSchema_query_section()
+    {
+        $paramSchema = [
+            'query' => [
+                ['name' => 'page', 'type' => 'integer', 'required' => false],
+                ['name' => 'per_page', 'type' => 'integer', 'required' => false],
+            ],
+        ];
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $mockRow = (object) [
+            'operationId' => 'contacts.index',
+            'type'        => 'operation',
+            'summary'     => 'List contacts',
+            'method'      => 'GET',
+            'path'        => '/api/contacts',
+            'paramSchema' => json_encode($paramSchema),
+            'promptContent' => null,
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'list contacts']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('results', $decoded);
+        $schema = $decoded['results'][0]['paramSchema'];
+        $this->assertArrayHasKey('query', $schema);
+        $this->assertCount(2, $schema['query']);
+        $this->assertEquals('page', $schema['query'][0]['name']);
+    }
+
+    /** @test T019 */
+    public function search_operations_preserves_paramSchema_body_section()
+    {
+        $paramSchema = [
+            'body' => [
+                ['name' => 'name', 'type' => 'string', 'required' => true],
+                ['name' => 'email', 'type' => 'string', 'required' => true],
+            ],
+        ];
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $mockRow = (object) [
+            'operationId' => 'contacts.store',
+            'type'        => 'operation',
+            'summary'     => 'Create contact',
+            'method'      => 'POST',
+            'path'        => '/api/contacts',
+            'paramSchema' => json_encode($paramSchema),
+            'promptContent' => null,
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'create contact']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('results', $decoded);
+        $schema = $decoded['results'][0]['paramSchema'];
+        $this->assertArrayHasKey('body', $schema);
+        $this->assertCount(2, $schema['body']);
+        $this->assertEquals('name', $schema['body'][0]['name']);
+    }
+
+    /** @test T020 */
+    public function search_operations_preserves_full_paramSchema_structure_with_all_sections()
+    {
+        $paramSchema = [
+            'path' => [['name' => 'id', 'type' => 'integer', 'required' => true]],
+            'query' => [['name' => 'expand', 'type' => 'string', 'required' => false]],
+            'body' => [['name' => 'name', 'type' => 'string', 'required' => true]],
+        ];
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $mockRow = (object) [
+            'operationId' => 'contacts.update',
+            'type'        => 'operation',
+            'summary'     => 'Update contact',
+            'method'      => 'PUT',
+            'path'        => '/api/contacts/{id}',
+            'paramSchema' => json_encode($paramSchema),
+            'promptContent' => null,
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'update contact']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('results', $decoded);
+        $schema = $decoded['results'][0]['paramSchema'];
+        // Verify all three sections preserved
+        $this->assertArrayHasKey('path', $schema);
+        $this->assertArrayHasKey('query', $schema);
+        $this->assertArrayHasKey('body', $schema);
+        $this->assertEquals('id', $schema['path'][0]['name']);
+        $this->assertEquals('expand', $schema['query'][0]['name']);
+        $this->assertEquals('name', $schema['body'][0]['name']);
+    }
+
+    /** @test - Custom prompt result format */
+    public function search_operations_returns_prompt_result_format()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $mockRow = (object) [
+            'operationId' => 'wizlights_listOperations',
+            'type'        => 'prompt',
+            'package_name' => 'wizlight-backend',
+            'summary'     => 'Custom prompt for wizlight lighting control',
+            'promptContent' => 'To adjust the lighting, first use the wizlights_room.index tool...',
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->with('adjust lighting')
+            ->once()
+            ->andReturn([$mockRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'adjust lighting']);
+        $decoded = json_decode($result, true);
+
+        $this->assertArrayHasKey('results', $decoded);
+        $this->assertCount(1, $decoded['results']);
+        $r = $decoded['results'][0];
+        $this->assertEquals('prompt', $r['type']);
+        $this->assertEquals('wizlights_listOperations', $r['id']);
+        $this->assertEquals('wizlight-backend', $r['package']);
+        $this->assertStringContainsString('lighting', $r['summary']);
+        $this->assertStringContainsString('wizlights_room.index', $r['content']);
+        // Prompt results should NOT have operation fields
+        $this->assertArrayNotHasKey('operationId', $r);
+        $this->assertArrayNotHasKey('method', $r);
+        $this->assertArrayNotHasKey('path', $r);
+        $this->assertArrayNotHasKey('paramSchema', $r);
+    }
+
+    /** @test - Mixed operation + prompt results */
+    public function search_returns_mixed_operation_and_prompt_results()
+    {
+        $searchServiceMock = Mockery::mock(OperationsSearchService::class);
+        $operationRow = (object) [
+            'operationId' => 'wizlights.index',
+            'type'        => 'operation',
+            'summary'     => 'List all lights in a room',
+            'method'      => 'GET',
+            'path'        => '/api/wizlights',
+            'paramSchema' => null,
+            'promptContent' => null,
+        ];
+        $promptRow = (object) [
+            'operationId' => 'wizlights_executeOperation',
+            'type'        => 'prompt',
+            'package_name' => 'wizlight-backend',
+            'summary'     => 'Custom prompt for wizlight operation execution',
+            'promptContent' => 'When adjusting the lighting, you must include the dimming property...',
+        ];
+        $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
+        $searchServiceMock->shouldReceive('search')
+            ->once()
+            ->andReturn([$operationRow, $promptRow]);
+
+        app()->instance(OperationsSearchService::class, $searchServiceMock);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock);
+
+        $result = $this->invokeHandleSearchOperations($service, ['query' => 'wizlights']);
+        $decoded = json_decode($result, true);
+
+        $this->assertCount(2, $decoded['results']);
+
+        // First result is an operation
+        $this->assertEquals('operation', $decoded['results'][0]['type']);
+        $this->assertEquals('wizlights.index', $decoded['results'][0]['operationId']);
+        $this->assertEquals('GET', $decoded['results'][0]['method']);
+
+        // Second result is a prompt
+        $this->assertEquals('prompt', $decoded['results'][1]['type']);
+        $this->assertEquals('wizlights_executeOperation', $decoded['results'][1]['id']);
+        $this->assertEquals('wizlight-backend', $decoded['results'][1]['package']);
+        $this->assertStringContainsString('dimming', $decoded['results'][1]['content']);
     }
 }

@@ -593,31 +593,71 @@ class AgentLoopService
             return json_encode(['error' => 'query parameter is required']);
         }
 
+        // Silently truncate long queries to a safe length
+        $query = mb_substr($query, 0, 500);
+
+        // Graceful degradation: check table existence before search
         $searchService = app(OperationsSearchService::class);
+
+        if (!$searchService->tableExists()) {
+            return json_encode([
+                'hint' => 'Search index is not available. Run reindex command first.',
+                'results' => [],
+            ]);
+        }
+
         $results = $searchService->search($query);
 
         if (empty($results)) {
             // Check if the table exists but is empty vs no matches
-            $count = \Illuminate\Support\Facades\DB::table('operation_search_index')->count();
-            if ($count === 0) {
-                return json_encode(['error' => "Search index is empty. Run 'php artisan llm-client:reindex' first."]);
+            try {
+                $count = \Illuminate\Support\Facades\DB::table('operation_search_index')->count();
+                if ($count === 0) {
+                    return json_encode([
+                        'hint' => "Search index is empty. Run 'php artisan llm-client:reindex' first.",
+                        'results' => [],
+                    ]);
+                }
+                // Table has data but query returned no matches
+                return json_encode([
+                    'hint' => 'No operations matched your query. Try broader search terms or use list_applications to browse available applications.',
+                    'results' => [],
+                ]);
+            } catch (\Throwable $e) {
+                // Fallback if count fails
+                return json_encode([
+                    'hint' => 'Search index is not available. Run reindex command first.',
+                    'results' => [],
+                ]);
             }
-            return json_encode([]);
         }
 
-        // Format results - decode paramSchema from JSON string to array
+        // Format results - decode paramSchema from JSON string to array using safe helper
         $formatted = [];
         foreach ($results as $row) {
-            $formatted[] = [
-                'operationId' => $row->operationId,
-                'summary' => $row->summary,
-                'method' => $row->method,
-                'path' => $row->path,
-                'paramSchema' => $row->paramSchema ? json_decode($row->paramSchema, true) : null,
-            ];
+            $type = $row->type ?? 'operation';
+
+            if ($type === 'prompt') {
+                $formatted[] = [
+                    'type' => 'prompt',
+                    'id' => $row->operationId,
+                    'package' => $row->package_name,
+                    'summary' => $row->summary,
+                    'content' => $row->promptContent,
+                ];
+            } else {
+                $formatted[] = [
+                    'type' => 'operation',
+                    'operationId' => $row->operationId,
+                    'summary' => $row->summary,
+                    'method' => $row->method,
+                    'path' => $row->path,
+                    'paramSchema' => OperationsSearchService::safeDecodeParamSchema($row->paramSchema),
+                ];
+            }
         }
 
-        return json_encode($formatted);
+        return json_encode(['results' => $formatted]);
     }
 
     private function handleExecuteOperation(array $arguments, Conversation $conversation): string
