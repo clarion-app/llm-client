@@ -361,4 +361,149 @@ class OperationCacheTest extends TestCase
         $this->assertNotNull($this->cache->get('conv-1', 'op-b'));
         $this->assertNotNull($this->cache->get('conv-1', 'op-c'));
     }
+
+    /** @test */
+    public function getEntries_returns_empty_array_for_empty_cache()
+    {
+        $entries = $this->cache->getEntries('conv-1');
+        $this->assertIsArray($entries);
+        $this->assertCount(0, $entries);
+    }
+
+    /** @test */
+    public function getEntries_returns_empty_array_for_unknown_conversation()
+    {
+        $this->cache->put('conv-1', 'create-contact', [
+            'operationId' => 'create-contact',
+            'summary' => 'Create a new contact',
+            'method' => 'POST',
+            'path' => '/contacts',
+            'paramSchema' => ['body_name' => ['type' => 'string']],
+        ]);
+
+        $entries = $this->cache->getEntries('conv-2');
+        $this->assertIsArray($entries);
+        $this->assertCount(0, $entries);
+    }
+
+    /** @test */
+    public function getEntries_returns_entries_most_recently_used_first()
+    {
+        $this->cache->put('conv-1', 'op-a', [
+            'operationId' => 'op-a',
+            'summary' => 'First',
+            'method' => 'GET',
+            'path' => '/a',
+            'paramSchema' => null,
+        ]);
+        $this->cache->put('conv-1', 'op-b', [
+            'operationId' => 'op-b',
+            'summary' => 'Second',
+            'method' => 'GET',
+            'path' => '/b',
+            'paramSchema' => null,
+        ]);
+        $this->cache->put('conv-1', 'op-c', [
+            'operationId' => 'op-c',
+            'summary' => 'Third',
+            'method' => 'GET',
+            'path' => '/c',
+            'paramSchema' => null,
+        ]);
+
+        $entries = $this->cache->getEntries('conv-1');
+
+        $this->assertCount(3, $entries);
+        // Most recently used first (op-c was last put)
+        $this->assertEquals('op-c', $entries[0]['operationId']);
+        $this->assertEquals('op-b', $entries[1]['operationId']);
+        $this->assertEquals('op-a', $entries[2]['operationId']);
+    }
+
+    /** @test */
+    public function getEntries_includes_all_fields()
+    {
+        $this->cache->put('conv-1', 'create-contact', [
+            'operationId' => 'create-contact',
+            'summary' => 'Create a new contact',
+            'method' => 'POST',
+            'path' => '/contacts',
+            'paramSchema' => ['type' => 'object', 'properties' => ['name' => ['type' => 'string']]],
+        ]);
+
+        $entries = $this->cache->getEntries('conv-1');
+
+        $this->assertCount(1, $entries);
+        $entry = $entries[0];
+        $this->assertEquals('create-contact', $entry['operationId']);
+        $this->assertEquals('Create a new contact', $entry['summary']);
+        $this->assertEquals('POST', $entry['method']);
+        $this->assertEquals('/contacts', $entry['path']);
+        $this->assertIsArray($entry['paramSchema']);
+    }
+
+    /** @test */
+    public function getEntries_truncates_to_limit()
+    {
+        for ($i = 1; $i <= 10; $i++) {
+            $this->cache->put('conv-1', 'op-' . $i, [
+                'operationId' => 'op-' . $i,
+                'summary' => 'Operation ' . $i,
+                'method' => 'GET',
+                'path' => '/op/' . $i,
+                'paramSchema' => null,
+            ]);
+        }
+
+        $entries = $this->cache->getEntries('conv-1', 5);
+
+        $this->assertCount(5, $entries);
+        // Most recently used first
+        $this->assertEquals('op-10', $entries[0]['operationId']);
+        $this->assertEquals('op-9', $entries[1]['operationId']);
+        $this->assertEquals('op-8', $entries[2]['operationId']);
+        $this->assertEquals('op-7', $entries[3]['operationId']);
+        $this->assertEquals('op-6', $entries[4]['operationId']);
+    }
+
+    /** @test */
+    public function getEntries_respects_custom_limit()
+    {
+        for ($i = 1; $i <= 5; $i++) {
+            $this->cache->put('conv-1', 'op-' . $i, [
+                'operationId' => 'op-' . $i,
+                'summary' => 'Operation ' . $i,
+                'method' => 'GET',
+                'path' => '/op/' . $i,
+                'paramSchema' => null,
+            ]);
+        }
+
+        $entries = $this->cache->getEntries('conv-1', 3);
+        $this->assertCount(3, $entries);
+
+        $entries = $this->cache->getEntries('conv-1', 10);
+        $this->assertCount(5, $entries);
+    }
+
+    /** @test */
+    public function getEntries_with_25_entries_and_limit_20_returns_20_most_recently_used()
+    {
+        for ($i = 1; $i <= 25; $i++) {
+            $this->cache->put('conv-1', 'op-' . $i, [
+                'operationId' => 'op-' . $i,
+                'summary' => 'Operation ' . $i,
+                'method' => 'GET',
+                'path' => '/op/' . $i,
+                'paramSchema' => null,
+            ]);
+        }
+
+        $entries = $this->cache->getEntries('conv-1', 20);
+
+        $this->assertCount(20, $entries);
+        // Most recently used first (op-25 down to op-6)
+        $this->assertEquals('op-25', $entries[0]['operationId']);
+        $this->assertEquals('op-6', $entries[19]['operationId']);
+    }
 }

@@ -13,7 +13,7 @@ class ConversationFactory extends Factory
     public function definition(): array
     {
         return [
-            'server_id' => (string) Str::uuid(),
+            'server_id' => null,
             'title' => null,
             'model' => 'gpt-4',
             'character' => 'Clarion',

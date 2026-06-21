@@ -2,6 +2,7 @@
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
@@ -19,7 +20,12 @@ return new class extends Migration
             $table->json('param_schema')->nullable();
             $table->timestamps();
 
-            $table->fullText(['searchable_text']);
+            // Fulltext index not supported on SQLite (used for testing)
+            $driver = config('database.default', 'sqlite');
+            $connection = DB::connection($driver);
+            if ($connection->getDriverName() !== 'sqlite') {
+                $table->fullText(['searchable_text']);
+            }
         });
     }
 

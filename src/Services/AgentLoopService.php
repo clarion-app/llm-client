@@ -666,6 +666,50 @@ class AgentLoopService
         return true;
     }
 
+    /**
+     * Builds a "Known Operations" section for the system prompt.
+     *
+     * Returns null when the cache has no entries for this conversation.
+     * Returns a formatted markdown section with operation details otherwise.
+     *
+     * @param Conversation $conversation The conversation context
+     * @return string|null The formatted section or null if empty
+     */
+    private function buildKnownOperationsSection(Conversation $conversation): ?string
+    {
+        $entries = $this->operationCache->getEntries($conversation->id, 20);
+
+        if (empty($entries)) {
+            return null;
+        }
+
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '## Known Operations';
+        $lines[] = '';
+
+        foreach ($entries as $entry) {
+            $operationId = $entry['operationId'] ?? 'unknown';
+            $method = strtoupper($entry['method'] ?? 'GET');
+            $path = $entry['path'] ?? '/';
+            $summary = $entry['summary'] ?? '';
+            $paramSchema = $entry['paramSchema'] ?? null;
+
+            $lines[] = "**{$operationId}** ({$method} {$path})";
+            $lines[] = "  - Summary: {$summary}";
+
+            if ($paramSchema && is_array($paramSchema)) {
+                $params = json_encode($paramSchema, JSON_UNESCAPED_SLASHES);
+                $lines[] = "  - Parameters: {$params}";
+            } else {
+                $lines[] = "  - Parameters: none";
+            }
+            $lines[] = '';
+        }
+
+        return implode(PHP_EOL, $lines);
+    }
+
     public function buildMessagesPayload(Conversation $conversation): array
     {
         $dbMessages = Message::where('conversation_id', $conversation->id)
@@ -676,13 +720,10 @@ class AgentLoopService
 
         $systemPrompt = config('llm-client.agent_loop.system_prompt', '');
 
-        // Append "Recently Used Operations" section when cache has entries
-        $summaries = $this->operationCache->getSummaries($conversation->id);
-        if (!empty($summaries)) {
-            $systemPrompt .= PHP_EOL . 'Recently Used Operations:' . PHP_EOL;
-            foreach ($summaries as $summary) {
-                $systemPrompt .= '- ' . $summary . PHP_EOL;
-            }
+        // Append "Known Operations" section when cache has entries
+        $knownOpsSection = $this->buildKnownOperationsSection($conversation);
+        if ($knownOpsSection !== null) {
+            $systemPrompt .= $knownOpsSection;
         }
 
         if (!empty($systemPrompt)) {

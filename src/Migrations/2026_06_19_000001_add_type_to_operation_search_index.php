@@ -38,10 +38,14 @@ return new class extends Migration
             }
         }
 
-        // Create new combined fulltext index
-        Schema::table('operation_search_index', function (Blueprint $table) {
-            $table->fullText(['type', 'searchable_text']);
-        });
+        // Create new combined fulltext index (skip on SQLite)
+        $driver = config('database.default', 'sqlite');
+        $connection = DB::connection($driver);
+        if ($connection->getDriverName() !== 'sqlite') {
+            Schema::table('operation_search_index', function (Blueprint $table) {
+                $table->fullText(['type', 'searchable_text']);
+            });
+        }
     }
 
     public function down(): void
@@ -55,9 +59,14 @@ return new class extends Migration
             }
         });
 
-        Schema::table('operation_search_index', function (Blueprint $table) {
-            $table->fullText(['searchable_text']);
-        });
+        // Recreate original fulltext index (skip on SQLite)
+        $driver = config('database.default', 'sqlite');
+        $connection = DB::connection($driver);
+        if ($connection->getDriverName() !== 'sqlite') {
+            Schema::table('operation_search_index', function (Blueprint $table) {
+                $table->fullText(['searchable_text']);
+            });
+        }
 
         Schema::table('operation_search_index', function (Blueprint $table) {
             $table->dropColumn('type', 'prompt_content');

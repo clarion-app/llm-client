@@ -105,7 +105,7 @@ class OperationCache
     /**
      * Get formatted one-line summaries for all cached operations in a conversation.
      *
-     * Used for system prompt injection ("Recently Used Operations" section).
+     * Used for system prompt injection ("Known Operations" section).
      *
      * @param string $conversationId Conversation UUID
      * @return string[] Array of formatted summary strings, e.g. "create-contact (POST /contacts)"
@@ -127,6 +127,27 @@ class OperationCache
         }
 
         return $summaries;
+    }
+
+    /**
+     * Get full cached entries for a conversation, ordered most-recently-used first.
+     *
+     * @param string $conversationId Conversation UUID
+     * @param int $limit Maximum entries to return (default 20)
+     * @return array Array of entry arrays (each entry has operationId, summary, method, path, paramSchema)
+     */
+    public function getEntries(string $conversationId, int $limit = 20): array
+    {
+        if (!isset(self::$caches[$conversationId])) {
+            return [];
+        }
+
+        $entries = array_values(self::$caches[$conversationId]);
+
+        // Reverse so most recently used (last in array) comes first
+        $entries = array_reverse($entries);
+
+        return array_slice($entries, 0, $limit);
     }
 
     /**

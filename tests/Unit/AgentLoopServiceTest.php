@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\OperationsSearchService;
+use ClarionApp\LlmClient\Services\OperationCache;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
@@ -1017,5 +1018,242 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('wizlights_executeOperation', $decoded['results'][1]['id']);
         $this->assertEquals('wizlight-backend', $decoded['results'][1]['package']);
         $this->assertStringContainsString('dimming', $decoded['results'][1]['content']);
+    }
+
+    /* ── Known Operations Section Tests (US1–US4) ── */
+
+    /**
+     * Create an AgentLoopService with a real OperationCache pre-populated with entries.
+     * Uses real OperationCache (in-memory, no DB) to avoid Mockery alias issues.
+     */
+    private function createServiceWithCacheEntries(string $conversationId, array $entries): AgentLoopService
+    {
+        $cache = new OperationCache();
+        // Pre-populate cache using put() to simulate cached operations
+        foreach ($entries as $entry) {
+            $cache->put($conversationId, $entry['operationId'], [
+                'summary' => $entry['summary'],
+                'method' => $entry['method'],
+                'path' => $entry['path'],
+                'paramSchema' => $entry['paramSchema'] ?? null,
+            ]);
+        }
+
+        // Use mocks only for McpToolRegistry and McpToolExecutor (no type hint issues)
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        return new AgentLoopService($registryMock, $executorMock, $cache);
+    }
+
+    /** @test */
+    public function build_known_operations_section_generates_bullet_list_format()
+    {
+        $conversation = Conversation::factory()->create();
+
+        $entries = [
+            [
+                'operationId' => 'create-contact',
+                'summary' => 'Create a new contact',
+                'method' => 'POST',
+                'path' => '/contacts',
+                'paramSchema' => ['type' => 'object', 'properties' => ['name' => ['type' => 'string']]],
+            ],
+            [
+                'operationId' => 'list-tasks',
+                'summary' => 'List all tasks',
+                'method' => 'GET',
+                'path' => '/tasks',
+                'paramSchema' => null,
+            ],
+        ];
+
+        $service = $this->createServiceWithCacheEntries($conversation->id, $entries);
+        $section = $this->invokeBuildKnownOperationsSection($service, $conversation);
+
+        $this->assertNotNull($section);
+        $this->assertStringContainsString("## Known Operations", $section);
+        $this->assertStringContainsString("**create-contact** (POST /contacts)", $section);
+        $this->assertStringContainsString("- Summary: Create a new contact", $section);
+        $this->assertStringContainsString("- Parameters:", $section);
+        $this->assertStringContainsString("**list-tasks** (GET /tasks)", $section);
+        $this->assertStringContainsString("- Summary: List all tasks", $section);
+        $this->assertStringContainsString("- Parameters: none", $section);
+    }
+
+    /** @test */
+    public function build_known_operations_section_handles_null_paramschema()
+    {
+        $conversation = Conversation::factory()->create();
+
+        $entries = [
+            [
+                'operationId' => 'delete-contact',
+                'summary' => 'Delete a contact',
+                'method' => 'DELETE',
+                'path' => '/contacts/1',
+                'paramSchema' => null,
+            ],
+        ];
+
+        $service = $this->createServiceWithCacheEntries($conversation->id, $entries);
+        $section = $this->invokeBuildKnownOperationsSection($service, $conversation);
+
+        $this->assertNotNull($section);
+        $this->assertStringContainsString("- Parameters: none", $section);
+    }
+
+    /** @test */
+    public function build_known_operations_section_returns_null_for_empty_cache()
+    {
+        $conversation = Conversation::factory()->create();
+
+        $cache = new OperationCache();
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        $service = new AgentLoopService($registryMock, $executorMock, $cache);
+        $section = $this->invokeBuildKnownOperationsSection($service, $conversation);
+
+        $this->assertNull($section);
+    }
+
+    /** @test */
+    public function build_messages_payload_includes_known_operations_section()
+    {
+        $conversation = Conversation::factory()->create();
+
+        $entries = [
+            [
+                'operationId' => 'create-contact',
+                'summary' => 'Create a new contact',
+                'method' => 'POST',
+                'path' => '/contacts',
+                'paramSchema' => null,
+            ],
+        ];
+
+        $service = $this->createServiceWithCacheEntries($conversation->id, $entries);
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('getTools')->andReturn(['tools' => [], 'nextCursor' => null]);
+        // Rebuild service with registry mock that has expectations
+        $cache = new OperationCache();
+        foreach ($entries as $entry) {
+            $cache->put($conversation->id, $entry['operationId'], [
+                'summary' => $entry['summary'],
+                'method' => $entry['method'],
+                'path' => $entry['path'],
+                'paramSchema' => $entry['paramSchema'] ?? null,
+            ]);
+        }
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $service = new AgentLoopService($registryMock, $executorMock, $cache);
+        $messages = $service->buildMessagesPayload($conversation);
+
+        // First message should be system with Known Operations
+        $this->assertEquals('system', $messages[0]['role']);
+        $this->assertStringContainsString('## Known Operations', $messages[0]['content']);
+        $this->assertStringContainsString('create-contact', $messages[0]['content']);
+        // Old "Recently Used Operations" should NOT appear
+        $this->assertStringNotContainsString('Recently Used Operations', $messages[0]['content']);
+    }
+
+    /** @test */
+    public function build_messages_payload_skips_known_operations_when_cache_empty()
+    {
+        $conversation = Conversation::factory()->create();
+
+        $cache = new OperationCache();
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('getTools')->andReturn(['tools' => [], 'nextCursor' => null]);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        // Set base system prompt to something non-empty
+        config(['llm-client.agent_loop.system_prompt' => 'You are a helpful assistant.']);
+
+        $service = new AgentLoopService($registryMock, $executorMock, $cache);
+        $messages = $service->buildMessagesPayload($conversation);
+
+        // System message should exist but not contain Known Operations
+        $systemMsg = collect($messages)->firstWhere('role', 'system');
+        $this->assertNotNull($systemMsg);
+        $this->assertStringNotContainsString('Known Operations', $systemMsg['content']);
+    }
+
+    /** @test */
+    public function build_known_operations_section_has_clear_delimiter()
+    {
+        $conversation = Conversation::factory()->create();
+
+        $entries = [
+            [
+                'operationId' => 'test-op',
+                'summary' => 'A test operation',
+                'method' => 'GET',
+                'path' => '/test',
+                'paramSchema' => null,
+            ],
+        ];
+
+        $service = $this->createServiceWithCacheEntries($conversation->id, $entries);
+        $section = $this->invokeBuildKnownOperationsSection($service, $conversation);
+
+        $this->assertNotNull($section);
+        // Section should start with blank lines then ## Known Operations
+        $this->assertMatchesRegularExpression('/\n+## Known Operations\n/', $section);
+    }
+
+    /** @test */
+    public function build_messages_payload_with_empty_base_prompt_and_cache_entries()
+    {
+        config(['llm-client.agent_loop.system_prompt' => '']);
+
+        $conversation = Conversation::factory()->create();
+
+        $entries = [
+            [
+                'operationId' => 'test-op',
+                'summary' => 'Test',
+                'method' => 'GET',
+                'path' => '/test',
+                'paramSchema' => null,
+            ],
+        ];
+
+        // Build service with mocked registry (for buildMessagesPayload getTools call)
+        $cache = new OperationCache();
+        foreach ($entries as $entry) {
+            $cache->put($conversation->id, $entry['operationId'], [
+                'summary' => $entry['summary'],
+                'method' => $entry['method'],
+                'path' => $entry['path'],
+                'paramSchema' => $entry['paramSchema'] ?? null,
+            ]);
+        }
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('getTools')->andReturn(['tools' => [], 'nextCursor' => null]);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        $service = new AgentLoopService($registryMock, $executorMock, $cache);
+        $messages = $service->buildMessagesPayload($conversation);
+
+        // System message should still exist with Known Operations section
+        $systemMsg = collect($messages)->firstWhere('role', 'system');
+        $this->assertNotNull($systemMsg);
+        $this->assertStringContainsString('## Known Operations', $systemMsg['content']);
+        $this->assertStringContainsString('test-op', $systemMsg['content']);
+    }
+
+    /**
+     * Helper to invoke private method buildKnownOperationsSection via reflection.
+     */
+    private function invokeBuildKnownOperationsSection(AgentLoopService $service, Conversation $conversation): ?string
+    {
+        $reflection = new \ReflectionClass($service);
+        $method = $reflection->getMethod('buildKnownOperationsSection');
+        $method->setAccessible(true);
+        return $method->invoke($service, $conversation);
     }
 }
