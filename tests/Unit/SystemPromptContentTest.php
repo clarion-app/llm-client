@@ -99,4 +99,92 @@ class SystemPromptContentTest extends TestCase
             'System prompt must contain poor-match retry guidance'
         );
     }
+
+    /* ------------------------------------------------------------------ */
+    /* New tests added by feature 025-agent-prompt-tool-selection          */
+    /* ------------------------------------------------------------------ */
+
+    /** @test T004 [US1] — prompt contains direct execution rule for known operations */
+    public function prompt_contains_direct_execution_rule()
+    {
+        $this->assertTrue(
+            stripos($this->prompt, 'execute_operation directly') !== false ||
+            stripos($this->prompt, 'direct execution') !== false,
+            'System prompt must contain direct execution guidance for known operations'
+        );
+    }
+
+    /** @test T005 [US1] — prompt contains concrete example of direct execute flow with real operationId */
+    public function prompt_contains_direct_execute_example()
+    {
+        $this->assertTrue(
+            stripos($this->prompt, 'execute_operation') !== false &&
+            (stripos($this->prompt, 'contacts.store') !== false ||
+             stripos($this->prompt, 'weather.forecast') !== false),
+            'System prompt must contain a concrete direct-execute example with a real operationId'
+        );
+    }
+
+    /** @test T008a [Edge Case] — prompt contains ambiguity handling rule */
+    public function prompt_contains_ambiguity_handling_rule()
+    {
+        $this->assertTrue(
+            stripos($this->prompt, 'clarif') !== false &&
+            stripos($this->prompt, 'multiple') !== false,
+            'System prompt must contain ambiguity handling when multiple operations match'
+        );
+    }
+
+    /** @test T009 [US2] — prompt contains fallback to search_operations for unknown operations */
+    public function prompt_contains_search_fallback_rule()
+    {
+        $this->assertTrue(
+            stripos($this->prompt, 'search_operations') !== false &&
+            (stripos($this->prompt, 'fallback') !== false ||
+             stripos($this->prompt, 'otherwise') !== false ||
+             stripos($this->prompt, 'if no') !== false ||
+             stripos($this->prompt, 'if the request does not match') !== false),
+            'System prompt must contain fallback to search_operations for unknown operations'
+        );
+    }
+
+    /** @test T009a [US2] — prompt contains preference for known operations over search (FR-003 coverage) */
+    public function prompt_contains_prefer_known_operations()
+    {
+        $this->assertTrue(
+            stripos($this->prompt, 'prefer') !== false ||
+            stripos($this->prompt, 'reduce latenc') !== false ||
+            stripos($this->prompt, 'skip search') !== false,
+            'System prompt must indicate preference for known operations over search (latency reduction)'
+        );
+    }
+
+    /** @test T013 [US3] — prompt still contains list_applications (capability discovery preserved) */
+    public function prompt_preserves_list_applications_rule()
+    {
+        $this->assertStringContainsString('list_applications', $this->prompt);
+    }
+
+    /** @test T014 [US3] — prompt still contains Recovery Rules section */
+    public function prompt_preserves_recovery_rules_section()
+    {
+        $this->assertStringContainsString('Recovery Rules', $this->prompt);
+    }
+
+    /** @test T015 [US3] — prompt still contains Response Style section */
+    public function prompt_preserves_response_style_section()
+    {
+        $this->assertStringContainsString('Response Style', $this->prompt);
+    }
+
+    /** @test T016 [US3] — prompt still contains search-then-execute example */
+    public function prompt_preserves_search_then_execute_example()
+    {
+        $this->assertTrue(
+            stripos($this->prompt, 'search-then-execute') !== false ||
+            (stripos($this->prompt, 'search_operations') !== false &&
+             stripos($this->prompt, 'Example') !== false),
+            'System prompt must still contain search-then-execute example'
+        );
+    }
 }
