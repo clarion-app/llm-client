@@ -12,6 +12,7 @@ use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpPromptRegistry;
 use ClarionApp\LlmClient\Services\McpResourceHandler;
+use ClarionApp\LlmClient\Services\OperationCache;
 use ClarionApp\LlmClient\Services\OperationsSearchService;
 use Illuminate\Support\Facades\Event;
 
@@ -52,10 +53,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             __DIR__.'/../config/llm-client.php', 'llm-client'
         );
 
+        $this->app->singleton(OperationCache::class, function ($app) {
+            return new OperationCache();
+        });
+
         $this->app->singleton(AgentLoopService::class, function ($app) {
             return new AgentLoopService(
                 $app->make(McpToolRegistry::class),
-                $app->make(McpToolExecutor::class)
+                $app->make(McpToolExecutor::class),
+                $app->make(OperationCache::class)
             );
         });
 

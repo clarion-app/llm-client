@@ -18,11 +18,13 @@ class AgentLoopService
 {
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
+    private OperationCache $operationCache;
 
-    public function __construct(McpToolRegistry $toolRegistry, McpToolExecutor $toolExecutor)
+    public function __construct(McpToolRegistry $toolRegistry, McpToolExecutor $toolExecutor, OperationCache $operationCache)
     {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
+        $this->operationCache = $operationCache;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -589,13 +591,23 @@ class AgentLoopService
             $params = array_diff_key($arguments, array_flip(['operationId', 'parameters']));
         }
 
-        $details = ApiManager::getOperationDetails($operationId);
-        if (empty((array) $details)) {
-            return json_encode(['error' => "Unknown operation: {$operationId}"]);
-        }
+        // Check cache first — skip ApiManager lookup on hit
+        $cached = $this->operationCache->get($conversation->id, $operationId);
+        if ($cached) {
+            $method = $cached['method'];
+            $pathTemplate = $cached['path'];
+        } else {
+            $details = ApiManager::getOperationDetails($operationId);
+            if (empty((array) $details)) {
+                return json_encode(['error' => "Unknown operation: {$operationId}"]);
+            }
 
-        $method = strtoupper($details['method'] ?? 'GET');
-        $pathTemplate = $details['path'] ?? '';
+            // Cache the resolved operation details
+            $this->operationCache->put($conversation->id, $operationId, $details);
+
+            $method = strtoupper($details['method'] ?? 'GET');
+            $pathTemplate = $details['path'] ?? '';
+        }
 
         // Check confirmation/rejection
         $validation = ApiCallValidator::validate($operationId, $method, $pathTemplate);
@@ -663,6 +675,16 @@ class AgentLoopService
         $payload = [];
 
         $systemPrompt = config('llm-client.agent_loop.system_prompt', '');
+
+        // Append "Recently Used Operations" section when cache has entries
+        $summaries = $this->operationCache->getSummaries($conversation->id);
+        if (!empty($summaries)) {
+            $systemPrompt .= PHP_EOL . 'Recently Used Operations:' . PHP_EOL;
+            foreach ($summaries as $summary) {
+                $systemPrompt .= '- ' . $summary . PHP_EOL;
+            }
+        }
+
         if (!empty($systemPrompt)) {
             $payload[] = [
                 'role' => 'system',

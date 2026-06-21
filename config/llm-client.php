@@ -68,4 +68,9 @@ return [
     'operations_search' => [
         'default_limit' => 10,    // Maximum results returned by search
     ],
+
+    // Operation Cache configuration
+    'operation_cache' => [
+        'max_entries' => 25,    // Max cached operations per conversation (LRU eviction)
+    ],
 ];
