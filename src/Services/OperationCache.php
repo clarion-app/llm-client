@@ -30,7 +30,7 @@ class OperationCache
 
     public function __construct(?int $maxEntries = null)
     {
-        $this->maxEntries = $maxEntries ?? (int) config('llm-client.operation_cache.max_entries', 25);
+        $this->maxEntries = $maxEntries ?? (int) config('llm-client.operation_cache.max_entries', 20);
     }
 
     /**

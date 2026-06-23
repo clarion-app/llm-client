@@ -76,6 +76,6 @@ return [
 
     // Operation Cache configuration
     'operation_cache' => [
-        'max_entries' => 25,    // Max cached operations per conversation (LRU eviction)
+        'max_entries' => 20,    // Max cached operations per conversation (LRU eviction)
     ],
 ];

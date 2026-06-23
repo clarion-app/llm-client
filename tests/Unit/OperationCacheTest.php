@@ -506,4 +506,205 @@ class OperationCacheTest extends TestCase
         $this->assertEquals('op-25', $entries[0]['operationId']);
         $this->assertEquals('op-6', $entries[19]['operationId']);
     }
+
+    /** @test */
+    public function cache_never_exceeds_max_capacity_with_50_inserts()
+    {
+        // Use maxEntries=20 to match the new default
+        $cache = new OperationCache(20);
+        $this->resetCache();
+        $this->cache = $cache;
+
+        // Insert 50 unique operations
+        for ($i = 1; $i <= 50; $i++) {
+            $this->cache->put('conv-1', 'op-' . $i, [
+                'operationId' => 'op-' . $i,
+                'summary' => 'Operation ' . $i,
+                'method' => 'GET',
+                'path' => '/op/' . $i,
+                'paramSchema' => null,
+            ]);
+        }
+
+        // Cache should never exceed 20 entries
+        $this->assertEquals(20, $this->cache->count('conv-1'), 'Cache count should be exactly 20');
+
+        // Only the last 20 operations (op-31 through op-50) should remain
+        $entries = $this->cache->getEntries('conv-1', 50);
+        $this->assertCount(20, $entries);
+
+        // First 30 operations should be evicted
+        for ($i = 1; $i <= 30; $i++) {
+            $this->assertNull(
+                $this->cache->get('conv-1', 'op-' . $i),
+                "op-{$i} should have been evicted"
+            );
+        }
+
+        // Last 20 operations should be present
+        for ($i = 31; $i <= 50; $i++) {
+            $result = $this->cache->get('conv-1', 'op-' . $i);
+            $this->assertNotNull(
+                $result,
+                "op-{$i} should still be in cache"
+            );
+            $this->assertEquals('op-' . $i, $result['operationId']);
+        }
+    }
+
+    /** @test */
+    public function single_entry_cache_evicts_immediately()
+    {
+        $cache = new OperationCache(1);
+        $this->resetCache();
+        $this->cache = $cache;
+
+        // Add op-a
+        $this->cache->put('conv-1', 'op-a', [
+            'operationId' => 'op-a',
+            'summary' => 'A',
+            'method' => 'GET',
+            'path' => '/a',
+            'paramSchema' => null,
+        ]);
+
+        // Add op-b — should evict op-a immediately
+        $this->cache->put('conv-1', 'op-b', [
+            'operationId' => 'op-b',
+            'summary' => 'B',
+            'method' => 'GET',
+            'path' => '/b',
+            'paramSchema' => null,
+        ]);
+
+        // op-a should be evicted
+        $this->assertNull($this->cache->get('conv-1', 'op-a'), 'op-a should have been evicted');
+
+        // op-b should remain
+        $result = $this->cache->get('conv-1', 'op-b');
+        $this->assertNotNull($result, 'op-b should exist');
+        $this->assertEquals('op-b', $result['operationId']);
+
+        // Cache count should be exactly 1
+        $this->assertEquals(1, $this->cache->count('conv-1'));
+    }
+
+    /** @test */
+    public function rapid_eviction_cycles_stable()
+    {
+        $cache = new OperationCache(20);
+        $this->resetCache();
+        $this->cache = $cache;
+
+        // Perform 100 add-evict cycles with unique operations
+        for ($i = 1; $i <= 100; $i++) {
+            $this->cache->put('conv-1', 'op-' . $i, [
+                'operationId' => 'op-' . $i,
+                'summary' => 'Operation ' . $i,
+                'method' => 'GET',
+                'path' => '/op/' . $i,
+                'paramSchema' => null,
+            ]);
+
+            // Count should never exceed 20 at any point
+            $this->assertLessThanOrEqual(
+                20,
+                $this->cache->count('conv-1'),
+                "Count should not exceed 20 after inserting op-{$i}"
+            );
+        }
+
+        // Final count should be exactly 20
+        $this->assertEquals(20, $this->cache->count('conv-1'));
+
+        // All entries in cache should be from the last 20 inserts (op-81 through op-100)
+        $entries = $this->cache->getEntries('conv-1', 50);
+        $this->assertCount(20, $entries);
+
+        // First 80 operations should be evicted
+        for ($i = 1; $i <= 80; $i++) {
+            $this->assertNull(
+                $this->cache->get('conv-1', 'op-' . $i),
+                "op-{$i} should have been evicted"
+            );
+        }
+
+        // Last 20 operations should be present
+        for ($i = 81; $i <= 100; $i++) {
+            $result = $this->cache->get('conv-1', 'op-' . $i);
+            $this->assertNotNull(
+                $result,
+                "op-{$i} should still be in cache"
+            );
+            $this->assertEquals('op-' . $i, $result['operationId']);
+        }
+    }
+
+    /** @test */
+    public function readd_evicted_operation_with_new_details()
+    {
+        $cache = new OperationCache(3);
+        $this->resetCache();
+        $this->cache = $cache;
+
+        // Add op-a, op-b, op-c
+        $this->cache->put('conv-1', 'op-a', [
+            'operationId' => 'op-a',
+            'summary' => 'A',
+            'method' => 'GET',
+            'path' => '/a',
+            'paramSchema' => null,
+        ]);
+
+        $this->cache->put('conv-1', 'op-b', [
+            'operationId' => 'op-b',
+            'summary' => 'B',
+            'method' => 'GET',
+            'path' => '/b',
+            'paramSchema' => null,
+        ]);
+
+        $this->cache->put('conv-1', 'op-c', [
+            'operationId' => 'op-c',
+            'summary' => 'C',
+            'method' => 'GET',
+            'path' => '/c',
+            'paramSchema' => null,
+        ]);
+
+        // Access op-a to make it MRU
+        $this->cache->get('conv-1', 'op-a');
+
+        // Add op-d — should evict op-b (least recently used)
+        $this->cache->put('conv-1', 'op-d', [
+            'operationId' => 'op-d',
+            'summary' => 'D',
+            'method' => 'GET',
+            'path' => '/d',
+            'paramSchema' => null,
+        ]);
+
+        // Confirm op-b is evicted
+        $this->assertNull($this->cache->get('conv-1', 'op-b'), 'op-b should be evicted');
+
+        // Re-add op-b with different summary
+        $this->cache->put('conv-1', 'op-b', [
+            'operationId' => 'op-b',
+            'summary' => 'B (re-added)',
+            'method' => 'POST',
+            'path' => '/b/v2',
+            'paramSchema' => null,
+        ]);
+
+        // op-b should be accessible with new summary
+        $result = $this->cache->get('conv-1', 'op-b');
+        $this->assertNotNull($result, 'op-b should be re-added');
+        $this->assertEquals('B (re-added)', $result['summary']);
+        $this->assertEquals('POST', $result['method']);
+        $this->assertEquals('/b/v2', $result['path']);
+
+        // op-b should be at MRU position (last in getEntries order, first when reversed)
+        $entries = $this->cache->getEntries('conv-1');
+        $this->assertEquals('op-b', $entries[0]['operationId'], 'op-b should be at MRU position (first in getEntries)');
+    }
 }
