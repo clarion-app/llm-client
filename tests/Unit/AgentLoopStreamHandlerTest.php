@@ -100,7 +100,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         // Third chunk: more arguments
         $chunk3 = "data: " . json_encode([
             'choices' => [['delta' => ['tool_calls' => [
-                ['index' => 0, 'function' => ['arguments' => ': "Jane"}']],
+                ['index' => 0, 'function' => ['arguments' => ': "Jane"}}']],
             ]], 'finish_reason' => null]],
         ]) . "\n\n";
 

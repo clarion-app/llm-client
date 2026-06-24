@@ -5,10 +5,12 @@ namespace ClarionApp\LlmClient\Tests\Unit;
 use Tests\TestCase;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 use PHPUnit\Framework\Attributes\Test;
+use Mockery;
 
 class ApiCallConfirmationTest extends TestCase
 {
@@ -36,20 +38,25 @@ class ApiCallConfirmationTest extends TestCase
     #[Test]
     public function approval_executes_pending_call()
     {
-        $pendingData = json_encode([
-            '__pending_api_call' => true,
-            'operationId' => 'updateContact',
-            'method' => 'PUT',
-            'path' => '/api/clarion-app/contacts/contact/123',
-            'body' => ['name' => 'Updated'],
-        ]);
+        $this->mock(AgentLoopService::class, function ($mock) {
+            $mock->shouldReceive('resume')->once();
+        });
 
         $message = Message::create([
             'conversation_id' => $this->conversation->id,
             'role' => 'system',
             'user' => 'System',
-            'content' => $pendingData,
+            'content' => '',
             'responseTime' => 0,
+            'tool_data' => [
+                'pending_confirmation' => [
+                    'operationId' => 'updateContact',
+                    'method' => 'PUT',
+                    'path' => '/api/clarion-app/contacts/contact/123',
+                    'body' => ['name' => 'Updated'],
+                    'expires_at' => now()->addMinutes(5)->toDateTimeString(),
+                ],
+            ],
         ]);
 
         $response = $this->actingAs($this->user, 'api')
@@ -61,25 +68,28 @@ class ApiCallConfirmationTest extends TestCase
         $response->assertStatus(200);
     }
 
-    // T024 — denial cancels pending call
-
     #[Test]
     public function denial_cancels_pending_call()
     {
-        $pendingData = json_encode([
-            '__pending_api_call' => true,
-            'operationId' => 'deleteContact',
-            'method' => 'DELETE',
-            'path' => '/api/clarion-app/contacts/contact/123',
-            'body' => null,
-        ]);
+        $this->mock(AgentLoopService::class, function ($mock) {
+            $mock->shouldReceive('resume')->once();
+        });
 
         $message = Message::create([
             'conversation_id' => $this->conversation->id,
             'role' => 'system',
             'user' => 'System',
-            'content' => $pendingData,
+            'content' => '',
             'responseTime' => 0,
+            'tool_data' => [
+                'pending_confirmation' => [
+                    'operationId' => 'deleteContact',
+                    'method' => 'DELETE',
+                    'path' => '/api/clarion-app/contacts/contact/123',
+                    'body' => null,
+                    'expires_at' => now()->addMinutes(5)->toDateTimeString(),
+                ],
+            ],
         ]);
 
         $response = $this->actingAs($this->user, 'api')
@@ -89,11 +99,6 @@ class ApiCallConfirmationTest extends TestCase
             ]);
 
         $response->assertStatus(200);
-
-        // Verify the message is marked as cancelled
-        $updatedMessage = Message::find($message->id);
-        $content = json_decode($updatedMessage->content, true);
-        $this->assertTrue($content['__cancelled'] ?? false);
     }
 
     // T024 — non-owner cannot confirm
