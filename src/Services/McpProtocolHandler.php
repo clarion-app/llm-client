@@ -44,7 +44,18 @@ class McpProtocolHandler
             return $this->handleNotificationsInitialized($sessionId, $userId);
         }
 
-        // All other methods require a valid session
+        // Check for known methods before requiring a session
+        // so unknown methods return -32601 instead of -32600
+        $knownSessionMethods = [
+            'ping', 'tools/list', 'tools/call', 'prompts/list',
+            'prompts/get', 'resources/list', 'resources/templates/list',
+            'resources/read',
+        ];
+        if (!in_array($method, $knownSessionMethods, true)) {
+            return $this->errorResponse($id, -32601, "Method not found: {$method}");
+        }
+
+        // All remaining methods require a valid session
         $session = $this->enforceSession($sessionId, $userId);
         if ($session === null) {
             return $this->errorResponse($id, -32600, 'Invalid Request: Valid Mcp-Session-Id header required');
