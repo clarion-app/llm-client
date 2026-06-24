@@ -49,8 +49,8 @@ class McpToolExecutor
             );
         }
 
-        // Unflatten arguments
-        $resolved = $this->unflattenArguments($cleanArguments, $pathTemplate);
+        // Extract arguments
+        $resolved = $this->extractArguments($cleanArguments, $pathTemplate);
 
         // Validate via ApiCallValidator
         $validation = ApiCallValidator::validate($operationId, $method, $resolved['path']);
@@ -98,7 +98,7 @@ class McpToolExecutor
 
         $token->consume();
 
-        $resolved = $this->unflattenArguments($arguments, $pathTemplate);
+        $resolved = $this->extractArguments($arguments, $pathTemplate);
         return $this->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
     }
 
@@ -190,26 +190,33 @@ class McpToolExecutor
         }
     }
 
-    public function unflattenArguments(array $arguments, string $pathTemplate): array
+    public function extractArguments(array $arguments, string $pathTemplate): array
     {
         $path = $pathTemplate;
         $query = [];
         $body = [];
 
-        foreach ($arguments as $key => $value) {
-            if (str_starts_with($key, 'path_')) {
-                $paramName = substr($key, 5);
-                $path = str_replace('{' . $paramName . '}', (string) $value, $path);
-            } elseif (str_starts_with($key, 'query_')) {
-                $paramName = substr($key, 6);
-                $query[$paramName] = $value;
-            } elseif (str_starts_with($key, 'body_')) {
-                $paramName = substr($key, 5);
-                $body[$paramName] = $value;
-            } else {
-                // No prefix — treat as body param
-                $body[$key] = $value;
-            }
+        // Handle structured format: {path: {...}, query: {...}, body: {...}}
+        $pathParams = $arguments['path'] ?? [];
+        $queryParams = $arguments['query'] ?? [];
+        $bodyParams = $arguments['body'] ?? [];
+
+        // Path parameters - substitute into path template
+        foreach ($pathParams as $key => $value) {
+            if ($value === null) continue;
+            $path = str_replace('{' . $key . '}', (string) $value, $path);
+        }
+
+        // Query parameters
+        foreach ($queryParams as $key => $value) {
+            if ($value === null) continue;
+            $query[$key] = $value;
+        }
+
+        // Body parameters
+        foreach ($bodyParams as $key => $value) {
+            if ($value === null) continue;
+            $body[$key] = $value;
         }
 
         return [
@@ -221,7 +228,7 @@ class McpToolExecutor
 
     private function hashArguments(array $arguments): string
     {
-        return hash('sha256', json_encode($arguments, JSON_SORT_KEYS));
+        return hash('sha256', json_encode($arguments, JSON_THROW_ON_ERROR));
     }
 
     private function errorResult(string $message): array

@@ -51,7 +51,8 @@ class McpToolRegistryTest extends TestCase
         $this->assertEquals('contacts.listContacts', $tool['name']);
         $this->assertEquals('List all contacts', $tool['description']);
         $this->assertEquals('object', $tool['inputSchema']['type']);
-        $this->assertArrayHasKey('query_page', $tool['inputSchema']['properties']);
+        $this->assertArrayHasKey('query', $tool['inputSchema']['properties']);
+        $this->assertArrayHasKey('page', $tool['inputSchema']['properties']['query']['properties']);
     }
 
     /** @test */
@@ -79,7 +80,7 @@ class McpToolRegistryTest extends TestCase
     }
 
     /** @test */
-    public function generates_flat_input_schema_with_prefixes()
+    public function generates_structured_input_schema_with_sub_objects()
     {
         $this->mockApiManager([
             '@clarion-app/contacts' => [
@@ -123,11 +124,13 @@ class McpToolRegistryTest extends TestCase
         $result = $registry->getTools();
         $schema = $result['tools'][0]['inputSchema'];
 
-        $this->assertArrayHasKey('path_contact', $schema['properties']);
-        $this->assertArrayHasKey('body_name', $schema['properties']);
-        $this->assertArrayHasKey('body_email', $schema['properties']);
-        $this->assertContains('path_contact', $schema['required'] ?? []);
-        $this->assertContains('body_name', $schema['required'] ?? []);
+        $this->assertArrayHasKey('path', $schema['properties']);
+        $this->assertArrayHasKey('contact', $schema['properties']['path']['properties']);
+        $this->assertArrayHasKey('body', $schema['properties']);
+        $this->assertArrayHasKey('name', $schema['properties']['body']['properties']);
+        $this->assertArrayHasKey('email', $schema['properties']['body']['properties']);
+        $this->assertContains('path', $schema['required'] ?? []);
+        $this->assertContains('body', $schema['required'] ?? []);
     }
 
     /** @test */

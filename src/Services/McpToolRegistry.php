@@ -112,7 +112,9 @@ class McpToolRegistry
 
     private function buildInputSchema(array $opDetails): array
     {
-        $properties = [];
+        $pathProps = [];
+        $queryProps = [];
+        $bodyProps = [];
         $required = [];
 
         // Path and query parameters
@@ -124,16 +126,19 @@ class McpToolRegistry
             }
 
             $in = $param['in'] ?? 'query';
-            $prefix = $in === 'path' ? 'path_' : 'query_';
-            $flatName = $prefix . $paramName;
-
-            $properties[$flatName] = $param['schema'] ?? ['type' => 'string'];
+            $schema = $param['schema'] ?? ['type' => 'string'];
             if (!empty($param['description'])) {
-                $properties[$flatName]['description'] = $param['description'];
+                $schema['description'] = $param['description'];
+            }
+
+            if ($in === 'path') {
+                $pathProps[$paramName] = $schema;
+            } else {
+                $queryProps[$paramName] = $schema;
             }
 
             if (!empty($param['required'])) {
-                $required[] = $flatName;
+                $required[] = 'path';
             }
         }
 
@@ -145,15 +150,25 @@ class McpToolRegistry
 
             if ($jsonSchema && isset($jsonSchema['properties'])) {
                 foreach ($jsonSchema['properties'] as $propName => $propSchema) {
-                    $flatName = "body_{$propName}";
-                    $properties[$flatName] = $propSchema;
+                    $bodyProps[$propName] = $propSchema;
                 }
 
                 $bodyRequired = $jsonSchema['required'] ?? [];
                 foreach ($bodyRequired as $reqName) {
-                    $required[] = "body_{$reqName}";
+                    $required[] = 'body';
                 }
             }
+        }
+
+        $properties = [];
+        if (!empty($pathProps)) {
+            $properties['path'] = ['type' => 'object', 'properties' => $pathProps];
+        }
+        if (!empty($queryProps)) {
+            $properties['query'] = ['type' => 'object', 'properties' => $queryProps];
+        }
+        if (!empty($bodyProps)) {
+            $properties['body'] = ['type' => 'object', 'properties' => $bodyProps];
         }
 
         $schema = [
@@ -162,7 +177,7 @@ class McpToolRegistry
         ];
 
         if (!empty($required)) {
-            $schema['required'] = $required;
+            $schema['required'] = array_unique($required);
         }
 
         return $schema;

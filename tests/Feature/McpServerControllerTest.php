@@ -102,7 +102,7 @@ class McpServerControllerTest extends TestCase
             'method' => 'tools/call',
             'params' => [
                 'name' => 'contacts.deleteContact',
-                'arguments' => ['path_contact' => 'abc-123'],
+                'arguments' => ['path' => ['contact' => 'abc-123']],
             ],
         ], ['Mcp-Session-Id' => $sessionId]);
 
@@ -123,7 +123,7 @@ class McpServerControllerTest extends TestCase
             'params' => [
                 'name' => 'contacts.deleteContact',
                 'arguments' => [
-                    'path_contact' => 'abc-123',
+                    'path' => ['contact' => 'abc-123'],
                     '_confirmation_token' => $confirmationToken,
                 ],
             ],

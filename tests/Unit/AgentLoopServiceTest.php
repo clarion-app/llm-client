@@ -39,10 +39,15 @@ class AgentLoopServiceTest extends TestCase
                         'inputSchema' => [
                             'type' => 'object',
                             'properties' => [
-                                'body_name' => ['type' => 'string'],
-                                'body_email' => ['type' => 'string'],
+                                'body' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'name' => ['type' => 'string'],
+                                        'email' => ['type' => 'string'],
+                                    ],
+                                ],
                             ],
-                            'required' => ['body_name'],
+                            'required' => ['body'],
                         ],
                         'annotations' => ['readOnlyHint' => false],
                         '_meta' => ['operationId' => 'storeContact', 'method' => 'POST', 'path' => '/api/contacts'],
@@ -60,7 +65,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('function', $tools[0]['type']);
         $this->assertEquals('contacts.store', $tools[0]['function']['name']);
         $this->assertEquals('Create a new contact', $tools[0]['function']['description']);
-        $this->assertArrayHasKey('body_name', $tools[0]['function']['parameters']['properties']);
+        $this->assertArrayHasKey('body', $tools[0]['function']['parameters']['properties']);
         // _meta and annotations should NOT be included
         $this->assertArrayNotHasKey('_meta', $tools[0]);
         $this->assertArrayNotHasKey('annotations', $tools[0]);
@@ -139,7 +144,7 @@ class AgentLoopServiceTest extends TestCase
                         'type' => 'function',
                         'function' => [
                             'name' => 'contacts.store',
-                            'arguments' => '{"body_name": "Jane"}',
+                            'arguments' => '{"body":{"name": "Jane"}}',
                         ],
                     ],
                 ],
@@ -249,7 +254,7 @@ class AgentLoopServiceTest extends TestCase
                         'type' => 'function',
                         'function' => [
                             'name' => 'contacts.destroy',
-                            'arguments' => '{"path_id": "42"}',
+                            'arguments' => '{"path":{"id": "42"}}',
                         ],
                     ],
                 ],
@@ -259,7 +264,7 @@ class AgentLoopServiceTest extends TestCase
                     'tool_name' => 'contacts.destroy',
                     'method' => 'DELETE',
                     'path' => '/api/contacts/42',
-                    'arguments' => ['path_id' => '42'],
+                    'arguments' => ['path' => ['id' => '42']],
                     'conversation_history_snapshot' => [],
                     'expires_at' => now()->addMinutes(5)->toIso8601String(),
                 ],
@@ -311,7 +316,7 @@ class AgentLoopServiceTest extends TestCase
                         'type' => 'function',
                         'function' => [
                             'name' => 'contacts.destroy',
-                            'arguments' => '{"path_id": "42"}',
+                            'arguments' => '{"path":{"id": "42"}}',
                         ],
                     ],
                 ],
@@ -321,7 +326,7 @@ class AgentLoopServiceTest extends TestCase
                     'tool_name' => 'contacts.destroy',
                     'method' => 'DELETE',
                     'path' => '/api/contacts/42',
-                    'arguments' => ['path_id' => '42'],
+                    'arguments' => ['path' => ['id' => '42']],
                     'conversation_history_snapshot' => [],
                     'expires_at' => now()->addMinutes(5)->toIso8601String(),
                 ],
@@ -361,7 +366,7 @@ class AgentLoopServiceTest extends TestCase
                         'type' => 'function',
                         'function' => [
                             'name' => 'contacts.destroy',
-                            'arguments' => '{"path_id": "42"}',
+                            'arguments' => '{"path":{"id": "42"}}',
                         ],
                     ],
                 ],
@@ -371,7 +376,7 @@ class AgentLoopServiceTest extends TestCase
                     'tool_name' => 'contacts.destroy',
                     'method' => 'DELETE',
                     'path' => '/api/contacts/42',
-                    'arguments' => ['path_id' => '42'],
+                    'arguments' => ['path' => ['id' => '42']],
                     'conversation_history_snapshot' => [],
                     'expires_at' => now()->subMinutes(1)->toIso8601String(),
                 ],
@@ -515,7 +520,7 @@ class AgentLoopServiceTest extends TestCase
             'summary'     => 'Store a new contact',
             'method'      => 'POST',
             'path'        => '/api/contacts',
-            'paramSchema' => json_encode(['body' => [['name' => 'body_name', 'type' => 'string']]]),
+            'paramSchema' => json_encode(['body' => [['name' => 'name', 'type' => 'string']]]),
             'promptContent' => null,
         ];
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -1255,5 +1260,67 @@ class AgentLoopServiceTest extends TestCase
         $method = $reflection->getMethod('buildKnownOperationsSection');
         $method->setAccessible(true);
         return $method->invoke($service, $conversation);
+    }
+
+    /** @test T014 */
+    public function execute_operation_meta_tool_has_structured_parameters_schema()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('getTools')
+            ->with(null)
+            ->andReturn([
+                'tools' => [],
+                'nextCursor' => null,
+            ]);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $tools = $service->buildToolsPayload();
+
+        // Find execute_operation meta-tool
+        $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
+        $this->assertNotNull($execOp, 'execute_operation meta-tool should exist');
+
+        $paramsProps = $execOp['function']['parameters']['properties']['parameters']['properties'];
+        $this->assertArrayHasKey('path', $paramsProps);
+        $this->assertArrayHasKey('query', $paramsProps);
+        $this->assertArrayHasKey('body', $paramsProps);
+
+        // Each sub-object should have additionalProperties: true
+        $this->assertTrue($paramsProps['path']['additionalProperties']);
+        $this->assertTrue($paramsProps['query']['additionalProperties']);
+        $this->assertTrue($paramsProps['body']['additionalProperties']);
+    }
+
+    /** @test T015 */
+    public function execute_operation_description_mentions_structured_format()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('getTools')
+            ->with(null)
+            ->andReturn([
+                'tools' => [],
+                'nextCursor' => null,
+            ]);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $tools = $service->buildToolsPayload();
+
+        $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
+        $this->assertNotNull($execOp);
+
+        $desc = $execOp['function']['description'];
+        // Should mention structured format, not flat prefixes
+        $this->assertStringContainsString('structured', $desc);
+        $this->assertStringContainsString('path', strtolower($desc));
+        $this->assertStringContainsString('query', strtolower($desc));
+        $this->assertStringContainsString('body', strtolower($desc));
+        // Should NOT mention flat prefixes
+        $this->assertStringNotContainsString('path_', $desc);
+        $this->assertStringNotContainsString('query_', $desc);
+        $this->assertStringNotContainsString('body_', $desc);
     }
 }

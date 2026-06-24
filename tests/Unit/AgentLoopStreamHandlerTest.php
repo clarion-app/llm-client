@@ -77,7 +77,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         // Second chunk: argument fragment
         $chunk2 = "data: " . json_encode([
             'choices' => [['delta' => ['tool_calls' => [
-                ['index' => 0, 'function' => ['arguments' => '{"body_name"']],
+                ['index' => 0, 'function' => ['arguments' => '{"body":{"name"']],
             ]], 'finish_reason' => null]],
         ]) . "\n\n";
 
@@ -95,7 +95,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         $this->assertCount(1, $handler->toolCalls);
         $this->assertEquals('call_abc', $handler->toolCalls[0]['id']);
         $this->assertEquals('contacts.store', $handler->toolCalls[0]['function']['name']);
-        $this->assertEquals('{"body_name": "Jane"}', $handler->toolCalls[0]['function']['arguments']);
+        $this->assertEquals('{"body":{"name": "Jane"}}', $handler->toolCalls[0]['function']['arguments']);
     }
 
     /** @test */
@@ -145,7 +145,7 @@ class AgentLoopStreamHandlerTest extends TestCase
                 'type' => 'function',
                 'function' => [
                     'name' => 'contacts.store',
-                    'arguments' => '{"body_name": "Jane"}',
+                    'arguments' => '{"body":{"name": "Jane"}}',
                 ],
             ],
         ];
@@ -276,7 +276,7 @@ class AgentLoopStreamHandlerTest extends TestCase
                 'type' => 'function',
                 'function' => [
                     'name' => 'contacts.destroy',
-                    'arguments' => '{"path_id": "42"}',
+                    'arguments' => '{"path":{"id": "42"}}',
                 ],
             ],
         ];
@@ -326,7 +326,7 @@ class AgentLoopStreamHandlerTest extends TestCase
                 'type' => 'function',
                 'function' => [
                     'name' => 'contacts.destroy',
-                    'arguments' => '{"path_id": "99"}',
+                    'arguments' => '{"path":{"id": "99"}}',
                 ],
             ],
         ];

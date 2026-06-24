@@ -62,18 +62,30 @@ class ReindexOperationsJob implements ShouldQueue
                 $paramSchema = [];
 
                 // Path/query parameters
+                $pathParams = [];
+                $queryParams = [];
                 foreach ($opDetails['parameters'] ?? [] as $param) {
                     $name = $param['name'] ?? null;
                     if (!$name) continue;
                     $in = $param['in'] ?? 'query';
-                    $prefix = $in === 'path' ? 'path_' : 'query_';
-                    $paramNames[] = $prefix . $name;
-                    $paramSchema[$prefix . $name] = [
+                    $paramInfo = [
                         'type' => $param['schema']['type'] ?? 'string',
                         'in' => $in,
                         'description' => $param['description'] ?? '',
                         'required' => !empty($param['required']),
                     ];
+                    if ($in === 'path') {
+                        $pathParams[$name] = $paramInfo;
+                    } else {
+                        $queryParams[$name] = $paramInfo;
+                    }
+                    $paramNames[] = $name;
+                }
+                if (!empty($pathParams)) {
+                    $paramSchema['path'] = $pathParams;
+                }
+                if (!empty($queryParams)) {
+                    $paramSchema['query'] = $queryParams;
                 }
 
                 // Body parameters
@@ -83,15 +95,17 @@ class ReindexOperationsJob implements ShouldQueue
                     $jsonSchema = $content['application/json']['schema'] ?? null;
                     if ($jsonSchema && isset($jsonSchema['properties'])) {
                         $bodyRequired = $jsonSchema['required'] ?? [];
+                        $bodyParams = [];
                         foreach ($jsonSchema['properties'] as $propName => $propSchema) {
-                            $paramNames[] = 'body_' . $propName;
-                            $paramSchema['body_' . $propName] = [
+                            $paramNames[] = $propName;
+                            $bodyParams[$propName] = [
                                 'type' => $propSchema['type'] ?? 'string',
                                 'in' => 'body',
                                 'description' => $propSchema['description'] ?? '',
                                 'required' => in_array($propName, $bodyRequired),
                             ];
                         }
+                        $paramSchema['body'] = $bodyParams;
                     }
                 }
 

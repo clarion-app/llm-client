@@ -31,7 +31,7 @@ class McpConfirmationTokenTest extends TestCase
             'session_id' => $this->session->id,
             'tool_name' => 'contacts.destroy',
             'arguments_hash' => hash('sha256', 'test'),
-            'arguments_snapshot' => ['path_contact' => 'abc'],
+            'arguments_snapshot' => ['path' => ['contact' => 'abc']],
             'expires_at' => Carbon::now()->addMinutes(5),
         ]);
 
@@ -49,7 +49,7 @@ class McpConfirmationTokenTest extends TestCase
             'session_id' => $this->session->id,
             'tool_name' => 'contacts.destroy',
             'arguments_hash' => hash('sha256', 'test'),
-            'arguments_snapshot' => ['path_contact' => 'abc'],
+            'arguments_snapshot' => ['path' => ['contact' => 'abc']],
             'expires_at' => Carbon::now()->addMinutes(5),
             'used_at' => Carbon::now(),
         ]);
@@ -68,7 +68,7 @@ class McpConfirmationTokenTest extends TestCase
             'session_id' => $this->session->id,
             'tool_name' => 'contacts.destroy',
             'arguments_hash' => hash('sha256', 'test'),
-            'arguments_snapshot' => ['path_contact' => 'abc'],
+            'arguments_snapshot' => ['path' => ['contact' => 'abc']],
             'expires_at' => Carbon::now()->subMinutes(1),
         ]);
 
@@ -86,7 +86,7 @@ class McpConfirmationTokenTest extends TestCase
             'session_id' => $this->session->id,
             'tool_name' => 'contacts.destroy',
             'arguments_hash' => hash('sha256', 'test'),
-            'arguments_snapshot' => ['path_contact' => 'abc'],
+            'arguments_snapshot' => ['path' => ['contact' => 'abc']],
             'expires_at' => Carbon::now()->addMinutes(5),
         ]);
 
@@ -104,7 +104,7 @@ class McpConfirmationTokenTest extends TestCase
             'session_id' => $this->session->id,
             'tool_name' => 'contacts.destroy',
             'arguments_hash' => hash('sha256', 'test'),
-            'arguments_snapshot' => ['path_contact' => 'abc'],
+            'arguments_snapshot' => ['path' => ['contact' => 'abc']],
             'expires_at' => Carbon::now()->addMinutes(5),
         ]);
 

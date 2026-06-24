@@ -37,7 +37,7 @@ class McpToolExecutorTest extends TestCase
     }
 
     /** @test */
-    public function unflattens_path_params_into_url()
+    public function extracts_path_params_into_url()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $registryMock->shouldReceive('findTool')
@@ -59,7 +59,7 @@ class McpToolExecutorTest extends TestCase
         ]);
 
         $executor = new McpToolExecutor($registryMock);
-        $result = $executor->executeTool('contacts.show', ['path_contact' => 'abc'], $this->session);
+        $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'abc']], $this->session);
 
         $this->assertFalse($result['isError']);
         $this->assertEquals('text', $result['content'][0]['type']);
@@ -67,7 +67,7 @@ class McpToolExecutorTest extends TestCase
     }
 
     /** @test */
-    public function unflattens_query_params_into_query_string()
+    public function extracts_query_params_into_query_string()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $registryMock->shouldReceive('findTool')
@@ -89,7 +89,7 @@ class McpToolExecutorTest extends TestCase
         ]);
 
         $executor = new McpToolExecutor($registryMock);
-        $result = $executor->executeTool('contacts.index', ['query_page' => 2], $this->session);
+        $result = $executor->executeTool('contacts.index', ['query' => ['page' => 2]], $this->session);
 
         $this->assertFalse($result['isError']);
         Http::assertSent(function ($request) {
@@ -98,7 +98,7 @@ class McpToolExecutorTest extends TestCase
     }
 
     /** @test */
-    public function unflattens_body_params_into_request_body()
+    public function extracts_body_params_into_request_body()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $registryMock->shouldReceive('findTool')
@@ -121,8 +121,7 @@ class McpToolExecutorTest extends TestCase
 
         $executor = new McpToolExecutor($registryMock);
         $result = $executor->executeTool('contacts.store', [
-            'body_name' => 'Bob',
-            'body_email' => 'bob@example.com',
+            'body' => ['name' => 'Bob', 'email' => 'bob@example.com'],
         ], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -207,7 +206,7 @@ class McpToolExecutorTest extends TestCase
         $this->mockApiManagerDetails('showContact', '/api/clarion-app/contacts/contact/{contact}', 'get');
 
         $executor = new McpToolExecutor($registryMock);
-        $result = $executor->executeTool('contacts.show', ['path_contact' => '../../../etc/passwd'], $this->session);
+        $result = $executor->executeTool('contacts.show', ['path' => ['contact' => '../../../etc/passwd']], $this->session);
 
         $this->assertTrue($result['isError']);
         $this->assertStringContainsString('traversal', $result['content'][0]['text']);
@@ -232,7 +231,7 @@ class McpToolExecutorTest extends TestCase
         $this->mockApiManagerDetails('deleteContact', '/api/clarion-app/contacts/contact/{contact}', 'delete');
 
         $executor = new McpToolExecutor($registryMock);
-        $result = $executor->executeTool('contacts.destroy', ['path_contact' => 'abc'], $this->session);
+        $result = $executor->executeTool('contacts.destroy', ['path' => ['contact' => 'abc']], $this->session);
 
         $this->assertFalse($result['isError']);
         $content = json_decode($result['content'][0]['text'], true);
@@ -258,8 +257,8 @@ class McpToolExecutorTest extends TestCase
 
         $this->mockApiManagerDetails('deleteContact', '/api/clarion-app/contacts/contact/{contact}', 'delete');
 
-        $arguments = ['path_contact' => 'abc'];
-        $argumentsHash = hash('sha256', json_encode($arguments, JSON_SORT_KEYS));
+        $arguments = ['path' => ['contact' => 'abc']];
+        $argumentsHash = hash('sha256', json_encode($arguments));
 
         $token = McpConfirmationToken::create([
             'session_id' => $this->session->id,
@@ -304,8 +303,8 @@ class McpToolExecutorTest extends TestCase
 
         $this->mockApiManagerDetails('deleteContact', '/api/clarion-app/contacts/contact/{contact}', 'delete');
 
-        $arguments = ['path_contact' => 'abc'];
-        $argumentsHash = hash('sha256', json_encode($arguments, JSON_SORT_KEYS));
+        $arguments = ['path' => ['contact' => 'abc']];
+        $argumentsHash = hash('sha256', json_encode($arguments));
 
         $token = McpConfirmationToken::create([
             'session_id' => $this->session->id,
@@ -345,13 +344,13 @@ class McpToolExecutorTest extends TestCase
             'session_id' => $this->session->id,
             'tool_name' => 'contacts.destroy',
             'arguments_hash' => hash('sha256', 'different-args'),
-            'arguments_snapshot' => ['path_contact' => 'different'],
+            'arguments_snapshot' => ['path' => ['contact' => 'different']],
             'expires_at' => Carbon::now()->addMinutes(5),
         ]);
 
         $executor = new McpToolExecutor($registryMock);
         $result = $executor->executeTool('contacts.destroy', [
-            'path_contact' => 'abc',
+            'path' => ['contact' => 'abc'],
             '_confirmation_token' => $token->id,
         ], $this->session);
 
@@ -381,8 +380,8 @@ class McpToolExecutorTest extends TestCase
 
         $this->mockApiManagerDetails('deleteContact', '/api/clarion-app/contacts/contact/{contact}', 'delete');
 
-        $arguments = ['path_contact' => 'abc'];
-        $argumentsHash = hash('sha256', json_encode($arguments, JSON_SORT_KEYS));
+        $arguments = ['path' => ['contact' => 'abc']];
+        $argumentsHash = hash('sha256', json_encode($arguments));
 
         $token = McpConfirmationToken::create([
             'session_id' => $otherSession->id,
@@ -424,10 +423,310 @@ class McpToolExecutorTest extends TestCase
         ]);
 
         $executor = new McpToolExecutor($registryMock);
-        $result = $executor->executeTool('contacts.show', ['path_contact' => 'nonexistent'], $this->session);
+        $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'nonexistent']], $this->session);
 
         $this->assertTrue($result['isError']);
         $this->assertStringContainsString('not found', strtolower($result['content'][0]['text']));
+    }
+
+    /** @test */
+    public function extracts_structured_path_params_into_url()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.show')
+            ->andReturn([
+                'name' => 'contacts.show',
+                '_meta' => [
+                    'operationId' => 'showContact',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('showContact', '/api/clarion-app/contacts/contact/{contact}', 'get');
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Alice']], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'abc']], $this->session);
+
+        $this->assertFalse($result['isError']);
+        $this->assertEquals('text', $result['content'][0]['type']);
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), '/contact/abc');
+        });
+    }
+
+    /** @test */
+    public function extracts_structured_query_params_into_query_string()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.index')
+            ->andReturn([
+                'name' => 'contacts.index',
+                '_meta' => [
+                    'operationId' => 'listContacts',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('listContacts', '/api/clarion-app/contacts/contact', 'get');
+
+        Http::fake([
+            '*' => Http::response(['data' => []], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.index', ['query' => ['page' => '2']], $this->session);
+
+        $this->assertFalse($result['isError']);
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), 'page=2');
+        });
+    }
+
+    /** @test */
+    public function extracts_structured_body_params_into_request_body()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.store')
+            ->andReturn([
+                'name' => 'contacts.store',
+                '_meta' => [
+                    'operationId' => 'createContact',
+                    'method' => 'POST',
+                    'path' => '/api/clarion-app/contacts/contact',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('createContact', '/api/clarion-app/contacts/contact', 'post');
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'new', 'name' => 'Bob']], 201),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.store', [
+            'body' => ['name' => 'Bob', 'email' => 'bob@example.com'],
+        ], $this->session);
+
+        $this->assertFalse($result['isError']);
+        Http::assertSent(function ($request) {
+            $body = $request->data();
+            return ($body['name'] ?? null) === 'Bob' && ($body['email'] ?? null) === 'bob@example.com';
+        });
+    }
+
+    /** @test */
+    public function extracts_combined_all_three_param_types()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.update')
+            ->andReturn([
+                'name' => 'contacts.update',
+                '_meta' => [
+                    'operationId' => 'updateContact',
+                    'method' => 'PUT',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('updateContact', '/api/clarion-app/contacts/contact/{contact}', 'put');
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Updated']], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.update', [
+            'path' => ['contact' => 'abc'],
+            'query' => ['include' => 'groups'],
+            'body' => ['name' => 'Updated'],
+        ], $this->session);
+
+        $this->assertFalse($result['isError']);
+        Http::assertSent(function ($request) {
+            $url = $request->url();
+            $body = $request->data();
+            return str_contains($url, '/contact/abc')
+                && str_contains($url, 'include=groups')
+                && ($body['name'] ?? null) === 'Updated';
+        });
+    }
+
+    /** @test */
+    public function e2e_mcp_structured_path_with_all_param_types()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.show')
+            ->andReturn([
+                'name' => 'contacts.show',
+                '_meta' => [
+                    'operationId' => 'showContact',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('showContact', '/api/clarion-app/contacts/contact/{contact}', 'get');
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Alice']], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.show', [
+            'path' => ['contact' => 'abc-123'],
+            'query' => ['expand' => 'profile'],
+            'body' => ['_source' => 'full'],
+        ], $this->session);
+
+        $this->assertFalse($result['isError']);
+        Http::assertSent(function ($request) {
+            $url = $request->url();
+            return str_contains($url, '/contact/abc-123') && str_contains($url, 'expand=profile');
+        });
+    }
+
+    /** @test */
+    public function handles_path_only_params_no_query_or_body()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.show')
+            ->andReturn([
+                'name' => 'contacts.show',
+                '_meta' => [
+                    'operationId' => 'showContact',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('showContact', '/api/clarion-app/contacts/contact/{contact}', 'get');
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'abc']], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'abc']], $this->session);
+
+        $this->assertFalse($result['isError']);
+    }
+
+    /** @test */
+    public function handles_empty_params_gracefully()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.index')
+            ->andReturn([
+                'name' => 'contacts.index',
+                '_meta' => [
+                    'operationId' => 'listContacts',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('listContacts', '/api/clarion-app/contacts/contact', 'get');
+
+        Http::fake([
+            '*' => Http::response(['data' => []], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.index', [], $this->session);
+
+        $this->assertFalse($result['isError']);
+    }
+
+    /** @test */
+    public function skips_null_values_in_structured_params()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.show')
+            ->andReturn([
+                'name' => 'contacts.show',
+                '_meta' => [
+                    'operationId' => 'showContact',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('showContact', '/api/clarion-app/contacts/contact/{contact}', 'get');
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'abc']], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        // null value for path should be skipped (not substituted)
+        $result = $executor->executeTool('contacts.show', [
+            'path' => ['contact' => null],
+            'query' => ['page' => null, 'search' => 'john'],
+        ], $this->session);
+
+        $this->assertFalse($result['isError']);
+        Http::assertSent(function ($request) {
+            // null contact should leave {contact} unsubstituted
+            return str_contains($request->url(), '{contact}')
+                && !str_contains($request->url(), 'page=')
+                && str_contains($request->url(), 'search=john');
+        });
+    }
+
+    /** @test */
+    public function handles_body_only_params()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.store')
+            ->andReturn([
+                'name' => 'contacts.store',
+                '_meta' => [
+                    'operationId' => 'createContact',
+                    'method' => 'POST',
+                    'path' => '/api/clarion-app/contacts/contact',
+                ],
+            ]);
+
+        $this->mockApiCallValidator('allow');
+        $this->mockApiManagerDetails('createContact', '/api/clarion-app/contacts/contact', 'post');
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'new']], 201),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock);
+        $result = $executor->executeTool('contacts.store', [
+            'body' => ['name' => 'New Contact'],
+        ], $this->session);
+
+        $this->assertFalse($result['isError']);
+        Http::assertSent(function ($request) {
+            $body = $request->data();
+            return ($body['name'] ?? null) === 'New Contact';
+        });
     }
 
     private function mockApiCallValidator(string $status, ?string $reason = null): void

@@ -442,7 +442,7 @@ class AgentLoopService
                 'type' => 'function',
                 'function' => [
                     'name' => 'execute_operation',
-                    'description' => 'Execute an API operation. Pass the operationId from search_operations and any required parameters. Path parameters should be prefixed with "path_", query parameters with "query_", and request body parameters with "body_".',
+                    'description' => 'Execute an API operation. Pass the operationId from search_operations and a structured parameters object with optional "path", "query", and "body" sub-objects containing the respective parameters.',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
@@ -452,7 +452,27 @@ class AgentLoopService
                             ],
                             'parameters' => [
                                 'type' => 'object',
-                                'description' => 'Operation parameters. Use "path_" prefix for path params, "query_" for query params, "body_" for request body fields.',
+                                'description' => 'Operation parameters as a structured object with optional path, query, and body sub-objects.',
+                                'properties' => [
+                                    'path' => [
+                                        'type' => 'object',
+                                        'description' => 'Path parameters for URL substitution (e.g., {"id": "123"} for /contacts/{id})',
+                                        'properties' => new \stdClass(),
+                                        'additionalProperties' => true,
+                                    ],
+                                    'query' => [
+                                        'type' => 'object',
+                                        'description' => 'Query string parameters (e.g., {"search": "john", "page": "1"})',
+                                        'properties' => new \stdClass(),
+                                        'additionalProperties' => true,
+                                    ],
+                                    'body' => [
+                                        'type' => 'object',
+                                        'description' => 'Request body fields for POST/PUT/PATCH operations',
+                                        'properties' => new \stdClass(),
+                                        'additionalProperties' => true,
+                                    ],
+                                ],
                             ],
                         ],
                         'required' => ['operationId'],
@@ -585,12 +605,6 @@ class AgentLoopService
 
         $params = $arguments['parameters'] ?? [];
 
-        // LLMs sometimes flatten nested parameters to the top level
-        // (e.g. path_id, body_state alongside operationId instead of inside "parameters")
-        if (empty($params)) {
-            $params = array_diff_key($arguments, array_flip(['operationId', 'parameters']));
-        }
-
         // Check cache first — skip ApiManager lookup on hit
         $cached = $this->operationCache->get($conversation->id, $operationId);
         if ($cached) {
@@ -634,7 +648,7 @@ class AgentLoopService
     public function executeApiCall(string $operationId, string $method, string $pathTemplate, array $params, Conversation $conversation): string
     {
         $session = $this->getOrCreateSession($conversation);
-        $resolved = $this->toolExecutor->unflattenArguments($params, $pathTemplate);
+        $resolved = $this->toolExecutor->extractArguments($params, $pathTemplate);
         $result = $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
 
         return $this->extractResultContent($result);

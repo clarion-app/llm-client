@@ -39,7 +39,7 @@ class OperationCacheTest extends TestCase
             'summary' => 'Create a new contact',
             'method' => 'POST',
             'path' => '/contacts',
-            'paramSchema' => ['body_name' => ['type' => 'string']],
+            'paramSchema' => ['body' => ['name' => ['type' => 'string']]],
         ];
 
         $this->cache->put('conv-1', 'create-contact', $details);
@@ -378,7 +378,7 @@ class OperationCacheTest extends TestCase
             'summary' => 'Create a new contact',
             'method' => 'POST',
             'path' => '/contacts',
-            'paramSchema' => ['body_name' => ['type' => 'string']],
+            'paramSchema' => ['body' => ['name' => ['type' => 'string']]],
         ]);
 
         $entries = $this->cache->getEntries('conv-2');

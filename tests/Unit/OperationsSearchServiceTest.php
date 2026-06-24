@@ -24,7 +24,7 @@ class OperationsSearchServiceTest extends TestCase
             'summary' => 'Store a new contact',
             'method' => 'POST',
             'path' => '/api/contacts',
-            'paramSchema' => json_encode(['body_name' => ['type' => 'string', 'in' => 'body', 'required' => true]]),
+            'paramSchema' => json_encode(['body' => ['name' => ['type' => 'string', 'in' => 'body', 'required' => true]]]),
             'promptContent' => null,
         ];
         $mockRow2 = (object) [
