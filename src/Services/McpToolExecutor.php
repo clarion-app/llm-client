@@ -14,13 +14,18 @@ class McpToolExecutor
 {
     private McpToolRegistry $toolRegistry;
     private CallValidatorInterface $validator;
+    private \Closure $tokenFactory;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
-        ?CallValidatorInterface $validator = null
+        ?CallValidatorInterface $validator = null,
+        ?\Closure $tokenFactory = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->validator = $validator ?? new ApiCallValidatorAdapter();
+        $this->tokenFactory = $tokenFactory ?? function (User $user) {
+            return $user->createToken('McpToolCall')->accessToken;
+        };
     }
 
     public function executeTool(string $name, array $arguments, McpSession $session): array
@@ -144,7 +149,7 @@ class McpToolExecutor
             return $this->errorResult('Session user not found');
         }
 
-        $accessToken = $user->createToken('McpToolCall')->accessToken;
+        $accessToken = ($this->tokenFactory)($user);
 
         $baseUrl = rtrim(env('APP_URL'), '/');
         $url = $baseUrl . '/api' . $path;

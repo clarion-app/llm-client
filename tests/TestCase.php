@@ -25,6 +25,9 @@ abstract class TestCase extends BaseTestCase
             'prefix'   => '',
         ]);
 
+        // Set APP_KEY for encrypted casts (e.g., Server token encryption).
+        $app['config']->set('app.key', 'base64:'.base64_encode(random_bytes(32)));
+
         // Disable EloquentMultiChainBridge in tests to avoid dependencies
         // on the multichain service, data_stream_registries table, etc.
         $app['config']->set('eloquent-multichain-bridge.disabled', true);
