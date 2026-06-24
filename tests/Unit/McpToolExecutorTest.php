@@ -63,7 +63,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Alice']], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'abc']], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -92,7 +92,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => []], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.index', ['query' => ['page' => 2]], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -122,7 +122,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'new', 'name' => 'Bob']], 201),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.store', [
             'body' => ['name' => 'Bob', 'email' => 'bob@example.com'],
         ], $this->session);
@@ -155,7 +155,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => [['id' => '1', 'name' => 'Alice']]], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.index', [], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -181,7 +181,7 @@ class McpToolExecutorTest extends TestCase
 
         $validatorMock = $this->mockValidator('reject', 'Path is denylisted');
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('llm-client.listConversations', [], $this->session);
 
         $this->assertTrue($result['isError']);
@@ -205,7 +205,7 @@ class McpToolExecutorTest extends TestCase
 
         $validatorMock = $this->mockValidator('reject', 'Path traversal detected');
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.show', ['path' => ['contact' => '../../../etc/passwd']], $this->session);
 
         $this->assertTrue($result['isError']);
@@ -229,7 +229,7 @@ class McpToolExecutorTest extends TestCase
 
         $validatorMock = $this->mockValidator('confirm', 'DELETE requests require user confirmation');
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.destroy', ['path' => ['contact' => 'abc']], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -271,7 +271,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(null, 204),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.destroy', array_merge($arguments, [
             '_confirmation_token' => $token->id,
         ]), $this->session);
@@ -310,7 +310,7 @@ class McpToolExecutorTest extends TestCase
 
         $validatorMock = Mockery::mock(CallValidatorInterface::class);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.destroy', array_merge($arguments, [
             '_confirmation_token' => $token->id,
         ]), $this->session);
@@ -344,7 +344,7 @@ class McpToolExecutorTest extends TestCase
 
         $validatorMock = Mockery::mock(CallValidatorInterface::class);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.destroy', [
             'path' => ['contact' => 'abc'],
             '_confirmation_token' => $token->id,
@@ -387,7 +387,7 @@ class McpToolExecutorTest extends TestCase
 
         $validatorMock = Mockery::mock(CallValidatorInterface::class);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.destroy', array_merge($arguments, [
             '_confirmation_token' => $token->id,
         ]), $this->session);
@@ -417,7 +417,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['message' => 'Contact not found'], 404),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'nonexistent']], $this->session);
 
         $this->assertTrue($result['isError']);
@@ -445,7 +445,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Alice']], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'abc']], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -476,7 +476,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => []], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.index', ['query' => ['page' => '2']], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -506,7 +506,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'new', 'name' => 'Bob']], 201),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.store', [
             'body' => ['name' => 'Bob', 'email' => 'bob@example.com'],
         ], $this->session);
@@ -539,7 +539,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Updated']], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.update', [
             'path' => ['contact' => 'abc'],
             'query' => ['include' => 'groups'],
@@ -577,7 +577,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Alice']], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.show', [
             'path' => ['contact' => 'abc-123'],
             'query' => ['expand' => 'profile'],
@@ -612,7 +612,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'abc']], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'abc']], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -639,7 +639,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => []], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.index', [], $this->session);
 
         $this->assertFalse($result['isError']);
@@ -666,7 +666,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'abc']], 200),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         // null value for path should be skipped (not substituted)
         $result = $executor->executeTool('contacts.show', [
             'path' => ['contact' => null],
@@ -703,7 +703,7 @@ class McpToolExecutorTest extends TestCase
             '*' => Http::response(['data' => ['id' => 'new']], 201),
         ]);
 
-        $executor = new McpToolExecutor($registryMock, $validatorMock);
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
         $result = $executor->executeTool('contacts.store', [
             'body' => ['name' => 'New Contact'],
         ], $this->session);
