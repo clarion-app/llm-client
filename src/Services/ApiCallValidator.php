@@ -52,7 +52,7 @@ class ApiCallValidator
         }
 
         // Check if HTTP method requires confirmation
-        $confirmMethods = config('llm-client.confirm_methods', ['PUT', 'PATCH', 'DELETE']);
+        $confirmMethods = config('llm-client.confirm_methods', ['DELETE']);
         if (in_array(strtoupper($method), $confirmMethods, true)) {
             return [
                 'status' => self::STATUS_CONFIRM,

@@ -76,7 +76,7 @@ class ApiCallValidatorTest extends TestCase
                 'details' => ['operationId' => 'deleteContact'],
             ]);
 
-        foreach (['PUT', 'PATCH', 'DELETE'] as $method) {
+        foreach (['DELETE'] as $method) {
             $result = ApiCallValidator::validate('deleteContact', $method, '/api/clarion-app/contacts/contact/123');
             $this->assertEquals(ApiCallValidator::STATUS_CONFIRM, $result['status']);
         }
