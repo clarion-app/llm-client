@@ -5,6 +5,8 @@ namespace ClarionApp\LlmClient\Tests\Unit;
 use ClarionApp\LlmClient\Services\OperationCache;
 use PHPUnit\Framework\TestCase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class OperationCacheTest extends TestCase
 {
     private OperationCache $cache;
@@ -31,7 +33,7 @@ class OperationCacheTest extends TestCase
         $property->setValue(null, []);
     }
 
-    /** @test */
+    #[Test]
     public function put_and_get_basic_operation()
     {
         $details = [
@@ -52,21 +54,21 @@ class OperationCacheTest extends TestCase
         $this->assertEquals('/contacts', $result['path']);
     }
 
-    /** @test */
+    #[Test]
     public function get_returns_null_for_missing_operation()
     {
         $result = $this->cache->get('conv-1', 'nonexistent');
         $this->assertNull($result);
     }
 
-    /** @test */
+    #[Test]
     public function get_returns_null_for_empty_cache()
     {
         $result = $this->cache->get('conv-1', 'anything');
         $this->assertNull($result);
     }
 
-    /** @test */
+    #[Test]
     public function put_is_idempotent_for_same_operationId()
     {
         $details = [
@@ -85,7 +87,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(1, $summaries);
     }
 
-    /** @test */
+    #[Test]
     public function put_updates_existing_entry()
     {
         $detailsV1 = [
@@ -112,7 +114,7 @@ class OperationCacheTest extends TestCase
         $this->assertEquals('PUT', $result['method']);
     }
 
-    /** @test */
+    #[Test]
     public function getSummaries_returns_formatted_entries()
     {
         $this->cache->put('conv-1', 'create-contact', [
@@ -138,7 +140,7 @@ class OperationCacheTest extends TestCase
         $this->assertStringContainsString('list-tasks (GET /tasks)', $summaries[1]);
     }
 
-    /** @test */
+    #[Test]
     public function getSummaries_returns_empty_array_for_empty_cache()
     {
         $summaries = $this->cache->getSummaries('conv-1');
@@ -146,7 +148,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(0, $summaries);
     }
 
-    /** @test */
+    #[Test]
     public function getSummaries_returns_empty_for_unknown_conversation()
     {
         $this->cache->put('conv-1', 'create-contact', [
@@ -161,7 +163,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(0, $summaries);
     }
 
-    /** @test */
+    #[Test]
     public function per_conversation_isolation()
     {
         $this->cache->put('conv-A', 'create-contact', [
@@ -186,7 +188,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(0, $summariesB);
     }
 
-    /** @test */
+    #[Test]
     public function lru_eviction_at_max_entries_boundary()
     {
         // Add 25 entries (max_entries = 25)
@@ -227,7 +229,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(25, $summaries);
     }
 
-    /** @test */
+    #[Test]
     public function lru_eviction_respects_access_order()
     {
         // Add 3 entries with max=3
@@ -283,7 +285,7 @@ class OperationCacheTest extends TestCase
         $this->assertNotNull($this->cache->get('conv-1', 'op-d'));
     }
 
-    /** @test */
+    #[Test]
     public function multiple_conversations_have_independent_eviction()
     {
         // Fill conversation A to max
@@ -325,7 +327,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(25, $summariesA);
     }
 
-    /** @test */
+    #[Test]
     public function multiple_puts_in_single_turn()
     {
         // Simulate multiple operations cached in one agent loop iteration
@@ -362,7 +364,7 @@ class OperationCacheTest extends TestCase
         $this->assertNotNull($this->cache->get('conv-1', 'op-c'));
     }
 
-    /** @test */
+    #[Test]
     public function getEntries_returns_empty_array_for_empty_cache()
     {
         $entries = $this->cache->getEntries('conv-1');
@@ -370,7 +372,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(0, $entries);
     }
 
-    /** @test */
+    #[Test]
     public function getEntries_returns_empty_array_for_unknown_conversation()
     {
         $this->cache->put('conv-1', 'create-contact', [
@@ -386,7 +388,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(0, $entries);
     }
 
-    /** @test */
+    #[Test]
     public function getEntries_returns_entries_most_recently_used_first()
     {
         $this->cache->put('conv-1', 'op-a', [
@@ -420,7 +422,7 @@ class OperationCacheTest extends TestCase
         $this->assertEquals('op-a', $entries[2]['operationId']);
     }
 
-    /** @test */
+    #[Test]
     public function getEntries_includes_all_fields()
     {
         $this->cache->put('conv-1', 'create-contact', [
@@ -442,7 +444,7 @@ class OperationCacheTest extends TestCase
         $this->assertIsArray($entry['paramSchema']);
     }
 
-    /** @test */
+    #[Test]
     public function getEntries_truncates_to_limit()
     {
         for ($i = 1; $i <= 10; $i++) {
@@ -466,7 +468,7 @@ class OperationCacheTest extends TestCase
         $this->assertEquals('op-6', $entries[4]['operationId']);
     }
 
-    /** @test */
+    #[Test]
     public function getEntries_respects_custom_limit()
     {
         for ($i = 1; $i <= 5; $i++) {
@@ -486,7 +488,7 @@ class OperationCacheTest extends TestCase
         $this->assertCount(5, $entries);
     }
 
-    /** @test */
+    #[Test]
     public function getEntries_with_25_entries_and_limit_20_returns_20_most_recently_used()
     {
         for ($i = 1; $i <= 25; $i++) {
@@ -507,7 +509,7 @@ class OperationCacheTest extends TestCase
         $this->assertEquals('op-6', $entries[19]['operationId']);
     }
 
-    /** @test */
+    #[Test]
     public function cache_never_exceeds_max_capacity_with_50_inserts()
     {
         // Use maxEntries=20 to match the new default
@@ -552,7 +554,7 @@ class OperationCacheTest extends TestCase
         }
     }
 
-    /** @test */
+    #[Test]
     public function single_entry_cache_evicts_immediately()
     {
         $cache = new OperationCache(1);
@@ -589,7 +591,7 @@ class OperationCacheTest extends TestCase
         $this->assertEquals(1, $this->cache->count('conv-1'));
     }
 
-    /** @test */
+    #[Test]
     public function rapid_eviction_cycles_stable()
     {
         $cache = new OperationCache(20);
@@ -640,7 +642,7 @@ class OperationCacheTest extends TestCase
         }
     }
 
-    /** @test */
+    #[Test]
     public function readd_evicted_operation_with_new_details()
     {
         $cache = new OperationCache(3);

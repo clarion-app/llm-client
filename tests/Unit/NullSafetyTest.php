@@ -6,11 +6,15 @@ use Tests\TestCase;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class NullSafetyTest extends TestCase
 {
     use RefreshDatabase;
 
-    /** @test T038 — ServerController update returns 404 for non-existent server */
+    // T038 — ServerController update returns 404 for non-existent server
+
+    #[Test]
     public function server_update_returns_404_for_non_existent()
     {
         $user = User::factory()->create();
@@ -26,7 +30,9 @@ class NullSafetyTest extends TestCase
         $response->assertStatus(404);
     }
 
-    /** @test T038 — ServerController destroy returns 404 for non-existent server */
+    // T038 — ServerController destroy returns 404 for non-existent server
+
+    #[Test]
     public function server_destroy_returns_404_for_non_existent()
     {
         $user = User::factory()->create();
@@ -38,7 +44,9 @@ class NullSafetyTest extends TestCase
         $response->assertStatus(404);
     }
 
-    /** @test T039 — ConversationController store returns 422 when no server/model available */
+    // T039 — ConversationController store returns 422 when no server/model available
+
+    #[Test]
     public function conversation_store_returns_422_when_no_server_available()
     {
         $user = User::factory()->create();

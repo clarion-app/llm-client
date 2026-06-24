@@ -14,6 +14,8 @@ use Mockery;
  * full Laravel app bootstrap. These tests verify class structure,
  * method signatures, and basic behavior.
  */
+use PHPUnit\Framework\Attributes\Test;
+
 class OperationsSearchIntegrationTest extends TestCase
 {
     protected function tearDown(): void
@@ -22,19 +24,19 @@ class OperationsSearchIntegrationTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function operations_search_service_exists_and_is_callable()
     {
         $this->assertTrue(class_exists(OperationsSearchService::class));
     }
 
-    /** @test */
+    #[Test]
     public function reindex_job_exists_and_implementation()
     {
         $this->assertTrue(class_exists(ReindexOperationsJob::class));
     }
 
-    /** @test */
+    #[Test]
     public function reindex_command_exists_and_has_signature()
     {
         $this->assertTrue(class_exists(ReindexOperationsCommand::class));
@@ -42,13 +44,13 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertEquals('llm-client:reindex', $command->getName());
     }
 
-    /** @test */
+    #[Test]
     public function listener_exists()
     {
         $this->assertTrue(class_exists(ReindexOnPackageChange::class));
     }
 
-    /** @test */
+    #[Test]
     public function cross_package_search_returns_merged_results()
     {
         $mockRow1 = (object) [
@@ -89,7 +91,7 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertContains('weather.forecast', $operationIds);
     }
 
-    /** @test */
+    #[Test]
     public function result_limit_enforcement()
     {
         // DB limit is applied at query level, so mock returns only the limited set
@@ -125,7 +127,7 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertCount(10, $results);
     }
 
-    /** @test */
+    #[Test]
     public function result_limit_custom_value_enforcement()
     {
         $mockRows = [];
@@ -159,7 +161,7 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertCount(5, $results);
     }
 
-    /** @test */
+    #[Test]
     public function empty_index_returns_error_message_in_agent_handler()
     {
         $collectionMock = Mockery::mock();
@@ -182,7 +184,9 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertEmpty($results);
     }
 
-    /** @test T021 - Integration: complete flow with valid query returns correct format */
+    // T021 - Integration: complete flow with valid query returns correct format
+
+    #[Test]
     public function search_operations_complete_flow_returns_formatted_results()
     {
         $paramSchema = json_encode([
@@ -227,7 +231,9 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertEquals('name', $decoded['body'][0]['name']);
     }
 
-    /** @test T022 - Integration: malformed paramSchema in DB row returns null without error */
+    // T022 - Integration: malformed paramSchema in DB row returns null without error
+
+    #[Test]
     public function search_operations_handles_malformed_paramSchema_in_db_row()
     {
         $mockRow1 = (object) [
@@ -272,7 +278,9 @@ class OperationsSearchIntegrationTest extends TestCase
         $this->assertNull($decoded2);
     }
 
-    /** @test T023 - Integration: operations with no parameters returns paramSchema null */
+    // T023 - Integration: operations with no parameters returns paramSchema null
+
+    #[Test]
     public function search_operations_handles_operations_with_no_parameters()
     {
         $mockRow = (object) [

@@ -7,6 +7,8 @@ use ClarionApp\LlmClient\Services\OperationsSearchService;
 use Illuminate\Database\ConnectionInterface;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class OperationsSearchServiceTest extends TestCase
 {
     protected function tearDown(): void
@@ -15,7 +17,7 @@ class OperationsSearchServiceTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function search_with_populated_index_returns_ranked_results()
     {
         $mockRow1 = (object) [
@@ -69,7 +71,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertEquals('contacts.index', $results[1]->operationId);
     }
 
-    /** @test */
+    #[Test]
     public function search_with_empty_index_returns_empty_array()
     {
         $collectionMock = Mockery::mock();
@@ -92,7 +94,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertEmpty($results);
     }
 
-    /** @test */
+    #[Test]
     public function search_with_no_matches_returns_empty_array()
     {
         $collectionMock = Mockery::mock();
@@ -115,7 +117,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertEmpty($results);
     }
 
-    /** @test */
+    #[Test]
     public function search_uses_custom_limit_when_provided()
     {
         $collectionMock = Mockery::mock();
@@ -137,7 +139,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertIsArray($results);
     }
 
-    /** @test */
+    #[Test]
     public function search_uses_config_default_limit()
     {
         $collectionMock = Mockery::mock();
@@ -159,7 +161,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertIsArray($results);
     }
 
-    /** @test */
+    #[Test]
     public function table_exists_returns_true_when_table_is_present()
     {
         $schemaBuilderMock = Mockery::mock();
@@ -175,7 +177,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertTrue($service->tableExists());
     }
 
-    /** @test */
+    #[Test]
     public function table_exists_returns_false_when_table_is_absent()
     {
         $schemaBuilderMock = Mockery::mock();
@@ -191,7 +193,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertFalse($service->tableExists());
     }
 
-    /** @test */
+    #[Test]
     public function safe_decode_param_schema_returns_array_for_valid_json()
     {
         $json = json_encode(['path' => [['name' => 'id', 'type' => 'string']]]);
@@ -202,7 +204,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertEquals('id', $result['path'][0]['name']);
     }
 
-    /** @test */
+    #[Test]
     public function safe_decode_param_schema_returns_null_for_malformed_json()
     {
         $result = OperationsSearchService::safeDecodeParamSchema('{invalid json');
@@ -210,7 +212,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertNull($result);
     }
 
-    /** @test */
+    #[Test]
     public function safe_decode_param_schema_returns_null_for_null_input()
     {
         $result = OperationsSearchService::safeDecodeParamSchema(null);
@@ -218,7 +220,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertNull($result);
     }
 
-    /** @test */
+    #[Test]
     public function safe_decode_param_schema_returns_null_for_empty_string()
     {
         $result = OperationsSearchService::safeDecodeParamSchema('');
@@ -226,7 +228,7 @@ class OperationsSearchServiceTest extends TestCase
         $this->assertNull($result);
     }
 
-    /** @test */
+    #[Test]
     public function safe_decode_param_schema_returns_array_when_input_is_already_array()
     {
         $input = ['body' => [['name' => 'name', 'type' => 'string']]];

@@ -12,6 +12,8 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpProtocolHandlerPromptsResourcesTest extends TestCase
 {
     private McpProtocolHandler $handler;
@@ -50,7 +52,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function prompts_list_dispatch_returns_jsonrpc_response_with_prompts_array()
     {
         $mockRegistry = Mockery::mock(McpPromptRegistry::class);
@@ -80,7 +82,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
         $this->assertArrayHasKey('nextCursor', $result['result']);
     }
 
-    /** @test */
+    #[Test]
     public function prompts_get_dispatch_returns_jsonrpc_response_with_description_and_messages()
     {
         $mockRegistry = Mockery::mock(McpPromptRegistry::class);
@@ -115,7 +117,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
         $this->assertEquals('user', $result['result']['messages'][0]['role']);
     }
 
-    /** @test */
+    #[Test]
     public function prompts_get_dispatch_returns_32602_error_for_invalid_prompt_name()
     {
         $mockRegistry = Mockery::mock(McpPromptRegistry::class);
@@ -136,7 +138,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
         $this->assertStringContainsString('Prompt not found', $result['error']['message']);
     }
 
-    /** @test */
+    #[Test]
     public function resources_list_dispatch_returns_jsonrpc_response_with_resources_array()
     {
         $mockHandler = Mockery::mock(McpResourceHandler::class);
@@ -164,7 +166,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
         $this->assertCount(1, $result['result']['resources']);
     }
 
-    /** @test */
+    #[Test]
     public function resources_read_dispatch_for_conversation_uri_returns_jsonrpc_response_with_contents()
     {
         $mockHandler = Mockery::mock(McpResourceHandler::class);
@@ -192,7 +194,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
         $this->assertCount(1, $result['result']['contents']);
     }
 
-    /** @test */
+    #[Test]
     public function resources_templates_list_dispatch_returns_jsonrpc_response_with_resource_templates_array()
     {
         $mockHandler = Mockery::mock(McpResourceHandler::class);

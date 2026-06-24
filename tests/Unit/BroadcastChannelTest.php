@@ -8,9 +8,12 @@ use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
 use Illuminate\Broadcasting\PrivateChannel;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class BroadcastChannelTest extends TestCase
 {
-    /** @test T016 */
+    // T016
+    #[Test]
     public function finish_event_broadcasts_on_private_channel()
     {
         $event = new FinishOpenAIConversationResponseEvent('test-conv-id', 'test reply');
@@ -20,7 +23,9 @@ class BroadcastChannelTest extends TestCase
         $this->assertInstanceOf(PrivateChannel::class, $channels[0]);
     }
 
-    /** @test T016 */
+    // T016
+
+    #[Test]
     public function new_message_event_broadcasts_on_private_channel()
     {
         $event = new NewConversationMessageEvent('test-conv-id', 'test-msg-id');
@@ -30,7 +35,9 @@ class BroadcastChannelTest extends TestCase
         $this->assertInstanceOf(PrivateChannel::class, $channels[0]);
     }
 
-    /** @test T016 */
+    // T016
+
+    #[Test]
     public function update_event_broadcasts_on_private_channel()
     {
         $event = new UpdateOpenAIConversationResponseEvent('test-conv-id', 'test-msg-id', 'test reply');

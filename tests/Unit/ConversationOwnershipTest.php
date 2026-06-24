@@ -8,6 +8,8 @@ use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ConversationOwnershipTest extends TestCase
 {
     use RefreshDatabase;
@@ -32,7 +34,9 @@ class ConversationOwnershipTest extends TestCase
         ]);
     }
 
-    /** @test T010 */
+    // T010
+
+    #[Test]
     public function show_returns_403_for_non_owner()
     {
         $response = $this->actingAs($this->otherUser, 'api')
@@ -41,7 +45,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(403);
     }
 
-    /** @test T011 */
+    // T011
+
+    #[Test]
     public function update_returns_403_for_non_owner()
     {
         $response = $this->actingAs($this->otherUser, 'api')
@@ -54,7 +60,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(403);
     }
 
-    /** @test T012 */
+    // T012
+
+    #[Test]
     public function destroy_returns_403_for_non_owner()
     {
         $response = $this->actingAs($this->otherUser, 'api')
@@ -63,7 +71,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(403);
     }
 
-    /** @test T013 */
+    // T013
+
+    #[Test]
     public function generate_title_returns_403_for_non_owner()
     {
         $response = $this->actingAs($this->otherUser, 'api')
@@ -72,7 +82,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(403);
     }
 
-    /** @test T014 */
+    // T014
+
+    #[Test]
     public function show_returns_404_for_non_existent_conversation()
     {
         $fakeId = '00000000-0000-0000-0000-000000000000';
@@ -83,7 +95,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(404);
     }
 
-    /** @test T014 */
+    // T014
+
+    #[Test]
     public function update_returns_404_for_non_existent_conversation()
     {
         $fakeId = '00000000-0000-0000-0000-000000000000';
@@ -98,7 +112,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(404);
     }
 
-    /** @test T014 */
+    // T014
+
+    #[Test]
     public function destroy_returns_404_for_non_existent_conversation()
     {
         $fakeId = '00000000-0000-0000-0000-000000000000';
@@ -109,7 +125,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(404);
     }
 
-    /** @test T014a */
+    // T014a
+
+    #[Test]
     public function show_returns_404_for_soft_deleted_conversation()
     {
         $this->conversation->delete();
@@ -120,7 +138,9 @@ class ConversationOwnershipTest extends TestCase
         $response->assertStatus(404);
     }
 
-    /** @test Owner can access their own conversation */
+    // Owner can access their own conversation
+
+    #[Test]
     public function show_returns_200_for_owner()
     {
         $response = $this->actingAs($this->ownerUser, 'api')

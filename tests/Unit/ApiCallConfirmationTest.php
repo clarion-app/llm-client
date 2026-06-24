@@ -8,6 +8,8 @@ use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ApiCallConfirmationTest extends TestCase
 {
     use RefreshDatabase;
@@ -29,7 +31,9 @@ class ApiCallConfirmationTest extends TestCase
         ]);
     }
 
-    /** @test T024 — approval triggers execution of pending call */
+    // T024 — approval triggers execution of pending call
+
+    #[Test]
     public function approval_executes_pending_call()
     {
         $pendingData = json_encode([
@@ -57,7 +61,9 @@ class ApiCallConfirmationTest extends TestCase
         $response->assertStatus(200);
     }
 
-    /** @test T024 — denial cancels pending call */
+    // T024 — denial cancels pending call
+
+    #[Test]
     public function denial_cancels_pending_call()
     {
         $pendingData = json_encode([
@@ -90,7 +96,9 @@ class ApiCallConfirmationTest extends TestCase
         $this->assertTrue($content['__cancelled'] ?? false);
     }
 
-    /** @test T024 — non-owner cannot confirm */
+    // T024 — non-owner cannot confirm
+
+    #[Test]
     public function non_owner_cannot_confirm_api_call()
     {
         $otherUser = User::factory()->create();
@@ -104,7 +112,9 @@ class ApiCallConfirmationTest extends TestCase
         $response->assertStatus(403);
     }
 
-    /** @test T024 — 404 for non-existent conversation */
+    // T024 — 404 for non-existent conversation
+
+    #[Test]
     public function returns_404_for_non_existent_conversation()
     {
         $fakeId = '00000000-0000-0000-0000-000000000000';

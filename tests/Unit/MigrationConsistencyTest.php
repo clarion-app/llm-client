@@ -4,9 +4,12 @@ namespace ClarionApp\LlmClient\Tests\Unit;
 
 use Tests\TestCase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class MigrationConsistencyTest extends TestCase
 {
-    /** @test T043 — servers migration down() references correct table name */
+    // T043 — servers migration down() references correct table name
+    #[Test]
     public function servers_migration_drops_correct_table()
     {
         $migrationPath = __DIR__ . '/../../src/Migrations/2023_09_27_000000_create_servers_table.php';
@@ -17,7 +20,9 @@ class MigrationConsistencyTest extends TestCase
         $this->assertStringNotContainsString("Schema::dropIfExists('servers')", $content);
     }
 
-    /** @test T043 — all migrations use anonymous classes */
+    // T043 — all migrations use anonymous classes
+
+    #[Test]
     public function migrations_use_anonymous_classes()
     {
         $migrationFiles = glob(__DIR__ . '/../../src/Migrations/*.php');
@@ -32,7 +37,9 @@ class MigrationConsistencyTest extends TestCase
         }
     }
 
-    /** @test T043 — user settings migration drops correct table */
+    // T043 — user settings migration drops correct table
+
+    #[Test]
     public function user_settings_migration_drops_correct_table()
     {
         $migrationPath = __DIR__ . '/../../src/Migrations/2026_03_30_000000_create_llm_user_settings_table.php';

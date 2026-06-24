@@ -6,6 +6,8 @@ use Tests\TestCase;
 use ClarionApp\LlmClient\Services\UrlValidator;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class UrlValidatorTest extends TestCase
 {
     protected function setUp(): void
@@ -20,7 +22,9 @@ class UrlValidatorTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test T020 — reject loopback */
+    // T020 — reject loopback
+
+    #[Test]
     public function rejects_loopback_ip()
     {
         $result = UrlValidator::validate('http://127.0.0.1/secret');
@@ -28,35 +32,45 @@ class UrlValidatorTest extends TestCase
         $this->assertStringContainsString('private or reserved', $result['reason']);
     }
 
-    /** @test T020 — reject 10.x range */
+    // T020 — reject 10.x range
+
+    #[Test]
     public function rejects_rfc1918_10_range()
     {
         $result = UrlValidator::validate('http://10.0.0.1/admin');
         $this->assertFalse($result['valid']);
     }
 
-    /** @test T020 — reject 172.16.x range */
+    // T020 — reject 172.16.x range
+
+    #[Test]
     public function rejects_rfc1918_172_range()
     {
         $result = UrlValidator::validate('http://172.16.0.1/admin');
         $this->assertFalse($result['valid']);
     }
 
-    /** @test T020 — reject 192.168.x range */
+    // T020 — reject 192.168.x range
+
+    #[Test]
     public function rejects_rfc1918_192_range()
     {
         $result = UrlValidator::validate('http://192.168.1.1/router');
         $this->assertFalse($result['valid']);
     }
 
-    /** @test T020 — reject link-local */
+    // T020 — reject link-local
+
+    #[Test]
     public function rejects_link_local_169_254()
     {
         $result = UrlValidator::validate('http://169.254.169.254/latest/meta-data/');
         $this->assertFalse($result['valid']);
     }
 
-    /** @test T020 — reject file:// scheme */
+    // T020 — reject file:// scheme
+
+    #[Test]
     public function rejects_file_scheme()
     {
         $result = UrlValidator::validate('file:///etc/passwd');
@@ -64,7 +78,9 @@ class UrlValidatorTest extends TestCase
         $this->assertStringContainsString('scheme', strtolower($result['reason']));
     }
 
-    /** @test T020 — reject ftp:// scheme */
+    // T020 — reject ftp:// scheme
+
+    #[Test]
     public function rejects_ftp_scheme()
     {
         $result = UrlValidator::validate('ftp://evil.com/payload');
@@ -72,7 +88,9 @@ class UrlValidatorTest extends TestCase
         $this->assertStringContainsString('HTTP and HTTPS', $result['reason']);
     }
 
-    /** @test T020 — accept valid public URL */
+    // T020 — accept valid public URL
+
+    #[Test]
     public function accepts_valid_public_http_url()
     {
         $ip = gethostbyname('example.com');
@@ -84,14 +102,18 @@ class UrlValidatorTest extends TestCase
         $this->assertTrue($result['valid']);
     }
 
-    /** @test T020 — reject 0.0.0.0 */
+    // T020 — reject 0.0.0.0
+
+    #[Test]
     public function rejects_zero_ip()
     {
         $result = UrlValidator::validate('http://0.0.0.0/');
         $this->assertFalse($result['valid']);
     }
 
-    /** @test T021 — enforce max redirect hops */
+    // T021 — enforce max redirect hops
+
+    #[Test]
     public function rejects_when_max_redirect_hops_exceeded()
     {
         $maxRedirects = config('llm-client.ssrf.max_redirects', 5);
@@ -100,14 +122,18 @@ class UrlValidatorTest extends TestCase
         $this->assertStringContainsString('redirect hops', $result['reason']);
     }
 
-    /** @test T021 — redirect to private IP is rejected */
+    // T021 — redirect to private IP is rejected
+
+    #[Test]
     public function rejects_redirect_to_private_ip()
     {
         $result = UrlValidator::validateRedirect('http://127.0.0.1/internal', 0);
         $this->assertFalse($result['valid']);
     }
 
-    /** @test T021 — redirect within limit to public URL is accepted */
+    // T021 — redirect within limit to public URL is accepted
+
+    #[Test]
     public function accepts_redirect_within_limit_to_public_url()
     {
         $ip = gethostbyname('example.com');

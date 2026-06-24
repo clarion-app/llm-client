@@ -6,23 +6,25 @@ use PHPUnit\Framework\TestCase;
 use ClarionApp\LlmClient\Jobs\ReindexOperationsJob;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ReindexOperationsJobTest extends TestCase
 {
-    /** @test */
+    #[Test]
     public function job_implements_should_queue()
     {
         $job = new ReindexOperationsJob();
         $this->assertInstanceOf(ShouldQueue::class, $job);
     }
 
-    /** @test */
+    #[Test]
     public function job_has_handle_method()
     {
         $job = new ReindexOperationsJob();
         $this->assertTrue(method_exists($job, 'handle'));
     }
 
-    /** @test */
+    #[Test]
     public function job_uses_dispatchable_trait()
     {
         $reflection = new \ReflectionClass(ReindexOperationsJob::class);
@@ -34,7 +36,7 @@ class ReindexOperationsJobTest extends TestCase
         );
     }
 
-    /** @test */
+    #[Test]
     public function job_uses_queueable_trait()
     {
         $reflection = new \ReflectionClass(ReindexOperationsJob::class);
@@ -46,7 +48,7 @@ class ReindexOperationsJobTest extends TestCase
         );
     }
 
-    /** @test */
+    #[Test]
     public function job_handles_missing_operation_id_gracefully()
     {
         // Verify the job source code contains the expected skip logic
@@ -60,7 +62,7 @@ class ReindexOperationsJobTest extends TestCase
         $this->assertStringContainsString('no details found', $source);
     }
 
-    /** @test */
+    #[Test]
     public function job_builds_searchable_text_from_components()
     {
         // Verify the job source code constructs searchable_text correctly

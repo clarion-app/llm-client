@@ -13,6 +13,8 @@ use Illuminate\Support\Carbon;
 use Laravel\Passport\Passport;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpServerControllerTest extends TestCase
 {
     use RefreshDatabase;
@@ -33,7 +35,7 @@ class McpServerControllerTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function full_mcp_lifecycle()
     {
         Passport::actingAs($this->user);
@@ -130,7 +132,7 @@ class McpServerControllerTest extends TestCase
         $this->assertFalse($result['isError']);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_unauthenticated_request()
     {
         $response = $this->postJson('/api/clarion-app/llm-client/mcp', [

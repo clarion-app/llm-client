@@ -6,23 +6,25 @@ use PHPUnit\Framework\TestCase;
 use ClarionApp\LlmClient\Commands\ReindexOperationsCommand;
 use Illuminate\Console\Command;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ReindexOperationsCommandTest extends TestCase
 {
-    /** @test */
+    #[Test]
     public function command_has_correct_signature()
     {
         $command = new ReindexOperationsCommand();
         $this->assertEquals('llm-client:reindex', $command->getName());
     }
 
-    /** @test */
+    #[Test]
     public function command_has_description()
     {
         $command = new ReindexOperationsCommand();
         $this->assertNotEmpty($command->getDescription());
     }
 
-    /** @test */
+    #[Test]
     public function command_returns_success()
     {
         // Create a test wrapper that captures dispatch calls

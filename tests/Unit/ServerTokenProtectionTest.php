@@ -6,11 +6,15 @@ use Tests\TestCase;
 use ClarionApp\LlmClient\Models\Server;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ServerTokenProtectionTest extends TestCase
 {
     use RefreshDatabase;
 
-    /** @test T035 — Server JSON serialization excludes token field */
+    // T035 — Server JSON serialization excludes token field
+
+    #[Test]
     public function server_json_excludes_token()
     {
         $server = Server::create([
@@ -23,7 +27,9 @@ class ServerTokenProtectionTest extends TestCase
         $this->assertArrayNotHasKey('token', $json);
     }
 
-    /** @test T036 — Server token is encrypted in database, decrypted transparently */
+    // T036 — Server token is encrypted in database, decrypted transparently
+
+    #[Test]
     public function server_token_is_encrypted_at_rest()
     {
         $plainToken = 'sk-secret-token-value';

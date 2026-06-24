@@ -14,6 +14,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class AgentLoopStreamHandlerTest extends TestCase
 {
     use RefreshDatabase;
@@ -26,7 +28,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function parses_text_deltas_from_sse_chunks()
     {
         Event::fake([
@@ -61,7 +63,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         $this->assertEquals('Hello world', $handler->reply);
     }
 
-    /** @test */
+    #[Test]
     public function parses_tool_calls_deltas_with_argument_accumulation()
     {
         Event::fake([
@@ -112,7 +114,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         $this->assertEquals('{"body":{"name": "Jane"}}', $handler->toolCalls[0]['function']['arguments']);
     }
 
-    /** @test */
+    #[Test]
     public function finish_detects_plain_text_response()
     {
         Event::fake([
@@ -151,7 +153,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         Event::assertDispatched(FinishOpenAIConversationResponseEvent::class);
     }
 
-    /** @test */
+    #[Test]
     public function finish_detects_tool_calls_response()
     {
         Event::fake([
@@ -201,7 +203,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         Event::assertDispatched(ToolExecutionEvent::class);
     }
 
-    /** @test */
+    #[Test]
     public function tracks_iteration_count()
     {
         Event::fake([
@@ -232,7 +234,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         $this->assertEquals(5, $parsedData['iteration']);
     }
 
-    /** @test */
+    #[Test]
     public function max_iteration_limit_triggers_error_message()
     {
         Event::fake([
@@ -300,7 +302,7 @@ class AgentLoopStreamHandlerTest extends TestCase
 
     // === US2 Tests (T039) ===
 
-    /** @test */
+    #[Test]
     public function finish_suspends_loop_when_confirmation_required()
     {
         Event::fake([
@@ -356,7 +358,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         Event::assertDispatched(\ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class);
     }
 
-    /** @test */
+    #[Test]
     public function tool_data_pending_confirmation_stored_correctly()
     {
         Event::fake([
@@ -416,7 +418,7 @@ class AgentLoopStreamHandlerTest extends TestCase
 
     // === US4 Tests (T041) ===
 
-    /** @test */
+    #[Test]
     public function tool_execution_errors_fed_back_to_llm()
     {
         Event::fake([
@@ -474,7 +476,7 @@ class AgentLoopStreamHandlerTest extends TestCase
 
     // === US5 Tests (T042) ===
 
-    /** @test */
+    #[Test]
     public function handle_creates_assistant_message_on_first_text_chunk()
     {
         Event::fake([
@@ -507,7 +509,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         Event::assertDispatched(UpdateOpenAIConversationResponseEvent::class);
     }
 
-    /** @test */
+    #[Test]
     public function update_event_broadcast_per_text_delta()
     {
         Event::fake([

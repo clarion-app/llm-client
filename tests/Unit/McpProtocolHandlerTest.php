@@ -11,6 +11,8 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpProtocolHandlerTest extends TestCase
 {
     use RefreshDatabase;
@@ -25,7 +27,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->userId = (string) Str::uuid();
     }
 
-    /** @test */
+    #[Test]
     public function returns_parse_error_for_invalid_json()
     {
         $request = Request::create('/api/mcp', 'POST', [], [], [], [], 'not json');
@@ -35,7 +37,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertStringContainsString('Parse error', $result['error']['message']);
     }
 
-    /** @test */
+    #[Test]
     public function returns_invalid_request_for_missing_jsonrpc()
     {
         $request = Request::create('/api/mcp', 'POST', [], [], [], [
@@ -47,7 +49,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertEquals(-32600, $result['error']['code']);
     }
 
-    /** @test */
+    #[Test]
     public function returns_invalid_request_for_missing_method()
     {
         $request = Request::create('/api/mcp', 'POST', [], [], [], [
@@ -59,7 +61,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertEquals(-32600, $result['error']['code']);
     }
 
-    /** @test */
+    #[Test]
     public function returns_method_not_found_for_unknown_method()
     {
         $request = $this->makeJsonRpcRequest('unknown/method', [], 1);
@@ -69,7 +71,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertEquals(-32601, $result['error']['code']);
     }
 
-    /** @test */
+    #[Test]
     public function handles_initialize_and_returns_session_id()
     {
         $request = $this->makeJsonRpcRequest('initialize', [
@@ -88,7 +90,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertArrayHasKey('_sessionId', $result);
     }
 
-    /** @test */
+    #[Test]
     public function handles_notifications_initialized_returns_204_marker()
     {
         // First initialize to get a session
@@ -109,7 +111,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertTrue($result['_noContent']);
     }
 
-    /** @test */
+    #[Test]
     public function handles_ping_with_empty_result()
     {
         // Initialize first
@@ -129,7 +131,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertEquals(new \stdClass(), $result['result']);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_non_init_request_without_session()
     {
         $request = $this->makeJsonRpcRequest('tools/list', [], 1);
@@ -140,7 +142,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertEquals(-32600, $result['error']['code']);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_non_init_request_with_invalid_session()
     {
         $request = $this->makeJsonRpcRequest('tools/list', [], 1, (string) Str::uuid());
@@ -151,7 +153,7 @@ class McpProtocolHandlerTest extends TestCase
         $this->assertEquals(-32600, $result['error']['code']);
     }
 
-    /** @test */
+    #[Test]
     public function initialize_rejects_unsupported_protocol_version()
     {
         $request = $this->makeJsonRpcRequest('initialize', [

@@ -7,6 +7,8 @@ use ClarionApp\LlmClient\Services\McpPromptRegistry;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpPromptRegistryTest extends TestCase
 {
     protected function tearDown(): void
@@ -17,7 +19,7 @@ class McpPromptRegistryTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function getPrompts_returns_all_prompts_from_registered_packages_with_correct_name_format()
     {
         $this->mockPackages([
@@ -50,7 +52,7 @@ class McpPromptRegistryTest extends TestCase
         }
     }
 
-    /** @test */
+    #[Test]
     public function getPrompts_with_cursor_returns_paginated_results_using_base64_cursor_pattern()
     {
         $prompts = [];
@@ -79,7 +81,7 @@ class McpPromptRegistryTest extends TestCase
         $this->assertNull($result2['nextCursor']);
     }
 
-    /** @test */
+    #[Test]
     public function getPrompt_returns_structured_prompt_with_description_and_messages_for_valid_name()
     {
         $this->mockPackages([
@@ -100,7 +102,7 @@ class McpPromptRegistryTest extends TestCase
         $this->assertEquals('To adjust the lighting of a room...', $result['messages'][0]['content']['text']);
     }
 
-    /** @test */
+    #[Test]
     public function getPrompt_returns_null_for_nonexistent_prompt_name()
     {
         $this->mockPackages([
@@ -115,7 +117,7 @@ class McpPromptRegistryTest extends TestCase
         $this->assertNull($result);
     }
 
-    /** @test */
+    #[Test]
     public function getPrompt_with_arguments_appends_user_command_to_prompt_message_content()
     {
         $this->mockPackages([
@@ -134,7 +136,7 @@ class McpPromptRegistryTest extends TestCase
         $this->assertStringContainsString('User command:', $text);
     }
 
-    /** @test */
+    #[Test]
     public function packages_with_empty_customPrompts_are_skipped_without_error()
     {
         $this->mockPackages([
