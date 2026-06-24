@@ -8,10 +8,13 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\UrlValidator;
 use Illuminate\Support\Str;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Mockery;
 
 class McpResourceHandlerTest extends TestCase
 {
+    use RefreshDatabase;
+
     protected function tearDown(): void
     {
         restore_error_handler();
@@ -25,24 +28,19 @@ class McpResourceHandlerTest extends TestCase
     /** @test */
     public function listResources_returns_users_conversations_as_mcp_resource_entries_with_conversation_uri()
     {
-        $userId = (string) Str::uuid();
-        $convId = (string) Str::uuid();
+        $conversation = Conversation::factory()->create([
+            'title' => 'Test Chat',
+            'user_id' => 'test-user-id',
+        ]);
 
-        $conversation = $this->makeMockConversation($convId, $userId, 'Test Chat', 'gpt-4', 5);
-
-        $mockQuery = Mockery::mock('Illuminate\Database\Eloquent\Builder');
-        $mockQuery->shouldReceive('where')->with('user_id', $userId)->andReturnSelf();
-        $mockQuery->shouldReceive('withCount')->with('messages')->andReturnSelf();
-        $mockQuery->shouldReceive('orderBy')->with('updated_at', 'desc')->andReturnSelf();
-        $mockQuery->shouldReceive('skip')->with(0)->andReturnSelf();
-        $mockQuery->shouldReceive('take')->with(51)->andReturn($mockQuery);
-        $mockQuery->shouldReceive('get')->andReturn(collect([$conversation]));
-
-        $mock = Mockery::mock('alias:' . Conversation::class);
-        $mock->shouldReceive('query')->andReturn($mockQuery);
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'role' => 'user',
+            'content' => 'Hello',
+        ]);
 
         $handler = new McpResourceHandler();
-        $result = $handler->listResources($userId);
+        $result = $handler->listResources('test-user-id');
 
         $this->assertArrayHasKey('resources', $result);
         $this->assertCount(1, $result['resources']);
@@ -55,22 +53,17 @@ class McpResourceHandlerTest extends TestCase
     /** @test */
     public function listResources_returns_paginated_results_using_base64_cursor()
     {
-        $userId = (string) Str::uuid();
-        $conversations = collect();
-        for ($i = 0; $i < 51; $i++) {
-            $conversations->push($this->makeMockConversation((string) Str::uuid(), $userId, "Chat {$i}", 'gpt-4', $i + 1));
+        $userId = 'test-user-id';
+        $conversations = Conversation::factory()->count(51)->create([
+            'user_id' => $userId,
+        ]);
+        foreach ($conversations as $conv) {
+            Message::factory()->create([
+                'conversation_id' => $conv->id,
+                'role' => 'user',
+                'content' => 'Hello',
+            ]);
         }
-
-        $mockQuery = Mockery::mock('Illuminate\Database\Eloquent\Builder');
-        $mockQuery->shouldReceive('where')->with('user_id', $userId)->andReturnSelf();
-        $mockQuery->shouldReceive('withCount')->with('messages')->andReturnSelf();
-        $mockQuery->shouldReceive('orderBy')->with('updated_at', 'desc')->andReturnSelf();
-        $mockQuery->shouldReceive('skip')->with(0)->andReturnSelf();
-        $mockQuery->shouldReceive('take')->with(51)->andReturn($mockQuery);
-        $mockQuery->shouldReceive('get')->andReturn($conversations);
-
-        $mock = Mockery::mock('alias:' . Conversation::class);
-        $mock->shouldReceive('query')->andReturn($mockQuery);
 
         $handler = new McpResourceHandler();
         $result = $handler->listResources($userId);
@@ -85,18 +78,7 @@ class McpResourceHandlerTest extends TestCase
     /** @test */
     public function listResources_only_returns_conversations_owned_by_authenticated_user()
     {
-        $userId = (string) Str::uuid();
-
-        $mockQuery = Mockery::mock('Illuminate\Database\Eloquent\Builder');
-        $mockQuery->shouldReceive('where')->with('user_id', $userId)->once()->andReturnSelf();
-        $mockQuery->shouldReceive('withCount')->with('messages')->andReturnSelf();
-        $mockQuery->shouldReceive('orderBy')->with('updated_at', 'desc')->andReturnSelf();
-        $mockQuery->shouldReceive('skip')->with(0)->andReturnSelf();
-        $mockQuery->shouldReceive('take')->with(51)->andReturn($mockQuery);
-        $mockQuery->shouldReceive('get')->andReturn(collect());
-
-        $mock = Mockery::mock('alias:' . Conversation::class);
-        $mock->shouldReceive('query')->andReturn($mockQuery);
+        $userId = 'test-user-id';
 
         $handler = new McpResourceHandler();
         $result = $handler->listResources($userId);
@@ -107,27 +89,25 @@ class McpResourceHandlerTest extends TestCase
     /** @test */
     public function readResource_with_conversation_uri_returns_message_history_as_json_with_metadata()
     {
-        $userId = (string) Str::uuid();
-        $convId = (string) Str::uuid();
-        $uri = "conversation://{$convId}";
+        $userId = 'test-user-id';
+        $conversation = Conversation::factory()->create([
+            'user_id' => $userId,
+            'title' => 'Test Chat',
+            'model' => 'gpt-4',
+        ]);
 
-        $message1 = (object) ['role' => 'user', 'content' => 'Hello', 'created_at' => '2026-04-09 10:00:00'];
-        $message2 = (object) ['role' => 'assistant', 'content' => 'Hi there!', 'created_at' => '2026-04-09 10:00:05'];
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'role' => 'user',
+            'content' => 'Hello',
+        ]);
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'content' => 'Hi there!',
+        ]);
 
-        $conversation = $this->makeMockConversation($convId, $userId, 'Test Chat', 'gpt-4', 2);
-
-        $messagesQuery = Mockery::mock('Illuminate\Database\Eloquent\Builder');
-        $messagesQuery->shouldReceive('orderBy')->with('created_at', 'asc')->andReturnSelf();
-        $messagesQuery->shouldReceive('skip')->with(0)->andReturnSelf();
-        $messagesQuery->shouldReceive('take')->with(101)->andReturn($messagesQuery);
-        $messagesQuery->shouldReceive('get')->andReturn(collect([$message1, $message2]));
-
-        $conversation->shouldReceive('messages')->andReturn($messagesQuery);
-
-        $mock = Mockery::mock('alias:' . Conversation::class);
-        $mock->shouldReceive('where')->with('id', $convId)->andReturnSelf();
-        $mock->shouldReceive('first')->andReturn($conversation);
-
+        $uri = "conversation://{$conversation->id}";
         $handler = new McpResourceHandler();
         $result = $handler->readResource($userId, $uri);
 
@@ -146,29 +126,16 @@ class McpResourceHandlerTest extends TestCase
     /** @test */
     public function readResource_paginates_messages_at_100_per_page_with_cursor()
     {
-        $userId = (string) Str::uuid();
-        $convId = (string) Str::uuid();
-        $uri = "conversation://{$convId}";
+        $userId = 'test-user-id';
+        $conversation = Conversation::factory()->create([
+            'user_id' => $userId,
+        ]);
 
-        $messages = collect();
-        for ($i = 0; $i < 101; $i++) {
-            $messages->push((object) ['role' => 'user', 'content' => "Message {$i}", 'created_at' => "2026-04-09 10:00:{$i}"]);
-        }
+        $messages = Message::factory()->count(101)->create([
+            'conversation_id' => $conversation->id,
+        ]);
 
-        $conversation = $this->makeMockConversation($convId, $userId, 'Test Chat', 'gpt-4', 150);
-
-        $messagesQuery = Mockery::mock('Illuminate\Database\Eloquent\Builder');
-        $messagesQuery->shouldReceive('orderBy')->with('created_at', 'asc')->andReturnSelf();
-        $messagesQuery->shouldReceive('skip')->with(0)->andReturnSelf();
-        $messagesQuery->shouldReceive('take')->with(101)->andReturn($messagesQuery);
-        $messagesQuery->shouldReceive('get')->andReturn($messages);
-
-        $conversation->shouldReceive('messages')->andReturn($messagesQuery);
-
-        $mock = Mockery::mock('alias:' . Conversation::class);
-        $mock->shouldReceive('where')->with('id', $convId)->andReturnSelf();
-        $mock->shouldReceive('first')->andReturn($conversation);
-
+        $uri = "conversation://{$conversation->id}";
         $handler = new McpResourceHandler();
         $result = $handler->readResource($userId, $uri);
 
@@ -180,17 +147,13 @@ class McpResourceHandlerTest extends TestCase
     /** @test */
     public function readResource_returns_32002_error_for_conversation_owned_by_different_user()
     {
-        $userId = (string) Str::uuid();
-        $otherUserId = (string) Str::uuid();
-        $convId = (string) Str::uuid();
-        $uri = "conversation://{$convId}";
+        $userId = 'test-user-id';
+        $otherUserId = 'other-user-id';
+        $conversation = Conversation::factory()->create([
+            'user_id' => $otherUserId,
+        ]);
 
-        $conversation = $this->makeMockConversation($convId, $otherUserId, 'Other User Chat', 'gpt-4', 5);
-
-        $mock = Mockery::mock('alias:' . Conversation::class);
-        $mock->shouldReceive('where')->with('id', $convId)->andReturnSelf();
-        $mock->shouldReceive('first')->andReturn($conversation);
-
+        $uri = "conversation://{$conversation->id}";
         $handler = new McpResourceHandler();
         $result = $handler->readResource($userId, $uri);
 
@@ -201,13 +164,9 @@ class McpResourceHandlerTest extends TestCase
     /** @test */
     public function readResource_returns_32002_error_for_nonexistent_conversation_uuid()
     {
-        $userId = (string) Str::uuid();
+        $userId = 'test-user-id';
         $convId = (string) Str::uuid();
         $uri = "conversation://{$convId}";
-
-        $mock = Mockery::mock('alias:' . Conversation::class);
-        $mock->shouldReceive('where')->with('id', $convId)->andReturnSelf();
-        $mock->shouldReceive('first')->andReturn(null);
 
         $handler = new McpResourceHandler();
         $result = $handler->readResource($userId, $uri);
@@ -310,27 +269,5 @@ class McpResourceHandlerTest extends TestCase
 
         $this->assertArrayHasKey('error', $result);
         $this->assertEquals(-32603, $result['error']['code']);
-    }
-
-    // --- Helpers ---
-
-    private function makeMockConversation(string $id, string $userId, string $title, string $model, int $messagesCount)
-    {
-        $conv = Mockery::mock('ClarionApp\LlmClient\Models\Conversation');
-        $conv->shouldReceive('getAttribute')->with('id')->andReturn($id);
-        $conv->shouldReceive('getAttribute')->with('user_id')->andReturn($userId);
-        $conv->shouldReceive('getAttribute')->with('title')->andReturn($title);
-        $conv->shouldReceive('getAttribute')->with('model')->andReturn($model);
-        $conv->shouldReceive('getAttribute')->with('channel')->andReturn('web');
-        $conv->shouldReceive('getAttribute')->with('messages_count')->andReturn($messagesCount);
-        $conv->shouldReceive('getAttribute')->with('updated_at')->andReturn('2026-04-09 10:00:00');
-        $conv->id = $id;
-        $conv->user_id = $userId;
-        $conv->title = $title;
-        $conv->model = $model;
-        $conv->channel = 'web';
-        $conv->messages_count = $messagesCount;
-        $conv->updated_at = '2026-04-09 10:00:00';
-        return $conv;
     }
 }

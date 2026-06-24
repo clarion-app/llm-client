@@ -48,7 +48,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertCount(1, $result['tools']);
 
         $tool = $result['tools'][0];
-        $this->assertEquals('contacts.listContacts', $tool['name']);
+        $this->assertEquals('contacts_listContacts', $tool['name']);
         $this->assertEquals('List all contacts', $tool['description']);
         $this->assertEquals('object', $tool['inputSchema']['type']);
         $this->assertArrayHasKey('query', $tool['inputSchema']['properties']);
@@ -76,7 +76,7 @@ class McpToolRegistryTest extends TestCase
         $registry = new McpToolRegistry();
         $result = $registry->getTools();
 
-        $this->assertEquals('contacts.store', $result['tools'][0]['name']);
+        $this->assertEquals('contacts_store', $result['tools'][0]['name']);
     }
 
     /** @test */
@@ -255,7 +255,7 @@ class McpToolRegistryTest extends TestCase
         $result = $registry->getTools(null, 'contacts');
 
         $this->assertCount(1, $result['tools']);
-        $this->assertEquals('contacts.listContacts', $result['tools'][0]['name']);
+        $this->assertEquals('contacts_listContacts', $result['tools'][0]['name']);
     }
 
     /** @test */
@@ -457,16 +457,22 @@ class McpToolRegistryTest extends TestCase
             $descriptions[$pkg] = ['description' => "Description for {$pkg}"];
         }
 
-        $mock = Mockery::mock('alias:' . ClarionPackageServiceProvider::class);
-        $mock->shouldReceive('getPackageDescriptions')
-            ->andReturn($descriptions);
+        // Use reflection to set static properties instead of alias mock (class already exists)
+        $reflector = new \ReflectionClass(ClarionPackageServiceProvider::class);
 
-        foreach ($packageOperations as $pkg => $ops) {
-            $mock->shouldReceive('getPackageOperations')
-                ->with($pkg)
-                ->andReturn($ops);
-        }
+        $descProp = $reflector->getProperty('packageDescriptions');
+        $descProp->setAccessible(true);
+        $descProp->setValue(null, $descriptions);
 
+        $opsProp = $reflector->getProperty('packageOperations');
+        $opsProp->setAccessible(true);
+        $opsProp->setValue(null, $packageOperations);
+
+        $customPromptsProp = $reflector->getProperty('customPrompts');
+        $customPromptsProp->setAccessible(true);
+        $customPromptsProp->setValue(null, []);
+
+        // Mock ApiManager with alias (concrete class, not abstract)
         $apiMock = Mockery::mock('alias:' . ApiManager::class);
         foreach ($operationDetailsMap as $opId => $details) {
             $apiMock->shouldReceive('getOperationDetails')

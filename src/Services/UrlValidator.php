@@ -14,15 +14,20 @@ class UrlValidator
      */
     public static function validate(string $url): array
     {
-        // Check scheme
+        // Check scheme first
         $parsed = parse_url($url);
-        if ($parsed === false || !isset($parsed['scheme']) || !isset($parsed['host'])) {
+        if ($parsed === false || !isset($parsed['scheme'])) {
             return ['valid' => false, 'reason' => 'Malformed URL'];
         }
 
         $scheme = strtolower($parsed['scheme']);
         if (!in_array($scheme, ['http', 'https'], true)) {
             return ['valid' => false, 'reason' => 'Only HTTP and HTTPS schemes are allowed'];
+        }
+
+        // Check host is present for HTTP(S) URLs
+        if (!isset($parsed['host'])) {
+            return ['valid' => false, 'reason' => 'Malformed URL'];
         }
 
         // Resolve hostname to IP

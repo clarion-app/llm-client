@@ -626,11 +626,11 @@ class AgentLoopService
         // Check confirmation/rejection
         $validation = ApiCallValidator::validate($operationId, $method, $pathTemplate);
 
-        if ($validation['status'] === ApiCallValidator::STATUS_REJECT) {
+        if ($validation['status'] === 'reject') {
             return json_encode(['error' => $validation['reason'] ?? 'Operation rejected']);
         }
 
-        if ($validation['status'] === ApiCallValidator::STATUS_CONFIRM) {
+        if ($validation['status'] === 'confirm') {
             // Return a special marker — the stream handler will detect this and suspend
             return json_encode([
                 '__requires_confirmation' => true,

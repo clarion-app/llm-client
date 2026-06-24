@@ -56,13 +56,13 @@ class McpToolExecutor
         $validation = ApiCallValidator::validate($operationId, $method, $resolved['path']);
 
         switch ($validation['status']) {
-            case ApiCallValidator::STATUS_REJECT:
+            case 'reject':
                 return $this->errorResult($validation['reason'] ?? 'Request rejected');
 
-            case ApiCallValidator::STATUS_CONFIRM:
+            case 'confirm':
                 return $this->createConfirmationToken($name, $cleanArguments, $session);
 
-            case ApiCallValidator::STATUS_ALLOW:
+            case 'allow':
                 return $this->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
 
             default:

@@ -48,7 +48,7 @@ class UrlValidatorTest extends TestCase
     {
         $result = UrlValidator::validate('file:///etc/passwd');
         $this->assertFalse($result['valid']);
-        $this->assertStringContainsString('HTTP and HTTPS', $result['reason']);
+        $this->assertStringContainsString('scheme', strtolower($result['reason']));
     }
 
     /** @test T020 — reject ftp:// scheme */

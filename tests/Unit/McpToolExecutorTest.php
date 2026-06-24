@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Services\ApiCallValidator;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\McpConfirmationToken;
 use ClarionApp\Backend\ApiManager;
+use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
@@ -20,18 +21,22 @@ class McpToolExecutorTest extends TestCase
     use RefreshDatabase;
 
     private McpSession $session;
+    private User $user;
 
     protected function setUp(): void
     {
         parent::setUp();
+        $this->user = User::factory()->create();
         $this->session = McpSession::create([
-            'user_id' => (string) Str::uuid(),
+            'user_id' => $this->user->id,
             'protocol_version' => '2025-03-26',
         ]);
     }
 
     protected function tearDown(): void
     {
+        restore_error_handler();
+        restore_exception_handler();
         Mockery::close();
         parent::tearDown();
     }

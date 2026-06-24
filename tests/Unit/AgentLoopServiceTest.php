@@ -10,8 +10,10 @@ use ClarionApp\LlmClient\Services\OperationsSearchService;
 use ClarionApp\LlmClient\Services\OperationCache;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Mockery;
 
@@ -31,96 +33,65 @@ class AgentLoopServiceTest extends TestCase
     public function build_tools_payload_converts_mcp_tools_to_openai_format()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->with(null)
-            ->andReturn([
-                'tools' => [
-                    [
-                        'name' => 'contacts.store',
-                        'description' => 'Create a new contact',
-                        'inputSchema' => [
-                            'type' => 'object',
-                            'properties' => [
-                                'body' => [
-                                    'type' => 'object',
-                                    'properties' => [
-                                        'name' => ['type' => 'string'],
-                                        'email' => ['type' => 'string'],
-                                    ],
-                                ],
-                            ],
-                            'required' => ['body'],
-                        ],
-                        'annotations' => ['readOnlyHint' => false],
-                        '_meta' => ['operationId' => 'storeContact', 'method' => 'POST', 'path' => '/api/contacts'],
-                    ],
-                ],
-                'nextCursor' => null,
-            ]);
-
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        $this->assertCount(1, $tools);
-        $this->assertEquals('function', $tools[0]['type']);
-        $this->assertEquals('contacts.store', $tools[0]['function']['name']);
-        $this->assertEquals('Create a new contact', $tools[0]['function']['description']);
-        $this->assertArrayHasKey('body', $tools[0]['function']['parameters']['properties']);
-        // _meta and annotations should NOT be included
-        $this->assertArrayNotHasKey('_meta', $tools[0]);
-        $this->assertArrayNotHasKey('annotations', $tools[0]);
+        // buildToolsPayload now returns 3 hardcoded meta-tools
+        $this->assertCount(3, $tools);
+
+        // Verify all 3 meta-tools are present
+        $toolNames = collect($tools)->pluck('function.name')->toArray();
+        $this->assertContains('list_applications', $toolNames);
+        $this->assertContains('execute_operation', $toolNames);
+        $this->assertContains('search_operations', $toolNames);
+
+        // Verify structure of each tool
+        foreach ($tools as $tool) {
+            $this->assertEquals('function', $tool['type']);
+            $this->assertArrayHasKey('name', $tool['function']);
+            $this->assertArrayHasKey('description', $tool['function']);
+            $this->assertArrayHasKey('parameters', $tool['function']);
+        }
     }
 
     /** @test */
-    public function build_tools_payload_paginates_through_all_tools()
+    public function build_tools_payload_returns_three_meta_tools()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->with(null)
-            ->once()
-            ->andReturn([
-                'tools' => [
-                    [
-                        'name' => 'contacts.index',
-                        'description' => 'List contacts',
-                        'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()],
-                        'annotations' => [],
-                        '_meta' => ['operationId' => 'listContacts', 'method' => 'GET', 'path' => '/api/contacts'],
-                    ],
-                ],
-                'nextCursor' => 'cursor_page2',
-            ]);
-        $registryMock->shouldReceive('getTools')
-            ->with('cursor_page2')
-            ->once()
-            ->andReturn([
-                'tools' => [
-                    [
-                        'name' => 'contacts.store',
-                        'description' => 'Create contact',
-                        'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()],
-                        'annotations' => [],
-                        '_meta' => ['operationId' => 'storeContact', 'method' => 'POST', 'path' => '/api/contacts'],
-                    ],
-                ],
-                'nextCursor' => null,
-            ]);
-
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        $this->assertCount(2, $tools);
-        $this->assertEquals('contacts.index', $tools[0]['function']['name']);
-        $this->assertEquals('contacts.store', $tools[1]['function']['name']);
+        $this->assertCount(3, $tools);
+
+        // Verify list_applications has no parameters
+        $listApps = collect($tools)->firstWhere('function.name', 'list_applications');
+        $this->assertNotNull($listApps);
+        $this->assertCount(0, (array) $listApps['function']['parameters']['properties']);
+
+        // Verify execute_operation has operationId and parameters sub-objects
+        $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
+        $this->assertNotNull($execOp);
+        $this->assertArrayHasKey('operationId', $execOp['function']['parameters']['properties']);
+        $this->assertArrayHasKey('parameters', $execOp['function']['parameters']['properties']);
+        $this->assertArrayHasKey('required', $execOp['function']['parameters']);
+
+        // Verify search_operations has query parameter
+        $searchOps = collect($tools)->firstWhere('function.name', 'search_operations');
+        $this->assertNotNull($searchOps);
+        $this->assertArrayHasKey('query', $searchOps['function']['parameters']['properties']);
+        $this->assertContains('query', $searchOps['function']['parameters']['required']);
     }
 
     /** @test */
     public function build_messages_payload_reconstructs_tool_data_into_openai_format()
     {
+        // Set system_prompt to empty so no system message is prepended
+        config(['llm-client.agent_loop.system_prompt' => '']);
+
         $conversation = Conversation::factory()->create();
 
         // User message
@@ -175,7 +146,7 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $messages = $service->buildMessagesPayload($conversation);
 
-        // user message
+        // user message (first message now, no system prompt)
         $this->assertEquals('user', $messages[0]['role']);
         $this->assertEquals('Create a contact named Jane', $messages[0]['content']);
 
@@ -198,7 +169,11 @@ class AgentLoopServiceTest extends TestCase
     {
         Queue::fake();
 
-        $conversation = Conversation::factory()->create(['is_processing' => false]);
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => false,
+            'server_id' => $server->id,
+        ]);
         Message::create([
             'conversation_id' => $conversation->id,
             'role' => 'user',
@@ -208,9 +183,6 @@ class AgentLoopServiceTest extends TestCase
         ]);
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->andReturn(['tools' => [], 'nextCursor' => null]);
-
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
@@ -226,9 +198,6 @@ class AgentLoopServiceTest extends TestCase
     public function start_enforces_max_iteration_limit()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->andReturn(['tools' => [], 'nextCursor' => null]);
-
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
@@ -242,7 +211,8 @@ class AgentLoopServiceTest extends TestCase
     {
         Queue::fake();
 
-        $conversation = Conversation::factory()->create(['is_processing' => true]);
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create(['is_processing' => true, 'server_id' => $server->id]);
         $message = Message::create([
             'conversation_id' => $conversation->id,
             'role' => 'assistant',
@@ -263,6 +233,7 @@ class AgentLoopServiceTest extends TestCase
                 'tool_results' => null,
                 'iteration' => 1,
                 'pending_confirmation' => [
+                    'operationId' => 'destroyContact',
                     'tool_name' => 'contacts.destroy',
                     'method' => 'DELETE',
                     'path' => '/api/contacts/42',
@@ -274,8 +245,6 @@ class AgentLoopServiceTest extends TestCase
         ]);
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->andReturn(['tools' => [], 'nextCursor' => null]);
         $registryMock->shouldReceive('findTool')
             ->with('contacts.destroy')
             ->andReturn([
@@ -284,7 +253,9 @@ class AgentLoopServiceTest extends TestCase
             ]);
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $executorMock->shouldReceive('executeTool')
+        $executorMock->shouldReceive('extractArguments')
+            ->andReturn(['path' => '/api/contacts/42', 'query' => [], 'body' => []]);
+        $executorMock->shouldReceive('executeHttpCall')
             ->andReturn([
                 'content' => [['type' => 'text', 'text' => '{"success": true}']],
                 'isError' => false,
@@ -304,7 +275,8 @@ class AgentLoopServiceTest extends TestCase
     {
         Queue::fake();
 
-        $conversation = Conversation::factory()->create(['is_processing' => true]);
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create(['is_processing' => true, 'server_id' => $server->id]);
         $message = Message::create([
             'conversation_id' => $conversation->id,
             'role' => 'assistant',
@@ -325,6 +297,7 @@ class AgentLoopServiceTest extends TestCase
                 'tool_results' => null,
                 'iteration' => 1,
                 'pending_confirmation' => [
+                    'operationId' => 'destroyContact',
                     'tool_name' => 'contacts.destroy',
                     'method' => 'DELETE',
                     'path' => '/api/contacts/42',
@@ -336,8 +309,6 @@ class AgentLoopServiceTest extends TestCase
         ]);
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->andReturn(['tools' => [], 'nextCursor' => null]);
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
@@ -401,12 +372,10 @@ class AgentLoopServiceTest extends TestCase
     {
         Queue::fake();
 
-        $conversation = Conversation::factory()->create(['is_processing' => false]);
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'server_id' => $server->id]);
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->andReturn(['tools' => [], 'nextCursor' => null]);
-
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
@@ -455,34 +424,45 @@ class AgentLoopServiceTest extends TestCase
     {
         $conversation = Conversation::factory()->create(['is_processing' => false]);
 
-        // First user message
-        Message::create([
+        // Use DB::table to insert with explicit timestamps (bypass Eloquent auto-timestamps)
+        $conn = config('database.default');
+        DB::table('messages')->insert([
+            'id' => (string) \Str::uuid(),
             'conversation_id' => $conversation->id,
             'role' => 'user',
             'user' => 'Tim',
             'content' => 'First message',
             'responseTime' => 0,
-            'created_at' => now()->subMinutes(2),
+            'tool_data' => null,
+            'created_at' => '2025-01-01 10:00:00',
+            'updated_at' => '2025-01-01 10:00:00',
+            'deleted_at' => null,
         ]);
 
-        // Assistant response
-        Message::create([
+        DB::table('messages')->insert([
+            'id' => (string) \Str::uuid(),
             'conversation_id' => $conversation->id,
             'role' => 'assistant',
             'user' => 'Clarion',
             'content' => 'First reply',
             'responseTime' => 1,
-            'created_at' => now()->subMinute(),
+            'tool_data' => null,
+            'created_at' => '2025-01-01 10:01:00',
+            'updated_at' => '2025-01-01 10:01:00',
+            'deleted_at' => null,
         ]);
 
-        // Second user message (arrived while processing) — this is newer
-        Message::create([
+        DB::table('messages')->insert([
+            'id' => (string) \Str::uuid(),
             'conversation_id' => $conversation->id,
             'role' => 'user',
             'user' => 'Tim',
             'content' => 'Second message',
             'responseTime' => 0,
-            'created_at' => now(),
+            'tool_data' => null,
+            'created_at' => '2025-01-01 10:02:00',
+            'updated_at' => '2025-01-01 10:02:00',
+            'deleted_at' => null,
         ]);
 
         // Latest user message is newer than latest assistant message
@@ -496,7 +476,14 @@ class AgentLoopServiceTest extends TestCase
             ->latest('created_at')
             ->first();
 
-        $this->assertTrue($latestUser->created_at > $latestAssistant->created_at);
+        $this->assertNotNull($latestUser);
+        $this->assertNotNull($latestAssistant);
+        // Verify user message timestamp (10:02) is strictly after assistant (10:01)
+        $this->assertTrue(
+            $latestUser->created_at->gt($latestAssistant->created_at),
+            'User message (' . $latestUser->created_at->format('H:i:s') .
+            ') should be newer than assistant (' . $latestAssistant->created_at->format('H:i:s') . ')'
+        );
     }
 
     // === US1 Tests: Search Operations Core (T006-T012) ===
@@ -705,12 +692,11 @@ class AgentLoopServiceTest extends TestCase
 
         app()->instance(OperationsSearchService::class, $searchServiceMock);
 
-        // Mock DB::table()->count() for empty index check
-        $dbMock = Mockery::mock();
-        $dbMock->shouldReceive('table')->with('operation_search_index')->andReturnSelf();
-        $dbMock->shouldReceive('count')->once()->andReturn(5); // Table has data
+        // Mock DB facade properly using partial mock
+        $queryMock = Mockery::mock();
+        $queryMock->shouldReceive('count')->once()->andReturn(5); // Table has data
 
-        app()->instance('db', $dbMock);
+        DB::shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
@@ -736,12 +722,11 @@ class AgentLoopServiceTest extends TestCase
 
         app()->instance(OperationsSearchService::class, $searchServiceMock);
 
-        // Mock DB::table()->count() returning 0 (empty index)
-        $dbMock = Mockery::mock();
-        $dbMock->shouldReceive('table')->with('operation_search_index')->andReturnSelf();
-        $dbMock->shouldReceive('count')->once()->andReturn(0);
+        // Mock DB facade properly using partial mock
+        $queryMock = Mockery::mock();
+        $queryMock->shouldReceive('count')->once()->andReturn(0); // Empty index
 
-        app()->instance('db', $dbMock);
+        DB::shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
@@ -1141,9 +1126,7 @@ class AgentLoopServiceTest extends TestCase
         ];
 
         $service = $this->createServiceWithCacheEntries($conversation->id, $entries);
-        $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')->andReturn(['tools' => [], 'nextCursor' => null]);
-        // Rebuild service with registry mock that has expectations
+        // Rebuild service with registry mock (no getTools expectations needed)
         $cache = new OperationCache();
         foreach ($entries as $entry) {
             $cache->put($conversation->id, $entry['operationId'], [
@@ -1153,6 +1136,7 @@ class AgentLoopServiceTest extends TestCase
                 'paramSchema' => $entry['paramSchema'] ?? null,
             ]);
         }
+        $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
         $service = new AgentLoopService($registryMock, $executorMock, $cache);
         $messages = $service->buildMessagesPayload($conversation);
@@ -1173,7 +1157,6 @@ class AgentLoopServiceTest extends TestCase
         $cache = new OperationCache();
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')->andReturn(['tools' => [], 'nextCursor' => null]);
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         // Set base system prompt to something non-empty
@@ -1240,7 +1223,6 @@ class AgentLoopServiceTest extends TestCase
         }
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')->andReturn(['tools' => [], 'nextCursor' => null]);
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, $cache);
@@ -1268,13 +1250,6 @@ class AgentLoopServiceTest extends TestCase
     public function execute_operation_meta_tool_has_structured_parameters_schema()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->with(null)
-            ->andReturn([
-                'tools' => [],
-                'nextCursor' => null,
-            ]);
-
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
@@ -1299,13 +1274,6 @@ class AgentLoopServiceTest extends TestCase
     public function execute_operation_description_mentions_structured_format()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
-        $registryMock->shouldReceive('getTools')
-            ->with(null)
-            ->andReturn([
-                'tools' => [],
-                'nextCursor' => null,
-            ]);
-
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
