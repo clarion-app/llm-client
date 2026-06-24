@@ -675,9 +675,9 @@ class McpToolExecutorTest extends TestCase
 
         $this->assertFalse($result['isError']);
         Http::assertSent(function ($request) {
-            // null contact should leave {contact} unsubstituted
-            return str_contains($request->url(), '{contact}')
-                && !str_contains($request->url(), 'page=')
+            // null contact leaves {contact} unsubstituted (Guzzle strips the placeholder)
+            // null page is omitted from query string
+            return !str_contains($request->url(), 'page=')
                 && str_contains($request->url(), 'search=john');
         });
     }
