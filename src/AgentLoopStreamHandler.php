@@ -141,8 +141,8 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
         $conversation->update(['is_processing' => false]);
 
-        // Generate title on first conversation exchange
-        if ($conversation->title === null) {
+        // Generate title on first conversation exchange (requires a server)
+        if ($conversation->title === null && $conversation->server_id !== null) {
             $titleRequest = new OpenAIGenerateConversationTitleRequest($conversation);
             $titleRequest->sendGenerateConversationTitle();
         }
@@ -169,13 +169,15 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         }
 
         $toolResults = [];
+        $metaToolNames = ['list_applications', 'execute_operation', 'search_operations'];
+        $registry = app(\ClarionApp\LlmClient\Services\McpToolRegistry::class);
 
         foreach ($this->toolCalls as $toolCall) {
             $toolName = $toolCall['function']['name'] ?? '';
             $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
             $toolCallId = $toolCall['id'] ?? '';
 
-            Log::info('AgentLoopStreamHandler: executing meta-tool', [
+            Log::info('AgentLoopStreamHandler: executing tool', [
                 'tool' => $toolName,
                 'arguments' => $arguments,
                 'iteration' => $iteration,
@@ -183,42 +185,102 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
             event(new ToolExecutionEvent($conversationId, $toolName, 'executing'));
 
-            $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation);
+            // Non-meta tools: resolve via McpToolRegistry and check for confirmation
+            $result = null;
+            if (!in_array($toolName, $metaToolNames, true)) {
+                $toolDef = $registry->findTool($toolName);
+                if ($toolDef && !empty($toolDef['_meta'])) {
+                    $meta = $toolDef['_meta'];
+                    $method = $meta['method'] ?? '';
 
-            // Check if execute_operation needs confirmation
-            $decoded = json_decode($result, true);
-            if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
-                $pendingConfirmation = [
-                    'tool_name' => 'execute_operation',
-                    'operationId' => $decoded['operationId'],
-                    'method' => $decoded['method'],
-                    'path' => $decoded['path'],
-                    'arguments' => $decoded['parameters'] ?? [],
-                    'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
-                ];
+                    // destructive operations require user confirmation
+                    if (strtoupper($method) === 'DELETE' || strtoupper($method) === 'PUT' || strtoupper($method) === 'PATCH') {
+                        $pendingConfirmation = [
+                            'tool_name' => $toolName,
+                            'operationId' => $meta['operationId'] ?? null,
+                            'method' => $method,
+                            'path' => $meta['path'] ?? null,
+                            'arguments' => $arguments,
+                            'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                        ];
 
-                $toolData = [
-                    'tool_calls' => $this->toolCalls,
-                    'tool_results' => null,
-                    'iteration' => $iteration,
-                    'pending_confirmation' => $pendingConfirmation,
-                ];
+                        $toolData = [
+                            'tool_calls' => $this->toolCalls,
+                            'tool_results' => null,
+                            'iteration' => $iteration,
+                            'pending_confirmation' => $pendingConfirmation,
+                        ];
 
-                $this->message->update([
-                    'content' => $this->reply ?: '',
-                    'tool_data' => $toolData,
-                ]);
+                        $this->message->update([
+                            'content' => $this->reply ?: '',
+                            'tool_data' => $toolData,
+                        ]);
 
-                event(new ApiCallConfirmationRequiredEvent(
-                    $conversationId,
-                    $this->message->id,
-                    $decoded['method'],
-                    $decoded['path'],
-                    $decoded['parameters'] ?? [],
-                    'execute_operation'
-                ));
+                        event(new ApiCallConfirmationRequiredEvent(
+                            $conversationId,
+                            $this->message->id,
+                            $method,
+                            $meta['path'] ?? '',
+                            $arguments,
+                            $toolName
+                        ));
 
-                return; // Suspend for confirmation
+                        return; // Suspend for confirmation
+                    }
+
+                    // Safe read operations — execute via McpToolExecutor
+                    $toolExecutor = app(\ClarionApp\LlmClient\Services\McpToolExecutor::class);
+                    $session = \ClarionApp\LlmClient\Models\McpSession::where('user_id', $conversation->user_id)->first();
+                    if (!$session) {
+                        $session = \ClarionApp\LlmClient\Models\McpSession::create([
+                            'user_id' => $conversation->user_id,
+                            'protocol_version' => '2025-03-26',
+                        ]);
+                    }
+                    $execResult = $toolExecutor->executeTool($toolName, $arguments, $session);
+                    $result = json_encode($execResult);
+                }
+            }
+
+            // Meta tools or unresolved non-meta tools: fall through to executeMetaTool
+            if ($result === null) {
+                $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation);
+
+                // Check if execute_operation needs confirmation
+                $decoded = json_decode($result, true);
+                if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
+                    $pendingConfirmation = [
+                        'tool_name' => 'execute_operation',
+                        'operationId' => $decoded['operationId'],
+                        'method' => $decoded['method'],
+                        'path' => $decoded['path'],
+                        'arguments' => $decoded['parameters'] ?? [],
+                        'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                    ];
+
+                    $toolData = [
+                        'tool_calls' => $this->toolCalls,
+                        'tool_results' => null,
+                        'iteration' => $iteration,
+                        'pending_confirmation' => $pendingConfirmation,
+                    ];
+
+                    $this->message->update([
+                        'content' => $this->reply ?: '',
+                        'tool_data' => $toolData,
+                    ]);
+
+                    event(new ApiCallConfirmationRequiredEvent(
+                        $conversationId,
+                        $this->message->id,
+                        $decoded['method'],
+                        $decoded['path'],
+                        $decoded['parameters'] ?? [],
+                        'execute_operation'
+                    ));
+
+                    return; // Suspend for confirmation
+                }
             }
 
             $toolResults[] = [
@@ -252,8 +314,12 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             return;
         }
 
-        // Dispatch next iteration
-        $agentLoopService->start($conversation, $iteration + 1);
+        // Dispatch next iteration (requires a server for the LLM API call)
+        if ($conversation->server_id !== null) {
+            $agentLoopService->start($conversation, $iteration + 1);
+        } else {
+            $conversation->update(['is_processing' => false]);
+        }
     }
 
     private function handleMaxIterationReached(Conversation $conversation): void

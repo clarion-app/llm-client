@@ -13,10 +13,14 @@ use ClarionApp\Backend\Models\User;
 class McpToolExecutor
 {
     private McpToolRegistry $toolRegistry;
+    private CallValidatorInterface $validator;
 
-    public function __construct(McpToolRegistry $toolRegistry)
-    {
+    public function __construct(
+        McpToolRegistry $toolRegistry,
+        ?CallValidatorInterface $validator = null
+    ) {
         $this->toolRegistry = $toolRegistry;
+        $this->validator = $validator ?? new ApiCallValidatorAdapter();
     }
 
     public function executeTool(string $name, array $arguments, McpSession $session): array
@@ -52,8 +56,8 @@ class McpToolExecutor
         // Extract arguments
         $resolved = $this->extractArguments($cleanArguments, $pathTemplate);
 
-        // Validate via ApiCallValidator
-        $validation = ApiCallValidator::validate($operationId, $method, $resolved['path']);
+        // Validate via CallValidator
+        $validation = $this->validator->validate($operationId, $method, $resolved['path']);
 
         switch ($validation['status']) {
             case 'reject':
