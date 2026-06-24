@@ -160,6 +160,10 @@ class AgentControllerTest extends TestCase
     #[Test]
     public function agent_endpoint_returns_422_when_no_server_configured()
     {
+        // Remove the fallback server/model created in setUp so the controller
+        // has nothing to fall back on when the user has no UserSetting.
+        $this->server->delete();
+
         $userNoServer = User::factory()->create();
 
         $response = $this->actingAs($userNoServer, 'api')
