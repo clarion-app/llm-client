@@ -4,9 +4,22 @@ namespace ClarionApp\LlmClient\Tests\Unit;
 
 use Tests\TestCase;
 use ClarionApp\LlmClient\Services\UrlValidator;
+use Mockery;
 
 class UrlValidatorTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Mockery::close();
+    }
+
+    protected function tearDown(): void
+    {
+        Mockery::close();
+        parent::tearDown();
+    }
+
     /** @test T020 — reject loopback */
     public function rejects_loopback_ip()
     {
@@ -62,6 +75,11 @@ class UrlValidatorTest extends TestCase
     /** @test T020 — accept valid public URL */
     public function accepts_valid_public_http_url()
     {
+        $ip = gethostbyname('example.com');
+        if ($ip === 'example.com' || !filter_var($ip, FILTER_VALIDATE_IP)) {
+            $this->markTestSkipped('DNS resolution unavailable for example.com');
+        }
+
         $result = UrlValidator::validate('https://example.com/page');
         $this->assertTrue($result['valid']);
     }
@@ -92,6 +110,11 @@ class UrlValidatorTest extends TestCase
     /** @test T021 — redirect within limit to public URL is accepted */
     public function accepts_redirect_within_limit_to_public_url()
     {
+        $ip = gethostbyname('example.com');
+        if ($ip === 'example.com' || !filter_var($ip, FILTER_VALIDATE_IP)) {
+            $this->markTestSkipped('DNS resolution unavailable for example.com');
+        }
+
         $result = UrlValidator::validateRedirect('https://example.com/redirected', 0);
         $this->assertTrue($result['valid']);
     }

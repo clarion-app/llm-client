@@ -4,10 +4,12 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use Tests\TestCase;
 use Illuminate\Foundation\Testing\RefreshDatabase;
-use ClarionApp\Backend\ApiManager;
-use ClarionApp\Backend\ClarionPackageServiceProvider;
-use ClarionApp\LlmClient\Services\ApiCallValidator;
-use App\Models\User;
+use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Services\McpToolRegistry;
+use ClarionApp\LlmClient\Services\McpToolExecutor;
+use ClarionApp\LlmClient\Models\McpConfirmationToken;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Carbon;
 use Laravel\Passport\Passport;
 use Mockery;
 
@@ -76,9 +78,7 @@ class McpServerControllerTest extends TestCase
         $this->assertIsArray($tools);
         $this->assertNotEmpty($tools);
 
-        // Step 4: tools/call safe tool
-        $this->mockApiCallValidator('allow');
-
+        // Step 4: tools/call safe tool (GET — returns mocked success)
         $response = $this->postJson('/api/clarion-app/llm-client/mcp', [
             'jsonrpc' => '2.0',
             'id' => 3,
@@ -93,9 +93,7 @@ class McpServerControllerTest extends TestCase
         $result = $response->json('result');
         $this->assertFalse($result['isError']);
 
-        // Step 5: tools/call destructive tool (blocked)
-        $this->mockApiCallValidator('confirm', 'DELETE requests require confirmation');
-
+        // Step 5: tools/call destructive tool (DELETE — returns confirmation_required)
         $response = $this->postJson('/api/clarion-app/llm-client/mcp', [
             'jsonrpc' => '2.0',
             'id' => 4,
@@ -113,9 +111,7 @@ class McpServerControllerTest extends TestCase
         $this->assertTrue($content['confirmation_required']);
         $confirmationToken = $content['confirmation_token'];
 
-        // Step 6: Resubmit with confirmation token
-        $this->mockApiCallValidator('allow');
-
+        // Step 6: Resubmit with confirmation token (returns success)
         $response = $this->postJson('/api/clarion-app/llm-client/mcp', [
             'jsonrpc' => '2.0',
             'id' => 5,
@@ -153,49 +149,97 @@ class McpServerControllerTest extends TestCase
 
     private function mockToolDiscovery(): void
     {
-        $mock = Mockery::mock('alias:' . ClarionPackageServiceProvider::class);
-        $mock->shouldReceive('getPackageDescriptions')
+        // Mock McpToolRegistry — resolves via app() in McpProtocolHandler.
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('getTools')
             ->andReturn([
-                '@clarion-app/contacts' => ['description' => 'Contacts package'],
+                'tools' => [
+                    [
+                        'name' => 'contacts.listContacts',
+                        'description' => 'List all contacts',
+                        'inputSchema' => [],
+                    ],
+                    [
+                        'name' => 'contacts.deleteContact',
+                        'description' => 'Delete a contact',
+                        'inputSchema' => [],
+                    ],
+                ],
+                'nextCursor' => null,
             ]);
-        $mock->shouldReceive('getPackageOperations')
-            ->with('@clarion-app/contacts')
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.listContacts')
             ->andReturn([
-                ['operationId' => 'listContacts', 'summary' => 'List all contacts'],
-                ['operationId' => 'deleteContact', 'summary' => 'Delete a contact'],
-            ]);
-
-        $apiMock = Mockery::mock('alias:' . ApiManager::class);
-        $apiMock->shouldReceive('getOperationDetails')
-            ->with('listContacts')
-            ->andReturn([
-                'path' => '/api/clarion-app/contacts/contact',
-                'method' => 'get',
-                'details' => [
+                'name' => 'contacts.listContacts',
+                'description' => 'List all contacts',
+                'inputSchema' => [],
+                '_meta' => [
                     'operationId' => 'listContacts',
-                    'summary' => 'List all contacts',
+                    'method' => 'get',
+                    'path' => '/api/clarion-app/contacts/contact',
                 ],
             ]);
-        $apiMock->shouldReceive('getOperationDetails')
-            ->with('deleteContact')
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.deleteContact')
             ->andReturn([
-                'path' => '/api/clarion-app/contacts/contact/{contact}',
-                'method' => 'delete',
-                'details' => [
+                'name' => 'contacts.deleteContact',
+                'description' => 'Delete a contact',
+                'inputSchema' => [],
+                '_meta' => [
                     'operationId' => 'deleteContact',
-                    'summary' => 'Delete a contact',
+                    'method' => 'delete',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
                 ],
             ]);
-    }
 
-    private function mockApiCallValidator(string $status, ?string $reason = null): void
-    {
-        $result = ['status' => $status];
-        if ($reason) {
-            $result['reason'] = $reason;
-        }
+        // Mock McpToolExecutor — resolves via app() in McpProtocolHandler.
+        // We need it to handle 3 scenarios:
+        // 1. GET call (listContacts) → success
+        // 2. DELETE call without confirmation_token → confirmation_required
+        // 3. DELETE call with confirmation_token → success
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $executorMock->shouldReceive('executeTool')
+            ->with('contacts.listContacts', Mockery::type('array'), Mockery::type('object'))
+            ->andReturn([
+                'content' => [['type' => 'text', 'mimeType' => 'application/json', 'text' => json_encode(['items' => []])]],
+                'isError' => false,
+            ]);
 
-        $mock = Mockery::mock('alias:' . ApiCallValidator::class);
-        $mock->shouldReceive('validate')->andReturn($result);
+        // First call for deleteContact (no confirmation token) → returns confirmation
+        $executorMock->shouldReceive('executeTool')
+            ->with('contacts.deleteContact', Mockery::on(function ($args) {
+                return empty($args['_confirmation_token'] ?? null);
+            }), Mockery::type('object'))
+            ->andReturnUsing(function ($args) {
+                return [
+                    'content' => [
+                        [
+                            'type' => 'text',
+                            'mimeType' => 'application/json',
+                            'text' => json_encode([
+                                'confirmation_required' => true,
+                                'confirmation_token' => 'test-token-' . bin2hex(random_bytes(8)),
+                                'tool_name' => 'contacts.deleteContact',
+                                'message' => 'This is a destructive operation.',
+                                'expires_in_seconds' => 300,
+                            ]),
+                        ],
+                    ],
+                    'isError' => false,
+                ];
+            });
+
+        // Second call for deleteContact (with confirmation token) → success
+        $executorMock->shouldReceive('executeTool')
+            ->with('contacts.deleteContact', Mockery::on(function ($args) {
+                return !empty($args['_confirmation_token'] ?? null);
+            }), Mockery::type('object'))
+            ->andReturn([
+                'content' => [['type' => 'text', 'mimeType' => 'application/json', 'text' => json_encode(['status' => 'deleted'])]],
+                'isError' => false,
+            ]);
+
+        $this->instance(McpToolRegistry::class, $registryMock);
+        $this->instance(McpToolExecutor::class, $executorMock);
     }
 }

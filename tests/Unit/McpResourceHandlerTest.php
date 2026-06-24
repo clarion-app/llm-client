@@ -196,13 +196,10 @@ class McpResourceHandlerTest extends TestCase
     {
         $uri = 'page://https://example.com/article';
 
-        $urlMock = Mockery::mock('alias:' . UrlValidator::class);
-        $urlMock->shouldReceive('validate')
-            ->with('https://example.com/article')
-            ->once()
-            ->andReturn(['valid' => true]);
-
         $handler = Mockery::mock(McpResourceHandler::class)->makePartial();
+        $handler->setValidator(function (string $url) {
+            return ['valid' => true];
+        });
         $handler->shouldReceive('fetchPageText')
             ->with('https://example.com/article')
             ->once()
@@ -221,13 +218,10 @@ class McpResourceHandlerTest extends TestCase
     {
         $uri = 'page://http://192.168.1.1/admin';
 
-        $urlMock = Mockery::mock('alias:' . UrlValidator::class);
-        $urlMock->shouldReceive('validate')
-            ->with('http://192.168.1.1/admin')
-            ->once()
-            ->andReturn(['valid' => false, 'reason' => 'Private IP address']);
-
         $handler = new McpResourceHandler();
+        $handler->setValidator(function (string $url) {
+            return ['valid' => false, 'reason' => 'Private IP address'];
+        });
         $result = $handler->readResource('any-user-id', $uri);
 
         $this->assertArrayHasKey('error', $result);
@@ -253,13 +247,10 @@ class McpResourceHandlerTest extends TestCase
     {
         $uri = 'page://https://example.com/article';
 
-        $urlMock = Mockery::mock('alias:' . UrlValidator::class);
-        $urlMock->shouldReceive('validate')
-            ->with('https://example.com/article')
-            ->once()
-            ->andReturn(['valid' => true]);
-
         $handler = Mockery::mock(McpResourceHandler::class)->makePartial();
+        $handler->setValidator(function (string $url) {
+            return ['valid' => true];
+        });
         $handler->shouldReceive('fetchPageText')
             ->with('https://example.com/article')
             ->once()

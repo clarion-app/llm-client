@@ -29,7 +29,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function parses_text_deltas_from_sse_chunks()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create();
 
@@ -58,7 +64,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function parses_tool_calls_deltas_with_argument_accumulation()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create();
 
@@ -103,7 +115,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function finish_detects_plain_text_response()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create();
 
@@ -136,7 +154,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function finish_detects_tool_calls_response()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create(['is_processing' => true]);
 
@@ -180,7 +204,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function tracks_iteration_count()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create();
 
@@ -205,7 +235,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function max_iteration_limit_triggers_error_message()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create(['is_processing' => true]);
 
@@ -267,7 +303,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function finish_suspends_loop_when_confirmation_required()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create(['is_processing' => true]);
 
@@ -317,7 +359,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function tool_data_pending_confirmation_stored_correctly()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create(['is_processing' => true]);
 
@@ -371,7 +419,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function tool_execution_errors_fed_back_to_llm()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create(['is_processing' => true]);
 
@@ -423,7 +477,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function handle_creates_assistant_message_on_first_text_chunk()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create();
 
@@ -450,7 +510,13 @@ class AgentLoopStreamHandlerTest extends TestCase
     /** @test */
     public function update_event_broadcast_per_text_delta()
     {
-        Event::fake();
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
 
         $conversation = Conversation::factory()->create();
 

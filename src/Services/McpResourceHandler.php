@@ -10,6 +10,30 @@ use Illuminate\Support\Carbon;
 
 class McpResourceHandler
 {
+    /**
+     * Callable for URL validation.
+     * Defaults to UrlValidator::validate when not overridden.
+     */
+    protected $validator;
+
+    /**
+     * Set a custom URL validator (useful for testing).
+     */
+    public function setValidator(callable $validator): self
+    {
+        $this->validator = $validator;
+        return $this;
+    }
+
+    /**
+     * Validate a URL using the configured validator.
+     */
+    protected function validateUrl(string $url): array
+    {
+        $validator = $this->validator ?? [UrlValidator::class, 'validate'];
+        return $validator($url);
+    }
+
     public function listResources(string $userId, ?string $cursor = null): array
     {
         $offset = 0;
@@ -212,7 +236,7 @@ class McpResourceHandler
             ];
         }
 
-        $validation = UrlValidator::validate($url);
+        $validation = $this->validateUrl($url);
         if (!$validation['valid']) {
             return [
                 'error' => [
