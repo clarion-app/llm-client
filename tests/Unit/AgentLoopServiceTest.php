@@ -21,6 +21,8 @@ class AgentLoopServiceTest extends TestCase
 
     protected function tearDown(): void
     {
+        restore_error_handler();
+        restore_exception_handler();
         Mockery::close();
         parent::tearDown();
     }
@@ -58,7 +60,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
         $this->assertCount(1, $tools);
@@ -108,7 +110,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
         $this->assertCount(2, $tools);
@@ -170,7 +172,7 @@ class AgentLoopServiceTest extends TestCase
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $messages = $service->buildMessagesPayload($conversation);
 
         // user message
@@ -211,7 +213,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $service->start($conversation);
 
         $conversation->refresh();
@@ -229,7 +231,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         // The max iterations config should be accessible
         $this->assertEquals(20, config('llm-client.agent_loop.max_iterations'));
@@ -288,7 +290,7 @@ class AgentLoopServiceTest extends TestCase
                 'isError' => false,
             ]);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $service->resume($conversation, $message, true);
 
         Queue::assertPushed(SendHttpStreamRequest::class);
@@ -339,7 +341,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $service->resume($conversation, $message, false);
 
         Queue::assertPushed(SendHttpStreamRequest::class);
@@ -386,7 +388,7 @@ class AgentLoopServiceTest extends TestCase
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $this->expectException(\RuntimeException::class);
         $service->resume($conversation, $message, true);
@@ -407,7 +409,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         // Simulate what MessageController::store() does
         Message::create([
@@ -534,7 +536,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'create a contact']);
         $decoded = json_decode($result, true);
@@ -567,7 +569,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $this->invokeHandleSearchOperations($service, ['query' => $longQuery]);
         // If we get here without exception, truncation worked
@@ -579,7 +581,7 @@ class AgentLoopServiceTest extends TestCase
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, []);
         $decoded = json_decode($result, true);
@@ -617,7 +619,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'list contacts']);
         $decoded = json_decode($result, true);
@@ -648,7 +650,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'broken']);
         $decoded = json_decode($result, true);
@@ -683,7 +685,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'test']);
         $decoded = json_decode($result, true);
@@ -712,7 +714,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'xyz_nonexistent']);
         $decoded = json_decode($result, true);
@@ -743,7 +745,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'test']);
         $decoded = json_decode($result, true);
@@ -764,7 +766,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'test']);
         $decoded = json_decode($result, true);
@@ -800,7 +802,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'get contact']);
         $decoded = json_decode($result, true);
@@ -841,7 +843,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'list contacts']);
         $decoded = json_decode($result, true);
@@ -881,7 +883,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'create contact']);
         $decoded = json_decode($result, true);
@@ -920,7 +922,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'update contact']);
         $decoded = json_decode($result, true);
@@ -957,7 +959,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'adjust lighting']);
         $decoded = json_decode($result, true);
@@ -1006,7 +1008,7 @@ class AgentLoopServiceTest extends TestCase
 
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
 
         $result = $this->invokeHandleSearchOperations($service, ['query' => 'wizlights']);
         $decoded = json_decode($result, true);
@@ -1275,7 +1277,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
         // Find execute_operation meta-tool
@@ -1306,7 +1308,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, Mockery::mock(ClarionApp\LlmClient\Services\OperationCache::class));
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
         $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');

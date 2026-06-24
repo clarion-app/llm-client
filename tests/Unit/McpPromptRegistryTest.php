@@ -11,6 +11,8 @@ class McpPromptRegistryTest extends TestCase
 {
     protected function tearDown(): void
     {
+        restore_error_handler();
+        restore_exception_handler();
         Mockery::close();
         parent::tearDown();
     }
@@ -156,14 +158,15 @@ class McpPromptRegistryTest extends TestCase
             $descriptions[$pkg] = ['description' => "Description for {$pkg}"];
         }
 
-        $mock = Mockery::mock('alias:' . ClarionPackageServiceProvider::class);
-        $mock->shouldReceive('getPackageDescriptions')
-            ->andReturn($descriptions);
+        // Directly manipulate static properties instead of mocking the abstract class
+        $reflection = new \ReflectionClass(ClarionPackageServiceProvider::class);
 
-        foreach ($packagePrompts as $pkg => $prompts) {
-            $mock->shouldReceive('getCustomPrompts')
-                ->with($pkg)
-                ->andReturn($prompts);
-        }
+        $descProp = $reflection->getProperty('packageDescriptions');
+        $descProp->setAccessible(true);
+        $descProp->setValue(null, $descriptions);
+
+        $promptsProp = $reflection->getProperty('customPrompts');
+        $promptsProp->setAccessible(true);
+        $promptsProp->setValue(null, $packagePrompts);
     }
 }

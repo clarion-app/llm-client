@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Services\McpProtocolHandler;
 use ClarionApp\LlmClient\Services\McpPromptRegistry;
 use ClarionApp\LlmClient\Services\McpResourceHandler;
 use ClarionApp\LlmClient\Services\McpSessionManager;
+use ClarionApp\LlmClient\Models\McpSession;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use Mockery;
@@ -16,7 +17,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
     private McpProtocolHandler $handler;
     private string $userId;
     private string $sessionId;
-    private $mockSession;
+    private McpSession $mockSession;
 
     protected function setUp(): void
     {
@@ -24,11 +25,10 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
         $this->userId = (string) Str::uuid();
         $this->sessionId = (string) Str::uuid();
 
-        // Mock session object
-        $this->mockSession = (object) [
-            'id' => $this->sessionId,
-            'user_id' => $this->userId,
-        ];
+        // Create a real (but unsaved) McpSession model for proper type checking
+        $this->mockSession = new McpSession();
+        $this->mockSession->id = $this->sessionId;
+        $this->mockSession->user_id = $this->userId;
 
         // Mock session manager to avoid database access
         $mockSessionManager = Mockery::mock(McpSessionManager::class);
@@ -44,6 +44,8 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
 
     protected function tearDown(): void
     {
+        restore_error_handler();
+        restore_exception_handler();
         Mockery::close();
         parent::tearDown();
     }

@@ -14,6 +14,8 @@ class McpResourceHandlerTest extends TestCase
 {
     protected function tearDown(): void
     {
+        restore_error_handler();
+        restore_exception_handler();
         Mockery::close();
         parent::tearDown();
     }
