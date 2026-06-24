@@ -18,7 +18,8 @@
     "autoload": {
         "psr-4": {
             "ClarionApp\\LlmClient\\": "src/",
-            "ClarionApp\\LlmClient\\Database\\Factories\\": "database/factories/"
+            "ClarionApp\\LlmClient\\Database\\Factories\\": "database/factories/",
+            "Database\\Factories\\": "database/factories/"
         }
     },
     "require-dev": {

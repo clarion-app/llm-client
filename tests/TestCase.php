@@ -4,6 +4,8 @@ namespace Tests;
 
 use Orchestra\Testbench\TestCase as BaseTestCase;
 use ClarionApp\LlmClient\LlmClientServiceProvider;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Database\Schema\Blueprint;
 
 abstract class TestCase extends BaseTestCase
 {
@@ -22,6 +24,21 @@ abstract class TestCase extends BaseTestCase
             'database' => ':memory:',
             'prefix'   => '',
         ]);
+
+        // Disable EloquentMultiChainBridge in tests to avoid dependencies
+        // on the multichain service, data_stream_registries table, etc.
+        $app['config']->set('eloquent-multichain-bridge.disabled', true);
+
+        // Configure auth for tests (api guard with token driver).
+        $app['config']->set('auth.defaults.guard', 'api');
+        $app['config']->set('auth.guards.api', [
+            'driver'   => 'token',
+            'provider' => 'users',
+        ]);
+        $app['config']->set('auth.providers.users', [
+            'driver' => 'eloquent',
+            'model'  => \ClarionApp\Backend\Models\User::class,
+        ]);
     }
 
     /**
@@ -34,5 +51,39 @@ abstract class TestCase extends BaseTestCase
         if (!class_exists('App\Http\Controllers\Controller')) {
             eval('namespace App\Http\Controllers { class Controller { } }');
         }
+
+        // Stub the multichain service.
+        // The User model uses EloquentMultiChainBridge which depends on this.
+        // In tests we don't need actual multichain — a no-op stub is sufficient.
+        $app->singleton('multichain', function () {
+            $stub = new class {
+                public function __call($method, $arguments) { return null; }
+                public function publish($stream, $key, $value) { return 'stub-txid'; }
+                public function liststreams($stream) { throw new \Exception('not found'); }
+                public function create($type, $name, $private) { return null; }
+                public function subscribe($stream) { return null; }
+            };
+            return $stub;
+        });
+    }
+
+    /**
+     * Define hooks for deploying the database.
+     */
+    protected function defineDatabaseMigrations(): void
+    {
+        // Create the users table (required by tests that use User::factory()).
+        // This mirrors the backend migration without pulling in the full
+        // ClarionBackendServiceProvider and all its dependencies.
+        Schema::create('users', function (Blueprint $table) {
+            $table->uuid('id')->primary();
+            $table->string('name');
+            $table->string('email')->unique();
+            $table->timestamp('email_verified_at')->nullable();
+            $table->string('password');
+            $table->rememberToken();
+            $table->timestamps();
+            $table->softDeletes();
+        });
     }
 }
