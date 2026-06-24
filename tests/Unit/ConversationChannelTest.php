@@ -9,6 +9,8 @@ use ClarionApp\LlmClient\Models\LanguageModel;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ConversationChannelTest extends TestCase
 {
     use RefreshDatabase;
@@ -31,7 +33,9 @@ class ConversationChannelTest extends TestCase
         ], $overrides));
     }
 
-    /** @test T004 — channel accessor returns 'web' for null */
+    // T004 — channel accessor returns 'web' for null
+
+    #[Test]
     public function channel_accessor_returns_web_for_null()
     {
         $conversation = $this->createConversation();
@@ -39,14 +43,18 @@ class ConversationChannelTest extends TestCase
         $this->assertEquals('web', $conversation->channel);
     }
 
-    /** @test T004 — stores explicit channel value */
+    // T004 — stores explicit channel value
+
+    #[Test]
     public function stores_explicit_channel_value()
     {
         $conversation = $this->createConversation(['channel' => 'telegram']);
         $this->assertEquals('telegram', $conversation->channel);
     }
 
-    /** @test T004 — validates channel format allows valid values */
+    // T004 — validates channel format allows valid values
+
+    #[Test]
     public function validates_channel_format_allows_valid_values()
     {
         $validChannels = ['web', 'telegram', 'discord', 'whats-app', 'custom_channel', 'my-channel-123'];
@@ -57,14 +65,18 @@ class ConversationChannelTest extends TestCase
         }
     }
 
-    /** @test T004 — channel is in fillable */
+    // T004 — channel is in fillable
+
+    #[Test]
     public function channel_is_in_fillable()
     {
         $conversation = new Conversation();
         $this->assertContains('channel', $conversation->getFillable());
     }
 
-    /** @test T004 — channel max length is 50 characters */
+    // T004 — channel max length is 50 characters
+
+    #[Test]
     public function channel_max_length_is_50_characters()
     {
         $conversation = $this->createConversation(['channel' => str_repeat('a', 50)]);

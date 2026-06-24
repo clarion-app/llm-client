@@ -13,6 +13,8 @@ use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class AgentControllerTest extends TestCase
 {
     use RefreshDatabase;
@@ -47,7 +49,9 @@ class AgentControllerTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test T005 — auth:api rejects unauthenticated requests */
+    // T005 — auth:api rejects unauthenticated requests
+
+    #[Test]
     public function agent_endpoint_rejects_unauthenticated_requests()
     {
         $response = $this->postJson('/api/clarion-app/llm-client/agent', [
@@ -57,7 +61,9 @@ class AgentControllerTest extends TestCase
         $response->assertStatus(401);
     }
 
-    /** @test T005 — valid request returns 200 with response */
+    // T005 — valid request returns 200 with response
+
+    #[Test]
     public function agent_endpoint_returns_200_with_response()
     {
         $mockService = Mockery::mock(AgentLoopService::class);
@@ -79,7 +85,9 @@ class AgentControllerTest extends TestCase
             ->assertJsonStructure(['conversation_id', 'message_id', 'content', 'status']);
     }
 
-    /** @test T005 — conversation lookup by user+channel+inactivity threshold */
+    // T005 — conversation lookup by user+channel+inactivity threshold
+
+    #[Test]
     public function agent_endpoint_reuses_recent_conversation_by_channel()
     {
         $conversation = Conversation::create([
@@ -115,7 +123,9 @@ class AgentControllerTest extends TestCase
             ->assertJson(['conversation_id' => $conversation->id]);
     }
 
-    /** @test T005 — confirmation_required returns 202 */
+    // T005 — confirmation_required returns 202
+
+    #[Test]
     public function agent_endpoint_returns_202_for_confirmation_required()
     {
         $mockService = Mockery::mock(AgentLoopService::class);
@@ -145,7 +155,9 @@ class AgentControllerTest extends TestCase
             ->assertJsonStructure(['confirmation']);
     }
 
-    /** @test T005 — error code for missing server */
+    // T005 — error code for missing server
+
+    #[Test]
     public function agent_endpoint_returns_422_when_no_server_configured()
     {
         $userNoServer = User::factory()->create();
@@ -159,7 +171,9 @@ class AgentControllerTest extends TestCase
             ->assertJson(['code' => 'no_server']);
     }
 
-    /** @test T005 — error code for processing conflict */
+    // T005 — error code for processing conflict
+
+    #[Test]
     public function agent_endpoint_returns_409_when_conversation_is_processing()
     {
         $conversation = Conversation::create([

@@ -9,6 +9,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpSessionManagerTest extends TestCase
 {
     use RefreshDatabase;
@@ -23,7 +25,7 @@ class McpSessionManagerTest extends TestCase
         $this->userId = (string) Str::uuid();
     }
 
-    /** @test */
+    #[Test]
     public function creates_session_with_valid_params()
     {
         $session = $this->manager->createSession(
@@ -43,7 +45,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertNotNull($session->id);
     }
 
-    /** @test */
+    #[Test]
     public function creates_session_with_nullable_fields()
     {
         $session = $this->manager->createSession(
@@ -56,7 +58,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertNull($session->capabilities);
     }
 
-    /** @test */
+    #[Test]
     public function validates_existing_session_for_correct_user()
     {
         $session = $this->manager->createSession($this->userId, '2025-03-26');
@@ -67,7 +69,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertEquals($session->id, $validated->id);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_session_for_wrong_user()
     {
         $session = $this->manager->createSession($this->userId, '2025-03-26');
@@ -78,7 +80,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertNull($validated);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_nonexistent_session()
     {
         $validated = $this->manager->validateSession((string) Str::uuid(), $this->userId);
@@ -86,7 +88,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertNull($validated);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_soft_deleted_session()
     {
         $session = $this->manager->createSession($this->userId, '2025-03-26');
@@ -97,7 +99,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertNull($validated);
     }
 
-    /** @test */
+    #[Test]
     public function terminates_session_via_soft_delete()
     {
         $session = $this->manager->createSession($this->userId, '2025-03-26');
@@ -108,7 +110,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertSoftDeleted('mcp_sessions', ['id' => $session->id]);
     }
 
-    /** @test */
+    #[Test]
     public function terminate_returns_false_for_wrong_user()
     {
         $session = $this->manager->createSession($this->userId, '2025-03-26');
@@ -119,7 +121,7 @@ class McpSessionManagerTest extends TestCase
         $this->assertFalse($result);
     }
 
-    /** @test */
+    #[Test]
     public function touch_session_updates_updated_at()
     {
         $session = $this->manager->createSession($this->userId, '2025-03-26');

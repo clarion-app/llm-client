@@ -11,6 +11,8 @@ use Illuminate\Support\Str;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpResourceHandlerTest extends TestCase
 {
     use RefreshDatabase;
@@ -25,7 +27,7 @@ class McpResourceHandlerTest extends TestCase
 
     // --- US3 Tests: Conversation Resources ---
 
-    /** @test */
+    #[Test]
     public function listResources_returns_users_conversations_as_mcp_resource_entries_with_conversation_uri()
     {
         $conversation = Conversation::factory()->create([
@@ -50,7 +52,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertArrayHasKey('nextCursor', $result);
     }
 
-    /** @test */
+    #[Test]
     public function listResources_returns_paginated_results_using_base64_cursor()
     {
         $userId = 'test-user-id';
@@ -75,7 +77,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertArrayHasKey('offset', $decoded);
     }
 
-    /** @test */
+    #[Test]
     public function listResources_only_returns_conversations_owned_by_authenticated_user()
     {
         $userId = 'test-user-id';
@@ -86,7 +88,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertEmpty($result['resources']);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_with_conversation_uri_returns_message_history_as_json_with_metadata()
     {
         $userId = 'test-user-id';
@@ -123,7 +125,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertCount(2, $data['messages']);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_paginates_messages_at_100_per_page_with_cursor()
     {
         $userId = 'test-user-id';
@@ -144,7 +146,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertNotNull($data['pagination']['nextCursor']);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_returns_32002_error_for_conversation_owned_by_different_user()
     {
         $userId = 'test-user-id';
@@ -161,7 +163,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertEquals(-32002, $result['error']['code']);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_returns_32002_error_for_nonexistent_conversation_uuid()
     {
         $userId = 'test-user-id';
@@ -177,7 +179,7 @@ class McpResourceHandlerTest extends TestCase
 
     // --- US4 Tests: Page Resources ---
 
-    /** @test */
+    #[Test]
     public function listResourceTemplates_returns_page_resource_template_with_page_uri_template()
     {
         $handler = new McpResourceHandler();
@@ -191,7 +193,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertArrayHasKey('nextCursor', $result);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_with_page_uri_validates_url_and_returns_extracted_text()
     {
         $uri = 'page://https://example.com/article';
@@ -213,7 +215,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertEquals('Extracted page text content', $result['contents'][0]['text']);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_with_page_uri_rejects_private_reserved_ips_with_32602_error()
     {
         $uri = 'page://http://192.168.1.1/admin';
@@ -229,7 +231,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertStringContainsString('URL validation failed', $result['error']['message']);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_returns_32002_error_for_unsupported_uri_scheme()
     {
         $uri = 'unknown://something';
@@ -242,7 +244,7 @@ class McpResourceHandlerTest extends TestCase
         $this->assertStringContainsString('Unsupported resource URI scheme', $result['error']['message']);
     }
 
-    /** @test */
+    #[Test]
     public function readResource_with_page_uri_returns_32603_error_when_chrome_driver_unavailable()
     {
         $uri = 'page://https://example.com/article';

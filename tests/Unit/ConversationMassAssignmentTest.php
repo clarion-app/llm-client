@@ -9,11 +9,15 @@ use ClarionApp\LlmClient\Models\LanguageModel;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ConversationMassAssignmentTest extends TestCase
 {
     use RefreshDatabase;
 
-    /** @test T033 — update with extra user_id field does not change owner */
+    // T033 — update with extra user_id field does not change owner
+
+    #[Test]
     public function update_with_extra_user_id_does_not_change_owner()
     {
         $owner = User::factory()->create();

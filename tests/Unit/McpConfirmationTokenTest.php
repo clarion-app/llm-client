@@ -9,6 +9,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpConfirmationTokenTest extends TestCase
 {
     use RefreshDatabase;
@@ -24,7 +26,7 @@ class McpConfirmationTokenTest extends TestCase
         ]);
     }
 
-    /** @test */
+    #[Test]
     public function is_valid_returns_true_for_unused_unexpired_token()
     {
         $token = McpConfirmationToken::create([
@@ -42,7 +44,7 @@ class McpConfirmationTokenTest extends TestCase
         ));
     }
 
-    /** @test */
+    #[Test]
     public function is_valid_returns_false_when_used_at_is_set()
     {
         $token = McpConfirmationToken::create([
@@ -61,7 +63,7 @@ class McpConfirmationTokenTest extends TestCase
         ));
     }
 
-    /** @test */
+    #[Test]
     public function is_valid_returns_false_when_expired()
     {
         $token = McpConfirmationToken::create([
@@ -79,7 +81,7 @@ class McpConfirmationTokenTest extends TestCase
         ));
     }
 
-    /** @test */
+    #[Test]
     public function is_valid_returns_false_for_wrong_session_id()
     {
         $token = McpConfirmationToken::create([
@@ -97,7 +99,7 @@ class McpConfirmationTokenTest extends TestCase
         ));
     }
 
-    /** @test */
+    #[Test]
     public function consume_sets_used_at()
     {
         $token = McpConfirmationToken::create([

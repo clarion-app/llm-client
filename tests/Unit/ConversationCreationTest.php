@@ -10,11 +10,15 @@ use ClarionApp\LlmClient\Models\UserSetting;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class ConversationCreationTest extends TestCase
 {
     use RefreshDatabase;
 
-    /** @test T028 — conversation creation uses Auth::id() not User::first()->id */
+    // T028 — conversation creation uses Auth::id() not User::first()->id
+
+    #[Test]
     public function store_creates_conversation_for_authenticated_user()
     {
         $userA = User::factory()->create();
@@ -45,7 +49,9 @@ class ConversationCreationTest extends TestCase
         $this->assertNotEquals($userA->id, $conversation->user_id);
     }
 
-    /** @test T029 — conversation uses UserSetting defaults when server_id/model not provided */
+    // T029 — conversation uses UserSetting defaults when server_id/model not provided
+
+    #[Test]
     public function store_uses_user_setting_defaults()
     {
         $user = User::factory()->create();

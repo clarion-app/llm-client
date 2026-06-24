@@ -8,11 +8,15 @@ use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class MessageValidationTest extends TestCase
 {
     use RefreshDatabase;
 
-    /** @test T041 — message with invalid role is rejected */
+    // T041 — message with invalid role is rejected
+
+    #[Test]
     public function rejects_invalid_role()
     {
         $user = User::factory()->create();
@@ -43,7 +47,9 @@ class MessageValidationTest extends TestCase
         $response->assertStatus(422);
     }
 
-    /** @test T041 — valid roles are accepted */
+    // T041 — valid roles are accepted
+
+    #[Test]
     public function accepts_valid_roles()
     {
         $user = User::factory()->create();

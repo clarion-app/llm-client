@@ -15,7 +15,7 @@ use Illuminate\Support\Facades\Log;
 
 class AgentLoopStreamHandler extends HandleHttpStreamResponse
 {
-    public string $buffer = "\n\n";
+    public string $buffer = "";
     public string $reply = "";
     public ?Message $message = null;
     public array $toolCalls = [];
@@ -33,14 +33,19 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         // Log raw chunks for debugging
         // Log::debug('AgentLoopStreamHandler: raw chunk', ['content' => $content]);
 
-        $check = explode("\n\ndata: ", $this->buffer);
+        // Split on "\n\n" delimiters — complete SSE messages are terminated by blank lines
+        $parts = explode("\n\n", $this->buffer);
+        $this->buffer = array_pop($parts); // Keep last (possibly incomplete) part in buffer
 
-        while (count($check) > 1) {
-            $chunk = array_shift($check);
-            $this->buffer = implode("\n\ndata: ", $check);
-
+        foreach ($parts as $chunk) {
             $chunk = trim($chunk);
+            if ($chunk === '') continue;
             if ($chunk === '[DONE]') continue;
+
+            // Strip "data: " prefix if present
+            if (str_starts_with($chunk, 'data: ')) {
+                $chunk = substr($chunk, 6);
+            }
 
             $json = json_decode($chunk, true);
             if ($json === null) continue;

@@ -74,8 +74,9 @@ class MessageController extends Controller
             'conversation_id' => 'required|exists:conversations,id'
         ]);
 
-        $conversation = Conversation::find($message->conversation_id);
-        if($conversation->user_id != Auth::id())
+        $conversationId = $validatedData['conversation_id'];
+        $conversation = Conversation::find($conversationId);
+        if (!$conversation || $conversation->user_id != Auth::id())
         {
             return response()->json([], 403);
         }

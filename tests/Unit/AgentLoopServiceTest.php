@@ -17,6 +17,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class AgentLoopServiceTest extends TestCase
 {
     use RefreshDatabase;
@@ -29,7 +31,7 @@ class AgentLoopServiceTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function build_tools_payload_converts_mcp_tools_to_openai_format()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -56,7 +58,7 @@ class AgentLoopServiceTest extends TestCase
         }
     }
 
-    /** @test */
+    #[Test]
     public function build_tools_payload_returns_three_meta_tools()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -86,7 +88,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertContains('query', $searchOps['function']['parameters']['required']);
     }
 
-    /** @test */
+    #[Test]
     public function build_messages_payload_reconstructs_tool_data_into_openai_format()
     {
         // Set system_prompt to empty so no system message is prepended
@@ -164,7 +166,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('Contact Jane has been created.', $messages[3]['content']);
     }
 
-    /** @test */
+    #[Test]
     public function start_sets_is_processing_and_dispatches_stream_request()
     {
         Queue::fake();
@@ -194,7 +196,7 @@ class AgentLoopServiceTest extends TestCase
         Queue::assertPushed(SendHttpStreamRequest::class);
     }
 
-    /** @test */
+    #[Test]
     public function start_enforces_max_iteration_limit()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -206,7 +208,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals(20, config('llm-client.agent_loop.max_iterations'));
     }
 
-    /** @test */
+    #[Test]
     public function resume_dispatches_next_iteration_on_approval()
     {
         Queue::fake();
@@ -270,7 +272,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertNull($message->tool_data['pending_confirmation']);
     }
 
-    /** @test */
+    #[Test]
     public function resume_constructs_cancellation_result_on_denial()
     {
         Queue::fake();
@@ -322,7 +324,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertStringContainsString('cancelled', $message->tool_data['tool_results'][0]['content']);
     }
 
-    /** @test */
+    #[Test]
     public function resume_rejects_expired_confirmations()
     {
         $conversation = Conversation::factory()->create(['is_processing' => true]);
@@ -367,7 +369,7 @@ class AgentLoopServiceTest extends TestCase
 
     // === US1 Tests (T038) ===
 
-    /** @test */
+    #[Test]
     public function message_store_dispatches_agent_loop_start()
     {
         Queue::fake();
@@ -396,7 +398,7 @@ class AgentLoopServiceTest extends TestCase
         Queue::assertPushed(SendHttpStreamRequest::class);
     }
 
-    /** @test */
+    #[Test]
     public function message_store_skips_dispatch_when_is_processing()
     {
         Queue::fake();
@@ -419,7 +421,7 @@ class AgentLoopServiceTest extends TestCase
         // No dispatch should happen — verified by the controller logic
     }
 
-    /** @test */
+    #[Test]
     public function unprocessed_message_detected_after_loop_completion()
     {
         $conversation = Conversation::factory()->create(['is_processing' => false]);
@@ -499,7 +501,9 @@ class AgentLoopServiceTest extends TestCase
         return $method->invoke($service, $arguments);
     }
 
-    /** @test T006 */
+    // T006
+
+    #[Test]
     public function search_operations_returns_results_with_correct_wrapper_format()
     {
         // Mock OperationsSearchService via app() binding
@@ -538,7 +542,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertArrayHasKey('paramSchema', $decoded['results'][0]);
     }
 
-    /** @test T007 */
+    // T007
+
+    #[Test]
     public function search_operations_truncates_long_query()
     {
         $longQuery = str_repeat('a', 600);
@@ -563,7 +569,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertTrue(true);
     }
 
-    /** @test T008 */
+    // T008
+
+    #[Test]
     public function search_operations_returns_error_for_missing_query()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -577,7 +585,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('query parameter is required', $decoded['error']);
     }
 
-    /** @test T009 */
+    // T009
+
+    #[Test]
     public function search_operations_handles_null_param_schema()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -615,7 +625,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertNull($decoded['results'][0]['paramSchema']);
     }
 
-    /** @test T010 */
+    // T010
+
+    #[Test]
     public function search_operations_handles_malformed_param_schema()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -647,7 +659,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertNull($decoded['results'][0]['paramSchema']);
     }
 
-    /** @test T011 - limit is enforced by OperationsSearchService::search() with default $limit=10 */
+    // T011 - limit is enforced by OperationsSearchService::search() with default $limit=10
+
+    #[Test]
     public function search_operations_passes_default_limit_of_10()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -681,7 +695,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertCount(8, $decoded['results']);
     }
 
-    /** @test T013 */
+    // T013
+
+    #[Test]
     public function search_operations_returns_zero_match_hint_when_table_has_data_but_no_matches()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -711,7 +727,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEmpty($decoded['results']);
     }
 
-    /** @test T014 */
+    // T014
+
+    #[Test]
     public function search_operations_returns_empty_index_hint_when_table_has_zero_rows()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -741,7 +759,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEmpty($decoded['results']);
     }
 
-    /** @test T015 */
+    // T015
+
+    #[Test]
     public function search_operations_returns_missing_table_hint_when_table_does_not_exist()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -762,7 +782,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEmpty($decoded['results']);
     }
 
-    /** @test T017 */
+    // T017
+
+    #[Test]
     public function search_operations_preserves_paramSchema_path_section()
     {
         $paramSchema = [
@@ -800,7 +822,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('integer', $schema['path'][0]['type']);
     }
 
-    /** @test T018 */
+    // T018
+
+    #[Test]
     public function search_operations_preserves_paramSchema_query_section()
     {
         $paramSchema = [
@@ -840,7 +864,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('page', $schema['query'][0]['name']);
     }
 
-    /** @test T019 */
+    // T019
+
+    #[Test]
     public function search_operations_preserves_paramSchema_body_section()
     {
         $paramSchema = [
@@ -880,7 +906,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('name', $schema['body'][0]['name']);
     }
 
-    /** @test T020 */
+    // T020
+
+    #[Test]
     public function search_operations_preserves_full_paramSchema_structure_with_all_sections()
     {
         $paramSchema = [
@@ -923,7 +951,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('name', $schema['body'][0]['name']);
     }
 
-    /** @test - Custom prompt result format */
+    // - Custom prompt result format
+
+    #[Test]
     public function search_operations_returns_prompt_result_format()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -964,7 +994,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertArrayNotHasKey('paramSchema', $r);
     }
 
-    /** @test - Mixed operation + prompt results */
+    // - Mixed operation + prompt results
+
+    #[Test]
     public function search_returns_mixed_operation_and_prompt_results()
     {
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
@@ -1038,7 +1070,7 @@ class AgentLoopServiceTest extends TestCase
         return new AgentLoopService($registryMock, $executorMock, $cache);
     }
 
-    /** @test */
+    #[Test]
     public function build_known_operations_section_generates_bullet_list_format()
     {
         $conversation = Conversation::factory()->create();
@@ -1073,7 +1105,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertStringContainsString("- Parameters: none", $section);
     }
 
-    /** @test */
+    #[Test]
     public function build_known_operations_section_handles_null_paramschema()
     {
         $conversation = Conversation::factory()->create();
@@ -1095,7 +1127,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertStringContainsString("- Parameters: none", $section);
     }
 
-    /** @test */
+    #[Test]
     public function build_known_operations_section_returns_null_for_empty_cache()
     {
         $conversation = Conversation::factory()->create();
@@ -1110,7 +1142,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertNull($section);
     }
 
-    /** @test */
+    #[Test]
     public function build_messages_payload_includes_known_operations_section()
     {
         $conversation = Conversation::factory()->create();
@@ -1149,7 +1181,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertStringNotContainsString('Recently Used Operations', $messages[0]['content']);
     }
 
-    /** @test */
+    #[Test]
     public function build_messages_payload_skips_known_operations_when_cache_empty()
     {
         $conversation = Conversation::factory()->create();
@@ -1171,7 +1203,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertStringNotContainsString('Known Operations', $systemMsg['content']);
     }
 
-    /** @test */
+    #[Test]
     public function build_known_operations_section_has_clear_delimiter()
     {
         $conversation = Conversation::factory()->create();
@@ -1194,7 +1226,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertMatchesRegularExpression('/\n+## Known Operations\n/', $section);
     }
 
-    /** @test */
+    #[Test]
     public function build_messages_payload_with_empty_base_prompt_and_cache_entries()
     {
         config(['llm-client.agent_loop.system_prompt' => '']);
@@ -1246,7 +1278,9 @@ class AgentLoopServiceTest extends TestCase
         return $method->invoke($service, $conversation);
     }
 
-    /** @test T014 */
+    // T014
+
+    #[Test]
     public function execute_operation_meta_tool_has_structured_parameters_schema()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -1270,7 +1304,9 @@ class AgentLoopServiceTest extends TestCase
         $this->assertTrue($paramsProps['body']['additionalProperties']);
     }
 
-    /** @test T015 */
+    // T015
+
+    #[Test]
     public function execute_operation_description_mentions_structured_format()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);

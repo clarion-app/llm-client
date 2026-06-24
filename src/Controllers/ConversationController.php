@@ -103,13 +103,13 @@ class ConversationController extends Controller
         $validatedData['model'] = $modelName;
 
         $conversation = Conversation::create($validatedData);
-        
+
         Message::create([
-            'conversation_id'=>$conversation->id,
-            'role'=>"Assistant",
-            'user'=>"Clarion",
-            'content'=>"How can I help you today?",
-            'responseTime'=>0
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => 'How can I help you today?',
+            'responseTime' => 0
         ]);
 
         return response()->json($conversation, 201);

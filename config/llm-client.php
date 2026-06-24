@@ -9,7 +9,7 @@ return [
     ],
 
     // HTTP methods that require user confirmation before execution
-    'confirm_methods' => ['DELETE'],
+    'confirm_methods' => ['PUT', 'PATCH', 'DELETE'],
 
     'ssrf' => [
         'max_redirects' => 5,

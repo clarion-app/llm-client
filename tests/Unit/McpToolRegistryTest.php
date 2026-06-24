@@ -8,6 +8,8 @@ use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpToolRegistryTest extends TestCase
 {
     protected function tearDown(): void
@@ -16,7 +18,7 @@ class McpToolRegistryTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function converts_single_openapi_operation_to_mcp_tool()
     {
         $this->mockApiManager([
@@ -55,7 +57,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertArrayHasKey('page', $tool['inputSchema']['properties']['query']['properties']);
     }
 
-    /** @test */
+    #[Test]
     public function namespaces_tool_names_as_package_dot_operation()
     {
         $this->mockApiManager([
@@ -79,7 +81,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertEquals('contacts_store', $result['tools'][0]['name']);
     }
 
-    /** @test */
+    #[Test]
     public function generates_structured_input_schema_with_sub_objects()
     {
         $this->mockApiManager([
@@ -133,7 +135,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertContains('body', $schema['required'] ?? []);
     }
 
-    /** @test */
+    #[Test]
     public function handles_empty_operations()
     {
         $this->mockApiManager([
@@ -147,7 +149,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertNull($result['nextCursor']);
     }
 
-    /** @test */
+    #[Test]
     public function handles_malformed_openapi_gracefully()
     {
         $this->mockApiManager([
@@ -165,7 +167,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertIsArray($result['tools']);
     }
 
-    /** @test */
+    #[Test]
     public function implements_cursor_pagination_with_default_page_size()
     {
         $operations = [];
@@ -198,7 +200,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertNull($result2['nextCursor']);
     }
 
-    /** @test */
+    #[Test]
     public function next_cursor_absent_when_all_tools_fit_in_page()
     {
         $this->mockApiManager([
@@ -222,7 +224,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertNull($result['nextCursor']);
     }
 
-    /** @test */
+    #[Test]
     public function package_filter_scopes_to_single_package()
     {
         $this->mockApiManager([
@@ -258,7 +260,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertEquals('contacts_listContacts', $result['tools'][0]['name']);
     }
 
-    /** @test */
+    #[Test]
     public function get_tool_has_readonly_annotations_for_get()
     {
         $this->mockApiManager([
@@ -286,7 +288,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertFalse($annotations['openWorldHint']);
     }
 
-    /** @test */
+    #[Test]
     public function post_tool_has_correct_annotations()
     {
         $this->mockApiManager([
@@ -314,7 +316,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertFalse($annotations['openWorldHint']);
     }
 
-    /** @test */
+    #[Test]
     public function put_tool_has_idempotent_annotation()
     {
         $this->mockApiManager([
@@ -341,7 +343,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertTrue($annotations['idempotentHint']);
     }
 
-    /** @test */
+    #[Test]
     public function patch_tool_has_no_idempotent_annotation()
     {
         $this->mockApiManager([
@@ -368,7 +370,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertFalse($annotations['idempotentHint']);
     }
 
-    /** @test */
+    #[Test]
     public function delete_tool_has_destructive_and_idempotent_annotations()
     {
         $this->mockApiManager([
@@ -396,7 +398,7 @@ class McpToolRegistryTest extends TestCase
         $this->assertFalse($annotations['openWorldHint']);
     }
 
-    /** @test */
+    #[Test]
     public function all_tools_have_open_world_hint_false()
     {
         $this->mockApiManager([
@@ -425,7 +427,7 @@ class McpToolRegistryTest extends TestCase
         }
     }
 
-    /** @test */
+    #[Test]
     public function title_derived_from_openapi_summary()
     {
         $this->mockApiManager([

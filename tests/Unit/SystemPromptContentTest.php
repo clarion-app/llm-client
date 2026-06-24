@@ -4,6 +4,8 @@ namespace ClarionApp\LlmClient\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class SystemPromptContentTest extends TestCase
 {
     protected string $prompt;
@@ -16,38 +18,50 @@ class SystemPromptContentTest extends TestCase
         $this->prompt = $config['agent_loop']['system_prompt'] ?? '';
     }
 
-    /** @test FR-001 — prompt instructs search_operations for task requests */
+    // FR-001 — prompt instructs search_operations for task requests
+
+    #[Test]
     public function prompt_contains_search_operations_instruction()
     {
         $this->assertNotEmpty($this->prompt, 'System prompt must not be empty');
         $this->assertStringContainsString('search_operations', $this->prompt);
     }
 
-    /** @test FR-002 — prompt instructs execute_operation after search */
+    // FR-002 — prompt instructs execute_operation after search
+
+    #[Test]
     public function prompt_contains_execute_operation_instruction()
     {
         $this->assertStringContainsString('execute_operation', $this->prompt);
     }
 
-    /** @test FR-003 — prompt instructs list_applications for broad discovery */
+    // FR-003 — prompt instructs list_applications for broad discovery
+
+    #[Test]
     public function prompt_contains_list_applications_instruction()
     {
         $this->assertStringContainsString('list_applications', $this->prompt);
     }
 
-    /** @test FR-004 — prompt contains recovery instructions for empty search results */
+    // FR-004 — prompt contains recovery instructions for empty search results
+
+    #[Test]
     public function prompt_contains_empty_results_recovery()
     {
         $this->assertStringContainsString('no results', strtolower($this->prompt));
     }
 
-    /** @test FR-005 — prompt contains inline structured examples */
+    // FR-005 — prompt contains inline structured examples
+
+    #[Test]
     public function prompt_contains_inline_example()
     {
         $this->assertStringContainsString('Example', $this->prompt);
     }
 
-    /** @test FR-007 — prompt does NOT contain specific API endpoint paths */
+    // FR-007 — prompt does NOT contain specific API endpoint paths
+
+    #[Test]
     public function prompt_does_not_contain_api_endpoint_paths()
     {
         $this->assertDoesNotMatchRegularExpression(
@@ -57,7 +71,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test FR-008 — prompt contains silent on success instruction */
+    // FR-008 — prompt contains silent on success instruction
+
+    #[Test]
     public function prompt_contains_silent_on_success_instruction()
     {
         $this->assertTrue(
@@ -68,7 +84,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test FR-009 — prompt contains multi-operation sequential handling */
+    // FR-009 — prompt contains multi-operation sequential handling
+
+    #[Test]
     public function prompt_contains_multi_operation_instruction()
     {
         $this->assertTrue(
@@ -79,7 +97,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test FR-010 — prompt contains index unavailable recovery */
+    // FR-010 — prompt contains index unavailable recovery
+
+    #[Test]
     public function prompt_contains_index_unavailable_recovery()
     {
         $this->assertTrue(
@@ -89,7 +109,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test FR-011 — prompt contains poor match retry instruction */
+    // FR-011 — prompt contains poor match retry instruction
+
+    #[Test]
     public function prompt_contains_poor_match_retry()
     {
         $this->assertTrue(
@@ -104,7 +126,9 @@ class SystemPromptContentTest extends TestCase
     /* New tests added by feature 025-agent-prompt-tool-selection          */
     /* ------------------------------------------------------------------ */
 
-    /** @test T004 [US1] — prompt contains direct execution rule for known operations */
+    // T004 [US1] — prompt contains direct execution rule for known operations
+
+    #[Test]
     public function prompt_contains_direct_execution_rule()
     {
         $this->assertTrue(
@@ -114,7 +138,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test T005 [US1] — prompt contains concrete example of direct execute flow with real operationId */
+    // T005 [US1] — prompt contains concrete example of direct execute flow with real operationId
+
+    #[Test]
     public function prompt_contains_direct_execute_example()
     {
         $this->assertTrue(
@@ -125,7 +151,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test T008a [Edge Case] — prompt contains ambiguity handling rule */
+    // T008a [Edge Case] — prompt contains ambiguity handling rule
+
+    #[Test]
     public function prompt_contains_ambiguity_handling_rule()
     {
         $this->assertTrue(
@@ -135,7 +163,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test T009 [US2] — prompt contains fallback to search_operations for unknown operations */
+    // T009 [US2] — prompt contains fallback to search_operations for unknown operations
+
+    #[Test]
     public function prompt_contains_search_fallback_rule()
     {
         $this->assertTrue(
@@ -148,7 +178,9 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test T009a [US2] — prompt contains preference for known operations over search (FR-003 coverage) */
+    // T009a [US2] — prompt contains preference for known operations over search (FR-003 coverage)
+
+    #[Test]
     public function prompt_contains_prefer_known_operations()
     {
         $this->assertTrue(
@@ -159,25 +191,33 @@ class SystemPromptContentTest extends TestCase
         );
     }
 
-    /** @test T013 [US3] — prompt still contains list_applications (capability discovery preserved) */
+    // T013 [US3] — prompt still contains list_applications (capability discovery preserved)
+
+    #[Test]
     public function prompt_preserves_list_applications_rule()
     {
         $this->assertStringContainsString('list_applications', $this->prompt);
     }
 
-    /** @test T014 [US3] — prompt still contains Recovery Rules section */
+    // T014 [US3] — prompt still contains Recovery Rules section
+
+    #[Test]
     public function prompt_preserves_recovery_rules_section()
     {
         $this->assertStringContainsString('Recovery Rules', $this->prompt);
     }
 
-    /** @test T015 [US3] — prompt still contains Response Style section */
+    // T015 [US3] — prompt still contains Response Style section
+
+    #[Test]
     public function prompt_preserves_response_style_section()
     {
         $this->assertStringContainsString('Response Style', $this->prompt);
     }
 
-    /** @test T016 [US3] — prompt still contains search-then-execute example */
+    // T016 [US3] — prompt still contains search-then-execute example
+
+    #[Test]
     public function prompt_preserves_search_then_execute_example()
     {
         $this->assertTrue(

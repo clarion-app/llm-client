@@ -15,6 +15,8 @@ use Illuminate\Support\Str;
 use Carbon\Carbon;
 use Mockery;
 
+use PHPUnit\Framework\Attributes\Test;
+
 class McpToolExecutorTest extends TestCase
 {
     use RefreshDatabase;
@@ -40,7 +42,7 @@ class McpToolExecutorTest extends TestCase
         parent::tearDown();
     }
 
-    /** @test */
+    #[Test]
     public function extracts_path_params_into_url()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -69,7 +71,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertEquals('application/json', $result['content'][0]['mimeType']);
     }
 
-    /** @test */
+    #[Test]
     public function extracts_query_params_into_query_string()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -99,7 +101,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function extracts_body_params_into_request_body()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -132,7 +134,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function executes_safe_get_tool_and_returns_json_content()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -162,7 +164,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertStringContainsString('Alice', $result['content'][0]['text']);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_denylisted_tool_with_is_error()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -186,7 +188,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertStringContainsString('denylisted', $result['content'][0]['text']);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_path_traversal_with_is_error()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -210,7 +212,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertStringContainsString('traversal', $result['content'][0]['text']);
     }
 
-    /** @test */
+    #[Test]
     public function blocks_destructive_call_and_returns_confirmation_token()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -237,7 +239,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertEquals('contacts.destroy', $content['tool_name']);
     }
 
-    /** @test */
+    #[Test]
     public function validates_and_consumes_confirmation_token_on_resubmit()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -280,7 +282,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertNotNull($token->used_at);
     }
 
-    /** @test */
+    #[Test]
     public function rejects_expired_confirmation_token()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -317,7 +319,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertStringContainsString('expired', strtolower($result['content'][0]['text']));
     }
 
-    /** @test */
+    #[Test]
     public function rejects_token_with_wrong_arguments_hash()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -352,7 +354,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertStringContainsString('invalid', strtolower($result['content'][0]['text']));
     }
 
-    /** @test */
+    #[Test]
     public function rejects_token_from_different_session()
     {
         $otherSession = McpSession::create([
@@ -394,7 +396,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertStringContainsString('invalid', strtolower($result['content'][0]['text']));
     }
 
-    /** @test */
+    #[Test]
     public function wraps_backend_error_as_is_error()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -422,7 +424,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertStringContainsString('not found', strtolower($result['content'][0]['text']));
     }
 
-    /** @test */
+    #[Test]
     public function extracts_structured_path_params_into_url()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -453,7 +455,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function extracts_structured_query_params_into_query_string()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -483,7 +485,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function extracts_structured_body_params_into_request_body()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -516,7 +518,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function extracts_combined_all_three_param_types()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -554,7 +556,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function e2e_mcp_structured_path_with_all_param_types()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -589,7 +591,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function handles_path_only_params_no_query_or_body()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -616,7 +618,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertFalse($result['isError']);
     }
 
-    /** @test */
+    #[Test]
     public function handles_empty_params_gracefully()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -643,7 +645,7 @@ class McpToolExecutorTest extends TestCase
         $this->assertFalse($result['isError']);
     }
 
-    /** @test */
+    #[Test]
     public function skips_null_values_in_structured_params()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
@@ -680,7 +682,7 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
-    /** @test */
+    #[Test]
     public function handles_body_only_params()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
