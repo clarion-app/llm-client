@@ -452,6 +452,193 @@ class McpToolRegistryTest extends TestCase
         $this->assertEquals('List all contacts', $annotations['title']);
     }
 
+    // Tests for full raw schema reconstruction in McpToolRegistry::buildInputSchema()
+    #[Test]
+    public function build_input_schema_preserves_full_raw_schema_fields()
+    {
+        $this->mockApiManager([
+            '@clarion-app/contacts' => [
+                ['operationId' => 'createContact', 'summary' => 'Create a contact'],
+            ],
+        ], [
+            'createContact' => [
+                'path' => '/api/clarion-app/contacts/contact',
+                'method' => 'post',
+                'details' => [
+                    'operationId' => 'createContact',
+                    'summary' => 'Create a contact',
+                    'parameters' => [
+                        [
+                            'name' => 'status',
+                            'in' => 'query',
+                            'schema' => [
+                                'type' => 'string',
+                                'enum' => ['active', 'inactive', 'pending'],
+                                'default' => 'active',
+                            ],
+                            'description' => 'Filter by status',
+                        ],
+                    ],
+                    'requestBody' => [
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'name' => [
+                                            'type' => 'string',
+                                            'description' => 'Contact name',
+                                            'minLength' => 1,
+                                            'maxLength' => 255,
+                                        ],
+                                        'tags' => [
+                                            'type' => 'array',
+                                            'description' => 'Contact tags',
+                                            'items' => ['type' => 'string'],
+                                        ],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $registry = new McpToolRegistry();
+        $result = $registry->getTools();
+        $schema = $result['tools'][0]['inputSchema'];
+
+        // Verify enum and default are preserved in query param schema
+        $statusSchema = $schema['properties']['query']['properties']['status'];
+        $this->assertEquals(['active', 'inactive', 'pending'], $statusSchema['enum']);
+        $this->assertEquals('active', $statusSchema['default']);
+        $this->assertEquals('string', $statusSchema['type']);
+
+        // Verify minLength/maxLength are preserved in body param schema
+        $nameSchema = $schema['properties']['body']['properties']['name'];
+        $this->assertEquals(1, $nameSchema['minLength']);
+        $this->assertEquals(255, $nameSchema['maxLength']);
+
+        // Verify nested 'items' structure is preserved
+        $tagsSchema = $schema['properties']['body']['properties']['tags'];
+        $this->assertEquals('array', $tagsSchema['type']);
+        $this->assertEquals(['type' => 'string'], $tagsSchema['items']);
+    }
+
+    // Tests for McpToolRegistry::findTool() returning full inputSchema
+    #[Test]
+    public function find_tool_returns_full_input_schema()
+    {
+        $this->mockApiManager([
+            '@clarion-app/contacts' => [
+                ['operationId' => 'updateContact', 'summary' => 'Update a contact'],
+            ],
+        ], [
+            'updateContact' => [
+                'path' => '/api/clarion-app/contacts/contact/{contact}',
+                'method' => 'put',
+                'details' => [
+                    'operationId' => 'updateContact',
+                    'summary' => 'Update a contact',
+                    'parameters' => [
+                        [
+                            'name' => 'contact',
+                            'in' => 'path',
+                            'schema' => ['type' => 'string', 'format' => 'uuid'],
+                            'description' => 'Contact ID',
+                            'required' => true,
+                        ],
+                    ],
+                    'requestBody' => [
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'name' => ['type' => 'string'],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $registry = new McpToolRegistry();
+        $tool = $registry->findTool('contacts_updateContact');
+
+        $this->assertNotNull($tool);
+        $this->assertArrayHasKey('inputSchema', $tool);
+        // Verify format field is preserved
+        $this->assertEquals('uuid', $tool['inputSchema']['properties']['path']['properties']['contact']['format']);
+        // Verify body properties are preserved
+        $this->assertArrayHasKey('name', $tool['inputSchema']['properties']['body']['properties']);
+    }
+
+    // Tests for full schema field preservation in McpToolRegistry::buildInputSchema()
+    #[Test]
+    public function build_input_schema_preserves_all_openapi_fields()
+    {
+        $this->mockApiManager([
+            '@clarion-app/contacts' => [
+                ['operationId' => 'searchContacts', 'summary' => 'Search contacts'],
+            ],
+        ], [
+            'searchContacts' => [
+                'path' => '/api/clarion-app/contacts/contact',
+                'method' => 'get',
+                'details' => [
+                    'operationId' => 'searchContacts',
+                    'summary' => 'Search contacts',
+                    'parameters' => [
+                        [
+                            'name' => 'page',
+                            'in' => 'query',
+                            'schema' => [
+                                'type' => 'integer',
+                                'minimum' => 1,
+                                'maximum' => 1000,
+                                'default' => 1,
+                            ],
+                            'description' => 'Page number',
+                        ],
+                        [
+                            'name' => 'sort',
+                            'in' => 'query',
+                            'schema' => [
+                                'type' => 'string',
+                                'enum' => ['name', 'created_at', 'updated_at'],
+                                'default' => 'name',
+                                'pattern' => '^(name|created_at|updated_at)$',
+                            ],
+                            'description' => 'Sort field',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $registry = new McpToolRegistry();
+        $result = $registry->getTools();
+        $schema = $result['tools'][0]['inputSchema'];
+
+        // Verify all constraint fields are preserved for 'page'
+        $pageSchema = $schema['properties']['query']['properties']['page'];
+        $this->assertEquals('integer', $pageSchema['type']);
+        $this->assertEquals(1, $pageSchema['minimum']);
+        $this->assertEquals(1000, $pageSchema['maximum']);
+        $this->assertEquals(1, $pageSchema['default']);
+        $this->assertEquals('Page number', $pageSchema['description']);
+
+        // Verify enum, default, and pattern are preserved for 'sort'
+        $sortSchema = $schema['properties']['query']['properties']['sort'];
+        $this->assertEquals(['name', 'created_at', 'updated_at'], $sortSchema['enum']);
+        $this->assertEquals('name', $sortSchema['default']);
+        $this->assertEquals('^(name|created_at|updated_at)$', $sortSchema['pattern']);
+    }
+
     private function mockApiManager(array $packageOperations, array $operationDetailsMap): void
     {
         $descriptions = [];

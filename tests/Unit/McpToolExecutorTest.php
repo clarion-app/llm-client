@@ -715,6 +715,65 @@ class McpToolExecutorTest extends TestCase
         });
     }
 
+    // null paramSchema handling in McpToolRegistry and McpToolExecutor
+
+    #[Test]
+    public function executor_handles_tool_with_null_input_schema()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.list')
+            ->andReturn([
+                'name' => 'contacts.list',
+                'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()],
+                '_meta' => [
+                    'operationId' => 'listContacts',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact',
+                ],
+            ]);
+
+        $validatorMock = $this->mockValidator('allow');
+
+        Http::fake([
+            '*' => Http::response(['data' => []], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
+        $result = $executor->executeTool('contacts.list', [], $this->session);
+
+        $this->assertFalse($result['isError']);
+    }
+
+    #[Test]
+    public function executor_handles_tool_with_no_parameters_at_all()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.health')
+            ->andReturn([
+                'name' => 'contacts.health',
+                'inputSchema' => ['type' => 'object', 'properties' => new \stdClass()],
+                '_meta' => [
+                    'operationId' => 'healthCheck',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/health',
+                ],
+            ]);
+
+        $validatorMock = $this->mockValidator('allow');
+
+        Http::fake([
+            '*' => Http::response(['status' => 'ok'], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn() => 'test-token');
+        $result = $executor->executeTool('contacts.health', [], $this->session);
+
+        $this->assertFalse($result['isError']);
+        $this->assertEquals('text', $result['content'][0]['type']);
+    }
+
     private function mockValidator(string $status, ?string $reason = null): Mockery\MockInterface
     {
         $mock = Mockery::mock(CallValidatorInterface::class);

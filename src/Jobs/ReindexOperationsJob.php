@@ -61,19 +61,30 @@ class ReindexOperationsJob implements ShouldQueue
                 $paramNames = [];
                 $paramSchema = [];
 
-                // Path/query parameters
+                // Path/query parameters — store full raw OpenAPI schema objects
                 $pathParams = [];
                 $queryParams = [];
                 foreach ($opDetails['parameters'] ?? [] as $param) {
                     $name = $param['name'] ?? null;
                     if (!$name) continue;
                     $in = $param['in'] ?? 'query';
+                    // Store full raw schema object preserving enums, default, format, min/max, etc.
+                    $rawSchema = $param['schema'] ?? ['type' => 'string'];
+                    if (!empty($param['description'])) {
+                        $rawSchema['description'] = $param['description'];
+                    }
                     $paramInfo = [
-                        'type' => $param['schema']['type'] ?? 'string',
+                        'type' => $rawSchema['type'] ?? 'string',
                         'in' => $in,
                         'description' => $param['description'] ?? '',
                         'required' => !empty($param['required']),
                     ];
+                    // Merge all schema fields to preserve full OpenAPI richness
+                    foreach ($rawSchema as $key => $val) {
+                        if (!array_key_exists($key, $paramInfo)) {
+                            $paramInfo[$key] = $val;
+                        }
+                    }
                     if ($in === 'path') {
                         $pathParams[$name] = $paramInfo;
                     } else {
@@ -88,22 +99,25 @@ class ReindexOperationsJob implements ShouldQueue
                     $paramSchema['query'] = $queryParams;
                 }
 
-                // Body parameters
+                // Body parameters — store full raw OpenAPI schema objects
                 $requestBody = $opDetails['requestBody'] ?? null;
                 if ($requestBody) {
                     $content = $requestBody['content'] ?? [];
+                    // Skip non-JSON content types (T022)
                     $jsonSchema = $content['application/json']['schema'] ?? null;
                     if ($jsonSchema && isset($jsonSchema['properties'])) {
                         $bodyRequired = $jsonSchema['required'] ?? [];
                         $bodyParams = [];
                         foreach ($jsonSchema['properties'] as $propName => $propSchema) {
                             $paramNames[] = $propName;
-                            $bodyParams[$propName] = [
-                                'type' => $propSchema['type'] ?? 'string',
-                                'in' => 'body',
-                                'description' => $propSchema['description'] ?? '',
-                                'required' => in_array($propName, $bodyRequired),
-                            ];
+                            // Store full raw schema object for each body property
+                            $bodyParams[$propName] = array_merge(
+                                $propSchema,
+                                [
+                                    'in' => 'body',
+                                    'required' => in_array($propName, $bodyRequired),
+                                ]
+                            );
                         }
                         $paramSchema['body'] = $bodyParams;
                     }
@@ -127,6 +141,17 @@ class ReindexOperationsJob implements ShouldQueue
                     }
                 }
 
+                $paramSchemaJson = empty($paramSchema) ? null : json_encode($paramSchema);
+                if ($paramSchemaJson !== null) {
+                    $paramSchemaSize = strlen($paramSchemaJson);
+                    if ($paramSchemaSize > 10240) {
+                        Log::warning(
+                            "paramSchema exceeds 10KB for operation {$operationId}",
+                            ['size' => $paramSchemaSize, 'operation_id' => $operationId]
+                        );
+                    }
+                }
+
                 // Insert into index
                 DB::table('operation_search_index')->updateOrInsert(
                     ['operation_id' => $operationId],
@@ -136,7 +161,7 @@ class ReindexOperationsJob implements ShouldQueue
                         'method' => $method,
                         'path' => $path,
                         'searchable_text' => $searchableText,
-                        'param_schema' => empty($paramSchema) ? null : json_encode($paramSchema),
+                        'param_schema' => $paramSchemaJson,
                         'updated_at' => now(),
                     ]
                 );

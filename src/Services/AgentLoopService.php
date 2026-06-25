@@ -31,7 +31,7 @@ class AgentLoopService
     {
         $conversation->update(['is_processing' => true]);
 
-        $tools = $this->buildToolsPayload();
+        $tools = $this->buildToolsPayload($conversation);
         $messages = $this->buildMessagesPayload($conversation);
 
         $this->dispatchStreamRequest($conversation, $messages, $tools, $iteration);
@@ -79,7 +79,7 @@ class AgentLoopService
         $message->update(['tool_data' => $toolData]);
 
         // Continue the agent loop
-        $tools = $this->buildToolsPayload();
+        $tools = $this->buildToolsPayload($conversation);
         $messages = $this->buildMessagesPayload($conversation);
         $this->dispatchStreamRequest($conversation, $messages, $tools, $iteration);
     }
@@ -102,7 +102,7 @@ class AgentLoopService
         ]);
 
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
-        $tools = $this->buildToolsPayload();
+        $tools = $this->buildToolsPayload($conversation);
 
         try {
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
@@ -284,7 +284,7 @@ class AgentLoopService
 
         // Continue with synchronous loop
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
-        $tools = $this->buildToolsPayload();
+        $tools = $this->buildToolsPayload($conversation);
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
         for (; $iteration <= $maxIterations; $iteration++) {
@@ -424,7 +424,7 @@ class AgentLoopService
         return json_decode($response->getBody()->getContents(), true);
     }
 
-    public function buildToolsPayload(): array
+    public function buildToolsPayload(?Conversation $conversation = null): array
     {
         return [
             [
@@ -443,40 +443,7 @@ class AgentLoopService
                 'function' => [
                     'name' => 'execute_operation',
                     'description' => 'Execute an API operation. Pass the operationId from search_operations and a structured parameters object with optional "path", "query", and "body" sub-objects containing the respective parameters.',
-                    'parameters' => [
-                        'type' => 'object',
-                        'properties' => [
-                            'operationId' => [
-                                'type' => 'string',
-                                'description' => 'The operationId from search_operations',
-                            ],
-                            'parameters' => [
-                                'type' => 'object',
-                                'description' => 'Operation parameters as a structured object with optional path, query, and body sub-objects.',
-                                'properties' => [
-                                    'path' => [
-                                        'type' => 'object',
-                                        'description' => 'Path parameters for URL substitution (e.g., {"id": "123"} for /contacts/{id})',
-                                        'properties' => new \stdClass(),
-                                        'additionalProperties' => true,
-                                    ],
-                                    'query' => [
-                                        'type' => 'object',
-                                        'description' => 'Query string parameters (e.g., {"search": "john", "page": "1"})',
-                                        'properties' => new \stdClass(),
-                                        'additionalProperties' => true,
-                                    ],
-                                    'body' => [
-                                        'type' => 'object',
-                                        'description' => 'Request body fields for POST/PUT/PATCH operations',
-                                        'properties' => new \stdClass(),
-                                        'additionalProperties' => true,
-                                    ],
-                                ],
-                            ],
-                        ],
-                        'required' => ['operationId'],
-                    ],
+                    'parameters' => $this->buildExecuteOperationSchema($conversation),
                 ],
             ],
             [
@@ -497,6 +464,155 @@ class AgentLoopService
                 ],
             ],
         ];
+    }
+
+    /**
+     * Build the execute_operation tool parameters schema.
+     *
+     * When a conversation is provided, resolves cached operation paramSchema
+     * and injects operation-specific properties into the schema.
+     * Falls back to a generic schema when no operations are cached.
+     *
+     * @param Conversation|null $conversation Optional conversation for cache lookup
+     * @return array The parameters schema for execute_operation
+     */
+    private function buildExecuteOperationSchema(?Conversation $conversation = null): array
+    {
+        // Try to get paramSchema from cached operations (T008)
+        $paramSchema = null;
+        if ($conversation !== null) {
+            $paramSchema = $this->resolveParamSchema($conversation);
+        }
+
+        // T010: Fallback to generic schema when no operations are cached
+        if ($paramSchema === null || !is_array($paramSchema)) {
+            return [
+                'type' => 'object',
+                'properties' => [
+                    'operationId' => [
+                        'type' => 'string',
+                        'description' => 'The operationId from search_operations',
+                    ],
+                    'parameters' => [
+                        'type' => 'object',
+                        'description' => 'Operation parameters as a structured object with optional path, query, and body sub-objects.',
+                        'properties' => [
+                            'path' => [
+                                'type' => 'object',
+                                'description' => 'Path parameters for URL substitution (e.g., {"id": "123"} for /contacts/{id})',
+                                'properties' => new \stdClass(),
+                                'additionalProperties' => true,
+                            ],
+                            'query' => [
+                                'type' => 'object',
+                                'description' => 'Query string parameters (e.g., {"search": "john", "page": "1"})',
+                                'properties' => new \stdClass(),
+                                'additionalProperties' => true,
+                            ],
+                            'body' => [
+                                'type' => 'object',
+                                'description' => 'Request body fields for POST/PUT/PATCH operations',
+                                'properties' => new \stdClass(),
+                                'additionalProperties' => true,
+                            ],
+                        ],
+                    ],
+                ],
+                'required' => ['operationId'],
+            ];
+        }
+
+        return $this->buildDynamicParamSchema($paramSchema);
+    }
+
+    /**
+     * Resolve paramSchema from the operation cache for a conversation.
+     * Returns the most recent cached paramSchema or null if cache is empty.
+     *
+     * @param Conversation $conversation The conversation context
+     * @return array|null The paramSchema array or null
+     */
+    private function resolveParamSchema(Conversation $conversation): ?array
+    {
+        $entries = $this->operationCache->getEntries($conversation->id, 20);
+        if (empty($entries)) {
+            return null;
+        }
+
+        // getEntries() returns entries ordered most-recently-used first,
+        $firstEntry = $entries[0];
+        return $firstEntry['paramSchema'] ?? null;
+    }
+
+    /**
+     * Build a dynamic parameters schema from a paramSchema object.
+     *
+     * @param array $paramSchema The paramSchema with path/query/body groups
+     * @return array The parameters schema for execute_operation
+     */
+    private function buildDynamicParamSchema(array $paramSchema): array
+    {
+        $pathSchema = $this->buildParamGroupSchema($paramSchema['path'] ?? null);
+        $querySchema = $this->buildParamGroupSchema($paramSchema['query'] ?? null);
+        $bodySchema = $this->buildParamGroupSchema($paramSchema['body'] ?? null);
+
+        return [
+            'type' => 'object',
+            'properties' => [
+                'operationId' => [
+                    'type' => 'string',
+                    'description' => 'The operationId from search_operations',
+                ],
+                'parameters' => [
+                    'type' => 'object',
+                    'description' => 'Operation-specific parameter schema',
+                    'properties' => array_filter([
+                        'path' => $pathSchema,
+                        'query' => $querySchema,
+                        'body' => $bodySchema,
+                    ], fn($s) => $s !== null),
+                ],
+            ],
+            'required' => ['operationId'],
+        ];
+    }
+
+    /**
+     * Build a schema for a parameter group (path, query, or body).
+     *
+     * @param array|null $params Map of paramName => paramSchema
+     * @return array|null The group schema or null if no params
+     */
+    private function buildParamGroupSchema(?array $params): ?array
+    {
+        if (empty($params)) {
+            return null;
+        }
+
+        $properties = [];
+        $required = [];
+
+        foreach ($params as $name => $schema) {
+            // Build clean property schema (exclude internal fields like 'in', 'required')
+            $propSchema = [];
+            foreach ($schema as $key => $val) {
+                if ($key !== 'in' && $key !== 'required') {
+                    $propSchema[$key] = $val;
+                }
+            }
+            $properties[$name] = $propSchema;
+
+            if (!empty($schema['required'])) {
+                $required[] = $name;
+            }
+        }
+
+        $groupSchema = ['type' => 'object', 'properties' => $properties];
+        if (!empty($required)) {
+            $groupSchema['required'] = $required;
+        }
+
+        return $groupSchema;
     }
 
     public function executeMetaTool(string $toolName, array $arguments, Conversation $conversation): string
