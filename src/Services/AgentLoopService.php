@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
@@ -19,12 +20,18 @@ class AgentLoopService
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
+    private ProviderRegistry $providerRegistry;
 
-    public function __construct(McpToolRegistry $toolRegistry, McpToolExecutor $toolExecutor, OperationCache $operationCache)
-    {
+    public function __construct(
+        McpToolRegistry $toolRegistry,
+        McpToolExecutor $toolExecutor,
+        OperationCache $operationCache,
+        ?ProviderRegistry $providerRegistry = null
+    ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
         $this->operationCache = $operationCache;
+        $this->providerRegistry = $providerRegistry ?? new ProviderRegistry();
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -391,6 +398,7 @@ class AgentLoopService
 
     /**
      * Make a synchronous (non-streaming) LLM API call.
+     * Delegates to the resolved provider based on the server's provider_type.
      */
     private function callLlmSync(Conversation $conversation, array $messages, array $tools): array
     {
@@ -399,29 +407,14 @@ class AgentLoopService
             throw new \RuntimeException('No LLM server configured');
         }
 
-        $body = [
-            'temperature' => 1.0,
+        $provider = $this->providerRegistry->resolve($server);
+
+        $options = [
             'model' => $conversation->model,
-            'stream' => false,
-            'messages' => $messages,
+            'temperature' => 1.0,
         ];
 
-        if (!empty($tools)) {
-            $body['tools'] = $tools;
-        }
-
-        $client = new Client(['timeout' => 240]);
-
-        $response = $client->post($server->server_url, [
-            'headers' => [
-                'Content-type' => 'application/json',
-                'Accept' => 'application/json',
-                'Authorization' => 'Bearer ' . $server->token,
-            ],
-            'json' => $body,
-        ]);
-
-        return json_decode($response->getBody()->getContents(), true);
+        return $provider->chat($messages, $tools, $options);
     }
 
     public function buildToolsPayload(?Conversation $conversation = null): array
