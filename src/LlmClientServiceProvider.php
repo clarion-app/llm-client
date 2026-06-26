@@ -17,8 +17,10 @@ use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpPromptRegistry;
 use ClarionApp\LlmClient\Services\McpResourceHandler;
+use ClarionApp\LlmClient\Services\MessageFormatter;
 use ClarionApp\LlmClient\Services\OperationCache;
 use ClarionApp\LlmClient\Services\OperationsSearchService;
+use ClarionApp\LlmClient\Services\ToolFormatter;
 use GuzzleHttp\Client;
 use Illuminate\Support\Facades\Event;
 
@@ -70,12 +72,18 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new ProviderRegistry();
         });
 
+        $this->app->singleton(ToolFormatter::class, function ($app) {
+            return new ToolFormatter();
+        });
+
         $this->app->singleton(AgentLoopService::class, function ($app) {
             return new AgentLoopService(
                 $app->make(McpToolRegistry::class),
                 $app->make(McpToolExecutor::class),
                 $app->make(OperationCache::class),
-                $app->make(ProviderRegistry::class)
+                $app->make(ProviderRegistry::class),
+                $app->make(MessageFormatter::class),
+                $app->make(ToolFormatter::class)
             );
         });
 

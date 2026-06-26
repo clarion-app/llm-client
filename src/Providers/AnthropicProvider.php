@@ -43,9 +43,6 @@ class AnthropicProvider implements LlmProvider
             throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
 
-        // Convert tools from OpenAI format to Anthropic format
-        $anthropicTools = $this->convertTools($tools);
-
         $body = [
             'model' => $options['model'] ?? 'claude-sonnet-4-20250514',
             'messages' => $messages,
@@ -59,9 +56,9 @@ class AnthropicProvider implements LlmProvider
             $body['system'] = $options['system'];
         }
 
-        // Only include tools if non-empty
-        if (!empty($anthropicTools) && ($options['skip_tools'] ?? false) === false) {
-            $body['tools'] = $anthropicTools;
+        // Only include tools if non-empty (tools are pre-formatted by ToolFormatter)
+        if (!empty($tools) && ($options['skip_tools'] ?? false) === false) {
+            $body['tools'] = $tools;
         }
 
         try {
@@ -101,8 +98,6 @@ class AnthropicProvider implements LlmProvider
             throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
 
-        $anthropicTools = $this->convertTools($tools);
-
         $body = [
             'model' => $options['model'] ?? 'claude-sonnet-4-20250514',
             'messages' => $messages,
@@ -116,8 +111,9 @@ class AnthropicProvider implements LlmProvider
             $body['system'] = $options['system'];
         }
 
-        if (!empty($anthropicTools) && ($options['skip_tools'] ?? false) === false) {
-            $body['tools'] = $anthropicTools;
+        // Tools are pre-formatted by ToolFormatter
+        if (!empty($tools) && ($options['skip_tools'] ?? false) === false) {
+            $body['tools'] = $tools;
         }
 
         try {
@@ -308,26 +304,6 @@ class AnthropicProvider implements LlmProvider
                 'total_tokens' => ($usage['input_tokens'] ?? 0) + ($usage['output_tokens'] ?? 0),
             ],
         ];
-    }
-
-    /**
-     * Convert OpenAI-format tools to Anthropic format.
-     *
-     * OpenAI uses: { type: 'function', function: { name, description, parameters } }
-     * Anthropic uses: { name, description, input_schema }
-     */
-    private function convertTools(array $tools): array
-    {
-        $anthropicTools = [];
-        foreach ($tools as $tool) {
-            $function = $tool['function'] ?? [];
-            $anthropicTools[] = [
-                'name' => $function['name'] ?? '',
-                'description' => $function['description'] ?? '',
-                'input_schema' => $function['parameters'] ?? ['type' => 'object', 'properties' => []],
-            ];
-        }
-        return $anthropicTools;
     }
 
     /**
