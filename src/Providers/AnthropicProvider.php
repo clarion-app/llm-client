@@ -43,31 +43,20 @@ class AnthropicProvider implements LlmProvider
             throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
 
-        // Extract system message from messages array (Anthropic API separates system from messages)
-        $system = '';
-        $filteredMessages = [];
-        foreach ($messages as $msg) {
-            if ($msg['role'] === 'system') {
-                $system = $msg['content'];
-            } else {
-                $filteredMessages[] = $msg;
-            }
-        }
-
         // Convert tools from OpenAI format to Anthropic format
         $anthropicTools = $this->convertTools($tools);
 
         $body = [
             'model' => $options['model'] ?? 'claude-sonnet-4-20250514',
-            'messages' => $filteredMessages,
+            'messages' => $messages,
             'temperature' => $options['temperature'] ?? 1.0,
             'max_tokens' => $options['max_tokens'] ?? 4096,
             'stream' => false,
         ];
 
-        // Include system prompt if present
-        if ($system !== '') {
-            $body['system'] = $system;
+        // Include system prompt if present (pre-extracted by MessageFormatter)
+        if (isset($options['system']) && $options['system'] !== '') {
+            $body['system'] = $options['system'];
         }
 
         // Only include tools if non-empty
@@ -112,29 +101,19 @@ class AnthropicProvider implements LlmProvider
             throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
 
-        // Extract system message
-        $system = '';
-        $filteredMessages = [];
-        foreach ($messages as $msg) {
-            if ($msg['role'] === 'system') {
-                $system = $msg['content'];
-            } else {
-                $filteredMessages[] = $msg;
-            }
-        }
-
         $anthropicTools = $this->convertTools($tools);
 
         $body = [
             'model' => $options['model'] ?? 'claude-sonnet-4-20250514',
-            'messages' => $filteredMessages,
+            'messages' => $messages,
             'temperature' => $options['temperature'] ?? 1.0,
             'max_tokens' => $options['max_tokens'] ?? 4096,
             'stream' => true,
         ];
 
-        if ($system !== '') {
-            $body['system'] = $system;
+        // Include system prompt if present (pre-extracted by MessageFormatter)
+        if (isset($options['system']) && $options['system'] !== '') {
+            $body['system'] = $options['system'];
         }
 
         if (!empty($anthropicTools) && ($options['skip_tools'] ?? false) === false) {

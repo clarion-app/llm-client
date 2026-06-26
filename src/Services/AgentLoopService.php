@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
@@ -21,17 +22,20 @@ class AgentLoopService
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
     private ProviderRegistry $providerRegistry;
+    private MessageFormatter $messageFormatter;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
         McpToolExecutor $toolExecutor,
         OperationCache $operationCache,
-        ?ProviderRegistry $providerRegistry = null
+        ?ProviderRegistry $providerRegistry = null,
+        ?MessageFormatter $messageFormatter = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
         $this->operationCache = $operationCache;
         $this->providerRegistry = $providerRegistry ?? new ProviderRegistry();
+        $this->messageFormatter = $messageFormatter ?? new MessageFormatter();
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -39,9 +43,10 @@ class AgentLoopService
         $conversation->update(['is_processing' => true]);
 
         $tools = $this->buildToolsPayload($conversation);
-        $messages = $this->buildMessagesPayload($conversation);
+        $rawMessages = $this->buildMessagesPayload($conversation);
+        $formatted = $this->formatMessages($conversation, $rawMessages);
 
-        $this->dispatchStreamRequest($conversation, $messages, $tools, $iteration);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $tools, $iteration, $formatted['system']);
     }
 
     public function resume(Conversation $conversation, Message $message, bool $approved): void
@@ -87,8 +92,9 @@ class AgentLoopService
 
         // Continue the agent loop
         $tools = $this->buildToolsPayload($conversation);
-        $messages = $this->buildMessagesPayload($conversation);
-        $this->dispatchStreamRequest($conversation, $messages, $tools, $iteration);
+        $rawMessages = $this->buildMessagesPayload($conversation);
+        $formatted = $this->formatMessages($conversation, $rawMessages);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $tools, $iteration, $formatted['system']);
     }
 
     /**
@@ -113,8 +119,9 @@ class AgentLoopService
 
         try {
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
-                $messages = $this->buildMessagesPayload($conversation);
-                $response = $this->callLlmSync($conversation, $messages, $tools);
+                $rawMessages = $this->buildMessagesPayload($conversation);
+                $formatted = $this->formatMessages($conversation, $rawMessages);
+                $response = $this->callLlmSync($conversation, $formatted['messages'], $tools, $formatted['system']);
 
                 $choice = $response['choices'][0] ?? null;
                 if (!$choice) {
@@ -295,8 +302,9 @@ class AgentLoopService
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
         for (; $iteration <= $maxIterations; $iteration++) {
-            $messages = $this->buildMessagesPayload($conversation);
-            $response = $this->callLlmSync($conversation, $messages, $tools);
+            $rawMessages = $this->buildMessagesPayload($conversation);
+            $formatted = $this->formatMessages($conversation, $rawMessages);
+            $response = $this->callLlmSync($conversation, $formatted['messages'], $tools, $formatted['system']);
 
             $choice = $response['choices'][0] ?? null;
             if (!$choice) {
@@ -397,10 +405,24 @@ class AgentLoopService
     }
 
     /**
+     * Format messages using MessageFormatter for the conversation's provider type.
+     */
+    private function formatMessages(Conversation $conversation, array $messages): array
+    {
+        $server = Server::find($conversation->server_id);
+        if (!$server) {
+            throw new \RuntimeException('No LLM server configured');
+        }
+
+        $providerType = $server->providerType ?? ProviderType::OpenAI;
+        return $this->messageFormatter->formatForProvider($messages, $providerType);
+    }
+
+    /**
      * Make a synchronous (non-streaming) LLM API call.
      * Delegates to the resolved provider based on the server's provider_type.
      */
-    private function callLlmSync(Conversation $conversation, array $messages, array $tools): array
+    private function callLlmSync(Conversation $conversation, array $messages, array $tools, string $system = ''): array
     {
         $server = Server::find($conversation->server_id);
         if (!$server) {
@@ -413,6 +435,11 @@ class AgentLoopService
             'model' => $conversation->model,
             'temperature' => 1.0,
         ];
+
+        // Pass system prompt for providers that support it (Anthropic)
+        if ($system !== '') {
+            $options['system'] = $system;
+        }
 
         return $provider->chat($messages, $tools, $options);
     }
@@ -888,7 +915,7 @@ class AgentLoopService
         return $payload;
     }
 
-    private function dispatchStreamRequest(Conversation $conversation, array $messages, array $tools, int $iteration): void
+    private function dispatchStreamRequest(Conversation $conversation, array $messages, array $tools, int $iteration, string $system = ''): void
     {
         $server = Server::find($conversation->server_id);
 
@@ -897,6 +924,11 @@ class AgentLoopService
         $body->model = $conversation->model;
         $body->stream = true;
         $body->messages = $messages;
+
+        // Include system prompt for providers that support it (Anthropic)
+        if ($system !== '') {
+            $body->system = $system;
+        }
 
         if (!empty($tools)) {
             $body->tools = $tools;
