@@ -84,6 +84,32 @@ class ProviderRegistry
     }
 
     /**
+     * Resolve a provider instance for an explicit provider type and Server.
+     *
+     * Unlike {@see resolve()}, this method accepts an explicit ProviderType
+     * (e.g., from a conversation override) rather than deriving it from the Server.
+     * The Server is still passed to the factory for connection details.
+     *
+     * @param ProviderType $type Explicit provider type to resolve
+     * @param Server $server Server model with connection details
+     * @return LlmProvider Provider instance for the given type and server
+     * @throws RuntimeException If no provider is registered for the given type
+     */
+    public function resolveByType(ProviderType $type, Server $server): LlmProvider
+    {
+        $key = $type->value;
+
+        if (isset($this->factories[$key])) {
+            return call_user_func($this->factories[$key], $server);
+        }
+
+        throw new RuntimeException(
+            "No provider registered for type '{$key}'. " .
+            'Available types: ' . implode(', ', array_keys($this->factories))
+        );
+    }
+
+    /**
      * Get the list of registered provider types.
      *
      * @return list<string> Registered provider type values

@@ -78,4 +78,22 @@ return [
     'operation_cache' => [
         'max_entries' => 20,    // Max cached operations per conversation (LRU eviction)
     ],
+
+    // Per-provider defaults
+    'providers' => [
+        'openai' => [
+            'default_model' => env('LLM_OPENAI_DEFAULT_MODEL', 'gpt-4o'),
+            'timeout' => env('LLM_OPENAI_TIMEOUT', 240),
+        ],
+        'anthropic' => [
+            'default_model' => env('LLM_ANTHROPIC_DEFAULT_MODEL', 'claude-sonnet-4-20250514'),
+            'api_version' => env('LLM_ANTHROPIC_API_VERSION', '2025-04-14'),
+            'timeout' => env('LLM_ANTHROPIC_TIMEOUT', 240),
+        ],
+        'llama.cpp' => [
+            'default_model' => env('LLM_LLAMA_CPP_DEFAULT_MODEL', null),
+            'timeout' => env('LLM_LLAMA_CPP_TIMEOUT', 240),
+        ],
+    ],
 ];
+

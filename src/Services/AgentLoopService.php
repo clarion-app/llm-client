@@ -412,48 +412,47 @@ class AgentLoopService
     }
 
     /**
-     * Format messages using MessageFormatter for the conversation's provider type.
+     * Format messages using MessageFormatter for the conversation's effective provider type.
+     * Uses provider_override if set, otherwise falls back to server provider_type.
      */
     private function formatMessages(Conversation $conversation, array $messages): array
     {
-        $server = Server::find($conversation->server_id);
-        if (!$server) {
-            throw new \RuntimeException('No LLM server configured');
-        }
-
-        $providerType = $server->providerType ?? ProviderType::OpenAI;
+        $providerType = $conversation->effectiveProviderType;
         return $this->messageFormatter->formatForProvider($messages, $providerType);
     }
 
     /**
-     * Format tools using ToolFormatter for the conversation's provider type.
+     * Format tools using ToolFormatter for the conversation's effective provider type.
+     * Uses provider_override if set, otherwise falls back to server provider_type.
      */
     private function formatTools(Conversation $conversation, array $tools): array
     {
-        $server = Server::find($conversation->server_id);
-        if (!$server) {
-            throw new \RuntimeException('No LLM server configured');
-        }
-
-        $providerType = $server->providerType ?? ProviderType::OpenAI;
+        $providerType = $conversation->effectiveProviderType;
         return $this->toolFormatter->formatForProvider($tools, $providerType);
     }
 
     /**
      * Make a synchronous (non-streaming) LLM API call.
-     * Delegates to the resolved provider based on the server's provider_type.
+     * Delegates to the resolved provider based on the conversation's effective provider type.
      */
     private function callLlmSync(Conversation $conversation, array $messages, array $tools, string $system = ''): array
     {
-        $server = Server::find($conversation->server_id);
+        $server = $conversation->server;
         if (!$server) {
             throw new \RuntimeException('No LLM server configured');
         }
 
-        $provider = $this->providerRegistry->resolve($server);
+        $providerType = $conversation->effectiveProviderType;
+        $provider = $this->providerRegistry->resolveByType($providerType, $server);
+
+        // Use provider-specific default model when conversation model is null
+        $model = $conversation->model;
+        if ($model === null) {
+            $model = config('llm-client.providers.' . $providerType->value . '.default_model');
+        }
 
         $options = [
-            'model' => $conversation->model,
+            'model' => $model,
             'temperature' => 1.0,
         ];
 
