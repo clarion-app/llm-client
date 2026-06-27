@@ -3,9 +3,11 @@
 namespace ClarionApp\LlmClient;
 
 use ClarionApp\HttpQueue\HandleHttpStreamResponse;
+use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\SchemaValidator;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
@@ -137,6 +139,25 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
         // Plain text response — save and finish
         if ($this->message === null) return;
+
+        // Validate accumulated response against schema if configured
+        $schema = $parsedData['schema'] ?? null;
+        if ($schema !== null && !empty($schema)) {
+            $validator = new SchemaValidator();
+            try {
+                $validated = $validator->validate($this->reply, $schema);
+                // Use the validated content (re-encoded as JSON)
+                $this->reply = json_encode($validated);
+            } catch (SchemaValidationError $e) {
+                Log::warning('Schema validation failed for streaming response', [
+                    'conversation_id' => $conversationId,
+                    'error' => $e->getMessage(),
+                    'violations' => $e->getViolations(),
+                ]);
+                // For streaming, we log the warning but don't block the response
+                // (no retry mechanism for streaming responses)
+            }
+        }
 
         $this->message->content = $this->reply;
         $this->message->responseTime = $seconds;

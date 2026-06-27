@@ -12,7 +12,8 @@
         "clarion-app/eloquent-multichain-bridge": "dev-main",
         "clarion-app/http-queue": "dev-main",
         "php-webdriver/webdriver": "dev-main",
-        "clarion-app/backend": "dev-main"
+        "clarion-app/backend": "dev-main",
+        "justinrainbow/json-schema": "^6.0"
     },
     "license": "MIT",
     "autoload": {

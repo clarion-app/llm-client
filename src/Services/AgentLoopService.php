@@ -3,11 +3,13 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Contracts\ProviderType;
+use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\Services\SchemaValidator;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
@@ -24,6 +26,7 @@ class AgentLoopService
     private ProviderRegistry $providerRegistry;
     private MessageFormatter $messageFormatter;
     private ToolFormatter $toolFormatter;
+    private SchemaValidator $schemaValidator;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -31,7 +34,8 @@ class AgentLoopService
         OperationCache $operationCache,
         ?ProviderRegistry $providerRegistry = null,
         ?MessageFormatter $messageFormatter = null,
-        ?ToolFormatter $toolFormatter = null
+        ?ToolFormatter $toolFormatter = null,
+        ?SchemaValidator $schemaValidator = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -39,6 +43,7 @@ class AgentLoopService
         $this->providerRegistry = $providerRegistry ?? new ProviderRegistry();
         $this->messageFormatter = $messageFormatter ?? new MessageFormatter();
         $this->toolFormatter = $toolFormatter ?? new ToolFormatter();
+        $this->schemaValidator = $schemaValidator ?? new SchemaValidator();
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -105,8 +110,12 @@ class AgentLoopService
     /**
      * Synchronous agent loop execution for external channel integrations.
      * Returns the final response array or a confirmation-required structure.
+     *
+     * @param Conversation $conversation The conversation context.
+     * @param string $message The user message.
+     * @param array $options Optional: ['schema' => [...], 'retry_on_validation_failure' => bool, 'max_schema_retries' => int]
      */
-    public function run(Conversation $conversation, string $message): array
+    public function run(Conversation $conversation, string $message, array $options = []): array
     {
         $conversation->update(['is_processing' => true]);
 
@@ -122,6 +131,12 @@ class AgentLoopService
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
         $tools = $this->buildToolsPayload($conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
+
+        $shouldValidate = $this->schemaValidator->shouldValidate($options);
+        $retryOnValidationFailure = $options['retry_on_validation_failure'] ?? false;
+        $maxSchemaRetries = $options['max_schema_retries'] ?? config('llm-client.schema_validation.max_retries', 2);
+        $schemaRetryCount = 0;
+        $correctionPromptBuilder = new CorrectionPromptBuilder();
 
         try {
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
@@ -141,6 +156,46 @@ class AgentLoopService
 
                 // No tool calls — plain text response
                 if (empty($toolCalls)) {
+                    // Validate response against schema if configured
+                    $validatedContent = null;
+                    $validationError = null;
+
+                    if ($shouldValidate && !empty($options['schema'])) {
+                        try {
+                            $validatedContent = $this->schemaValidator->validate($content, $options['schema']);
+                        } catch (SchemaValidationError $e) {
+                            $validationError = $e;
+
+                            // Check if we should retry
+                            if ($retryOnValidationFailure && $schemaRetryCount < $maxSchemaRetries && !$e->isRetryExhausted()) {
+                                $schemaRetryCount++;
+
+                                // Build correction prompt and inject as user message
+                                $correctionPrompt = $correctionPromptBuilder->build(
+                                    $e->withRetryInfo($schemaRetryCount, $maxSchemaRetries)
+                                );
+
+                                // Create correction message to feed back to LLM
+                                Message::create([
+                                    'conversation_id' => $conversation->id,
+                                    'content' => $correctionPrompt,
+                                    'role' => 'user',
+                                    'user' => 'system',
+                                    'responseTime' => 0,
+                                ]);
+
+                                // Continue the loop to retry
+                                continue;
+                            }
+
+                            // Retry exhausted or disabled — throw the error
+                            if ($validationError && $retryOnValidationFailure) {
+                                throw $validationError->withRetryInfo($schemaRetryCount, $maxSchemaRetries);
+                            }
+                            throw $validationError;
+                        }
+                    }
+
                     $assistantMessage = Message::create([
                         'conversation_id' => $conversation->id,
                         'content' => $content,
@@ -159,7 +214,8 @@ class AgentLoopService
 
                     return [
                         'status' => 'completed',
-                        'content' => $content,
+                        'content' => $validatedContent !== null ? json_encode($validatedContent) : $content,
+                        'validated' => $validatedContent,
                         'message_id' => $assistantMessage->id,
                     ];
                 }
