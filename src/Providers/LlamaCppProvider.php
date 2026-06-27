@@ -96,6 +96,11 @@ class LlamaCppProvider implements LlmProvider
             }
         }
 
+        // JSON response format mode
+        if (isset($options['response_format']) && $options['response_format'] === 'json') {
+            $body['response_format'] = ['type' => 'json_object'];
+        }
+
         return $body;
     }
 

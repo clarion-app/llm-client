@@ -52,13 +52,18 @@ class AnthropicProvider implements LlmProvider
         ];
 
         // Include system prompt if present (pre-extracted by MessageFormatter)
-        if (isset($options['system']) && $options['system'] !== '') {
-            $body['system'] = $options['system'];
+        // JSON mode: prepend instruction to system prompt
+        $systemPrompt = $options['system'] ?? '';
+        if (isset($options['response_format']) && $options['response_format'] === 'json') {
+            $jsonInstruction = 'IMPORTANT: You must respond with valid JSON only. Do not include any explanatory text, markdown formatting, or code blocks. Return only raw JSON.';
+            if ($systemPrompt !== '') {
+                $systemPrompt = $jsonInstruction . "\n\n" . $systemPrompt;
+            } else {
+                $systemPrompt = $jsonInstruction;
+            }
         }
-
-        // Only include tools if non-empty (tools are pre-formatted by ToolFormatter)
-        if (!empty($tools) && ($options['skip_tools'] ?? false) === false) {
-            $body['tools'] = $tools;
+        if ($systemPrompt !== '') {
+            $body['system'] = $systemPrompt;
         }
 
         try {
@@ -107,8 +112,18 @@ class AnthropicProvider implements LlmProvider
         ];
 
         // Include system prompt if present (pre-extracted by MessageFormatter)
-        if (isset($options['system']) && $options['system'] !== '') {
-            $body['system'] = $options['system'];
+        // JSON mode: prepend instruction to system prompt
+        $systemPrompt = $options['system'] ?? '';
+        if (isset($options['response_format']) && $options['response_format'] === 'json') {
+            $jsonInstruction = 'IMPORTANT: You must respond with valid JSON only. Do not include any explanatory text, markdown formatting, or code blocks. Return only raw JSON.';
+            if ($systemPrompt !== '') {
+                $systemPrompt = $jsonInstruction . "\n\n" . $systemPrompt;
+            } else {
+                $systemPrompt = $jsonInstruction;
+            }
+        }
+        if ($systemPrompt !== '') {
+            $body['system'] = $systemPrompt;
         }
 
         // Tools are pre-formatted by ToolFormatter

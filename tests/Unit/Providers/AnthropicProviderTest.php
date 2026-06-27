@@ -350,4 +350,183 @@ class AnthropicProviderTest extends TestCase
 
         $provider->listModels();
     }
+
+    // ─── JSON Response Format ───
+
+    #[Test]
+    public function chat_with_json_response_format_prepends_system_instruction(): void
+    {
+        $capturedBodies = new \stdClass();
+        $capturedBodies->bodies = [];
+
+        $mock = new MockHandler([
+            function ($request) use ($capturedBodies) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, [], json_encode([
+                    'id' => 'msg_abc123',
+                    'type' => 'message',
+                    'role' => 'assistant',
+                    'model' => 'claude-sonnet-4-20250514',
+                    'content' => [['type' => 'text', 'text' => '{"key":"value"}']],
+                    'stop_reason' => 'end_turn',
+                    'usage' => ['input_tokens' => 10, 'output_tokens' => 8],
+                ]));
+            },
+        ]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        $provider->chat(
+            [['role' => 'user', 'content' => 'Return JSON']],
+            [],
+            ['response_format' => 'json', 'system' => 'You are a helpful assistant.']
+        );
+
+        $requestBody = $capturedBodies->bodies[0];
+
+        // Anthropic prepends JSON instruction to system prompt
+        $this->assertArrayHasKey('system', $requestBody);
+        $this->assertStringContainsString('JSON', $requestBody['system']);
+        $this->assertStringContainsString('You are a helpful assistant.', $requestBody['system']);
+    }
+
+    #[Test]
+    public function chat_without_json_response_format_preserves_system_prompt(): void
+    {
+        $capturedBodies = new \stdClass();
+        $capturedBodies->bodies = [];
+
+        $mock = new MockHandler([
+            function ($request) use ($capturedBodies) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, [], json_encode([
+                    'id' => 'msg_abc123',
+                    'type' => 'message',
+                    'role' => 'assistant',
+                    'model' => 'claude-sonnet-4-20250514',
+                    'content' => [['type' => 'text', 'text' => 'Hello']],
+                    'stop_reason' => 'end_turn',
+                    'usage' => ['input_tokens' => 10, 'output_tokens' => 8],
+                ]));
+            },
+        ]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        $provider->chat(
+            [['role' => 'user', 'content' => 'Hi']],
+            [],
+            ['system' => 'You are a helpful assistant.']
+        );
+
+        $requestBody = $capturedBodies->bodies[0];
+
+        // System prompt should be unchanged
+        $this->assertEquals('You are a helpful assistant.', $requestBody['system']);
+    }
+
+    #[Test]
+    public function stream_with_json_response_format_prepends_system_instruction(): void
+    {
+        $capturedBodies = new \stdClass();
+        $capturedBodies->bodies = [];
+
+        $sseData = "event: message_start\n";
+        $sseData .= "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\"}}\n\n";
+        $sseData .= "event: content_block_start\n";
+        $sseData .= "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        $sseData .= "event: content_block_delta\n";
+        $sseData .= "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"{\\\"key\\\"}\"}}\n\n";
+        $sseData .= "event: message_delta\n";
+        $sseData .= "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n";
+        $sseData .= "event: message_stop\n";
+        $sseData .= "data: {\"type\":\"message_stop\"}\n\n";
+
+        $stream = new Stream(fopen('php://temp', 'r+'));
+        $stream->write($sseData);
+        $stream->rewind();
+
+        $mock = new MockHandler([
+            function ($request) use ($capturedBodies, $stream) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, ['Content-Type' => 'text/event-stream'], $stream);
+            },
+        ]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        iterator_to_array($provider->stream(
+            [['role' => 'user', 'content' => 'Return JSON']],
+            [],
+            ['response_format' => 'json', 'system' => 'You are a helpful assistant.']
+        ));
+
+        $requestBody = $capturedBodies->bodies[0];
+
+        // Anthropic prepends JSON instruction to system prompt
+        $this->assertArrayHasKey('system', $requestBody);
+        $this->assertStringContainsString('JSON', $requestBody['system']);
+        $this->assertStringContainsString('You are a helpful assistant.', $requestBody['system']);
+    }
+
+    // ─── JSON Mode Per-Request Verification ───
+
+    #[Test]
+    public function json_mode_is_per_request_not_global(): void
+    {
+        $capturedBodies = new \stdClass();
+        $capturedBodies->bodies = [];
+
+        $mock = new MockHandler([
+            function ($request) use ($capturedBodies) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, [], json_encode([
+                    'id' => 'msg_abc123',
+                    'type' => 'message',
+                    'role' => 'assistant',
+                    'model' => 'claude-sonnet-4-20250514',
+                    'content' => [['type' => 'text', 'text' => '{"a":1}']],
+                    'stop_reason' => 'end_turn',
+                    'usage' => ['input_tokens' => 10, 'output_tokens' => 8],
+                ]));
+            },
+            function ($request) use ($capturedBodies) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, [], json_encode([
+                    'id' => 'msg_abc123',
+                    'type' => 'message',
+                    'role' => 'assistant',
+                    'model' => 'claude-sonnet-4-20250514',
+                    'content' => [['type' => 'text', 'text' => 'Plain text']],
+                    'stop_reason' => 'end_turn',
+                    'usage' => ['input_tokens' => 10, 'output_tokens' => 8],
+                ]));
+            },
+        ]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        // First request with JSON mode
+        $provider->chat(
+            [['role' => 'user', 'content' => 'Return JSON']],
+            [],
+            ['response_format' => 'json', 'system' => 'You are a helpful assistant.']
+        );
+
+        // Second request without JSON mode (same system prompt)
+        $provider->chat(
+            [['role' => 'user', 'content' => 'Plain text']],
+            [],
+            ['system' => 'You are a helpful assistant.']
+        );
+
+        $firstBody = $capturedBodies->bodies[0];
+        $secondBody = $capturedBodies->bodies[1];
+
+        // First request should have JSON instruction prepended
+        $this->assertStringContainsString('JSON', $firstBody['system']);
+
+        // Second request should NOT have JSON instruction
+        $this->assertEquals('You are a helpful assistant.', $secondBody['system']);
+    }
 }

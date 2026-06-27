@@ -52,8 +52,10 @@ interface LlmProvider
      *         }
      *     }
      * }> $tools Optional tool definitions with JSON Schema parameter definitions.
-     * @param array<string, mixed> $options Optional provider-specific configuration
-     *                                     (e.g., temperature, top_p, max_tokens, model).
+     * @param array<string, mixed> $options Optional provider-specific configuration.
+     *                                     Recognized keys:
+     *                                     - temperature, top_p, max_tokens, model (standard params)
+     *                                     - response_format: 'json' to enable JSON mode (provider-specific implementation)
      *
      * @return array{
      *     choices: list<array{
@@ -118,6 +120,9 @@ interface LlmProvider
      *     }
      * }> $tools Optional tool definitions (same format as chat()).
      * @param array<string, mixed> $options Optional provider-specific configuration.
+     *                                     Recognized keys:
+     *                                     - temperature, top_p, max_tokens, model (standard params)
+     *                                     - response_format: 'json' to enable JSON mode (provider-specific implementation)
      *
      * @return Generator<int, array{
      *     content?: string,

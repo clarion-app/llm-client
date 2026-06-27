@@ -92,6 +92,11 @@ class OpenAiProvider implements LlmProvider
             }
         }
 
+        // JSON response format mode
+        if (isset($options['response_format']) && $options['response_format'] === 'json') {
+            $body['response_format'] = ['type' => 'json_object'];
+        }
+
         try {
             $response = $this->client->post($this->server->server_url, [
                 'headers' => [
@@ -148,6 +153,11 @@ class OpenAiProvider implements LlmProvider
             if (isset($options[$opt])) {
                 $body[$opt] = $options[$opt];
             }
+        }
+
+        // JSON response format mode
+        if (isset($options['response_format']) && $options['response_format'] === 'json') {
+            $body['response_format'] = ['type' => 'json_object'];
         }
 
         try {

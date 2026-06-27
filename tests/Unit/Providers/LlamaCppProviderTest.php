@@ -487,4 +487,97 @@ class LlamaCppProviderTest extends TestCase
         $this->assertGreaterThanOrEqual(1, count($contentChunks));
         $this->assertEquals('Fallback response', $contentChunks[array_key_first($contentChunks)]['content']);
     }
+
+    // ─── JSON Response Format ───
+
+    #[Test]
+    public function chat_with_json_response_format_sends_response_format_param(): void
+    {
+        $capturedBodies = new \stdClass();
+        $capturedBodies->bodies = [];
+
+        $mock = new MockHandler([
+            function ($request) use ($capturedBodies) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, [], json_encode([
+                    'choices' => [['message' => ['role' => 'assistant', 'content' => '{"key":"value"}'], 'finish_reason' => 'stop']],
+                ]));
+            },
+        ]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        $provider->chat(
+            [['role' => 'user', 'content' => 'Return JSON']],
+            [],
+            ['response_format' => 'json']
+        );
+
+        $requestBody = $capturedBodies->bodies[0];
+
+        $this->assertArrayHasKey('response_format', $requestBody);
+        $this->assertEquals(['type' => 'json_object'], $requestBody['response_format']);
+    }
+
+    #[Test]
+    public function chat_without_json_response_format_omits_param(): void
+    {
+        $capturedBodies = new \stdClass();
+        $capturedBodies->bodies = [];
+
+        $mock = new MockHandler([
+            function ($request) use ($capturedBodies) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, [], json_encode([
+                    'choices' => [['message' => ['role' => 'assistant', 'content' => 'Hello'], 'finish_reason' => 'stop']],
+                ]));
+            },
+        ]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        $provider->chat(
+            [['role' => 'user', 'content' => 'Hi']],
+            []
+        );
+
+        $requestBody = $capturedBodies->bodies[0];
+
+        $this->assertArrayNotHasKey('response_format', $requestBody);
+    }
+
+    #[Test]
+    public function stream_with_json_response_format_sends_response_format_param(): void
+    {
+        $capturedBodies = new \stdClass();
+        $capturedBodies->bodies = [];
+
+        $sseData = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"{\\\"key\\\"}\"},\"finish_reason\":null}]}\n\n";
+        $sseData .= "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        $sseData .= "data: [DONE]\n\n";
+
+        $stream = new Stream(fopen('php://temp', 'r+'));
+        $stream->write($sseData);
+        $stream->rewind();
+
+        $mock = new MockHandler([
+            function ($request) use ($capturedBodies, $stream) {
+                $capturedBodies->bodies[] = json_decode((string) $request->getBody(), true);
+                return new Response(200, ['Content-Type' => 'text/event-stream'], $stream);
+            },
+        ]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        iterator_to_array($provider->stream(
+            [['role' => 'user', 'content' => 'Return JSON']],
+            [],
+            ['response_format' => 'json']
+        ));
+
+        $requestBody = $capturedBodies->bodies[0];
+
+        $this->assertArrayHasKey('response_format', $requestBody);
+        $this->assertEquals(['type' => 'json_object'], $requestBody['response_format']);
+    }
 }

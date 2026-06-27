@@ -435,7 +435,7 @@ class AgentLoopService
      * Make a synchronous (non-streaming) LLM API call.
      * Delegates to the resolved provider based on the conversation's effective provider type.
      */
-    private function callLlmSync(Conversation $conversation, array $messages, array $tools, string $system = ''): array
+    private function callLlmSync(Conversation $conversation, array $messages, array $tools, string $system = '', ?string $responseFormat = null): array
     {
         $server = $conversation->server;
         if (!$server) {
@@ -459,6 +459,11 @@ class AgentLoopService
         // Pass system prompt for providers that support it (Anthropic)
         if ($system !== '') {
             $options['system'] = $system;
+        }
+
+        // Pass response_format for JSON mode support
+        if (isset($responseFormat) && $responseFormat !== null) {
+            $options['response_format'] = $responseFormat;
         }
 
         return $provider->chat($messages, $tools, $options);
@@ -935,7 +940,7 @@ class AgentLoopService
         return $payload;
     }
 
-    private function dispatchStreamRequest(Conversation $conversation, array $messages, array $tools, int $iteration, string $system = ''): void
+    private function dispatchStreamRequest(Conversation $conversation, array $messages, array $tools, int $iteration, string $system = '', ?string $responseFormat = null): void
     {
         $server = Server::find($conversation->server_id);
 
@@ -948,6 +953,11 @@ class AgentLoopService
         // Include system prompt for providers that support it (Anthropic)
         if ($system !== '') {
             $body->system = $system;
+        }
+
+        // Include response_format for JSON mode support
+        if (isset($responseFormat) && $responseFormat !== null) {
+            $body->response_format = $responseFormat;
         }
 
         if (!empty($tools)) {
