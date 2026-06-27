@@ -243,6 +243,16 @@ class AnthropicProvider implements LlmProvider
     }
 
     /**
+     * Anthropic doesn't support model listing via the Messages API.
+     */
+    public function listModels(): array
+    {
+        throw new RuntimeException(
+            'Anthropic provider does not support model listing. Use getModels() on the Anthropic API directly if needed.'
+        );
+    }
+
+    /**
      * Map Anthropic response to unified completion result format.
      */
     private function mapResponse(array $response): array

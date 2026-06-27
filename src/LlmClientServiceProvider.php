@@ -10,6 +10,7 @@ use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Listeners\ReindexOnPackageChange;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\AnthropicProvider;
+use ClarionApp\LlmClient\Providers\LlamaCppProvider;
 use ClarionApp\LlmClient\Providers\OpenAiProvider;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\AgentLoopService;
@@ -117,6 +118,12 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $registry->register(
             ProviderType::Anthropic,
             fn (Server $server) => new AnthropicProvider($server, new Client(['timeout' => 240]))
+        );
+
+        // Register llama.cpp provider factory
+        $registry->register(
+            ProviderType::LlamaCpp,
+            fn (Server $server) => new LlamaCppProvider($server, new Client(['timeout' => 240]))
         );
 
         // Set default factory to OpenAI for legacy records

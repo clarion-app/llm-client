@@ -296,6 +296,39 @@ class OpenAiProviderTest extends TestCase
         $this->assertEquals('Response', $result['choices'][0]['message']['content']);
     }
 
+    // ─── listModels ───
+
+    #[Test]
+    public function listModels_returns_model_list(): void
+    {
+        $body = json_encode([
+            'object' => 'list',
+            'data' => [
+                [
+                    'id' => 'gpt-4o',
+                    'object' => 'model',
+                    'owned_by' => 'openai',
+                ],
+                [
+                    'id' => 'gpt-3.5-turbo',
+                    'object' => 'model',
+                    'owned_by' => 'openai',
+                ],
+            ],
+        ]);
+
+        $mock = new MockHandler([new Response(200, [], $body)]);
+        $server = $this->createServer();
+        $provider = $this->createProvider($server, $mock);
+
+        $result = $provider->listModels();
+
+        $this->assertArrayHasKey('models', $result);
+        $this->assertCount(2, $result['models']);
+        $this->assertEquals('gpt-4o', $result['models'][0]['id']);
+        $this->assertEquals('openai', $result['models'][0]['owned_by']);
+    }
+
     // ─── Tear Down ───
 
     protected function tearDown(): void

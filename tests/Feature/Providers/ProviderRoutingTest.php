@@ -204,6 +204,11 @@ class ProviderRoutingTest extends TestCase
             {
                 return strlen($text) / 4;
             }
+
+            public function listModels(): array
+            {
+                return ['models' => [['id' => $this->providerType . '-model']]];
+            }
         };
     }
 }

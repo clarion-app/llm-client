@@ -174,4 +174,24 @@ interface LlmProvider
      *                          or the tokenizer is unavailable.
      */
     public function countTokens(string $text, ?string $model = null): int;
+
+    /**
+     * List available models on this provider's server.
+     *
+     * Returns a unified model list regardless of provider type.
+     * Providers that do not support model listing should throw
+     * a descriptive RuntimeException.
+     *
+     * @return array{
+     *     models: list<array{
+     *         id: string,
+     *         object?: string,
+     *         owned_by?: string
+     *     }>
+     * } Model list with at minimum an `id` for each model.
+     *
+     * @throws RuntimeException If the provider does not support model listing
+     *                          or the request fails.
+     */
+    public function listModels(): array;
 }

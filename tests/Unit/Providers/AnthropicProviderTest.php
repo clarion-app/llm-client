@@ -336,4 +336,18 @@ class AnthropicProviderTest extends TestCase
         $this->assertIsInt($count);
         $this->assertGreaterThan(0, $count);
     }
+
+    // ─── listModels throws (Anthropic doesn't support model listing) ───
+
+    #[Test]
+    public function listModels_throws_runtime_exception(): void
+    {
+        $server = $this->createServer();
+        $provider = new AnthropicProvider($server);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('model listing');
+
+        $provider->listModels();
+    }
 }

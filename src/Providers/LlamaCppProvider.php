@@ -11,14 +11,18 @@ use GuzzleHttp\Exception\RequestException;
 use RuntimeException;
 
 /**
- * OpenAI-compatible provider implementation.
+ * llama.cpp provider implementation (OpenAI-compatible API).
  *
- * Supports OpenAI, Azure OpenAI, and local proxies (llama.cpp server, Ollama).
- * Uses the standard OpenAI Chat Completions API format.
+ * Supports local llama.cpp servers exposing the standard OpenAI Chat Completions
+ * protocol. Key difference from OpenAiProvider: authentication is optional —
+ * local servers often run without Bearer tokens.
+ *
+ * Additionally supports streaming fallback: if a streaming connection fails,
+ * the provider retries as a synchronous chat call and yields the result.
  *
  * @see LlmProvider for the provider contract.
  */
-class OpenAiProvider implements LlmProvider
+class LlamaCppProvider implements LlmProvider
 {
     private Server $server;
     private Client $client;
@@ -31,28 +35,71 @@ class OpenAiProvider implements LlmProvider
 
     /**
      * Extract the base URL from the server_url.
-     *
-     * The server_url may be a full endpoint URL (e.g., /v1/chat/completions)
-     * or a base URL. This method extracts the base for constructing other endpoints.
      */
     private function getBaseUrl(): string
     {
         $url = $this->server->server_url;
-        // If the URL ends with a known endpoint path, strip it to get the base
         $endpointPatterns = ['/v1/chat/completions', '/chat/completions', '/v1/chat', '/chat'];
         foreach ($endpointPatterns as $pattern) {
             if (str_ends_with($url, $pattern)) {
                 $base = substr($url, 0, strlen($url) - strlen($pattern));
-                // Ensure base ends with /
                 if (!str_ends_with($base, '/')) {
                     $base .= '/';
                 }
                 return rtrim($base, '/');
             }
         }
-        // If no pattern matches, assume it's already a base URL
         return rtrim($url, '/');
     }
+
+    /**
+     * Build headers array — includes Authorization only if token is set.
+     */
+    private function buildHeaders(string $accept): array
+    {
+        $headers = [
+            'Content-Type' => 'application/json',
+            'Accept' => $accept,
+        ];
+
+        if ($this->server->token !== null) {
+            $headers['Authorization'] = 'Bearer ' . $this->server->token;
+        }
+
+        return $headers;
+    }
+
+    /**
+     * Build the request body for chat/stream requests.
+     */
+    private function buildBody(array $messages, array $tools, array $options, bool $stream): array
+    {
+        $body = [
+            'model' => $options['model'] ?? null,
+            'messages' => $messages,
+            'temperature' => $options['temperature'] ?? 1.0,
+            'stream' => $stream,
+        ];
+
+        if ($body['model'] === null) {
+            unset($body['model']);
+        }
+
+        if (!empty($tools) && ($options['skip_tools'] ?? false) === false) {
+            $body['tools'] = $tools;
+        }
+
+        $allowedOptions = ['max_tokens', 'top_p', 'top_k', 'frequency_penalty', 'presence_penalty', 'stop', 'seed'];
+        foreach ($allowedOptions as $opt) {
+            if (isset($options[$opt])) {
+                $body[$opt] = $options[$opt];
+            }
+        }
+
+        return $body;
+    }
+
+    // ─── LlmProvider contract methods ───
 
     /**
      * Synchronous non-streaming chat completion.
@@ -63,42 +110,11 @@ class OpenAiProvider implements LlmProvider
             throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
         }
 
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
-        }
-
-        $body = [
-            'model' => $options['model'] ?? null,
-            'messages' => $messages,
-            'temperature' => $options['temperature'] ?? 1.0,
-            'stream' => false,
-        ];
-
-        // Remove null model to let the server use its default
-        if ($body['model'] === null) {
-            unset($body['model']);
-        }
-
-        // Only include tools if non-empty and model supports them
-        if (!empty($tools) && ($options['skip_tools'] ?? false) === false) {
-            $body['tools'] = $tools;
-        }
-
-        // Merge any additional options (max_tokens, top_p, etc.)
-        $allowedOptions = ['max_tokens', 'top_p', 'top_k', 'frequency_penalty', 'presence_penalty', 'stop', 'seed'];
-        foreach ($allowedOptions as $opt) {
-            if (isset($options[$opt])) {
-                $body[$opt] = $options[$opt];
-            }
-        }
+        $body = $this->buildBody($messages, $tools, $options, false);
 
         try {
             $response = $this->client->post($this->server->server_url, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
+                'headers' => $this->buildHeaders('application/json'),
                 'json' => $body,
             ]);
 
@@ -117,6 +133,9 @@ class OpenAiProvider implements LlmProvider
 
     /**
      * Streaming chat completion via PHP Generator.
+     *
+     * Includes fallback: if the streaming connection fails, retries as a
+     * synchronous chat() call and yields the full response as a single chunk.
      */
     public function stream(array $messages, array $tools = [], array $options = []): Generator
     {
@@ -124,39 +143,11 @@ class OpenAiProvider implements LlmProvider
             throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
         }
 
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
-        }
-
-        $body = [
-            'model' => $options['model'] ?? null,
-            'messages' => $messages,
-            'temperature' => $options['temperature'] ?? 1.0,
-            'stream' => true,
-        ];
-
-        if ($body['model'] === null) {
-            unset($body['model']);
-        }
-
-        if (!empty($tools) && ($options['skip_tools'] ?? false) === false) {
-            $body['tools'] = $tools;
-        }
-
-        $allowedOptions = ['max_tokens', 'top_p', 'top_k', 'frequency_penalty', 'presence_penalty', 'stop', 'seed'];
-        foreach ($allowedOptions as $opt) {
-            if (isset($options[$opt])) {
-                $body[$opt] = $options[$opt];
-            }
-        }
+        $body = $this->buildBody($messages, $tools, $options, true);
 
         try {
             $response = $this->client->post($this->server->server_url, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'text/event-stream',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
+                'headers' => $this->buildHeaders('text/event-stream'),
                 'json' => $body,
                 'stream' => true,
             ]);
@@ -172,9 +163,7 @@ class OpenAiProvider implements LlmProvider
 
                 $buffer .= $chunk;
 
-                // Process complete SSE lines
                 $lines = explode("\n", $buffer);
-                // Keep the last (possibly incomplete) line in the buffer
                 $buffer = array_pop($lines);
 
                 foreach ($lines as $line) {
@@ -183,7 +172,6 @@ class OpenAiProvider implements LlmProvider
                         continue;
                     }
 
-                    // Skip comment lines
                     if (str_starts_with($line, ':')) {
                         continue;
                     }
@@ -191,7 +179,6 @@ class OpenAiProvider implements LlmProvider
                     if (str_starts_with($line, 'data: ')) {
                         $data = substr($line, 6);
 
-                        // End of stream
                         if (trim($data) === '[DONE]') {
                             continue;
                         }
@@ -204,27 +191,46 @@ class OpenAiProvider implements LlmProvider
                         $choice = $parsed['choices'][0];
                         $delta = $choice['delta'] ?? [];
 
-                        // Yield content chunk
                         if (isset($delta['content']) && $delta['content'] !== null) {
                             yield ['content' => $delta['content']];
                         }
 
-                        // Yield tool call chunks
                         if (isset($delta['tool_calls']) && is_array($delta['tool_calls'])) {
                             yield ['tool_calls' => $delta['tool_calls']];
                         }
 
-                        // Yield finish reason
                         if (isset($choice['finish_reason']) && $choice['finish_reason'] !== null) {
                             yield ['finish_reason' => $choice['finish_reason']];
                         }
                     }
                 }
             }
+        } catch (ConnectException $e) {
+            // Fallback to synchronous chat on streaming connection failure
+            try {
+                $result = $this->chat($messages, $tools, $options);
+                $choice = $result['choices'][0] ?? null;
+                if ($choice !== null) {
+                    $message = $choice['message'] ?? [];
+                    if (isset($message['content']) && $message['content'] !== null) {
+                        yield ['content' => $message['content']];
+                    }
+                    if (isset($message['tool_calls'])) {
+                        yield ['tool_calls' => $message['tool_calls']];
+                    }
+                    if (isset($choice['finish_reason'])) {
+                        yield ['finish_reason' => $choice['finish_reason']];
+                    }
+                }
+            } catch (\Throwable $fallbackError) {
+                throw new RuntimeException(
+                    'Streaming failed and fallback chat also failed: ' . $e->getMessage() . ' | ' . $fallbackError->getMessage(),
+                    0,
+                    $e
+                );
+            }
         } catch (RequestException $e) {
             $this->throwErrorFromResponse($e->getResponse() ?? null, $e);
-        } catch (ConnectException $e) {
-            throw new RuntimeException('Streaming connection to LLM server failed: ' . $e->getMessage(), 0, $e);
         } catch (\Throwable $e) {
             if ($e instanceof RuntimeException) {
                 throw $e;
@@ -242,16 +248,10 @@ class OpenAiProvider implements LlmProvider
             throw new RuntimeException('Server URL is not configured. Cannot make embedding request.');
         }
 
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
-        }
-
         $baseUrl = $this->getBaseUrl();
         $embeddingsUrl = $baseUrl . '/v1/embeddings';
 
-        $body = [
-            'input' => $inputs,
-        ];
+        $body = ['input' => $inputs];
 
         if (!empty($options['model'])) {
             $body['model'] = $options['model'];
@@ -259,17 +259,12 @@ class OpenAiProvider implements LlmProvider
 
         try {
             $response = $this->client->post($embeddingsUrl, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
+                'headers' => $this->buildHeaders('application/json'),
                 'json' => $body,
             ]);
 
             $result = json_decode($response->getBody()->getContents(), true);
 
-            // Map to unified format
             $embeddings = [];
             foreach ($result['data'] ?? [] as $item) {
                 $embeddings[] = $item['embedding'] ?? [];
@@ -291,12 +286,9 @@ class OpenAiProvider implements LlmProvider
 
     /**
      * Count approximate tokens in text.
-     * Uses character-based approximation (~4 chars per token for GPT models).
      */
     public function countTokens(string $text, ?string $model = null): int
     {
-        // Character-based approximation for OpenAI models
-        // GPT models typically use ~4 characters per token
         return (int) ceil(strlen($text) / 4);
     }
 
@@ -309,20 +301,12 @@ class OpenAiProvider implements LlmProvider
             throw new RuntimeException('Server URL is not configured. Cannot list models.');
         }
 
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
-        }
-
         $baseUrl = $this->getBaseUrl();
         $modelsUrl = $baseUrl . '/v1/models';
 
         try {
             $response = $this->client->get($modelsUrl, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
+                'headers' => $this->buildHeaders('application/json'),
             ]);
 
             $result = json_decode($response->getBody()->getContents(), true);
@@ -332,15 +316,15 @@ class OpenAiProvider implements LlmProvider
                 $models[] = [
                     'id' => $item['id'],
                     'object' => $item['object'] ?? 'model',
-                    'owned_by' => $item['owned_by'] ?? '',
+                    'owned_by' => $item['owned_by'] ?? 'local',
                 ];
             }
 
             return ['models' => $models];
-        } catch (RequestException $e) {
-            $this->throwErrorFromResponse($e->getResponse() ?? null, $e);
         } catch (ConnectException $e) {
             throw new RuntimeException('Connection to LLM server failed: ' . $e->getMessage(), 0, $e);
+        } catch (RequestException $e) {
+            $this->throwErrorFromResponse($e->getResponse() ?? null, $e);
         } catch (\Throwable $e) {
             if ($e instanceof RuntimeException) {
                 throw $e;
@@ -387,15 +371,14 @@ class OpenAiProvider implements LlmProvider
             case 500:
             case 502:
             case 503:
-            case 504:
                 throw new RuntimeException(
-                    'Server error from LLM provider (HTTP ' . $statusCode . '): ' . ($errorMessage ?: 'Internal server error'),
+                    'Server error (' . $statusCode . '): ' . ($errorMessage ?: 'Internal server error'),
                     $statusCode,
                     $previous
                 );
             default:
                 throw new RuntimeException(
-                    'LLM request failed (HTTP ' . $statusCode . '): ' . ($errorMessage ?: 'Unknown error'),
+                    'LLM request failed (' . $statusCode . '): ' . ($errorMessage ?: 'Unknown error'),
                     $statusCode,
                     $previous
                 );

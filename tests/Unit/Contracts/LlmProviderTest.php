@@ -168,6 +168,11 @@ class LlmProviderTest extends TestCase
             {
                 return strlen($text) / 4;
             }
+
+            public function listModels(): array
+            {
+                return ['models' => [['id' => 'mock-model']]];
+            }
         };
 
         $this->assertInstanceOf(LlmProvider::class, $mock);
