@@ -21,9 +21,9 @@ return new class extends Migration
             $driver = DB::getDriverName();
 
             if ($driver === 'mysql') {
-                // MariaDB 11.0+ / MySQL 8.0+ VECTOR type via raw SQL
+                // MariaDB 11.7+ VECTOR type via raw SQL
                 DB::statement(sprintf(
-                    'ALTER TABLE llm_memory_entries ADD COLUMN embedding VECTOR<F32,%d> NULL',
+                    'ALTER TABLE llm_memory_entries ADD COLUMN embedding VECTOR(%d) NULL',
                     $dimension
                 ));
             } elseif ($driver === 'pgsql') {
