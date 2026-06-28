@@ -21,7 +21,12 @@ use ClarionApp\LlmClient\Services\McpResourceHandler;
 use ClarionApp\LlmClient\Services\MessageFormatter;
 use ClarionApp\LlmClient\Services\OperationCache;
 use ClarionApp\LlmClient\Services\OperationsSearchService;
+use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
+use ClarionApp\LlmClient\Services\SchemaMerger;
 use ClarionApp\LlmClient\Services\ToolFormatter;
+use ClarionApp\LlmClient\Presets\DecisionPreset;
+use ClarionApp\LlmClient\Presets\SummaryPreset;
+use ClarionApp\LlmClient\Presets\ExtractionPreset;
 use GuzzleHttp\Client;
 use Illuminate\Support\Facades\Event;
 
@@ -55,6 +60,9 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         // Populate provider registry with factory callables
         $this->registerProviders();
+
+        // Register built-in structured output presets
+        $this->registerPresets();
     }
 
     public function register(): void
@@ -84,7 +92,9 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(OperationCache::class),
                 $app->make(ProviderRegistry::class),
                 $app->make(MessageFormatter::class),
-                $app->make(ToolFormatter::class)
+                $app->make(ToolFormatter::class),
+                null,
+                $app->make(StructuredOutputPresetRegistry::class)
             );
         });
 
@@ -98,6 +108,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         $this->app->singleton(OperationsSearchService::class, function ($app) {
             return new OperationsSearchService();
+        });
+
+        $this->app->singleton(SchemaMerger::class, function () {
+            return new SchemaMerger();
+        });
+
+        $this->app->singleton(StructuredOutputPresetRegistry::class, function ($app) {
+            return new StructuredOutputPresetRegistry($app->make(SchemaMerger::class));
         });
     }
 
@@ -130,5 +148,26 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $registry->default(
             fn (Server $server) => new OpenAiProvider($server, new Client(['timeout' => 240]))
         );
+    }
+
+    /**
+     * Register built-in structured output presets with the registry.
+     */
+    protected function registerPresets(): void
+    {
+        $registry = $this->app->make(StructuredOutputPresetRegistry::class);
+        $enabled = config('llm-client.presets.enabled', ['decision', 'summary', 'extraction']);
+
+        $presetClasses = [
+            'decision' => DecisionPreset::class,
+            'summary' => SummaryPreset::class,
+            'extraction' => ExtractionPreset::class,
+        ];
+
+        foreach ($presetClasses as $name => $class) {
+            if (in_array($name, $enabled)) {
+                $registry->register(new $class());
+            }
+        }
     }
 }

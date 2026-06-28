@@ -79,6 +79,12 @@ return [
         'max_entries' => 20,    // Max cached operations per conversation (LRU eviction)
     ],
 
+    // Structured Output Presets configuration
+    'presets' => [
+        // Which built-in presets to register (all enabled by default)
+        'enabled' => ['decision', 'summary', 'extraction'],
+    ],
+
     // Per-provider defaults
     'providers' => [
         'openai' => [

@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Contracts\ProviderType;
+use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
@@ -10,6 +11,7 @@ use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\SchemaValidator;
+use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
@@ -27,6 +29,7 @@ class AgentLoopService
     private MessageFormatter $messageFormatter;
     private ToolFormatter $toolFormatter;
     private SchemaValidator $schemaValidator;
+    private ?StructuredOutputPresetRegistry $presetRegistry;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -35,7 +38,8 @@ class AgentLoopService
         ?ProviderRegistry $providerRegistry = null,
         ?MessageFormatter $messageFormatter = null,
         ?ToolFormatter $toolFormatter = null,
-        ?SchemaValidator $schemaValidator = null
+        ?SchemaValidator $schemaValidator = null,
+        ?StructuredOutputPresetRegistry $presetRegistry = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -44,6 +48,7 @@ class AgentLoopService
         $this->messageFormatter = $messageFormatter ?? new MessageFormatter();
         $this->toolFormatter = $toolFormatter ?? new ToolFormatter();
         $this->schemaValidator = $schemaValidator ?? new SchemaValidator();
+        $this->presetRegistry = $presetRegistry;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -113,11 +118,35 @@ class AgentLoopService
      *
      * @param Conversation $conversation The conversation context.
      * @param string $message The user message.
-     * @param array $options Optional: ['schema' => [...], 'retry_on_validation_failure' => bool, 'max_schema_retries' => int]
+     * @param array $options Optional: ['preset' => 'decision', 'preset_params' => [...], 'schema_overrides' => [...], 'schema' => [...], 'retry_on_validation_failure' => bool, 'max_schema_retries' => int]
      */
     public function run(Conversation $conversation, string $message, array $options = []): array
     {
         $conversation->update(['is_processing' => true]);
+
+        // Resolve preset schema if a preset name is specified
+        $presetName = $options['preset'] ?? null;
+        $presetParams = $options['preset_params'] ?? null;
+        $schemaOverrides = $options['schema_overrides'] ?? null;
+        $presetSystemPrompt = '';
+
+        if ($presetName && $this->presetRegistry !== null) {
+            try {
+                $resolvedSchema = $this->presetRegistry->resolveSchema($presetName, $presetParams, $schemaOverrides);
+                // If no explicit schema was provided, use the resolved preset schema
+                if (empty($options['schema'])) {
+                    $options['schema'] = $resolvedSchema;
+                }
+                // Fetch the preset's system prompt for injection
+                $preset = $this->presetRegistry->find($presetName);
+                $presetSystemPrompt = $preset->getSystemPrompt();
+            } catch (PresetNotFoundException $e) {
+                throw new \RuntimeException(sprintf('Structured output preset "%s" not found. %s', $presetName, $e->getMessage()));
+            }
+        } elseif (!empty($schemaOverrides) && $this->presetRegistry !== null) {
+            // schema_overrides without a preset name — treat as error
+            throw new \RuntimeException('schema_overrides requires a preset name. Specify "preset" option.');
+        }
 
         // Create the user message
         $userMessage = Message::create([
@@ -142,7 +171,12 @@ class AgentLoopService
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
                 $rawMessages = $this->buildMessagesPayload($conversation);
                 $formatted = $this->formatMessages($conversation, $rawMessages);
-                $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $formatted['system']);
+                // Inject preset system prompt into the base system prompt if present
+                $systemPrompt = $formatted['system'];
+                if ($presetSystemPrompt !== '') {
+                    $systemPrompt = $systemPrompt . "\n\n" . $presetSystemPrompt;
+                }
+                $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $systemPrompt);
 
                 $choice = $response['choices'][0] ?? null;
                 if (!$choice) {
