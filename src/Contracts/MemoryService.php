@@ -45,16 +45,20 @@ interface MemoryService
      * @param MemoryScope $scope Memory scope
      * @param string $agent_id Agent/character identifier
      * @param string $query Search query string
-     * @param string $mode Search mode: 'key_prefix' or 'content'
+     * @param string $mode Search mode: 'key_prefix', 'content', or 'semantic'
      * @param int $limit Maximum results (bounded by search_max_limit)
-     * @return MemoryEntry[]
+     * @param float|null $min_score Minimum similarity_score threshold for semantic mode (0.0-1.0, null = no filtering)
+     * @return MemoryEntry[] Results may include a 'similarity_score' attribute (0.0-1.0) when mode is 'semantic'
+     * @throws InvalidArgumentException If $mode is not a valid search mode
+     * @throws SemanticSearchException If mode is 'semantic' but scope is not LONG_TERM, or embedding provider is unavailable
      */
     public function search(
         MemoryScope $scope,
         string $agent_id,
         string $query,
         string $mode = 'key_prefix',
-        int $limit = 20
+        int $limit = 20,
+        ?float $min_score = null
     ): array;
 
     /**

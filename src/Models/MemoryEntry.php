@@ -21,11 +21,13 @@ class MemoryEntry extends Model
         'turn_id',
         'key',
         'content',
+        'embedding',
         'last_accessed_at',
     ];
 
     protected $casts = [
         'scope' => MemoryScope::class,
+        'embedding' => 'json',
         'last_accessed_at' => 'datetime',
     ];
 

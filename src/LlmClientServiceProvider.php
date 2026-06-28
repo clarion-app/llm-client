@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\Backend\Events\InstallComposerPackageEvent;
 use ClarionApp\Backend\Events\UninstallComposerPackageEvent;
+use ClarionApp\LlmClient\Commands\EmbedMemoryCommand;
 use ClarionApp\LlmClient\Commands\ReindexOperationsCommand;
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Listeners\ReindexOnPackageChange;
@@ -26,6 +27,7 @@ use ClarionApp\LlmClient\Services\SchemaMerger;
 use ClarionApp\LlmClient\Services\ToolFormatter;
 use ClarionApp\LlmClient\Services\MemoryService;
 use ClarionApp\LlmClient\Services\MemoryEvictionService;
+use ClarionApp\LlmClient\Services\EmbeddingService;
 use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
@@ -66,6 +68,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([
                 ReindexOperationsCommand::class,
+                EmbedMemoryCommand::class,
             ]);
         }
 
@@ -135,9 +138,16 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new MemoryEvictionService();
         });
 
+        $this->app->singleton(EmbeddingService::class, function ($app) {
+            return new EmbeddingService(
+                $app->make(ProviderRegistry::class)
+            );
+        });
+
         $this->app->singleton(MemoryServiceContract::class, function ($app) {
             return new MemoryService(
-                $app->make(MemoryEvictionService::class)
+                $app->make(MemoryEvictionService::class),
+                $app->make(EmbeddingService::class)
             );
         });
     }

@@ -99,6 +99,7 @@ abstract class TestCase extends BaseTestCase
             $table->string('turn_id')->nullable();
             $table->string('key', 64)->nullable();
             $table->text('content');
+            $table->json('embedding')->nullable();
             $table->timestamp('last_accessed_at')->useCurrent();
             $table->timestamps();
 

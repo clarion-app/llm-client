@@ -32,7 +32,7 @@ return [
         '- short_term: Persists across turns within a conversation session. Use to track conversation state, user preferences for this session, or accumulate context across turns. Automatically cleared when the session ends.'.PHP_EOL.
         '- long_term: Persists across conversation sessions. Use for facts about the user, learned preferences, or important references. Subject to LRU eviction (configurable limit). Use sparingly for truly persistent data.'.PHP_EOL.
         '- When creating entries, use descriptive keys (max 64 chars) for direct lookup, or omit key for auto-generated UUIDs.'.PHP_EOL.
-        '- Use memory_search with mode "key_prefix" for prefix matching on keys, or "content" for full-text search within content.'.PHP_EOL.
+        '- Use memory_search with mode "key_prefix" for prefix matching on keys, "content" for full-text search within content, or "semantic" for meaning-based search (long_term scope only, returns results with similarity_score 0.0-1.0)'.PHP_EOL.
         'Recovery Rules:'.PHP_EOL.
         '- If search_operations returns no results: try broader search terms once, then fall back to list_applications.'.PHP_EOL.
         '- If results don\'t match intent: retry search_operations once with rephrased broader terms, then fall back to list_applications.'.PHP_EOL.
@@ -91,6 +91,14 @@ return [
         'long_term_max_entries' => 200,  // Max long-term entries per agent (LRU eviction)
         'search_default_limit' => 20,    // Default max results for memory search
         'search_max_limit' => 100,       // Hard cap on search results
+
+        // Embedding configuration for semantic search
+        'embedding' => [
+            'server_id' => null,        // UUID of Server record for embedding provider (null = use chat provider if supported)
+            'dimension' => 1536,        // Vector dimension (must match embedding model output, default 1536 for text-embedding-3-small)
+            'model' => null,            // Optional: override embedding model name (e.g., 'text-embedding-3-small')
+            'enabled' => true,          // Master toggle: disable embedding generation entirely
+        ],
     ],
 
     // Structured Output Presets configuration
