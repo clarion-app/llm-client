@@ -88,5 +88,25 @@ abstract class TestCase extends BaseTestCase
             $table->timestamps();
             $table->softDeletes();
         });
+
+        // llm_memory_entries table (for memory system tests).
+        Schema::create('llm_memory_entries', function (Blueprint $table) {
+            $table->uuid('id')->primary();
+            $table->string('scope');
+            $table->uuid('agent_id');
+            $table->uuid('user_id');
+            $table->uuid('conversation_id')->nullable();
+            $table->string('turn_id')->nullable();
+            $table->string('key', 64)->nullable();
+            $table->text('content');
+            $table->timestamp('last_accessed_at')->useCurrent();
+            $table->timestamps();
+
+            $table->unique(['scope', 'agent_id', 'key']);
+            $table->index(['scope', 'agent_id']);
+            $table->index(['scope', 'user_id']);
+            $table->index(['scope', 'conversation_id']);
+            $table->index(['scope', 'last_accessed_at']);
+        });
     }
 }

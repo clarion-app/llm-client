@@ -12,6 +12,10 @@ use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\SchemaValidator;
 use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
+use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
+use ClarionApp\LlmClient\Contracts\MemoryScope;
+use ClarionApp\LlmClient\Events\AgentTurnCompleted;
+use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
@@ -30,6 +34,7 @@ class AgentLoopService
     private ToolFormatter $toolFormatter;
     private SchemaValidator $schemaValidator;
     private ?StructuredOutputPresetRegistry $presetRegistry;
+    private ?MemoryServiceContract $memoryService;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -39,7 +44,8 @@ class AgentLoopService
         ?MessageFormatter $messageFormatter = null,
         ?ToolFormatter $toolFormatter = null,
         ?SchemaValidator $schemaValidator = null,
-        ?StructuredOutputPresetRegistry $presetRegistry = null
+        ?StructuredOutputPresetRegistry $presetRegistry = null,
+        ?MemoryServiceContract $memoryService = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -49,6 +55,7 @@ class AgentLoopService
         $this->toolFormatter = $toolFormatter ?? new ToolFormatter();
         $this->schemaValidator = $schemaValidator ?? new SchemaValidator();
         $this->presetRegistry = $presetRegistry;
+        $this->memoryService = $memoryService;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -238,7 +245,14 @@ class AgentLoopService
                         'responseTime' => 0,
                     ]);
 
+                    $agentId = $conversation->character ?? $conversation->id;
+
                     $conversation->update(['is_processing' => false]);
+
+                    // Fire ConversationEnded for short-term memory cleanup (T018)
+                    \Illuminate\Support\Facades\Event::dispatch(
+                        new ConversationEnded($conversation->id, $agentId)
+                    );
 
                     // Generate title on first exchange
                     if ($conversation->title === null) {
@@ -326,10 +340,22 @@ class AgentLoopService
                     ],
                 ]);
 
+                // Fire AgentTurnCompleted for scratch memory cleanup (T013)
+                \Illuminate\Support\Facades\Event::dispatch(
+                    new AgentTurnCompleted((string)$iteration, $conversation->id)
+                );
+
                 // If all tool calls were successful execute_operation calls,
                 // stop the loop — no need for a summary response from the LLM.
                 if ($this->allExecuteOperationsSucceeded($toolCalls, $toolResults)) {
+                    $agentId = $conversation->character ?? $conversation->id;
                     $conversation->update(['is_processing' => false]);
+
+                    // Fire ConversationEnded for short-term memory cleanup (T018)
+                    \Illuminate\Support\Facades\Event::dispatch(
+                        new ConversationEnded($conversation->id, $agentId)
+                    );
+
                     return [
                         'status' => 'completed',
                         'content' => '',
@@ -339,7 +365,14 @@ class AgentLoopService
             }
 
             // Max iterations exceeded
+            $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
+
+            // Fire ConversationEnded for short-term memory cleanup (T018)
+            \Illuminate\Support\Facades\Event::dispatch(
+                new ConversationEnded($conversation->id, $agentId)
+            );
+
             return [
                 'status' => 'error',
                 'content' => 'Maximum iterations reached',
@@ -347,7 +380,14 @@ class AgentLoopService
                 'code' => 'max_iterations',
             ];
         } catch (\Throwable $e) {
+            $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
+
+            // Fire ConversationEnded for short-term memory cleanup (T018)
+            \Illuminate\Support\Facades\Event::dispatch(
+                new ConversationEnded($conversation->id, $agentId)
+            );
+
             throw $e;
         }
     }
@@ -366,7 +406,14 @@ class AgentLoopService
 
         $expiresAt = Carbon::parse($pending['expires_at']);
         if ($expiresAt->isPast()) {
+            $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
+
+            // Fire ConversationEnded for short-term memory cleanup (T018)
+            \Illuminate\Support\Facades\Event::dispatch(
+                new ConversationEnded($conversation->id, $agentId)
+            );
+
             throw new \RuntimeException('Confirmation has expired.');
         }
 
@@ -405,7 +452,14 @@ class AgentLoopService
 
             $choice = $response['choices'][0] ?? null;
             if (!$choice) {
+                $agentId = $conversation->character ?? $conversation->id;
                 $conversation->update(['is_processing' => false]);
+
+                // Fire ConversationEnded for short-term memory cleanup (T018)
+                \Illuminate\Support\Facades\Event::dispatch(
+                    new ConversationEnded($conversation->id, $agentId)
+                );
+
                 return ['status' => 'error', 'content' => 'No response from LLM', 'message_id' => null];
             }
 
@@ -422,7 +476,14 @@ class AgentLoopService
                     'responseTime' => 0,
                 ]);
 
+                $agentId = $conversation->character ?? $conversation->id;
                 $conversation->update(['is_processing' => false]);
+
+                // Fire ConversationEnded for short-term memory cleanup (T018)
+                \Illuminate\Support\Facades\Event::dispatch(
+                    new ConversationEnded($conversation->id, $agentId)
+                );
+
                 return [
                     'status' => 'completed',
                     'content' => $content,
@@ -497,7 +558,14 @@ class AgentLoopService
             ]);
         }
 
+        $agentId = $conversation->character ?? $conversation->id;
         $conversation->update(['is_processing' => false]);
+
+        // Fire ConversationEnded for short-term memory cleanup (T018)
+        \Illuminate\Support\Facades\Event::dispatch(
+            new ConversationEnded($conversation->id, $agentId)
+        );
+
         return ['status' => 'error', 'content' => 'Maximum iterations reached', 'message_id' => null];
     }
 
@@ -595,6 +663,107 @@ class AgentLoopService
                             ],
                         ],
                         'required' => ['query'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'memory_create',
+                    'description' => 'Create or update an entry in the memory store. Supports three scopes: scratch (ephemeral, discarded after this turn), short_term (persists across turns in this session), long_term (persists across sessions with LRU eviction).',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'scope' => [
+                                'type' => 'string',
+                                'enum' => ['scratch', 'short_term', 'long_term'],
+                                'description' => 'Memory scope: scratch (per-turn), short_term (per-session), long_term (persistent)',
+                            ],
+                            'key' => [
+                                'type' => 'string',
+                                'description' => 'Optional key for direct lookup (max 64 chars). Auto-generated UUID if omitted.',
+                            ],
+                            'content' => [
+                                'type' => 'string',
+                                'description' => 'The content to store',
+                            ],
+                        ],
+                        'required' => ['scope', 'content'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'memory_read',
+                    'description' => 'Read a memory entry by key or UUID. Updates last_accessed_at for LRU tracking.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'scope' => [
+                                'type' => 'string',
+                                'enum' => ['scratch', 'short_term', 'long_term'],
+                                'description' => 'Memory scope',
+                            ],
+                            'identifier' => [
+                                'type' => 'string',
+                                'description' => 'Entry key or UUID',
+                            ],
+                        ],
+                        'required' => ['scope', 'identifier'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'memory_search',
+                    'description' => 'Search memory entries within a scope. Supports key_prefix (prefix match on key) and content (full-text search) modes.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'scope' => [
+                                'type' => 'string',
+                                'enum' => ['scratch', 'short_term', 'long_term'],
+                                'description' => 'Memory scope',
+                            ],
+                            'query' => [
+                                'type' => 'string',
+                                'description' => 'Search query string',
+                            ],
+                            'mode' => [
+                                'type' => 'string',
+                                'enum' => ['key_prefix', 'content'],
+                                'description' => 'Search mode: key_prefix (default) or content',
+                            ],
+                            'limit' => [
+                                'type' => 'integer',
+                                'description' => 'Maximum results (default 20, max 100)',
+                            ],
+                        ],
+                        'required' => ['scope', 'query'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'memory_delete',
+                    'description' => 'Delete a memory entry by key or UUID.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'scope' => [
+                                'type' => 'string',
+                                'enum' => ['scratch', 'short_term', 'long_term'],
+                                'description' => 'Memory scope',
+                            ],
+                            'identifier' => [
+                                'type' => 'string',
+                                'description' => 'Entry key or UUID',
+                            ],
+                        ],
+                        'required' => ['scope', 'identifier'],
                     ],
                 ],
             ],
@@ -756,8 +925,154 @@ class AgentLoopService
             'list_applications' => $this->handleListApplications(),
             'execute_operation' => $this->handleExecuteOperation($arguments, $conversation),
             'search_operations' => $this->handleSearchOperations($arguments),
+            'memory_create' => $this->handleMemoryCreate($arguments, $conversation),
+            'memory_read' => $this->handleMemoryRead($arguments, $conversation),
+            'memory_search' => $this->handleMemorySearch($arguments, $conversation),
+            'memory_delete' => $this->handleMemoryDelete($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
+    }
+
+    private function handleMemoryCreate(array $arguments, Conversation $conversation): string
+    {
+        if ($this->memoryService === null) {
+            return json_encode(['error' => 'Memory service not available']);
+        }
+
+        $scopeValue = $arguments['scope'] ?? '';
+        $scope = MemoryScope::tryFrom($scopeValue);
+        if (!$scope) {
+            return json_encode(['error' => 'Invalid scope. Must be scratch, short_term, or long_term']);
+        }
+
+        $content = $arguments['content'] ?? '';
+        if ($content === '') {
+            return json_encode(['error' => 'content is required']);
+        }
+
+        $key = $arguments['key'] ?? null;
+        $agent_id = $conversation->character ?? $conversation->id;
+        $user_id = $conversation->user_id;
+        $conversation_id = $conversation->id;
+
+        // For scratch scope, turn_id is required - use current iteration
+        $turn_id = $arguments['turn_id'] ?? null;
+
+        try {
+            $entry = $this->memoryService->create(
+                $scope,
+                $agent_id,
+                $user_id,
+                $conversation_id,
+                $turn_id,
+                $key,
+                $content
+            );
+
+            return json_encode([
+                'id' => $entry->id,
+                'key' => $entry->key,
+                'scope' => $entry->scope->value,
+                'created' => true,
+            ]);
+        } catch (\Throwable $e) {
+            return json_encode(['error' => $e->getMessage()]);
+        }
+    }
+
+    private function handleMemoryRead(array $arguments, Conversation $conversation): string
+    {
+        if ($this->memoryService === null) {
+            return json_encode(['error' => 'Memory service not available']);
+        }
+
+        $scopeValue = $arguments['scope'] ?? '';
+        $scope = MemoryScope::tryFrom($scopeValue);
+        if (!$scope) {
+            return json_encode(['error' => 'Invalid scope']);
+        }
+
+        $identifier = $arguments['identifier'] ?? '';
+        if ($identifier === '') {
+            return json_encode(['error' => 'identifier is required']);
+        }
+
+        $agent_id = $conversation->character ?? $conversation->id;
+
+        $entry = $this->memoryService->read($scope, $agent_id, $identifier);
+        if (!$entry) {
+            return json_encode(['found' => false, 'error' => 'Entry not found']);
+        }
+
+        return json_encode([
+            'id' => $entry->id,
+            'key' => $entry->key,
+            'scope' => $entry->scope->value,
+            'content' => $entry->content,
+            'created_at' => $entry->created_at?->toIso8601String(),
+            'updated_at' => $entry->updated_at?->toIso8601String(),
+        ]);
+    }
+
+    private function handleMemorySearch(array $arguments, Conversation $conversation): string
+    {
+        if ($this->memoryService === null) {
+            return json_encode(['error' => 'Memory service not available']);
+        }
+
+        $scopeValue = $arguments['scope'] ?? '';
+        $scope = MemoryScope::tryFrom($scopeValue);
+        if (!$scope) {
+            return json_encode(['error' => 'Invalid scope']);
+        }
+
+        $query = $arguments['query'] ?? '';
+        if ($query === '') {
+            return json_encode(['error' => 'query is required']);
+        }
+
+        $mode = $arguments['mode'] ?? 'key_prefix';
+        $limit = (int) ($arguments['limit'] ?? config('llm-client.memory.search_default_limit', 20));
+
+        $agent_id = $conversation->character ?? $conversation->id;
+
+        $entries = $this->memoryService->search($scope, $agent_id, $query, $mode, $limit);
+
+        $results = array_map(function ($entry) {
+            return [
+                'id' => $entry->id,
+                'key' => $entry->key,
+                'scope' => $entry->scope->value,
+                'content' => $entry->content,
+                'last_accessed_at' => $entry->last_accessed_at?->toIso8601String(),
+            ];
+        }, $entries);
+
+        return json_encode(['results' => $results, 'count' => count($results)]);
+    }
+
+    private function handleMemoryDelete(array $arguments, Conversation $conversation): string
+    {
+        if ($this->memoryService === null) {
+            return json_encode(['error' => 'Memory service not available']);
+        }
+
+        $scopeValue = $arguments['scope'] ?? '';
+        $scope = MemoryScope::tryFrom($scopeValue);
+        if (!$scope) {
+            return json_encode(['error' => 'Invalid scope']);
+        }
+
+        $identifier = $arguments['identifier'] ?? '';
+        if ($identifier === '') {
+            return json_encode(['error' => 'identifier is required']);
+        }
+
+        $agent_id = $conversation->character ?? $conversation->id;
+
+        $deleted = $this->memoryService->delete($scope, $agent_id, $identifier);
+
+        return json_encode(['deleted' => $deleted]);
     }
 
     private function handleListApplications(): string

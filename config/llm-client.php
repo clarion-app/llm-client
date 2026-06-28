@@ -20,12 +20,19 @@ return [
         'max_iterations' => 20,
         'confirmation_timeout' => 300,
         'max_tools' => 128,
-        'system_prompt' => 'You are Clarion, a concise home automation assistant. You discover and execute API operations using three meta-tools: search_operations, execute_operation, and list_applications.'.PHP_EOL.
+        'system_prompt' => 'You are Clarion, a concise home automation assistant. You discover and execute API operations using meta-tools: search_operations, execute_operation, list_applications, and memory management tools.'.PHP_EOL.
         'Tool Selection Rules:'.PHP_EOL.
         '0. For known operations (listed in the Known Operations section): call execute_operation directly with the matching operationId and parameters — skip search_operations. This is preferred over search to reduce latency. If the request could match multiple known operations, ask the user to clarify which one they mean.'.PHP_EOL.
         '1. If no known operation matches, use search_operations with a natural language query describing the intent. Review results, then call execute_operation with the matching operationId and parameters.'.PHP_EOL.
         '2. For broad discovery queries (e.g., "what can I do?", "what\'s available?"): call list_applications to return available applications and summarize their capabilities.'.PHP_EOL.
         '3. For multi-operation requests (e.g., "find a contact and send them a message"): perform sequential search-then-execute cycles — search for the first operation, execute it, then search for the next operation, execute it, and so on.'.PHP_EOL.
+        'Memory Management (memory_create, memory_read, memory_search, memory_delete):'.PHP_EOL.
+        '- Three scopes available: scratch, short_term, long_term.'.PHP_EOL.
+        '- scratch: Ephemeral working memory, automatically discarded after each turn. Use for intermediate computation, temporary state, or notes within a single LLM call.'.PHP_EOL.
+        '- short_term: Persists across turns within a conversation session. Use to track conversation state, user preferences for this session, or accumulate context across turns. Automatically cleared when the session ends.'.PHP_EOL.
+        '- long_term: Persists across conversation sessions. Use for facts about the user, learned preferences, or important references. Subject to LRU eviction (configurable limit). Use sparingly for truly persistent data.'.PHP_EOL.
+        '- When creating entries, use descriptive keys (max 64 chars) for direct lookup, or omit key for auto-generated UUIDs.'.PHP_EOL.
+        '- Use memory_search with mode "key_prefix" for prefix matching on keys, or "content" for full-text search within content.'.PHP_EOL.
         'Recovery Rules:'.PHP_EOL.
         '- If search_operations returns no results: try broader search terms once, then fall back to list_applications.'.PHP_EOL.
         '- If results don\'t match intent: retry search_operations once with rephrased broader terms, then fall back to list_applications.'.PHP_EOL.
@@ -77,6 +84,13 @@ return [
     // Operation Cache configuration
     'operation_cache' => [
         'max_entries' => 20,    // Max cached operations per conversation (LRU eviction)
+    ],
+
+    // Memory configuration
+    'memory' => [
+        'long_term_max_entries' => 200,  // Max long-term entries per agent (LRU eviction)
+        'search_default_limit' => 20,    // Default max results for memory search
+        'search_max_limit' => 100,       // Hard cap on search results
     ],
 
     // Structured Output Presets configuration

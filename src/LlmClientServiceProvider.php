@@ -24,6 +24,13 @@ use ClarionApp\LlmClient\Services\OperationsSearchService;
 use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
 use ClarionApp\LlmClient\Services\SchemaMerger;
 use ClarionApp\LlmClient\Services\ToolFormatter;
+use ClarionApp\LlmClient\Services\MemoryService;
+use ClarionApp\LlmClient\Services\MemoryEvictionService;
+use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
+use ClarionApp\LlmClient\Events\AgentTurnCompleted;
+use ClarionApp\LlmClient\Events\ConversationEnded;
+use ClarionApp\LlmClient\Listeners\CleanupScratchMemory;
+use ClarionApp\LlmClient\Listeners\CleanupShortTermMemory;
 use ClarionApp\LlmClient\Presets\DecisionPreset;
 use ClarionApp\LlmClient\Presets\SummaryPreset;
 use ClarionApp\LlmClient\Presets\ExtractionPreset;
@@ -50,6 +57,10 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             [InstallComposerPackageEvent::class, UninstallComposerPackageEvent::class],
             ReindexOnPackageChange::class
         );
+
+        // Register memory lifecycle event listeners
+        Event::listen(AgentTurnCompleted::class, CleanupScratchMemory::class);
+        Event::listen(ConversationEnded::class, CleanupShortTermMemory::class);
 
         // Register Artisan commands
         if ($this->app->runningInConsole()) {
@@ -94,7 +105,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(MessageFormatter::class),
                 $app->make(ToolFormatter::class),
                 null,
-                $app->make(StructuredOutputPresetRegistry::class)
+                $app->make(StructuredOutputPresetRegistry::class),
+                $app->make(MemoryServiceContract::class)
             );
         });
 
@@ -116,6 +128,17 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         $this->app->singleton(StructuredOutputPresetRegistry::class, function ($app) {
             return new StructuredOutputPresetRegistry($app->make(SchemaMerger::class));
+        });
+
+        // Register memory services as singletons
+        $this->app->singleton(MemoryEvictionService::class, function () {
+            return new MemoryEvictionService();
+        });
+
+        $this->app->singleton(MemoryServiceContract::class, function ($app) {
+            return new MemoryService(
+                $app->make(MemoryEvictionService::class)
+            );
         });
     }
 

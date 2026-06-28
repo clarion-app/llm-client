@@ -40,14 +40,18 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        // buildToolsPayload now returns 3 hardcoded meta-tools
-        $this->assertCount(3, $tools);
+        // buildToolsPayload now returns 7 hardcoded meta-tools (3 original + 4 memory)
+        $this->assertCount(7, $tools);
 
-        // Verify all 3 meta-tools are present
+        // Verify all 7 meta-tools are present
         $toolNames = collect($tools)->pluck('function.name')->toArray();
         $this->assertContains('list_applications', $toolNames);
         $this->assertContains('execute_operation', $toolNames);
         $this->assertContains('search_operations', $toolNames);
+        $this->assertContains('memory_create', $toolNames);
+        $this->assertContains('memory_read', $toolNames);
+        $this->assertContains('memory_search', $toolNames);
+        $this->assertContains('memory_delete', $toolNames);
 
         // Verify structure of each tool
         foreach ($tools as $tool) {
@@ -59,7 +63,7 @@ class AgentLoopServiceTest extends TestCase
     }
 
     #[Test]
-    public function build_tools_payload_returns_three_meta_tools()
+    public function build_tools_payload_returns_seven_meta_tools()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
@@ -67,7 +71,7 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        $this->assertCount(3, $tools);
+        $this->assertCount(7, $tools);
 
         // Verify list_applications has no parameters
         $listApps = collect($tools)->firstWhere('function.name', 'list_applications');
