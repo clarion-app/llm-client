@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
+use ClarionApp\LlmClient\Models\DeclarativeMemory;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
@@ -33,8 +34,50 @@ class DeclarativeMemoryController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        // TODO (US3): Implement paginated list with optional type filter.
-        throw new \RuntimeException('index not yet implemented');
+        $userId = (string) auth()->id();
+
+        $query = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $userId);
+
+        // Optional type filter
+        if ($request->has('type')) {
+            $type = $request->input('type');
+            if (in_array($type, DeclarativeMemory::TYPES, true)) {
+                $query->where('type', $type);
+            }
+        }
+
+        $perPage = min((int) $request->input('per_page', 20), 100);
+        $page = (int) $request->input('page', 1);
+
+        $paginator = $query->orderBy('updated_at', 'desc')->paginate($perPage, ['*'], 'page', $page);
+
+        $data = array_map(function ($entry) {
+            return [
+                'id' => $entry->id,
+                'type' => $entry->type,
+                'content' => $entry->content,
+                'source' => $entry->source,
+                'created_at' => $entry->created_at?->toIso8601String(),
+                'updated_at' => $entry->updated_at?->toIso8601String(),
+            ];
+        }, $paginator->items());
+
+        return response()->json([
+            'data' => $data,
+            'links' => [
+                'first' => $paginator->url(1),
+                'last' => $paginator->url($paginator->lastPage()),
+                'prev' => $paginator->previousPageUrl(),
+                'next' => $paginator->nextPageUrl(),
+            ],
+            'meta' => [
+                'current_page' => $paginator->currentPage(),
+                'last_page' => $paginator->lastPage(),
+                'per_page' => $paginator->perPage(),
+                'total' => $paginator->total(),
+            ],
+        ]);
     }
 
     /**
@@ -86,8 +129,31 @@ class DeclarativeMemoryController extends Controller
      */
     public function update(Request $request, string $id): JsonResponse
     {
-        // TODO (US3): Replace content in place and return updated entry.
-        throw new \RuntimeException('update not yet implemented');
+        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+            'content' => ['required', 'string', 'min:1'],
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['error' => $validator->errors()->first()], 422);
+        }
+
+        $content = trim($request->input('content'));
+        $userId = (string) auth()->id();
+
+        try {
+            $entry = $this->declarativeMemoryService->updateByUser($userId, $id, $content);
+
+            return response()->json([
+                'id' => $entry->id,
+                'type' => $entry->type,
+                'content' => $entry->content,
+                'source' => $entry->source,
+                'created_at' => $entry->created_at?->toIso8601String(),
+                'updated_at' => $entry->updated_at?->toIso8601String(),
+            ], 200);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            return response()->json(['error' => 'Entry not found'], 404);
+        }
     }
 
     /**
@@ -98,7 +164,13 @@ class DeclarativeMemoryController extends Controller
      */
     public function destroy(string $id): Response
     {
-        // TODO (US3): Call forceDelete scoped to user_id.
-        throw new \RuntimeException('destroy not yet implemented');
+        $userId = (string) auth()->id();
+
+        try {
+            $this->declarativeMemoryService->delete($userId, $id);
+            return response()->noContent(204);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            return response()->json(['error' => 'Entry not found'], 404);
+        }
     }
 }

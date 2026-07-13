@@ -43,8 +43,36 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
      */
     public function updateByUser(string $userId, string $id, string $content): DeclarativeMemory
     {
-        // TODO (US3): Implement user edit with re-embed.
-        throw new \RuntimeException('updateByUser not yet implemented');
+        $entry = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $userId)
+            ->where('id', $id)
+            ->first();
+
+        if (!$entry) {
+            throw new \Illuminate\Database\Eloquent\ModelNotFoundException(
+                "Entry not found: {$id} for user {$userId}"
+            );
+        }
+
+        $entry->content = $content;
+
+        // Best-effort re-embed
+        if ($this->embeddingService->isEnabled()) {
+            try {
+                $entry->embedding = $this->embeddingService->generate($content);
+            } catch (\Throwable $e) {
+                Log::warning('Embedding generation failed during declarative memory update', [
+                    'user_id' => $userId,
+                    'entry_id' => $id,
+                    'error' => $e->getMessage(),
+                ]);
+                $entry->embedding = null;
+            }
+        }
+
+        $entry->save();
+        $entry->refresh();
+        return $entry;
     }
 
     /**
@@ -111,8 +139,18 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
      */
     public function delete(string $userId, string $id): bool
     {
-        // TODO (US3): Implement forceDelete with user scoping.
-        throw new \RuntimeException('delete not yet implemented');
+        $entry = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $userId)
+            ->where('id', $id)
+            ->first();
+
+        if (!$entry) {
+            throw new \Illuminate\Database\Eloquent\ModelNotFoundException(
+                "Entry not found: {$id} for user {$userId}"
+            );
+        }
+
+        return $entry->forceDelete();
     }
 
     /* -----------------------------------------------------------------

@@ -322,4 +322,74 @@ class DeclarativeMemoryServiceTest extends TestCase
             ->count();
         $this->assertEquals(2, $count);
     }
+
+    /* -----------------------------------------------------------------
+     * Recall Provenance Tests (User Story 4)
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function recall_distinguishes_user_stated_from_agent_learned(): void
+    {
+        $embeddingService = $this->createMock(EmbeddingService::class);
+        $embeddingService->method('isEnabled')->willReturn(false);
+        $service = new \ClarionApp\LlmClient\Services\DeclarativeMemoryService($embeddingService);
+
+        // Create a user_stated entry
+        $service->createByUser($this->user->id, 'preference', 'Always use 24-hour time format');
+
+        // Create an agent_learned entry directly (simulating confirmed agent write)
+        DeclarativeMemory::create([
+            'id' => (string) Str::uuid(),
+            'user_id' => $this->user->id,
+            'type' => 'fact',
+            'content' => 'User prefers Python over JavaScript',
+            'source' => 'agent_learned',
+        ]);
+
+        $recalled = $service->recall($this->user->id);
+
+        // Each entry must expose its source
+        $sources = $recalled['entries']->pluck('source')->toArray();
+        $this->assertContains('user_stated', $sources);
+        $this->assertContains('agent_learned', $sources);
+
+        // Verify source is per-entry, not just aggregate
+        foreach ($recalled['entries'] as $entry) {
+            $this->assertNotNull($entry->source);
+            $this->assertContains($entry->source, ['user_stated', 'agent_learned']);
+        }
+    }
+
+    #[Test]
+    public function recall_surfaces_rules_as_binding_group(): void
+    {
+        $embeddingService = $this->createMock(EmbeddingService::class);
+        $embeddingService->method('isEnabled')->willReturn(false);
+        $service = new \ClarionApp\LlmClient\Services\DeclarativeMemoryService($embeddingService);
+
+        // Create a rule entry
+        $service->createByUser($this->user->id, 'rule', 'Never delete files without confirmation');
+
+        // Create a fact entry
+        $service->createByUser($this->user->id, 'fact', 'I live in Boston');
+
+        // Create a preference entry
+        $service->createByUser($this->user->id, 'preference', 'Dark mode preferred');
+
+        $recalled = $service->recall($this->user->id);
+
+        // Rules must be in a distinct group
+        $this->assertArrayHasKey('rules', $recalled);
+        $this->assertCount(1, $recalled['rules']);
+        $firstRule = $recalled['rules']->first();
+        $this->assertEquals('rule', $firstRule->type);
+        $this->assertEquals('Never delete files without confirmation', $firstRule->content);
+
+        // Facts and preferences are separate
+        $this->assertCount(1, $recalled['facts']);
+        $this->assertCount(1, $recalled['preferences']);
+
+        // Total entries include all
+        $this->assertCount(3, $recalled['entries']);
+    }
 }
