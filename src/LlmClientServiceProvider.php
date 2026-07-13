@@ -28,8 +28,10 @@ use ClarionApp\LlmClient\Services\ToolFormatter;
 use ClarionApp\LlmClient\Services\MemoryService;
 use ClarionApp\LlmClient\Services\MemoryEvictionService;
 use ClarionApp\LlmClient\Services\EmbeddingService;
+use ClarionApp\LlmClient\Services\DeclarativeMemoryService as DeclarativeMemoryServiceImpl;
 use ClarionApp\LlmClient\Services\EpisodicMemoryService;
 use ClarionApp\LlmClient\Services\EpisodicMemorySearchService;
+use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
@@ -177,6 +179,13 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         $this->app->singleton(EpisodicMemorySearchService::class, function ($app) {
             return new EpisodicMemorySearchService(
+                $app->make(EmbeddingService::class)
+            );
+        });
+
+        // Register declarative memory service
+        $this->app->singleton(DeclarativeMemoryServiceContract::class, function ($app) {
+            return new DeclarativeMemoryServiceImpl(
                 $app->make(EmbeddingService::class)
             );
         });

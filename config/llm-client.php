@@ -110,6 +110,14 @@ return [
         'summarization_timeout_seconds' => 120, // Job timeout for summarization
     ],
 
+    // Declarative Memory configuration — permanent, user-scoped facts/preferences/rules.
+    // NOTE: intentionally has NO retention, eviction, or entry-cap settings.
+    'declarative_memory' => [
+        // Normalized cosine-similarity threshold (0.0–1.0) above which a new confirmed
+        // entry is treated as conflicting with an existing same-type entry and supersedes it (FR-010).
+        'conflict_similarity_threshold' => 0.85,
+    ],
+
     // Structured Output Presets configuration
     'presets' => [
         // Which built-in presets to register (all enabled by default)

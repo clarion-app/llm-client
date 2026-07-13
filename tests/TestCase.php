@@ -110,5 +110,21 @@ abstract class TestCase extends BaseTestCase
             $table->index(['scope', 'last_accessed_at']);
         });
 
+        // declarative_memories table (for declarative memory tests).
+        Schema::create('declarative_memories', function (Blueprint $table) {
+            $table->uuid('id')->primary();
+            $table->uuid('user_id');
+            $table->string('type');
+            $table->text('content');
+            $table->string('source');
+            $table->json('embedding')->nullable();
+            $table->timestamps();
+            $table->softDeletes();
+
+            $table->index('user_id');
+            $table->index(['user_id', 'type']);
+            $table->index('deleted_at');
+        });
+
     }
 }

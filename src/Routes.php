@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Controllers\MessageController;
 use ClarionApp\LlmClient\Controllers\LanguageModelController;
 use ClarionApp\LlmClient\Controllers\AgentController;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Controllers\DeclarativeMemoryController;
 use ClarionApp\LlmClient\Controllers\FetchPageController;
 use ClarionApp\LlmClient\Controllers\UserSettingController;
 use ClarionApp\LlmClient\Controllers\McpServerController;
@@ -38,6 +39,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('episodic-memories/search', [EpisodicMemoryController::class, "search"]);
     Route::patch('episodic-memories/{id}/protect', [EpisodicMemoryController::class, "protect"]);
     Route::delete('episodic-memories/{id}', [EpisodicMemoryController::class, "destroy"]);
+
+    // Declarative Memory endpoints (user-driven CRUD, behind auth:api)
+    Route::get('declarative-memories', [DeclarativeMemoryController::class, "index"]);
+    Route::post('declarative-memories', [DeclarativeMemoryController::class, "store"]);
+    Route::put('declarative-memories/{id}', [DeclarativeMemoryController::class, "update"]);
+    Route::delete('declarative-memories/{id}', [DeclarativeMemoryController::class, "destroy"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
