@@ -15,6 +15,7 @@ use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
 use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\MemoryScope;
 use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
+use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\Backend\ApiManager;
@@ -37,6 +38,7 @@ class AgentLoopService
     private ?StructuredOutputPresetRegistry $presetRegistry;
     private ?MemoryServiceContract $memoryService;
     private ?EpisodicMemoryServiceContract $episodicMemoryService;
+    private ?DeclarativeMemoryServiceContract $declarativeMemoryService;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -48,7 +50,8 @@ class AgentLoopService
         ?SchemaValidator $schemaValidator = null,
         ?StructuredOutputPresetRegistry $presetRegistry = null,
         ?MemoryServiceContract $memoryService = null,
-        ?EpisodicMemoryServiceContract $episodicMemoryService = null
+        ?EpisodicMemoryServiceContract $episodicMemoryService = null,
+        ?DeclarativeMemoryServiceContract $declarativeMemoryService = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -60,6 +63,7 @@ class AgentLoopService
         $this->presetRegistry = $presetRegistry;
         $this->memoryService = $memoryService;
         $this->episodicMemoryService = $episodicMemoryService;
+        $this->declarativeMemoryService = $declarativeMemoryService;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -93,19 +97,51 @@ class AgentLoopService
         $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
-        if ($approved) {
-            // Execute the confirmed operation
-            $resultContent = $this->executeApiCall(
-                $pending['operationId'],
-                $pending['method'],
-                $pending['path'],
-                $pending['arguments'] ?? [],
-                $conversation
-            );
+        $confirmationType = $pending['confirmation_type'] ?? 'api_call';
 
-            $toolData['tool_results'] = [
-                ['tool_call_id' => $toolCallId, 'content' => $resultContent],
-            ];
+        if ($approved) {
+            if ($confirmationType === 'declarative_memory') {
+                // Route declarative_memory proposals to applyAgentWrite with confirmation
+                $type = $pending['type'] ?? '';
+                $content = $pending['content'] ?? '';
+                $existingId = $pending['existingId'] ?? null;
+
+                if ($this->declarativeMemoryService !== null && $type && $content) {
+                    $entry = $this->declarativeMemoryService->applyAgentWrite(
+                        $conversation->user_id,
+                        $type,
+                        $content,
+                        true,
+                        $existingId
+                    );
+                    $resultContent = json_encode([
+                        'id' => $entry->id,
+                        'type' => $entry->type,
+                        'content' => $entry->content,
+                        'source' => $entry->source,
+                        'created' => true,
+                    ]);
+                } else {
+                    $resultContent = json_encode(['error' => 'Declarative memory service not available']);
+                }
+
+                $toolData['tool_results'] = [
+                    ['tool_call_id' => $toolCallId, 'content' => $resultContent],
+                ];
+            } else {
+                // Execute the confirmed API operation (existing path, unchanged)
+                $resultContent = $this->executeApiCall(
+                    $pending['operationId'],
+                    $pending['method'],
+                    $pending['path'],
+                    $pending['arguments'] ?? [],
+                    $conversation
+                );
+
+                $toolData['tool_results'] = [
+                    ['tool_call_id' => $toolCallId, 'content' => $resultContent],
+                ];
+            }
         } else {
             $toolData['tool_results'] = [
                 ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'],
@@ -285,14 +321,46 @@ class AgentLoopService
                     $decoded = json_decode($result, true);
 
                     if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
-                        $pendingConfirmation = [
-                            'tool_name' => 'execute_operation',
-                            'operationId' => $decoded['operationId'],
-                            'method' => $decoded['method'],
-                            'path' => $decoded['path'],
-                            'arguments' => $decoded['parameters'] ?? [],
-                            'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
-                        ];
+                        $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
+
+                        if ($confirmationType === 'declarative_memory') {
+                            $pendingConfirmation = [
+                                'tool_name' => 'propose_declarative_memory',
+                                'confirmation_type' => 'declarative_memory',
+                                'type' => $decoded['type'] ?? '',
+                                'content' => $decoded['content'] ?? '',
+                                'existingId' => $decoded['existingId'] ?? null,
+                                'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                            ];
+
+                            $confirmationPayload = [
+                                'confirmation_type' => 'declarative_memory',
+                                'type' => $decoded['type'] ?? '',
+                                'content' => $decoded['content'] ?? '',
+                                'existingId' => $decoded['existingId'] ?? null,
+                                'expires_at' => $pendingConfirmation['expires_at'],
+                            ];
+                        } else {
+                            // Default: execute_operation (api_call)
+                            $pendingConfirmation = [
+                                'tool_name' => 'execute_operation',
+                                'confirmation_type' => 'api_call',
+                                'operationId' => $decoded['operationId'],
+                                'method' => $decoded['method'],
+                                'path' => $decoded['path'],
+                                'arguments' => $decoded['parameters'] ?? [],
+                                'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                            ];
+
+                            $confirmationPayload = [
+                                'confirmation_type' => 'api_call',
+                                'operationId' => $decoded['operationId'],
+                                'method' => $decoded['method'],
+                                'path' => $decoded['path'],
+                                'arguments' => $decoded['parameters'] ?? [],
+                                'expires_at' => $pendingConfirmation['expires_at'],
+                            ];
+                        }
 
                         // Store message with pending confirmation
                         $assistantMessage = Message::create([
@@ -313,13 +381,7 @@ class AgentLoopService
                             'status' => 'confirmation_required',
                             'content' => $content ?: '',
                             'message_id' => $assistantMessage->id,
-                            'confirmation' => [
-                                'operationId' => $decoded['operationId'],
-                                'method' => $decoded['method'],
-                                'path' => $decoded['path'],
-                                'arguments' => $decoded['parameters'] ?? [],
-                                'expires_at' => $pendingConfirmation['expires_at'],
-                            ],
+                            'confirmation' => $confirmationPayload,
                         ];
                     }
 
@@ -504,14 +566,46 @@ class AgentLoopService
                 $decoded = json_decode($result, true);
 
                 if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
-                    $pendingConfirmation = [
-                        'tool_name' => 'execute_operation',
-                        'operationId' => $decoded['operationId'],
-                        'method' => $decoded['method'],
-                        'path' => $decoded['path'],
-                        'arguments' => $decoded['parameters'] ?? [],
-                        'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
-                    ];
+                    $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
+
+                    if ($confirmationType === 'declarative_memory') {
+                        $pendingConfirmation = [
+                            'tool_name' => 'propose_declarative_memory',
+                            'confirmation_type' => 'declarative_memory',
+                            'type' => $decoded['type'] ?? '',
+                            'content' => $decoded['content'] ?? '',
+                            'existingId' => $decoded['existingId'] ?? null,
+                            'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                        ];
+
+                        $confirmationPayload = [
+                            'confirmation_type' => 'declarative_memory',
+                            'type' => $decoded['type'] ?? '',
+                            'content' => $decoded['content'] ?? '',
+                            'existingId' => $decoded['existingId'] ?? null,
+                            'expires_at' => $pendingConfirmation['expires_at'],
+                        ];
+                    } else {
+                        // Default: execute_operation (api_call)
+                        $pendingConfirmation = [
+                            'tool_name' => 'execute_operation',
+                            'confirmation_type' => 'api_call',
+                            'operationId' => $decoded['operationId'],
+                            'method' => $decoded['method'],
+                            'path' => $decoded['path'],
+                            'arguments' => $decoded['parameters'] ?? [],
+                            'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                        ];
+
+                        $confirmationPayload = [
+                            'confirmation_type' => 'api_call',
+                            'operationId' => $decoded['operationId'],
+                            'method' => $decoded['method'],
+                            'path' => $decoded['path'],
+                            'arguments' => $decoded['parameters'] ?? [],
+                            'expires_at' => $pendingConfirmation['expires_at'],
+                        ];
+                    }
 
                     $assistantMessage = Message::create([
                         'conversation_id' => $conversation->id,
@@ -531,13 +625,7 @@ class AgentLoopService
                         'status' => 'confirmation_required',
                         'content' => $content ?: '',
                         'message_id' => $assistantMessage->id,
-                        'confirmation' => [
-                            'operationId' => $decoded['operationId'],
-                            'method' => $decoded['method'],
-                            'path' => $decoded['path'],
-                            'arguments' => $decoded['parameters'] ?? [],
-                            'expires_at' => $pendingConfirmation['expires_at'],
-                        ],
+                        'confirmation' => $confirmationPayload,
                     ];
                 }
 
@@ -771,6 +859,32 @@ class AgentLoopService
                     ],
                 ],
             ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'propose_declarative_memory',
+                    'description' => 'Propose a new declarative memory (fact, preference, or rule) to the user for confirmation. Nothing is persisted until the user explicitly confirms. Use this when you infer a new fact or preference about the user, or when you want to suggest a behavioral rule.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'type' => [
+                                'type' => 'string',
+                                'enum' => ['fact', 'preference', 'rule'],
+                                'description' => 'Type of declarative memory: fact (objective information), preference (user preference), or rule (binding behavioral constraint)',
+                            ],
+                            'content' => [
+                                'type' => 'string',
+                                'description' => 'The content to propose (e.g., "User prefers dark mode", "Always confirm before destructive actions")',
+                            ],
+                            'existingId' => [
+                                'type' => 'string',
+                                'description' => 'Optional: UUID of an existing entry to update (for inferred updates). Omit for new entries.',
+                            ],
+                        ],
+                        'required' => ['type', 'content'],
+                    ],
+                ],
+            ],
         ];
     }
 
@@ -933,6 +1047,7 @@ class AgentLoopService
             'memory_read' => $this->handleMemoryRead($arguments, $conversation),
             'memory_search' => $this->handleMemorySearch($arguments, $conversation),
             'memory_delete' => $this->handleMemoryDelete($arguments, $conversation),
+            'propose_declarative_memory' => $this->handleProposeDeclarativeMemory($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -1562,5 +1677,36 @@ class AgentLoopService
             return $result['content'][0]['text'] ?? json_encode($result['content']);
         }
         return json_encode($result);
+    }
+
+    /**
+     * Handle the propose_declarative_memory tool call.
+     *
+     * Returns a __requires_confirmation marker so the agent loop pauses
+     * and awaits user confirmation. Nothing is persisted at this point.
+     */
+    private function handleProposeDeclarativeMemory(array $arguments, Conversation $conversation): string
+    {
+        $type = $arguments['type'] ?? '';
+        $content = $arguments['content'] ?? '';
+        $existingId = $arguments['existingId'] ?? null;
+
+        if (!in_array($type, ['fact', 'preference', 'rule'], true)) {
+            return json_encode(['error' => 'Invalid type. Must be fact, preference, or rule']);
+        }
+
+        if ($content === '') {
+            return json_encode(['error' => 'content is required']);
+        }
+
+        // Return __requires_confirmation marker with confirmation_type: 'declarative_memory'
+        // This is transient — nothing is persisted yet
+        return json_encode([
+            '__requires_confirmation' => true,
+            'confirmation_type' => 'declarative_memory',
+            'type' => $type,
+            'content' => $content,
+            'existingId' => $existingId,
+        ]);
     }
 }

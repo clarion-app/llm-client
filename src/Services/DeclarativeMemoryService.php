@@ -49,6 +49,10 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
 
     /**
      * Apply an agent-sourced declarative memory write.
+     *
+     * Enforces the confirmation gate at the storage boundary:
+     * throws ConfirmationRequiredException BEFORE any DB read/write
+     * when userConfirmed is not true.
      */
     public function applyAgentWrite(
         string $userId,
@@ -57,8 +61,13 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
         bool $userConfirmed,
         ?string $existingId = null
     ): DeclarativeMemory {
-        // TODO (US2): Implement confirmation gate + agent-learned persist.
-        throw new \RuntimeException('applyAgentWrite not yet implemented');
+        // Hard confirmation gate — throw BEFORE any DB access (SC-004 / FR-003 / FR-003a)
+        if ($userConfirmed !== true) {
+            throw new ConfirmationRequiredException($type, $content, $existingId);
+        }
+
+        // Confirmed — persist as agent_learned via conflict/supersede path
+        return $this->resolveConflictAndStore($userId, $type, $content, 'agent_learned');
     }
 
     /* -----------------------------------------------------------------
