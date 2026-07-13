@@ -10,7 +10,7 @@ return new class extends Migration
     /**
      * Add embedding vector column to llm_memory_entries table.
      *
-     * Uses MariaDB VECTOR<F32,N> type for native vector similarity search,
+     * Uses MariaDB VECTOR(N) type for native vector similarity search,
      * with JSON fallback for SQLite and JSONB for PostgreSQL.
      */
     public function up(): void

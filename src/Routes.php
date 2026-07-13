@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Controllers\FetchPageController;
 use ClarionApp\LlmClient\Controllers\UserSettingController;
 use ClarionApp\LlmClient\Controllers\McpServerController;
+use ClarionApp\LlmClient\Controllers\EpisodicMemoryController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -31,6 +32,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::put('user-setting', [UserSettingController::class, "update"]);
 
     Route::post('mcp', [McpServerController::class, "handle"]);
+
+    // Episodic Memory endpoints (US3 - Search Past Conversation Events)
+    Route::get('episodic-memories', [EpisodicMemoryController::class, "index"]);
+    Route::post('episodic-memories/search', [EpisodicMemoryController::class, "search"]);
+    Route::patch('episodic-memories/{id}/protect', [EpisodicMemoryController::class, "protect"]);
+    Route::delete('episodic-memories/{id}', [EpisodicMemoryController::class, "destroy"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

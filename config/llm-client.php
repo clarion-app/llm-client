@@ -101,6 +101,15 @@ return [
         ],
     ],
 
+    // Episodic Memory configuration
+    'episodic_memory' => [
+        'retention_days' => 90,                // Default retention period in days
+        'cleanup_schedule' => 'daily',         // Cleanup job schedule
+        'max_topics_per_entry' => 10,          // Maximum topic tags per entry
+        'summary_max_ratio' => 0.20,           // Summary must be ≤ 20% of original word count
+        'summarization_timeout_seconds' => 120, // Job timeout for summarization
+    ],
+
     // Structured Output Presets configuration
     'presets' => [
         // Which built-in presets to register (all enabled by default)

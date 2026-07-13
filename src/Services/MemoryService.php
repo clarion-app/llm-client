@@ -223,7 +223,7 @@ class MemoryService implements MemoryServiceContract
         $results = MemoryEntry::where('scope', MemoryScope::LONG_TERM->value)
             ->where('agent_id', $agent_id)
             ->whereNotNull('embedding')
-            ->selectRaw('*, VECTOR_COSINE_DISTANCE(embedding, CAST(? AS VECTOR<F32,' . count($queryEmbedding) . '>) AS similarity_raw', [$embeddingVector])
+            ->selectRaw('*, VECTOR_COSINE_DISTANCE(embedding, CAST(? AS VECTOR(' . count($queryEmbedding) . '))) AS similarity_raw', [$embeddingVector])
             ->orderByDesc('similarity_raw')
             ->limit($limit)
             ->get();

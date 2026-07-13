@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\Services\SchemaValidator;
 use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
 use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\MemoryScope;
+use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\Backend\ApiManager;
@@ -35,6 +36,7 @@ class AgentLoopService
     private SchemaValidator $schemaValidator;
     private ?StructuredOutputPresetRegistry $presetRegistry;
     private ?MemoryServiceContract $memoryService;
+    private ?EpisodicMemoryServiceContract $episodicMemoryService;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -45,7 +47,8 @@ class AgentLoopService
         ?ToolFormatter $toolFormatter = null,
         ?SchemaValidator $schemaValidator = null,
         ?StructuredOutputPresetRegistry $presetRegistry = null,
-        ?MemoryServiceContract $memoryService = null
+        ?MemoryServiceContract $memoryService = null,
+        ?EpisodicMemoryServiceContract $episodicMemoryService = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -56,6 +59,7 @@ class AgentLoopService
         $this->schemaValidator = $schemaValidator ?? new SchemaValidator();
         $this->presetRegistry = $presetRegistry;
         $this->memoryService = $memoryService;
+        $this->episodicMemoryService = $episodicMemoryService;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -1290,6 +1294,140 @@ class AgentLoopService
         return implode(PHP_EOL, $lines);
     }
 
+    /**
+     * Build episodic memory recall section for system prompt (T019/T020b).
+     *
+     * Extracts topic keywords from the user's most recent message and retrieves
+     * relevant past episodic memories to inject into agent context.
+     *
+     * @return string|null The formatted episodic memory section or null if empty
+     */
+    private function buildEpisodicMemorySection(Conversation $conversation): ?string
+    {
+        if (!$this->episodicMemoryService) {
+            return null;
+        }
+
+        // Get the most recent user message to extract topics
+        $lastUserMessage = Message::where('conversation_id', $conversation->id)
+            ->where('role', 'user')
+            ->latest('created_at')
+            ->first();
+
+        if (!$lastUserMessage) {
+            return null;
+        }
+
+        // Extract topic keywords from user's message (simple keyword extraction)
+        $topics = $this->extractTopicsFromMessage($lastUserMessage->content);
+
+        if (empty($topics)) {
+            return null;
+        }
+
+        // Recall relevant episodic memories for each topic
+        $relevantMemories = [];
+        $userId = (string) $conversation->user_id;
+
+        foreach ($topics as $topic) {
+            $memories = $this->episodicMemoryService->recall($userId, $topic);
+            foreach ($memories as $memory) {
+                // Deduplicate by memory ID
+                if (!in_array($memory->id, array_column($relevantMemories, 'id'))) {
+                    $relevantMemories[] = $memory;
+                }
+            }
+
+            // Limit to top 5 memories to avoid bloating context
+            if (count($relevantMemories) >= 5) {
+                break;
+            }
+        }
+
+        if (empty($relevantMemories)) {
+            return null;
+        }
+
+        // Build the episodic memory section (T020b)
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '## Past Context (Episodic Memory)';
+        $lines[] = '';
+        $lines[] = 'The user has had past conversations on related topics. Reference these memories when relevant to the current conversation:';
+        $lines[] = '';
+
+        foreach ($relevantMemories as $memory) {
+            $date = $memory->created_at->format('M j, Y');
+            $topicsStr = implode(', ', $memory->topics ?? []);
+            $lines[] = "- **{$date}** (topics: {$topicsStr})";
+            $lines[] = "  - {$memory->summary}";
+            $lines[] = '';
+        }
+
+        $lines[] = 'When responding, cite these past memories naturally in your first exchange if relevant (e.g., "Last week we agreed on..."). Skip citation when no memories are relevant.';
+
+        return implode(PHP_EOL, $lines);
+    }
+
+    /**
+     * Extract topic keywords from a user message for episodic memory recall.
+     *
+     * Uses simple keyword extraction based on common technical/topic words.
+     *
+     * @return string[] Extracted topic keywords
+     */
+    private function extractTopicsFromMessage(string $message): array
+    {
+        // Common technical/topic keywords to look for
+        $commonTopics = [
+            'deployment', 'kubernetes', 'docker', 'database', 'api', 'security',
+            'authentication', 'authorization', 'performance', 'scaling', 'monitoring',
+            'logging', 'testing', 'ci/cd', 'infrastructure', 'configuration',
+            'migration', 'backup', 'recovery', 'compliance', 'audit',
+            'microservices', 'architecture', 'design', 'planning',
+            'scheduling', 'timelines', 'hiring', 'team', 'budget',
+            'canary', 'blue-green', 'rollback', 'release', 'versioning',
+            'frontend', 'backend', 'mobile', 'web', 'cloud',
+        ];
+
+        $lowerMessage = strtolower($message);
+        $foundTopics = [];
+
+        foreach ($commonTopics as $topic) {
+            if (stripos($message, $topic) !== false) {
+                $foundTopics[] = $topic;
+            }
+        }
+
+        // If no common topics found, extract content words (nouns/verbs) as fallback
+        if (empty($foundTopics)) {
+            // Remove common stop words and punctuation
+            $stopWords = ['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+                'could', 'should', 'may', 'might', 'shall', 'can', 'need', 'dare',
+                'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
+                'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above',
+                'below', 'between', 'out', 'off', 'over', 'under', 'again', 'further',
+                'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all',
+                'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
+                'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's',
+                't', 'just', 'don', 'now', 'i', 'me', 'my', 'myself', 'we', 'our',
+                'you', 'your', 'he', 'him', 'his', 'she', 'her', 'it', 'its', 'they',
+                'them', 'their', 'what', 'which', 'who', 'whom', 'this', 'that', 'these',
+                'those', 'am', 'about', 'if', 'because', 'while', 'and', 'but', 'or',
+                'i', 'me', 'my', 'is', 'it', 'we', 'my', 'the', 'a', 'an'];
+
+            $words = preg_replace('/[^\p{L}\p{N}\s]/u', '', $lowerMessage);
+            $words = explode(' ', trim($words));
+            $words = array_filter($words, fn($w) => strlen($w) > 2 && !in_array($w, $stopWords));
+
+            // Take first 3 meaningful words as topics
+            $foundTopics = array_slice(array_unique($words), 0, 3);
+        }
+
+        return array_slice($foundTopics, 0, 3);
+    }
+
     public function buildMessagesPayload(Conversation $conversation): array
     {
         $dbMessages = Message::where('conversation_id', $conversation->id)
@@ -1304,6 +1442,12 @@ class AgentLoopService
         $knownOpsSection = $this->buildKnownOperationsSection($conversation);
         if ($knownOpsSection !== null) {
             $systemPrompt .= $knownOpsSection;
+        }
+
+        // Append "Episodic Memory Recall" section with past relevant context (T019)
+        $episodicMemorySection = $this->buildEpisodicMemorySection($conversation);
+        if ($episodicMemorySection !== null) {
+            $systemPrompt .= $episodicMemorySection;
         }
 
         if (!empty($systemPrompt)) {

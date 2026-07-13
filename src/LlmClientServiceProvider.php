@@ -28,9 +28,13 @@ use ClarionApp\LlmClient\Services\ToolFormatter;
 use ClarionApp\LlmClient\Services\MemoryService;
 use ClarionApp\LlmClient\Services\MemoryEvictionService;
 use ClarionApp\LlmClient\Services\EmbeddingService;
+use ClarionApp\LlmClient\Services\EpisodicMemoryService;
+use ClarionApp\LlmClient\Services\EpisodicMemorySearchService;
 use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
+use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
+use ClarionApp\LlmClient\Events\EpisodicMemoryGenerationFailed;
 use ClarionApp\LlmClient\Listeners\CleanupScratchMemory;
 use ClarionApp\LlmClient\Listeners\CleanupShortTermMemory;
 use ClarionApp\LlmClient\Presets\DecisionPreset;
@@ -64,11 +68,26 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         Event::listen(AgentTurnCompleted::class, CleanupScratchMemory::class);
         Event::listen(ConversationEnded::class, CleanupShortTermMemory::class);
 
+        // Register episodic memory event listener (dispatch job on conversation end)
+        Event::listen(ConversationEnded::class, function ($event) {
+            $job = new \ClarionApp\LlmClient\Jobs\GenerateEpisodicMemoryJob(
+                $event->conversation_id,
+                $event->agent_id
+            );
+            dispatch($job);
+        });
+
+        // Register broadcast channel for episodic memory failure notifications
+        \Illuminate\Support\Facades\Broadcast::channel('user.{userId}.episodic-memory-failed', function ($user, $userId) {
+            return (string) $user->id === (string) $userId;
+        });
+
         // Register Artisan commands
         if ($this->app->runningInConsole()) {
             $this->commands([
                 ReindexOperationsCommand::class,
                 EmbedMemoryCommand::class,
+                \ClarionApp\LlmClient\Commands\CleanupExpiredEpisodicMemoriesCommand::class,
             ]);
         }
 
@@ -147,6 +166,17 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(MemoryServiceContract::class, function ($app) {
             return new MemoryService(
                 $app->make(MemoryEvictionService::class),
+                $app->make(EmbeddingService::class)
+            );
+        });
+
+        // Register episodic memory services as singletons
+        $this->app->singleton(EpisodicMemoryServiceContract::class, function ($app) {
+            return new EpisodicMemoryService();
+        });
+
+        $this->app->singleton(EpisodicMemorySearchService::class, function ($app) {
+            return new EpisodicMemorySearchService(
                 $app->make(EmbeddingService::class)
             );
         });

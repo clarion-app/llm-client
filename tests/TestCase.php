@@ -109,5 +109,6 @@ abstract class TestCase extends BaseTestCase
             $table->index(['scope', 'conversation_id']);
             $table->index(['scope', 'last_accessed_at']);
         });
+
     }
 }
