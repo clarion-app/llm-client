@@ -48,9 +48,33 @@ class DeclarativeMemoryController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
-        // TODO (US1): Validate type ∈ {fact,preference,rule}, non-empty content.
-        // Call createByUser and return 201 with the entry.
-        throw new \RuntimeException('store not yet implemented');
+        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+            'type' => ['required', 'string', 'in:fact,preference,rule'],
+            'content' => ['required', 'string', 'min:1'],
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['error' => $validator->errors()->first()], 422);
+        }
+
+        $type = $request->input('type');
+        $content = trim($request->input('content'));
+
+        if ($content === '') {
+            return response()->json(['error' => 'Content must not be empty'], 422);
+        }
+
+        $userId = (string) auth()->id();
+        $entry = $this->declarativeMemoryService->createByUser($userId, $type, $content);
+
+        return response()->json([
+            'id' => $entry->id,
+            'type' => $entry->type,
+            'content' => $entry->content,
+            'source' => $entry->source,
+            'created_at' => $entry->created_at?->toIso8601String(),
+            'updated_at' => $entry->updated_at?->toIso8601String(),
+        ], 201);
     }
 
     /**

@@ -35,8 +35,7 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
      */
     public function createByUser(string $userId, string $type, string $content): DeclarativeMemory
     {
-        // TODO (US1): Implement user-stated create with semantic supersede.
-        throw new \RuntimeException('createByUser not yet implemented');
+        return $this->resolveConflictAndStore($userId, $type, $content, 'user_stated');
     }
 
     /**
@@ -71,8 +70,18 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
      */
     public function recall(string $userId): array
     {
-        // TODO (US1/US4): Implement indexed recall with rule grouping.
-        throw new \RuntimeException('recall not yet implemented');
+        $entries = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $userId)
+            ->orderBy('type')
+            ->orderBy('updated_at', 'desc')
+            ->get();
+
+        return [
+            'entries' => $entries,
+            'rules' => $entries->where('type', 'rule'),
+            'facts' => $entries->where('type', 'fact'),
+            'preferences' => $entries->where('type', 'preference'),
+        ];
     }
 
     /**
@@ -80,8 +89,12 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
      */
     public function list(string $userId, int $page = 1, int $perPage = 20): LengthAwarePaginator
     {
-        // TODO (US3): Implement paginated list.
-        throw new \RuntimeException('list not yet implemented');
+        $perPage = min(max(1, $perPage), 100);
+
+        return DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $userId)
+            ->orderBy('updated_at', 'desc')
+            ->paginate($perPage, ['*'], 'page', $page);
     }
 
     /**
@@ -116,7 +129,102 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
         string $content,
         string $source
     ): DeclarativeMemory {
-        // TODO (US1): Implement semantic conflict resolution and storage.
-        throw new \RuntimeException('resolveConflictAndStore not yet implemented');
+        $threshold = config('llm-client.declarative_memory.conflict_similarity_threshold', 0.85);
+
+        // Best-effort: try to generate embedding for the new content
+        $newEmbedding = null;
+        $embeddingAvailable = false;
+
+        if ($this->embeddingService->isEnabled()) {
+            try {
+                $newEmbedding = $this->embeddingService->generate($content);
+                $embeddingAvailable = true;
+            } catch (\Throwable $e) {
+                Log::warning('Embedding generation failed for declarative memory, falling back to normalized exact match', [
+                    'user_id' => $userId,
+                    'type' => $type,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        // Semantic conflict check if embedding is available
+        if ($embeddingAvailable && $newEmbedding !== null) {
+            $existingEntries = DeclarativeMemory::withoutGlobalScope('user')
+                ->where('user_id', $userId)
+                ->where('type', $type)
+                ->whereNotNull('embedding')
+                ->get();
+
+            $bestMatch = null;
+            $bestSimilarity = 0.0;
+
+            foreach ($existingEntries as $entry) {
+                $existingEmbedding = $entry->embedding;
+                if (!is_array($existingEmbedding) || empty($existingEmbedding)) {
+                    continue;
+                }
+
+                $cosine = EmbeddingService::cosineSimilarity($newEmbedding, $existingEmbedding);
+                $normalized = EmbeddingService::normalizeSimilarity($cosine);
+
+                if ($normalized > $bestSimilarity) {
+                    $bestSimilarity = $normalized;
+                    $bestMatch = $entry;
+                }
+            }
+
+            // Supersede in place if similarity exceeds threshold
+            if ($bestMatch !== null && $bestSimilarity >= $threshold) {
+                $bestMatch->content = $content;
+                $bestMatch->embedding = $newEmbedding;
+                $bestMatch->save();
+                $bestMatch->refresh();
+                return $bestMatch;
+            }
+        }
+
+        // Fallback: normalized exact-content match (trim + lowercase + collapse whitespace)
+        $normalizedContent = preg_replace('/\s+/', ' ', trim(strtolower($content)));
+
+        $fallbackMatch = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $userId)
+            ->where('type', $type)
+            ->whereRaw('LOWER(TRIM(REPLACE(content, \'\\n\', \' \'))) = ?', [$normalizedContent])
+            ->first();
+
+        // Simpler fallback: iterate and compare normalized content
+        if ($fallbackMatch === null) {
+            $existingForType = DeclarativeMemory::withoutGlobalScope('user')
+                ->where('user_id', $userId)
+                ->where('type', $type)
+                ->get();
+
+            foreach ($existingForType as $entry) {
+                $entryNormalized = preg_replace('/\s+/', ' ', trim(strtolower($entry->content)));
+                if ($entryNormalized === $normalizedContent) {
+                    $fallbackMatch = $entry;
+                    break;
+                }
+            }
+        }
+
+        if ($fallbackMatch !== null) {
+            $fallbackMatch->content = $content;
+            $fallbackMatch->embedding = $newEmbedding;
+            $fallbackMatch->save();
+            $fallbackMatch->refresh();
+            return $fallbackMatch;
+        }
+
+        // No conflict — insert new entry
+        return DeclarativeMemory::create([
+            'id' => (string) \Illuminate\Support\Str::uuid(),
+            'user_id' => $userId,
+            'type' => $type,
+            'content' => $content,
+            'source' => $source,
+            'embedding' => $newEmbedding,
+        ]);
     }
 }
