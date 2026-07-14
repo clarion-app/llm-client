@@ -120,6 +120,29 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new ToolFormatter();
         });
 
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ChunkPartitioner::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\ChunkPartitioner();
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\CondensationSummaryStore::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\CondensationSummaryStore($app['cache.store']);
+        });
+
+        $this->app->singleton(ConversationCondenser::class, function ($app) {
+            return new ConversationCondenser(
+                $app->make(\ClarionApp\LlmClient\Services\ChunkPartitioner::class),
+                $app->make(\ClarionApp\LlmClient\Services\CondensationSummaryStore::class),
+                $app->make(ContextWindowBudgeter::class),
+                $app->make(\ClarionApp\LlmClient\Presets\CondensationPreset::class),
+                null,
+                $app->make(ProviderRegistry::class)
+            );
+        });
+
+        $this->app->singleton(ContextWindowBudgeter::class, function ($app) {
+            return new ContextWindowBudgeter();
+        });
+
         $this->app->singleton(AgentLoopService::class, function ($app) {
             return new AgentLoopService(
                 $app->make(McpToolRegistry::class),
@@ -130,7 +153,11 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(ToolFormatter::class),
                 null,
                 $app->make(StructuredOutputPresetRegistry::class),
-                $app->make(MemoryServiceContract::class)
+                $app->make(MemoryServiceContract::class),
+                null,
+                null,
+                $app->make(ContextWindowBudgeter::class),
+                $app->make(ConversationCondenser::class)
             );
         });
 

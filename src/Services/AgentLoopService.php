@@ -19,6 +19,7 @@ use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemory
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
+use ClarionApp\LlmClient\Services\ConversationCondenser;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
@@ -41,6 +42,7 @@ class AgentLoopService
     private ?EpisodicMemoryServiceContract $episodicMemoryService;
     private ?DeclarativeMemoryServiceContract $declarativeMemoryService;
     private ContextWindowBudgeter $contextWindowBudgeter;
+    private ?ConversationCondenser $conversationCondenser;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -54,7 +56,8 @@ class AgentLoopService
         ?MemoryServiceContract $memoryService = null,
         ?EpisodicMemoryServiceContract $episodicMemoryService = null,
         ?DeclarativeMemoryServiceContract $declarativeMemoryService = null,
-        ?ContextWindowBudgeter $contextWindowBudgeter = null
+        ?ContextWindowBudgeter $contextWindowBudgeter = null,
+        ?ConversationCondenser $conversationCondenser = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -68,6 +71,7 @@ class AgentLoopService
         $this->episodicMemoryService = $episodicMemoryService;
         $this->declarativeMemoryService = $declarativeMemoryService;
         $this->contextWindowBudgeter = $contextWindowBudgeter ?? new ContextWindowBudgeter();
+        $this->conversationCondenser = $conversationCondenser;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -690,6 +694,17 @@ class AgentLoopService
         $provider = $this->providerRegistry->resolveByType($providerType, $server);
         $model = $conversation->model;
         $estimator = fn (string $text) => $provider->countTokens($text, $model);
+
+        // Try condensation first if available, then fall back to trimming
+        if ($this->conversationCondenser) {
+            return $this->conversationCondenser->condenseOrTrim(
+                $messages,
+                $model,
+                $providerType,
+                $estimator,
+                $conversation->id
+            );
+        }
 
         return $this->contextWindowBudgeter->trim(
             $messages,

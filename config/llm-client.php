@@ -184,5 +184,37 @@ return [
         // 8K context with 2K reserve — safe for most modern models.
         'fallback' => ['context' => 8192, 'response_reserve' => 2048],
     ],
+
+    // Conversation condensation — replaces dropped older messages with cached per-chunk summaries.
+    // Composed in front of the ContextWindowBudgeter so trimming remains the fallback.
+    'condensation' => [
+        // Master toggle. When false, condensation is skipped and the budgeter trims normally.
+        'enabled' => true,
+
+        // Fixed chunk size in turn-units. The older portion is partitioned into chunks of this size
+        // by message ordinal (floor(ordinal / chunk_size)). Each chunk is summarized exactly once.
+        'chunk_size' => 20,
+
+        // Condensation model name. Null → use the conversation's effective model.
+        // Set to a cheaper model to reduce condensation cost.
+        'model' => null,
+
+        // Condensation provider type. Null → use the conversation's effective provider.
+        'provider' => null,
+
+        // Timeout in seconds for synchronous first-touch condensation.
+        // If the condensation call exceeds this, the request falls back to trimming.
+        'timeout_seconds' => 20,
+
+        // Number of consecutive condensation failures before entering cooldown.
+        'failure_threshold' => 3,
+
+        // Cooldown duration in seconds. While in cooldown, condensation is skipped entirely.
+        'cooldown_seconds' => 300,
+
+        // When true, opportunistically dispatch a queued pre-warm job when a chunk seals.
+        // The synchronous path remains the guarantee when the pre-warm hasn't landed.
+        'prewarm' => true,
+    ],
 ];
 
