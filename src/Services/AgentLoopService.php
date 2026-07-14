@@ -20,6 +20,7 @@ use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
 use ClarionApp\LlmClient\Services\ConversationCondenser;
+use ClarionApp\LlmClient\Services\ToolResultCondenser;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
@@ -43,6 +44,7 @@ class AgentLoopService
     private ?DeclarativeMemoryServiceContract $declarativeMemoryService;
     private ContextWindowBudgeter $contextWindowBudgeter;
     private ?ConversationCondenser $conversationCondenser;
+    private ?ToolResultCondenser $toolResultCondenser;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -57,7 +59,8 @@ class AgentLoopService
         ?EpisodicMemoryServiceContract $episodicMemoryService = null,
         ?DeclarativeMemoryServiceContract $declarativeMemoryService = null,
         ?ContextWindowBudgeter $contextWindowBudgeter = null,
-        ?ConversationCondenser $conversationCondenser = null
+        ?ConversationCondenser $conversationCondenser = null,
+        ?ToolResultCondenser $toolResultCondenser = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -72,6 +75,7 @@ class AgentLoopService
         $this->declarativeMemoryService = $declarativeMemoryService;
         $this->contextWindowBudgeter = $contextWindowBudgeter ?? new ContextWindowBudgeter();
         $this->conversationCondenser = $conversationCondenser;
+        $this->toolResultCondenser = $toolResultCondenser;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -134,11 +138,12 @@ class AgentLoopService
                     $resultContent = json_encode(['error' => 'Declarative memory service not available']);
                 }
 
+                $condensed = $this->condenseToolResult($resultContent, $conversation->id);
                 $toolData['tool_results'] = [
-                    ['tool_call_id' => $toolCallId, 'content' => $resultContent],
+                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
                 ];
             } else {
-                // Execute the confirmed API operation (existing path, unchanged)
+                // Execute the confirmed API operation
                 $resultContent = $this->executeApiCall(
                     $pending['operationId'],
                     $pending['method'],
@@ -147,8 +152,9 @@ class AgentLoopService
                     $conversation
                 );
 
+                $condensed = $this->condenseToolResult($resultContent, $conversation->id);
                 $toolData['tool_results'] = [
-                    ['tool_call_id' => $toolCallId, 'content' => $resultContent],
+                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
                 ];
             }
         } else {
@@ -398,10 +404,12 @@ class AgentLoopService
                         ];
                     }
 
+                    // Condense tool result if oversized
+                    $toolResultEntry = $this->condenseToolResult($result, $conversation->id);
                     $toolResults[] = [
                         'tool_call_id' => $toolCallId,
-                        'content' => $result,
-                    ];
+                        'content' => $toolResultEntry['content'],
+                    ] + array_filter($toolResultEntry, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
                 }
 
                 // Store the assistant message with tool data and continue loop
@@ -643,10 +651,11 @@ class AgentLoopService
                     ];
                 }
 
+                $toolResultEntry = $this->condenseToolResult($result, $conversation->id);
                 $toolResults[] = [
                     'tool_call_id' => $toolCall['id'] ?? '',
-                    'content' => $result,
-                ];
+                    'content' => $toolResultEntry['content'],
+                ] + array_filter($toolResultEntry, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
             }
 
             Message::create([
@@ -1762,5 +1771,27 @@ class AgentLoopService
             'content' => $content,
             'existingId' => $existingId,
         ]);
+    }
+
+    /**
+     * Condense a tool result if it exceeds the configured token threshold.
+     * Returns an array with 'content' and optional metadata fields.
+     */
+    private function condenseToolResult(string $result, string $conversationId): array
+    {
+        if (!$this->toolResultCondenser || !config('llm-client.tool_result_condensation.enabled', false)) {
+            return ['content' => $result];
+        }
+
+        $condensed = $this->toolResultCondenser->condense($result, $conversationId);
+
+        return [
+            'content' => $condensed['content'],
+            'reference_id' => $condensed['reference_id'] ?? null,
+            'original_tokens' => $condensed['original_tokens'] ?? null,
+            'condensed_tokens' => $condensed['condensed_tokens'] ?? null,
+            'method' => $condensed['method'] ?? null,
+            'condensed' => $condensed['condensed'] ?? false,
+        ];
     }
 }

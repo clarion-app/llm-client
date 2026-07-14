@@ -216,5 +216,27 @@ return [
         // The synchronous path remains the guarantee when the pre-warm hasn't landed.
         'prewarm' => true,
     ],
+
+    // Tool result condensation — intercepts oversized tool results before they enter agent context.
+    // Applies deterministic structure-aware reduction for JSON and LLM summarization for prose.
+    'tool_result_condensation' => [
+        // Master toggle. When false, all tool results pass through unchanged.
+        'enabled' => true,
+
+        // Token threshold: results at or below this size pass through without condensation.
+        'threshold_tokens' => 2000,
+
+        // Hard cap on condensed output size in tokens.
+        'max_condensed_tokens' => 500,
+
+        // Number of sample items to preserve in array reduction.
+        'sample_items' => 5,
+
+        // Timeout in seconds for LLM-based prose summarization.
+        'summarization_timeout_seconds' => 5,
+
+        // TTL for full-result cache entries in minutes.
+        'cache_ttl_minutes' => 240,
+    ],
 ];
 

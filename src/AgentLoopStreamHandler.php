@@ -13,6 +13,7 @@ use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
+use ClarionApp\LlmClient\Services\ToolResultCondenser;
 use Illuminate\Support\Facades\Log;
 
 class AgentLoopStreamHandler extends HandleHttpStreamResponse
@@ -21,6 +22,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
     public string $reply = "";
     public ?Message $message = null;
     public array $toolCalls = [];
+    private ?ToolResultCondenser $toolResultCondenser = null;
+
+    public function __construct(?ToolResultCondenser $toolResultCondenser = null)
+    {
+        parent::__construct();
+        $this->toolResultCondenser = $toolResultCondenser;
+    }
 
     public function handle($content, $data, $seconds)
     {
@@ -309,10 +317,12 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 }
             }
 
+            // Condense tool result if oversized
+            $toolResultEntry = $this->condenseToolResult($result, $conversationId);
             $toolResults[] = [
                 'tool_call_id' => $toolCallId,
-                'content' => $result,
-            ];
+                'content' => $toolResultEntry['content'],
+            ] + array_filter($toolResultEntry, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
 
             event(new ToolExecutionEvent($conversationId, $toolName, 'completed'));
         }
@@ -388,5 +398,26 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             $agentLoopService = app(AgentLoopService::class);
             $agentLoopService->start($conversation);
         }
+    }
+
+    /**
+     * Condense a tool result if it exceeds the configured token threshold.
+     */
+    private function condenseToolResult(string $result, string $conversationId): array
+    {
+        if (!$this->toolResultCondenser || !config('llm-client.tool_result_condensation.enabled', false)) {
+            return ['content' => $result];
+        }
+
+        $condensed = $this->toolResultCondenser->condense($result, $conversationId);
+
+        return [
+            'content' => $condensed['content'],
+            'reference_id' => $condensed['reference_id'] ?? null,
+            'original_tokens' => $condensed['original_tokens'] ?? null,
+            'condensed_tokens' => $condensed['condensed_tokens'] ?? null,
+            'method' => $condensed['method'] ?? null,
+            'condensed' => $condensed['condensed'] ?? false,
+        ];
     }
 }
