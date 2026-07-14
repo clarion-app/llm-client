@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServic
 use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
+use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
@@ -39,6 +40,7 @@ class AgentLoopService
     private ?MemoryServiceContract $memoryService;
     private ?EpisodicMemoryServiceContract $episodicMemoryService;
     private ?DeclarativeMemoryServiceContract $declarativeMemoryService;
+    private ContextWindowBudgeter $contextWindowBudgeter;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -51,7 +53,8 @@ class AgentLoopService
         ?StructuredOutputPresetRegistry $presetRegistry = null,
         ?MemoryServiceContract $memoryService = null,
         ?EpisodicMemoryServiceContract $episodicMemoryService = null,
-        ?DeclarativeMemoryServiceContract $declarativeMemoryService = null
+        ?DeclarativeMemoryServiceContract $declarativeMemoryService = null,
+        ?ContextWindowBudgeter $contextWindowBudgeter = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -64,6 +67,7 @@ class AgentLoopService
         $this->memoryService = $memoryService;
         $this->episodicMemoryService = $episodicMemoryService;
         $this->declarativeMemoryService = $declarativeMemoryService;
+        $this->contextWindowBudgeter = $contextWindowBudgeter ?? new ContextWindowBudgeter();
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -73,7 +77,8 @@ class AgentLoopService
         $tools = $this->buildToolsPayload($conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
-        $formatted = $this->formatMessages($conversation, $rawMessages);
+        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+        $formatted = $this->formatMessages($conversation, $trimmed);
 
         $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system']);
     }
@@ -155,7 +160,8 @@ class AgentLoopService
         $tools = $this->buildToolsPayload($conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
-        $formatted = $this->formatMessages($conversation, $rawMessages);
+        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+        $formatted = $this->formatMessages($conversation, $trimmed);
         $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system']);
     }
 
@@ -217,8 +223,11 @@ class AgentLoopService
         try {
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
                 $rawMessages = $this->buildMessagesPayload($conversation);
-                $formatted = $this->formatMessages($conversation, $rawMessages);
+                $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+                $formatted = $this->formatMessages($conversation, $trimmed);
                 // Inject preset system prompt into the base system prompt if present
+                // NOTE: the preset system prompt appended below is covered by the
+                // injected_section_reserve in the context_window config budget.
                 $systemPrompt = $formatted['system'];
                 if ($presetSystemPrompt !== '') {
                     $systemPrompt = $systemPrompt . "\n\n" . $presetSystemPrompt;
@@ -513,7 +522,8 @@ class AgentLoopService
 
         for (; $iteration <= $maxIterations; $iteration++) {
             $rawMessages = $this->buildMessagesPayload($conversation);
-            $formatted = $this->formatMessages($conversation, $rawMessages);
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+            $formatted = $this->formatMessages($conversation, $trimmed);
             $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $formatted['system']);
 
             $choice = $response['choices'][0] ?? null;
@@ -659,6 +669,35 @@ class AgentLoopService
         );
 
         return ['status' => 'error', 'content' => 'Maximum iterations reached', 'message_id' => null];
+    }
+
+    /**
+     * Apply context window trimming to the canonical message array.
+     * Inserts between buildMessagesPayload() and formatMessages() — the single shared seam.
+     *
+     * The trimmed array is used only for the request payload; the stored transcript is untouched.
+     *
+     * @param Conversation $conversation The conversation context.
+     * @param array $messages Canonical OpenAI-shaped message array from buildMessagesPayload().
+     * @return array Trimmed canonical message array.
+     */
+    private function applyContextWindowTrim(Conversation $conversation, array $messages): array
+    {
+        $providerType = $conversation->effectiveProviderType;
+        $server = $conversation->server;
+
+        // Resolve the provider and build the estimator closure.
+        $provider = $this->providerRegistry->resolveByType($providerType, $server);
+        $model = $conversation->model;
+        $estimator = fn (string $text) => $provider->countTokens($text, $model);
+
+        return $this->contextWindowBudgeter->trim(
+            $messages,
+            $model,
+            $providerType,
+            $estimator,
+            $conversation->id
+        );
     }
 
     /**

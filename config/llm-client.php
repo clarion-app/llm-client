@@ -140,5 +140,49 @@ return [
             'timeout' => env('LLM_LLAMA_CPP_TIMEOUT', 240),
         ],
     ],
+
+    // Context window budgeting — sliding window with token budgeting.
+    // Keeps agent requests under the model's accepted input size regardless
+    // of how long the stored history grows.
+    'context_window' => [
+        // Master toggle. When false, the budgeter is a pass-through (no trimming).
+        'enabled' => true,
+
+        // Fractional safety margin subtracted from raw context to absorb
+        // character-based estimation error (0.0–1.0).
+        // 15% headroom compensates for the inaccuracy of strlen-based token estimation.
+        'headroom_ratio' => env('LLM_CONTEXT_HEADROOM_RATIO', 0.15),
+
+        // Tokens reserved for same-budget injected content that is NOT part of the
+        // pinned system message measured directly (e.g. the preset system prompt
+        // appended after formatMessages() in run(); growth room for Known Operations,
+        // Episodic/Declarative memory, preferences).
+        // 1500 tokens covers a typical preset system prompt (~500) plus memory sections (~1000).
+        'injected_section_reserve' => 1500,
+
+        // Known models: exact model name → capacity + response reserve (tokens).
+        // Values sourced from provider published limits; response_reserve is a fixed
+        // per-model default independent of caller-supplied max_tokens.
+        'models' => [
+            // OpenAI: gpt-4o has a 128K context window; 4K response reserve for long answers.
+            'gpt-4o'                     => ['context' => 128000, 'response_reserve' => 4096],
+            // Anthropic: Claude Sonnet 4 has a 200K context window; 8K response reserve.
+            'claude-sonnet-4-20250514'   => ['context' => 200000, 'response_reserve' => 8192],
+            // Small local model for testing capacity adaptation (US3).
+            'llama3-8b'                  => ['context' => 8192, 'response_reserve' => 2048],
+        ],
+
+        // Per-provider defaults, used when the specific model is absent from 'models'.
+        // OpenAI fallback: conservative 8K (covers older models like text-davinci-003).
+        'providers' => [
+            'openai'    => ['context' => 8192,   'response_reserve' => 2048],
+            'anthropic' => ['context' => 200000, 'response_reserve' => 8192],
+            'llama.cpp' => ['context' => 8192,   'response_reserve' => 2048],
+        ],
+
+        // Conservative global fallback when neither model nor provider is configured.
+        // 8K context with 2K reserve — safe for most modern models.
+        'fallback' => ['context' => 8192, 'response_reserve' => 2048],
+    ],
 ];
 
