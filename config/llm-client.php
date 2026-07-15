@@ -254,5 +254,26 @@ return [
         // Whether to emit SmartHistoryTrimmed events.
         'emit_events' => true,
     ],
+
+    // Learning Preferences — feedback extraction and preference learning pipeline.
+    // Accumulates transient feedback signals, extracts implied preference patterns
+    // via LLM inference (deferred/queued), and proposes learned preferences for
+    // user confirmation through the DeclarativeMemory confirmation gate.
+    'learning_preferences' => [
+        // Number of consistent signals required before proposing a learned preference.
+        'promotion_threshold' => 5,
+
+        // Amount to reduce the effective count when a contradictory signal is detected.
+        'contradiction_decay' => 2,
+
+        // Maximum number of pending signals to process in a single extraction job run.
+        'extraction_batch_size' => 20,
+
+        // Whether to use LLM inference for pattern extraction (false = heuristic-only).
+        'llm_enabled' => true,
+
+        // Number of days to retain processed feedback signals before purging.
+        'signal_retention_days' => 30,
+    ],
 ];
 

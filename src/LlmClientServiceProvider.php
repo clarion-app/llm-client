@@ -34,13 +34,17 @@ use ClarionApp\LlmClient\Services\DeclarativeMemoryService as DeclarativeMemoryS
 use ClarionApp\LlmClient\Services\EpisodicMemoryService;
 use ClarionApp\LlmClient\Services\EpisodicMemorySearchService;
 use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
+use ClarionApp\LlmClient\Contracts\FeedbackSignalAccumulator as FeedbackSignalAccumulatorContract;
 use ClarionApp\LlmClient\Contracts\MemoryService as MemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
+use ClarionApp\LlmClient\Services\FeedbackSignalAccumulator as FeedbackSignalAccumulatorImpl;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Events\EpisodicMemoryGenerationFailed;
+use ClarionApp\LlmClient\Events\FeedbackReceived;
 use ClarionApp\LlmClient\Listeners\CleanupScratchMemory;
 use ClarionApp\LlmClient\Listeners\CleanupShortTermMemory;
+use ClarionApp\LlmClient\Listeners\PersistFeedbackSignal;
 use ClarionApp\LlmClient\Presets\DecisionPreset;
 use ClarionApp\LlmClient\Presets\SummaryPreset;
 use ClarionApp\LlmClient\Presets\ExtractionPreset;
@@ -81,8 +85,16 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             dispatch($job);
         });
 
+        // Register feedback signal persistence listener
+        Event::listen(FeedbackReceived::class, PersistFeedbackSignal::class);
+
         // Register broadcast channel for episodic memory failure notifications
         \Illuminate\Support\Facades\Broadcast::channel('user.{userId}.episodic-memory-failed', function ($user, $userId) {
+            return (string) $user->id === (string) $userId;
+        });
+
+        // Register broadcast channel for preference proposal notifications
+        \Illuminate\Support\Facades\Broadcast::channel('user.{userId}.preference-proposal', function ($user, $userId) {
             return (string) $user->id === (string) $userId;
         });
 
@@ -218,6 +230,11 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new DeclarativeMemoryServiceImpl(
                 $app->make(EmbeddingService::class)
             );
+        });
+
+        // Register feedback signal accumulator
+        $this->app->singleton(FeedbackSignalAccumulatorContract::class, function () {
+            return new FeedbackSignalAccumulatorImpl();
         });
     }
 
