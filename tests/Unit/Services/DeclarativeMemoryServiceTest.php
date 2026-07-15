@@ -40,6 +40,7 @@ class DeclarativeMemoryServiceTest extends TestCase
                 $table->string('type');
                 $table->text('content');
                 $table->string('source');
+                $table->integer('confidence_level')->nullable();
                 $table->json('embedding')->nullable();
                 $table->timestamps();
                 $table->softDeletes();
@@ -391,5 +392,326 @@ class DeclarativeMemoryServiceTest extends TestCase
 
         // Total entries include all
         $this->assertCount(3, $recalled['entries']);
+    }
+
+    /* -----------------------------------------------------------------
+     * Confidence Visibility on Recall (User Story 1 / User Story 3)
+     * ----------------------------------------------------------------- */
+
+    private function makeService(bool $embeddingEnabled = false): \ClarionApp\LlmClient\Services\DeclarativeMemoryService
+    {
+        $embeddingService = $this->createMock(EmbeddingService::class);
+        $embeddingService->method('isEnabled')->willReturn($embeddingEnabled);
+
+        return new \ClarionApp\LlmClient\Services\DeclarativeMemoryService($embeddingService);
+    }
+
+    #[Test]
+    public function recall_exposes_confidence_level_for_high_low_and_null(): void
+    {
+        $service = $this->makeService();
+
+        // User-stated → confidence_level is NULL
+        $service->createByUser($this->user->id, 'preference', 'Always use 24-hour time format');
+
+        // High-confidence learned pattern
+        $service->applyAgentWrite($this->user->id, 'fact', 'User prefers Python', true, null, 90);
+
+        // Low-confidence learned pattern
+        $service->applyAgentWrite($this->user->id, 'rule', 'Prefers short replies', true, null, 20);
+
+        $recalled = $service->recall($this->user->id);
+
+        $byContent = $recalled['entries']->keyBy('content');
+
+        $this->assertNull($byContent['Always use 24-hour time format']->confidence_level);
+        $this->assertSame(90, $byContent['User prefers Python']->confidence_level);
+        $this->assertSame(20, $byContent['Prefers short replies']->confidence_level);
+    }
+
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('confidenceLevelProvider')]
+    public function learned_pattern_recall_reports_confidence_level(int $confidence): void
+    {
+        $service = $this->makeService();
+
+        $service->applyAgentWrite($this->user->id, 'fact', 'A learned fact', true, null, $confidence);
+
+        $recalled = $service->recall($this->user->id);
+        $entry = $recalled['entries']->firstWhere('content', 'A learned fact');
+
+        $this->assertSame('agent_learned', $entry->source);
+        $this->assertSame($confidence, $entry->confidence_level);
+    }
+
+    public static function confidenceLevelProvider(): array
+    {
+        return [
+            'high confidence' => [95],
+            'low confidence' => [15],
+            'zero confidence' => [0],
+        ];
+    }
+
+    #[Test]
+    public function user_stated_entries_have_null_confidence_level(): void
+    {
+        $service = $this->makeService();
+
+        $result = $service->createByUser($this->user->id, 'preference', 'Dark mode preferred');
+
+        $this->assertNull($result->confidence_level);
+
+        $fromDb = DeclarativeMemory::withoutGlobalScope('user')->find($result->id);
+        $this->assertNull($fromDb->confidence_level);
+    }
+
+    /* -----------------------------------------------------------------
+     * Confidence Range Validation (User Story 3)
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function confirmed_write_rejects_confidence_below_zero(): void
+    {
+        $service = $this->makeService();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $service->applyAgentWrite($this->user->id, 'fact', 'Out of range', true, null, -1);
+    }
+
+    #[Test]
+    public function confirmed_write_rejects_confidence_above_one_hundred(): void
+    {
+        $service = $this->makeService();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $service->applyAgentWrite($this->user->id, 'fact', 'Out of range', true, null, 101);
+    }
+
+    #[Test]
+    public function confirmed_write_accepts_confidence_boundaries(): void
+    {
+        $service = $this->makeService();
+
+        $zero = $service->applyAgentWrite($this->user->id, 'fact', 'Zero bound', true, null, 0);
+        $hundred = $service->applyAgentWrite($this->user->id, 'preference', 'Hundred bound', true, null, 100);
+
+        $this->assertSame(0, $zero->confidence_level);
+        $this->assertSame(100, $hundred->confidence_level);
+    }
+
+    /* -----------------------------------------------------------------
+     * Learned → User-Stated Conversion on Edit (User Story 2)
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function editing_learned_entry_converts_source_to_user_stated(): void
+    {
+        $service = $this->makeService();
+
+        $learned = $service->applyAgentWrite($this->user->id, 'fact', 'User prefers Python', true, null, 80);
+        $this->assertSame('agent_learned', $learned->source);
+
+        $updated = $service->updateByUser($this->user->id, $learned->id, 'User prefers Rust');
+
+        $this->assertSame('user_stated', $updated->source);
+        $this->assertSame('User prefers Rust', $updated->content);
+    }
+
+    #[Test]
+    public function editing_learned_entry_clears_confidence_level_to_null(): void
+    {
+        $service = $this->makeService();
+
+        $learned = $service->applyAgentWrite($this->user->id, 'preference', 'Prefers dark mode', true, null, 65);
+        $this->assertSame(65, $learned->confidence_level);
+
+        $updated = $service->updateByUser($this->user->id, $learned->id, 'Prefers light mode');
+
+        $this->assertNull($updated->confidence_level);
+
+        $fromDb = DeclarativeMemory::withoutGlobalScope('user')->find($learned->id);
+        $this->assertNull($fromDb->confidence_level);
+        $this->assertSame('user_stated', $fromDb->source);
+    }
+
+    /* -----------------------------------------------------------------
+     * Precedence Rules (User Story 4)
+     * ----------------------------------------------------------------- */
+
+    /**
+     * Build a service whose embeddings all collide (high similarity), so that
+     * every same-type write is treated as a semantic conflict against existing rows.
+     */
+    private function makeCollidingEmbeddingService(): \ClarionApp\LlmClient\Services\DeclarativeMemoryService
+    {
+        $vector = array_fill(0, 1536, 0.0);
+        $vector[0] = 1.0;
+
+        $embeddingService = $this->createMock(EmbeddingService::class);
+        $embeddingService->method('isEnabled')->willReturn(true);
+        $embeddingService->method('generate')->willReturn($vector);
+
+        return new \ClarionApp\LlmClient\Services\DeclarativeMemoryService($embeddingService);
+    }
+
+    #[Test]
+    public function user_stated_entry_is_never_superseded_by_learned_pattern(): void
+    {
+        $service = $this->makeCollidingEmbeddingService();
+
+        // User states a preference
+        $userEntry = $service->createByUser($this->user->id, 'preference', 'Always use 24-hour time');
+        $this->assertSame('user_stated', $userEntry->source);
+
+        // Agent proposes a conflicting learned pattern (same type, colliding embedding)
+        $service->applyAgentWrite($this->user->id, 'preference', 'Prefers 12-hour time', true, null, 95);
+
+        // The user-stated entry must survive unchanged; a separate learned row is inserted
+        $userEntry->refresh();
+        $this->assertSame('user_stated', $userEntry->source);
+        $this->assertSame('Always use 24-hour time', $userEntry->content);
+        $this->assertNull($userEntry->confidence_level);
+
+        $count = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $this->user->id)
+            ->where('type', 'preference')
+            ->count();
+        $this->assertEquals(2, $count);
+    }
+
+    #[Test]
+    public function higher_confidence_learned_pattern_supersedes_older_learned_pattern(): void
+    {
+        $service = $this->makeCollidingEmbeddingService();
+
+        $first = $service->applyAgentWrite($this->user->id, 'fact', 'User likes tea', true, null, 40);
+
+        $second = $service->applyAgentWrite($this->user->id, 'fact', 'User strongly likes tea', true, null, 80);
+
+        // Higher confidence supersedes in place
+        $this->assertSame($first->id, $second->id);
+        $this->assertSame('User strongly likes tea', $second->content);
+        $this->assertSame(80, $second->confidence_level);
+
+        $count = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $this->user->id)
+            ->where('type', 'fact')
+            ->count();
+        $this->assertEquals(1, $count);
+    }
+
+    #[Test]
+    public function lower_confidence_learned_pattern_does_not_supersede(): void
+    {
+        $service = $this->makeCollidingEmbeddingService();
+
+        $first = $service->applyAgentWrite($this->user->id, 'fact', 'User likes tea', true, null, 80);
+
+        $second = $service->applyAgentWrite($this->user->id, 'fact', 'User maybe likes tea', true, null, 30);
+
+        // Lower confidence does not overwrite — a new row is inserted instead
+        $this->assertNotSame($first->id, $second->id);
+
+        $first->refresh();
+        $this->assertSame('User likes tea', $first->content);
+        $this->assertSame(80, $first->confidence_level);
+
+        $count = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $this->user->id)
+            ->where('type', 'fact')
+            ->count();
+        $this->assertEquals(2, $count);
+    }
+
+    #[Test]
+    public function newer_user_stated_entry_supersedes_older_user_stated_entry(): void
+    {
+        $service = $this->makeCollidingEmbeddingService();
+
+        $first = $service->createByUser($this->user->id, 'preference', 'Always use 24-hour time');
+
+        $second = $service->createByUser($this->user->id, 'preference', 'Prefer showing times as 24-hour');
+
+        // Unchanged behavior: user-stated restatement supersedes in place
+        $this->assertSame($first->id, $second->id);
+        $this->assertSame('Prefer showing times as 24-hour', $second->content);
+
+        $count = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $this->user->id)
+            ->where('type', 'preference')
+            ->count();
+        $this->assertEquals(1, $count);
+    }
+
+    /* -----------------------------------------------------------------
+     * Empty Store (User Story 6) & Edge Cases
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function recall_on_empty_store_returns_empty_groups_without_error(): void
+    {
+        $service = $this->makeService();
+
+        $recalled = $service->recall($this->user->id);
+
+        $this->assertCount(0, $recalled['entries']);
+        $this->assertCount(0, $recalled['rules']);
+        $this->assertCount(0, $recalled['facts']);
+        $this->assertCount(0, $recalled['preferences']);
+    }
+
+    #[Test]
+    public function identical_learned_and_user_stated_entries_coexist_without_conflict(): void
+    {
+        // Embeddings disabled and distinct types → no supersession between the two
+        $service = $this->makeService();
+
+        $userEntry = $service->createByUser($this->user->id, 'fact', 'User prefers Python');
+        $learnedEntry = $service->applyAgentWrite($this->user->id, 'preference', 'User prefers Python', true, null, 70);
+
+        $this->assertSame('user_stated', $userEntry->source);
+        $this->assertSame('agent_learned', $learnedEntry->source);
+        $this->assertNotSame($userEntry->id, $learnedEntry->id);
+
+        $count = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $this->user->id)
+            ->count();
+        $this->assertEquals(2, $count);
+    }
+
+    #[Test]
+    public function learned_pattern_with_zero_confidence_is_stored(): void
+    {
+        $service = $this->makeService();
+
+        $result = $service->applyAgentWrite($this->user->id, 'fact', 'A barely-supported guess', true, null, 0);
+
+        $this->assertSame('agent_learned', $result->source);
+        $this->assertSame(0, $result->confidence_level);
+
+        $fromDb = DeclarativeMemory::withoutGlobalScope('user')->find($result->id);
+        $this->assertSame(0, $fromDb->confidence_level);
+    }
+
+    #[Test]
+    public function all_entries_live_in_the_single_declarative_memories_table(): void
+    {
+        // FR-013 single-store invariant: user-stated and learned entries share one table.
+        $service = $this->makeService();
+
+        $service->createByUser($this->user->id, 'preference', 'User-stated preference');
+        $service->applyAgentWrite($this->user->id, 'fact', 'Learned fact', true, null, 55);
+
+        $rows = DeclarativeMemory::withoutGlobalScope('user')
+            ->where('user_id', $this->user->id)
+            ->get();
+
+        $this->assertCount(2, $rows);
+        $this->assertEqualsCanonicalizing(
+            ['user_stated', 'agent_learned'],
+            $rows->pluck('source')->all()
+        );
+        $this->assertSame('declarative_memories', (new DeclarativeMemory)->getTable());
     }
 }

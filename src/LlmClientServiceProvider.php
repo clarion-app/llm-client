@@ -15,6 +15,8 @@ use ClarionApp\LlmClient\Providers\LlamaCppProvider;
 use ClarionApp\LlmClient\Providers\OpenAiProvider;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
+use ClarionApp\LlmClient\Services\ConversationCondenser;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpPromptRegistry;
@@ -134,6 +136,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\CondensationSummaryStore::class),
                 $app->make(ContextWindowBudgeter::class),
                 $app->make(\ClarionApp\LlmClient\Presets\CondensationPreset::class),
+                null,
                 null,
                 $app->make(ProviderRegistry::class)
             );

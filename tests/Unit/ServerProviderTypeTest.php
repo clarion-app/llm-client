@@ -25,13 +25,16 @@ class ServerProviderTypeTest extends TestCase
     }
 
     #[Test]
-    public function server_model_casts_provider_type_to_enum(): void
+    public function server_model_exposes_provider_type_as_enum(): void
     {
+        // The model deliberately uses a getProviderTypeAttribute() accessor rather
+        // than a native enum cast: a cast fatals on legacy null/invalid values,
+        // whereas the accessor falls back to ProviderType::OpenAI. So provider_type
+        // must NOT be in $casts, and the accessor must return a ProviderType enum.
         $server = new Server();
-        $casts = $server->getCasts();
 
-        $this->assertArrayHasKey('provider_type', $casts);
-        $this->assertEquals(ProviderType::class, $casts['provider_type']);
+        $this->assertArrayNotHasKey('provider_type', $server->getCasts());
+        $this->assertInstanceOf(ProviderType::class, $server->provider_type);
     }
 
     #[Test]

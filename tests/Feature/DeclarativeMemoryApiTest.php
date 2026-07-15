@@ -40,6 +40,7 @@ class DeclarativeMemoryApiTest extends TestCase
                 $table->string('type');
                 $table->text('content');
                 $table->string('source');
+                $table->integer('confidence_level')->nullable();
                 $table->json('embedding')->nullable();
                 $table->timestamps();
                 $table->softDeletes();
@@ -213,5 +214,94 @@ class DeclarativeMemoryApiTest extends TestCase
 
         $this->expectException(\Illuminate\Database\Eloquent\ModelNotFoundException::class);
         $this->service->delete($user->id, (string) Str::uuid());
+    }
+
+    /* -----------------------------------------------------------------
+     * Unified View With Confidence (User Story 1)
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function list_returns_mixed_sources_with_confidence_levels(): void
+    {
+        $user = User::factory()->create();
+
+        // User-stated entry (confidence NULL)
+        $this->service->createByUser($user->id, 'preference', 'Always use 24-hour time format');
+
+        // Learned patterns with confidence
+        $this->service->applyAgentWrite($user->id, 'fact', 'User prefers Python', true, null, 85);
+        $this->service->applyAgentWrite($user->id, 'rule', 'Prefers short replies', true, null, 30);
+
+        $paginator = $this->service->list($user->id);
+        $this->assertCount(3, $paginator->items());
+
+        $byContent = collect($paginator->items())->keyBy('content');
+
+        $this->assertSame('user_stated', $byContent['Always use 24-hour time format']->source);
+        $this->assertNull($byContent['Always use 24-hour time format']->confidence_level);
+
+        $this->assertSame('agent_learned', $byContent['User prefers Python']->source);
+        $this->assertSame(85, $byContent['User prefers Python']->confidence_level);
+
+        $this->assertSame('agent_learned', $byContent['Prefers short replies']->source);
+        $this->assertSame(30, $byContent['Prefers short replies']->confidence_level);
+    }
+
+    /* -----------------------------------------------------------------
+     * Remove Learned Patterns (User Story 2)
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function learned_pattern_is_deleted_via_standard_remove_control(): void
+    {
+        $user = User::factory()->create();
+
+        $learned = $this->service->applyAgentWrite($user->id, 'fact', 'User prefers Python', true, null, 85);
+        $this->assertSame('agent_learned', $learned->source);
+
+        // The same delete() path used for user-stated entries removes learned patterns
+        $result = $this->service->delete($user->id, $learned->id);
+        $this->assertTrue($result);
+
+        $this->assertNull(DeclarativeMemory::withoutGlobalScope('user')->find($learned->id));
+
+        $paginator = $this->service->list($user->id);
+        $this->assertEmpty($paginator->items());
+    }
+
+    /* -----------------------------------------------------------------
+     * Empty Store (User Story 6) & Edge Cases
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function empty_store_list_returns_empty_array_without_error(): void
+    {
+        $user = User::factory()->create();
+
+        $paginator = $this->service->list($user->id);
+
+        $this->assertIsArray($paginator->items());
+        $this->assertCount(0, $paginator->items());
+        $this->assertEquals(0, $paginator->total());
+    }
+
+    #[Test]
+    public function removing_all_entries_behaves_like_new_user(): void
+    {
+        $user = User::factory()->create();
+
+        $a = $this->service->createByUser($user->id, 'fact', 'Fact A');
+        $b = $this->service->applyAgentWrite($user->id, 'preference', 'Learned preference', true, null, 50);
+
+        $this->service->delete($user->id, $a->id);
+        $this->service->delete($user->id, $b->id);
+
+        // Store is now empty — same observable state as a brand-new user
+        $paginator = $this->service->list($user->id);
+        $this->assertCount(0, $paginator->items());
+        $this->assertEquals(0, $paginator->total());
+
+        $recalled = $this->service->recall($user->id);
+        $this->assertCount(0, $recalled['entries']);
     }
 }

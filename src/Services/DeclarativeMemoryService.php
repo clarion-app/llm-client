@@ -40,6 +40,8 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
 
     /**
      * Update an existing declarative memory entry by the user.
+     *
+     * Editing a learned entry converts source to 'user_stated' and clears confidence_level.
      */
     public function updateByUser(string $userId, string $id, string $content): DeclarativeMemory
     {
@@ -55,6 +57,12 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
         }
 
         $entry->content = $content;
+
+        // Editing a learned entry converts it to user-stated and clears confidence
+        if ($entry->source === 'agent_learned') {
+            $entry->source = 'user_stated';
+            $entry->confidence_level = null;
+        }
 
         // Best-effort re-embed
         if ($this->embeddingService->isEnabled()) {
@@ -81,21 +89,31 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
      * Enforces the confirmation gate at the storage boundary:
      * throws ConfirmationRequiredException BEFORE any DB read/write
      * when userConfirmed is not true.
+     *
+     * Confidence level is validated (0-100) and stored with the entry.
      */
     public function applyAgentWrite(
         string $userId,
         string $type,
         string $content,
         bool $userConfirmed,
-        ?string $existingId = null
+        ?string $existingId = null,
+        ?int $confidenceLevel = null
     ): DeclarativeMemory {
         // Hard confirmation gate — throw BEFORE any DB access (SC-004 / FR-003 / FR-003a)
         if ($userConfirmed !== true) {
-            throw new ConfirmationRequiredException($type, $content, $existingId);
+            throw new ConfirmationRequiredException($type, $content, $existingId, $confidenceLevel);
+        }
+
+        // Validate confidence range (0-100) for confirmed writes
+        if ($confidenceLevel !== null && ($confidenceLevel < 0 || $confidenceLevel > 100)) {
+            throw new \InvalidArgumentException(
+                "confidence_level must be between 0 and 100, got: {$confidenceLevel}"
+            );
         }
 
         // Confirmed — persist as agent_learned via conflict/supersede path
-        return $this->resolveConflictAndStore($userId, $type, $content, 'agent_learned');
+        return $this->resolveConflictAndStore($userId, $type, $content, 'agent_learned', $confidenceLevel);
     }
 
     /* -----------------------------------------------------------------
@@ -164,17 +182,24 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
      * supersede in place when max ≥ threshold. On embedding failure, fall back
      * to normalized exact-content match. Never drops the write.
      *
+     * Precedence rules:
+     * - User-stated entries are never superseded by learned patterns
+     * - Higher-confidence learned patterns supersede older learned patterns
+     * - Newer user-stated entries supersede older user-stated entries (unchanged)
+     *
      * @param string $userId Owning user
      * @param string $type Entry type
      * @param string $content Entry content
      * @param string $source Provenance (user_stated or agent_learned)
+     * @param int|null $confidenceLevel Confidence percentage (0-100) for learned patterns
      * @return DeclarativeMemory The created or superseded entry
      */
     private function resolveConflictAndStore(
         string $userId,
         string $type,
         string $content,
-        string $source
+        string $source,
+        ?int $confidenceLevel = null
     ): DeclarativeMemory {
         $threshold = config('llm-client.declarative_memory.conflict_similarity_threshold', 0.85);
 
@@ -223,11 +248,46 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
 
             // Supersede in place if similarity exceeds threshold
             if ($bestMatch !== null && $bestSimilarity >= $threshold) {
-                $bestMatch->content = $content;
-                $bestMatch->embedding = $newEmbedding;
-                $bestMatch->save();
-                $bestMatch->refresh();
-                return $bestMatch;
+                // Precedence check: user-stated entries are never superseded by learned patterns
+                if ($source === 'agent_learned' && $bestMatch->source === 'user_stated') {
+                    // Learned pattern cannot supersede user-stated — fall through to insert new
+                } else {
+                    // Learned pattern can supersede older learned pattern if higher confidence
+                    if ($source === 'agent_learned' && $bestMatch->source === 'agent_learned') {
+                        $existingConfidence = $bestMatch->confidence_level;
+                        // Higher confidence wins; equal or lower confidence falls through to insert new
+                        if ($confidenceLevel !== null && $existingConfidence !== null) {
+                            if ($confidenceLevel <= $existingConfidence) {
+                                // New pattern not more confident — fall through to insert new
+                            } else {
+                                // Higher confidence — supersede
+                                $bestMatch->content = $content;
+                                $bestMatch->confidence_level = $confidenceLevel;
+                                $bestMatch->embedding = $newEmbedding;
+                                $bestMatch->save();
+                                $bestMatch->refresh();
+                                return $bestMatch;
+                            }
+                        } else {
+                            // If confidence is not set on either, allow supersede (existing behavior)
+                            $bestMatch->content = $content;
+                            $bestMatch->confidence_level = $confidenceLevel;
+                            $bestMatch->embedding = $newEmbedding;
+                            $bestMatch->save();
+                            $bestMatch->refresh();
+                            return $bestMatch;
+                        }
+                    } else {
+                        // User-stated superseding (unchanged behavior) or other valid case
+                        $bestMatch->content = $content;
+                        $bestMatch->confidence_level = $confidenceLevel;
+                        $bestMatch->embedding = $newEmbedding;
+                        $bestMatch->source = $source;
+                        $bestMatch->save();
+                        $bestMatch->refresh();
+                        return $bestMatch;
+                    }
+                }
             }
         }
 
@@ -257,11 +317,18 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
         }
 
         if ($fallbackMatch !== null) {
-            $fallbackMatch->content = $content;
-            $fallbackMatch->embedding = $newEmbedding;
-            $fallbackMatch->save();
-            $fallbackMatch->refresh();
-            return $fallbackMatch;
+            // Precedence check for fallback path too
+            if ($source === 'agent_learned' && $fallbackMatch->source === 'user_stated') {
+                // Learned pattern cannot supersede user-stated — fall through to insert new
+            } else {
+                $fallbackMatch->content = $content;
+                $fallbackMatch->confidence_level = $confidenceLevel;
+                $fallbackMatch->embedding = $newEmbedding;
+                $fallbackMatch->source = $source;
+                $fallbackMatch->save();
+                $fallbackMatch->refresh();
+                return $fallbackMatch;
+            }
         }
 
         // No conflict — insert new entry
@@ -271,6 +338,7 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
             'type' => $type,
             'content' => $content,
             'source' => $source,
+            'confidence_level' => $confidenceLevel,
             'embedding' => $newEmbedding,
         ]);
     }

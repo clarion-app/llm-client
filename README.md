@@ -26,4 +26,15 @@ The declarative scope stores explicit user-created facts, preferences, and behav
 
 Entries record a `type` (`fact` | `preference` | `rule`) and `source` (provenance: `user_stated` | `agent_learned`).
 
-See `specs/041-declarative-memory-store/quickstart.md` for API usage and behavior verification.
+#### Learned Patterns and Confidence
+
+The store holds both user-stated entries and patterns learned on the user's behalf, in a single table (no parallel model). A learned pattern (`source = agent_learned`) carries a `confidence_level` — a nullable integer from 0 to 100 reflecting how much consistent evidence supports it:
+
+- **`confidence_level` is `NULL` for user-stated entries** and set to 0–100 for learned patterns. Values outside 0–100 are rejected at the service layer.
+- **User-stated always wins** — when a learned pattern semantically conflicts with a user-stated entry, the user-stated entry is never superseded. A higher-confidence learned pattern may supersede an older learned pattern; a lower-confidence one does not.
+- **Editing a learned entry converts it** to `source = user_stated` and clears `confidence_level` to `NULL`.
+- **Confidence is visible everywhere** — surfaced on recall, in every API response, and carried in the `ConfirmationRequiredException` payload so the confirmation prompt can show it.
+
+`applyAgentWrite()` accepts an optional `$confidenceLevel` parameter; the confirmation gate still throws before any DB access when the write is not confirmed.
+
+See `specs/041-declarative-memory-store/quickstart.md` for base API usage and `specs/046-learned-patterns-store/quickstart.md` for learned-pattern behavior verification.

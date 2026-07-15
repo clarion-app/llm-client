@@ -58,6 +58,7 @@ class DeclarativeMemoryController extends Controller
                 'type' => $entry->type,
                 'content' => $entry->content,
                 'source' => $entry->source,
+                'confidence_level' => $entry->confidence_level,
                 'created_at' => $entry->created_at?->toIso8601String(),
                 'updated_at' => $entry->updated_at?->toIso8601String(),
             ];
@@ -115,6 +116,7 @@ class DeclarativeMemoryController extends Controller
             'type' => $entry->type,
             'content' => $entry->content,
             'source' => $entry->source,
+            'confidence_level' => $entry->confidence_level,
             'created_at' => $entry->created_at?->toIso8601String(),
             'updated_at' => $entry->updated_at?->toIso8601String(),
         ], 201);
@@ -148,6 +150,7 @@ class DeclarativeMemoryController extends Controller
                 'type' => $entry->type,
                 'content' => $entry->content,
                 'source' => $entry->source,
+                'confidence_level' => $entry->confidence_level,
                 'created_at' => $entry->created_at?->toIso8601String(),
                 'updated_at' => $entry->updated_at?->toIso8601String(),
             ], 200);

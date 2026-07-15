@@ -31,6 +31,7 @@ class DeclarativeMemoryNoExpiryTest extends TestCase
                 $table->string('type');
                 $table->text('content');
                 $table->string('source');
+                $table->integer('confidence_level')->nullable();
                 $table->json('embedding')->nullable();
                 $table->timestamps();
                 $table->softDeletes();

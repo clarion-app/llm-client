@@ -225,6 +225,7 @@ class ConversationCondensationTest extends TestCase
             new CondensationSummaryStore($cacheStore),
             new ContextWindowBudgeter(),
             new CondensationPreset(),
+            null,
             $condensationProvider,
             $registryMock
         );
@@ -310,6 +311,7 @@ class ConversationCondensationTest extends TestCase
             new CondensationSummaryStore($cacheStore),
             new ContextWindowBudgeter(),
             new CondensationPreset(),
+            null,
             $condensationProvider,
             $registryMock
         );
@@ -384,6 +386,7 @@ class ConversationCondensationTest extends TestCase
             new ContextWindowBudgeter(),
             new CondensationPreset(),
             null,
+            null,
             $registryMock
         );
 
@@ -447,6 +450,7 @@ class ConversationCondensationTest extends TestCase
             new CondensationSummaryStore($cacheStore),
             new ContextWindowBudgeter(),
             new CondensationPreset(),
+            null,
             $condensationProvider,
             $registryMock
         );

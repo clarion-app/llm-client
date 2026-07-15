@@ -12,6 +12,10 @@ return new class extends Migration
      */
     public function up(): void
     {
+        if (Schema::hasColumn('declarative_memories', 'embedding')) {
+            return;
+        }
+
         Schema::table('declarative_memories', function (Blueprint $table) {
             $driver = DB::getDriverName();
 

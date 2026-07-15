@@ -11,12 +11,16 @@ return new class extends Migration
      */
     public function up(): void
     {
+        if (Schema::hasTable('declarative_memories')) {
+            return;
+        }
         Schema::create('declarative_memories', function (Blueprint $table) {
             $table->uuid('id')->primary();
             $table->uuid('user_id');
             $table->string('type');       // fact | preference | rule
             $table->text('content');
             $table->string('source');     // user_stated | agent_learned
+            $table->integer('confidence_level')->nullable();
             $table->timestamps();
             $table->softDeletes();
 

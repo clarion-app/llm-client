@@ -52,10 +52,11 @@ interface DeclarativeMemoryService
      * @param string $content The content to store
      * @param bool $userConfirmed True only when the user has explicitly confirmed
      * @param string|null $existingId Existing entry ID for inferred updates (FR-003a), or null for new entries
+     * @param int|null $confidenceLevel Confidence percentage (0-100) for learned patterns
      * @return DeclarativeMemory The persisted entry
      * @throws \ClarionApp\LlmClient\Exceptions\ConfirmationRequiredException If userConfirmed is false
      */
-    public function applyAgentWrite(string $userId, string $type, string $content, bool $userConfirmed, ?string $existingId = null): DeclarativeMemory;
+    public function applyAgentWrite(string $userId, string $type, string $content, bool $userConfirmed, ?string $existingId = null, ?int $confidenceLevel = null): DeclarativeMemory;
 
     /**
      * Recall all declarative memories for a user.

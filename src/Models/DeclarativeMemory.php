@@ -25,10 +25,12 @@ class DeclarativeMemory extends Model
         'type',
         'content',
         'source',
+        'confidence_level',
         'embedding',
     ];
 
     protected $casts = [
+        'confidence_level' => 'integer',
         'embedding' => 'json',
     ];
 
@@ -41,6 +43,18 @@ class DeclarativeMemory extends Model
      * Valid source (provenance) values.
      */
     public const SOURCES = ['user_stated', 'agent_learned'];
+
+    /**
+     * Source value for user-stated entries.
+     */
+    public const SOURCE_USER_STATED = 'user_stated';
+
+    /**
+     * Source value for agent-learned entries (learned patterns).
+     *
+     * Learned patterns carry a confidence_level (0-100); user-stated entries do not.
+     */
+    public const LEARNED_PATTERN = 'agent_learned';
 
     /**
      * Register the per-user global scope.

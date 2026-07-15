@@ -8,10 +8,13 @@ use ClarionApp\LlmClient\Services\MemoryService;
 use ClarionApp\LlmClient\Models\MemoryEntry;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Events\ConversationEnded;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event as EventFacade;
 
 class MemoryLifecycleTest extends TestCase
 {
+    use RefreshDatabase;
+
     protected function getService(): MemoryService
     {
         return app(MemoryService::class);

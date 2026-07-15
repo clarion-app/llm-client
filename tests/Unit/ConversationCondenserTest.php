@@ -399,6 +399,7 @@ class ConversationCondenserTest extends TestCase
             $store,
             $budgeter,
             new CondensationPreset(),
+            null,
             $fakeProvider
         );
     }

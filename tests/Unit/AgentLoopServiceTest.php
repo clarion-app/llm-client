@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\OperationsSearchService;
 use ClarionApp\LlmClient\Services\OperationCache;
+use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
@@ -40,10 +41,11 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        // buildToolsPayload now returns 7 hardcoded meta-tools (3 original + 4 memory)
-        $this->assertCount(7, $tools);
+        // buildToolsPayload returns 8 hardcoded meta-tools
+        // (3 operation + 4 memory + 1 declarative-memory proposal)
+        $this->assertCount(8, $tools);
 
-        // Verify all 7 meta-tools are present
+        // Verify all 8 meta-tools are present
         $toolNames = collect($tools)->pluck('function.name')->toArray();
         $this->assertContains('list_applications', $toolNames);
         $this->assertContains('execute_operation', $toolNames);
@@ -52,6 +54,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertContains('memory_read', $toolNames);
         $this->assertContains('memory_search', $toolNames);
         $this->assertContains('memory_delete', $toolNames);
+        $this->assertContains('propose_declarative_memory', $toolNames);
 
         // Verify structure of each tool
         foreach ($tools as $tool) {
@@ -63,7 +66,7 @@ class AgentLoopServiceTest extends TestCase
     }
 
     #[Test]
-    public function build_tools_payload_returns_seven_meta_tools()
+    public function build_tools_payload_returns_eight_meta_tools()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
@@ -71,7 +74,7 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        $this->assertCount(7, $tools);
+        $this->assertCount(8, $tools);
 
         // Verify list_applications has no parameters
         $listApps = collect($tools)->firstWhere('function.name', 'list_applications');
@@ -191,7 +194,7 @@ class AgentLoopServiceTest extends TestCase
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
         $service->start($conversation);
 
         $conversation->refresh();
@@ -267,7 +270,7 @@ class AgentLoopServiceTest extends TestCase
                 'isError' => false,
             ]);
 
-        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
         $service->resume($conversation, $message, true);
 
         Queue::assertPushed(SendHttpStreamRequest::class);
@@ -318,7 +321,7 @@ class AgentLoopServiceTest extends TestCase
 
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
         $service->resume($conversation, $message, false);
 
         Queue::assertPushed(SendHttpStreamRequest::class);
@@ -384,7 +387,7 @@ class AgentLoopServiceTest extends TestCase
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
 
-        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
 
         // Simulate what MessageController::store() does
         Message::create([

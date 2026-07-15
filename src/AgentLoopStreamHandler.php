@@ -26,7 +26,6 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
     public function __construct(?ToolResultCondenser $toolResultCondenser = null)
     {
-        parent::__construct();
         $this->toolResultCondenser = $toolResultCondenser;
     }
 

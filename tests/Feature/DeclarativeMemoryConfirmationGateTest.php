@@ -38,6 +38,7 @@ class DeclarativeMemoryConfirmationGateTest extends TestCase
                 $table->string('type');
                 $table->text('content');
                 $table->string('source');
+                $table->integer('confidence_level')->nullable();
                 $table->json('embedding')->nullable();
                 $table->timestamps();
                 $table->softDeletes();
@@ -237,5 +238,74 @@ class DeclarativeMemoryConfirmationGateTest extends TestCase
         } catch (ConfirmationRequiredException $e) {
             $this->assertEquals($existingId, $e->existingId);
         }
+    }
+
+    /* -----------------------------------------------------------------
+     * Confidence in Confirmation Gate
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function confirmation_gate_carries_confidence_level_in_payload(): void
+    {
+        $user = \ClarionApp\Backend\Models\User::factory()->create();
+
+        $embeddingService = $this->createMock(EmbeddingService::class);
+        $embeddingService->method('isEnabled')->willReturn(false);
+        $service = new DeclarativeMemoryService($embeddingService);
+
+        $rowCountBefore = DeclarativeMemory::withoutGlobalScope('user')->count();
+
+        try {
+            $service->applyAgentWrite($user->id, 'fact', 'User prefers Python', false, null, 85);
+            $this->fail('Expected ConfirmationRequiredException');
+        } catch (ConfirmationRequiredException $e) {
+            $this->assertEquals('fact', $e->type);
+            $this->assertEquals('User prefers Python', $e->content);
+            $this->assertNull($e->existingId);
+            $this->assertSame(85, $e->confidenceLevel);
+        }
+
+        // The gate must throw before any DB write — no row created
+        $this->assertEquals($rowCountBefore, DeclarativeMemory::withoutGlobalScope('user')->count());
+    }
+
+    #[Test]
+    public function confirmed_agent_write_stores_confidence_level(): void
+    {
+        $user = \ClarionApp\Backend\Models\User::factory()->create();
+
+        $embeddingService = $this->createMock(EmbeddingService::class);
+        $embeddingService->method('isEnabled')->willReturn(false);
+        $service = new DeclarativeMemoryService($embeddingService);
+
+        $result = $service->applyAgentWrite($user->id, 'fact', 'User prefers Python over JavaScript', true, null, 72);
+
+        $this->assertEquals('agent_learned', $result->source);
+        $this->assertSame(72, $result->confidence_level);
+
+        // Verify persisted with confidence
+        $fromDb = DeclarativeMemory::withoutGlobalScope('user')->find($result->id);
+        $this->assertSame(72, $fromDb->confidence_level);
+    }
+
+    #[Test]
+    public function declined_proposal_with_confidence_leaves_no_trace(): void
+    {
+        $user = \ClarionApp\Backend\Models\User::factory()->create();
+
+        $embeddingService = $this->createMock(EmbeddingService::class);
+        $embeddingService->method('isEnabled')->willReturn(false);
+        $service = new DeclarativeMemoryService($embeddingService);
+
+        $rowCountBefore = DeclarativeMemory::withoutGlobalScope('user')->count();
+
+        // Agent proposes a learned pattern with confidence; user declines (userConfirmed = false)
+        try {
+            $service->applyAgentWrite($user->id, 'preference', 'Prefers concise answers', false, null, 60);
+        } catch (ConfirmationRequiredException $e) {
+            // Declined — nothing persists
+        }
+
+        $this->assertEquals($rowCountBefore, DeclarativeMemory::withoutGlobalScope('user')->count());
     }
 }
