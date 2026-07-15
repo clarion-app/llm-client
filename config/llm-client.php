@@ -238,5 +238,21 @@ return [
         // TTL for full-result cache entries in minutes.
         'cache_ttl_minutes' => 240,
     ],
+
+    // Smart history trimming — value-aware eviction that discards lowest-value content first
+    // when conversation history must shrink to fit the model's context window.
+    'smart_history_trimming' => [
+        // Master toggle. When false, smart trimming is skipped entirely.
+        'enabled' => true,
+
+        // Minimum number of recent message pairs to always preserve (exempt from eviction).
+        'preserved_pairs' => 10,
+
+        // Score cache TTL in minutes.
+        'score_cache_ttl_minutes' => 5,
+
+        // Whether to emit SmartHistoryTrimmed events.
+        'emit_events' => true,
+    ],
 ];
 

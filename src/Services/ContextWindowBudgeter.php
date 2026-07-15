@@ -288,7 +288,7 @@ final class ContextWindowBudgeter
      *
      * @return list<array{messages: list<array>, estimatedTokens: int, isNewest: bool}>
      */
-    private function groupIntoTurnUnits(array $messages, callable $estimator): array
+    public function groupIntoTurnUnits(array $messages, callable $estimator): array
     {
         $units = [];
         $i = 0;

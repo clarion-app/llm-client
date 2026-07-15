@@ -21,6 +21,7 @@ class ConversationCondenser
         private CondensationSummaryStore $store,
         private ContextWindowBudgeter $budgeter,
         private CondensationPreset $preset,
+        private ?SmartHistoryTrimmer $smartTrimmer = null,
         private ?LlmProvider $condensationProvider = null,
         private ?ProviderRegistry $providerRegistry = null,
         ?array $config = null
@@ -104,8 +105,9 @@ class ConversationCondenser
         $sealedChunks = $this->partitioner->findSealedChunks($historyMessages, $verbatimCount, $chunkSize);
 
         if (empty($sealedChunks)) {
-            // No sealed chunks to condense — fall back to trimming
-            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId);
+            // No sealed chunks to condense — try smart trim, then budgeter as safety net
+            $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
+            return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId);
         }
 
         // Look up or produce summaries for each sealed chunk
@@ -139,8 +141,9 @@ class ConversationCondenser
             if ($result !== null) {
                 $summaries[$missing['chunkIndex']] = $result;
             } else {
-                // Condensation failed — fall back to trimming
-                return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId);
+                // Condensation failed — try smart trim, then budgeter as safety net
+                $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
+                return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId);
             }
         }
 
@@ -178,8 +181,32 @@ class ConversationCondenser
         }
 
         // Assembled is larger than original (unlikely with proper summaries)
-        // Fall back to trimming
-        return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId);
+        // Fall back to smart trim, then budgeter as safety net
+        $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
+        return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId);
+    }
+
+    /**
+     * Apply smart history trimming if the trimmer is configured.
+     *
+     * @param list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}> $messages
+     * @param int $historyBudget Token budget for history
+     * @param callable(string): int $estimator Token estimator
+     * @param string $conversationId Conversation identifier for cache keys
+     *
+     * @return list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}>
+     */
+    private function applySmartTrim(
+        array $messages,
+        int $historyBudget,
+        callable $estimator,
+        string $conversationId,
+    ): array {
+        if ($this->smartTrimmer === null) {
+            return $messages;
+        }
+
+        return $this->smartTrimmer->trim($messages, $historyBudget, $estimator, $conversationId);
     }
 
     /**
