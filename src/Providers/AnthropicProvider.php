@@ -31,6 +31,21 @@ class AnthropicProvider implements LlmProvider
     }
 
     /**
+     * The anthropic-version header sent on every request.
+     *
+     * Falls back to the current release when the config is unavailable (e.g.
+     * the provider is constructed outside the container, as in unit tests).
+     */
+    private function apiVersion(): string
+    {
+        try {
+            return (string) config('llm-client.providers.anthropic.api_version', '2023-06-01');
+        } catch (\Throwable) {
+            return '2023-06-01';
+        }
+    }
+
+    /**
      * Synchronous non-streaming chat completion.
      */
     public function chat(array $messages, array $tools = [], array $options = []): array
@@ -72,7 +87,7 @@ class AnthropicProvider implements LlmProvider
                     'Content-Type' => 'application/json',
                     'Accept' => 'application/json',
                     'x-api-key' => $this->server->token,
-                    'anthropic-version' => '2023-06-01',
+                    'anthropic-version' => $this->apiVersion(),
                 ],
                 'json' => $body,
             ]);
@@ -136,7 +151,7 @@ class AnthropicProvider implements LlmProvider
                 'headers' => [
                     'Content-Type' => 'application/json',
                     'x-api-key' => $this->server->token,
-                    'anthropic-version' => '2023-06-01',
+                    'anthropic-version' => $this->apiVersion(),
                 ],
                 'json' => $body,
                 'stream' => true,

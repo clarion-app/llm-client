@@ -1338,41 +1338,59 @@ class AgentLoopServiceTest extends TestCase
     }
 
     #[Test]
-    public function build_tools_payload_with_conversation_injects_dynamic_paramschema()
+    public function build_tools_payload_emits_generic_envelope_schema()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
         $cache = new OperationCache();
 
-        // Seed the cache with a test operation that has path, query, and body params
-        $conversation_id = 'test-convo-' . uniqid();
-        $cache->put($conversation_id, 'createContact', [
-            'summary' => 'Create a new contact',
-            'method' => 'POST',
-            'path' => '/api/contacts',
-            'paramSchema' => [
-                'path' => [],
-                'query' => [],
-                'body' => [
-                    'name' => [
-                        'type' => 'string',
-                        'description' => 'The contact name',
-                        'required' => true,
-                    ],
-                    'email' => [
-                        'type' => 'string',
-                        'format' => 'email',
-                        'description' => 'The contact email address',
-                    ],
-                ],
-            ],
-        ]);
+        $service = new AgentLoopService($registryMock, $executorMock, $cache);
+        $tools = $service->buildToolsPayload();
 
-        // Create a real Conversation model in the DB
+        $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
+        $this->assertNotNull($execOp);
+
+        $paramsProps = $execOp['function']['parameters']['properties']['parameters']['properties'];
+
+        // All three groups are always offered, and each accepts arbitrary keys so
+        // any operation's parameters can be expressed.
+        foreach (['path', 'query', 'body'] as $group) {
+            $this->assertArrayHasKey($group, $paramsProps);
+            $this->assertTrue($paramsProps[$group]['additionalProperties']);
+            $this->assertCount(0, (array) ($paramsProps[$group]['properties'] ?? new \stdClass()));
+        }
+
+        // operationId is the only required field; no operation-specific field is
+        // ever marked required on the shared tool.
+        $this->assertEquals(['operationId'], $execOp['function']['parameters']['required']);
+        foreach (['path', 'query', 'body'] as $group) {
+            $this->assertArrayNotHasKey('required', $paramsProps[$group]);
+        }
+    }
+
+    #[Test]
+    public function build_tools_payload_schema_does_not_favor_most_recent_cached_operation()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $cache = new OperationCache();
+
         $server = Server::create(['name' => 'test', 'server_url' => 'https://api.test.com', 'token' => 'sk-test']);
         $conversation = Conversation::factory()->create(['server_id' => $server->id]);
 
-        // Put the cache entry using the actual conversation ID
+        // getContact needs a path param.
+        $cache->put($conversation->id, 'getContact', [
+            'summary' => 'Get a contact by ID',
+            'method' => 'GET',
+            'path' => '/api/contacts/{id}',
+            'paramSchema' => [
+                'path' => ['id' => ['type' => 'string', 'required' => true]],
+                'query' => [],
+                'body' => [],
+            ],
+        ]);
+
+        // createContact is cached last (most recently used) and needs a body param.
         $cache->put($conversation->id, 'createContact', [
             'summary' => 'Create a new contact',
             'method' => 'POST',
@@ -1380,107 +1398,27 @@ class AgentLoopServiceTest extends TestCase
             'paramSchema' => [
                 'path' => [],
                 'query' => [],
-                'body' => [
-                    'name' => [
-                        'type' => 'string',
-                        'description' => 'The contact name',
-                        'required' => true,
-                    ],
-                    'email' => [
-                        'type' => 'string',
-                        'format' => 'email',
-                        'description' => 'The contact email address',
-                    ],
-                ],
+                'body' => ['name' => ['type' => 'string', 'required' => true]],
             ],
         ]);
 
         $service = new AgentLoopService($registryMock, $executorMock, $cache);
-        $tools = $service->buildToolsPayload($conversation);
-
-        $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
-        $this->assertNotNull($execOp);
-
-        $params = $execOp['function']['parameters'];
-        $paramsProps = $params['properties']['parameters']['properties'];
-
-        // Should have body sub-object with specific properties from the cached paramSchema
-        $this->assertArrayHasKey('body', $paramsProps);
-        $this->assertArrayHasKey('properties', $paramsProps['body']);
-        $bodyProps = $paramsProps['body']['properties'];
-
-        // Verify name and email are present with correct types
-        $this->assertArrayHasKey('name', $bodyProps);
-        $this->assertEquals('string', $bodyProps['name']['type']);
-        $this->assertArrayHasKey('email', $bodyProps);
-        $this->assertEquals('string', $bodyProps['email']['type']);
-        $this->assertEquals('email', $bodyProps['email']['format']);
-
-        // Verify required field is preserved
-        $this->assertArrayHasKey('required', $paramsProps['body']);
-        $this->assertContains('name', $paramsProps['body']['required']);
-    }
-
-    #[Test]
-    public function build_tools_payload_without_conversation_returns_generic_schema()
-    {
-        $registryMock = Mockery::mock(McpToolRegistry::class);
-        $executorMock = Mockery::mock(McpToolExecutor::class);
-        $cache = new OperationCache();
-
-        $service = new AgentLoopService($registryMock, $executorMock, $cache);
-
-        // Call without conversation parameter (T010 fallback)
         $tools = $service->buildToolsPayload();
 
         $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
-        $this->assertNotNull($execOp);
+        $paramsProps = $execOp['function']['parameters']['properties']['parameters']['properties'];
 
-        $params = $execOp['function']['parameters'];
-        $paramsProps = $params['properties']['parameters']['properties'];
-
-        // Generic schema should have path, query, body with additionalProperties: true
+        // Regression: the schema previously described only the most-recently-used
+        // operation, which dropped the `path` group and marked createContact's
+        // `body.name` required — leaving getContact impossible to call correctly.
         $this->assertArrayHasKey('path', $paramsProps);
         $this->assertTrue($paramsProps['path']['additionalProperties']);
-        $this->assertArrayHasKey('query', $paramsProps);
-        $this->assertTrue($paramsProps['query']['additionalProperties']);
-        $this->assertArrayHasKey('body', $paramsProps);
-        $this->assertTrue($paramsProps['body']['additionalProperties']);
-
-        // Generic schema should NOT have specific property definitions
-        $this->assertCount(0, (array) ($paramsProps['path']['properties'] ?? new \stdClass()));
-        $this->assertCount(0, (array) ($paramsProps['query']['properties'] ?? new \stdClass()));
+        $this->assertArrayNotHasKey('required', $paramsProps['body']);
         $this->assertCount(0, (array) ($paramsProps['body']['properties'] ?? new \stdClass()));
     }
 
     #[Test]
-    public function build_tools_payload_with_empty_cache_returns_generic_schema()
-    {
-        $registryMock = Mockery::mock(McpToolRegistry::class);
-        $executorMock = Mockery::mock(McpToolExecutor::class);
-        $cache = new OperationCache();
-
-        // Create a conversation but do NOT seed the cache
-        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.test.com', 'token' => 'sk-test']);
-        $conversation = Conversation::factory()->create(['server_id' => $server->id]);
-
-        $service = new AgentLoopService($registryMock, $executorMock, $cache);
-        $tools = $service->buildToolsPayload($conversation);
-
-        $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
-        $this->assertNotNull($execOp);
-
-        $params = $execOp['function']['parameters'];
-        $paramsProps = $params['properties']['parameters']['properties'];
-
-        // Empty cache should fallback to generic schema (T010)
-        $this->assertTrue($paramsProps['path']['additionalProperties']);
-        $this->assertTrue($paramsProps['query']['additionalProperties']);
-        $this->assertTrue($paramsProps['body']['additionalProperties']);
-    }
-
-    #[Test]
-    public function build_tools_payload_preserves_path_and_query_params()
+    public function known_operations_section_carries_per_operation_param_schemas()
     {
         $registryMock = Mockery::mock(McpToolRegistry::class);
         $executorMock = Mockery::mock(McpToolExecutor::class);
@@ -1489,48 +1427,29 @@ class AgentLoopServiceTest extends TestCase
         $server = Server::create(['name' => 'test', 'server_url' => 'https://api.test.com', 'token' => 'sk-test']);
         $conversation = Conversation::factory()->create(['server_id' => $server->id]);
 
-        // Seed cache with path and query params
         $cache->put($conversation->id, 'getContact', [
             'summary' => 'Get a contact by ID',
             'method' => 'GET',
             'path' => '/api/contacts/{id}',
             'paramSchema' => [
-                'path' => [
-                    'id' => [
-                        'type' => 'string',
-                        'description' => 'The contact ID',
-                        'required' => true,
-                    ],
-                ],
-                'query' => [
-                    'include' => [
-                        'type' => 'string',
-                        'enum' => ['profile', 'address', 'all'],
-                        'description' => 'What to include in the response',
-                    ],
-                ],
+                'path' => ['id' => ['type' => 'string', 'required' => true]],
+                'query' => ['include' => ['type' => 'string', 'enum' => ['profile', 'all']]],
                 'body' => [],
             ],
         ]);
 
         $service = new AgentLoopService($registryMock, $executorMock, $cache);
-        $tools = $service->buildToolsPayload($conversation);
+        $payload = $service->buildMessagesPayload($conversation);
 
-        $execOp = collect($tools)->firstWhere('function.name', 'execute_operation');
-        $this->assertNotNull($execOp);
+        $system = collect($payload)->firstWhere('role', 'system')['content'] ?? '';
 
-        $paramsProps = $execOp['function']['parameters']['properties']['parameters']['properties'];
-
-        // Verify path param
-        $this->assertArrayHasKey('path', $paramsProps);
-        $this->assertArrayHasKey('id', $paramsProps['path']['properties']);
-        $this->assertEquals('string', $paramsProps['path']['properties']['id']['type']);
-        $this->assertContains('id', $paramsProps['path']['required']);
-
-        // Verify query param with enum preservation
-        $this->assertArrayHasKey('query', $paramsProps);
-        $this->assertArrayHasKey('include', $paramsProps['query']['properties']);
-        $this->assertIsArray($paramsProps['query']['properties']['include']['enum']);
-        $this->assertEquals(['profile', 'address', 'all'], $paramsProps['query']['properties']['include']['enum']);
+        // With the tool schema generic, this section is how per-operation
+        // parameter detail reaches the LLM.
+        $this->assertStringContainsString('Known Operations', $system);
+        $this->assertStringContainsString('getContact', $system);
+        $this->assertStringContainsString('GET /api/contacts/{id}', $system);
+        $this->assertStringContainsString('"id"', $system);
+        $this->assertStringContainsString('"include"', $system);
+        $this->assertStringContainsString('profile', $system);
     }
 }

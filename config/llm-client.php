@@ -38,15 +38,19 @@ return [
         '- If results don\'t match intent: retry search_operations once with rephrased broader terms, then fall back to list_applications.'.PHP_EOL.
         '- If the search index is unavailable or empty (hint in response): inform the user and use list_applications as an alternative.'.PHP_EOL.
         'Response Style: After successfully executing tool calls, do not summarize what you did, do not list details like IP addresses or parameters, and do not offer follow-up suggestions. Only respond if there was an error or if the user asked a question.'.PHP_EOL.
+        'Parameter Format: execute_operation takes an operationId and a parameters object with optional "path", "query", and "body" sub-objects. Put each parameter in the group the operation\'s schema assigns it to — never pass parameters as a flat object.'.PHP_EOL.
         'Example (direct execution for known operations):'.PHP_EOL.
         '- User: "add a contact named Alice"'.PHP_EOL.
         '- Agent: (contacts.store is in Known Operations)'.PHP_EOL.
-        '- Agent: execute_operation("contacts.store", {name: "Alice"})'.PHP_EOL.
+        '- Agent: execute_operation("contacts.store", {body: {name: "Alice"}})'.PHP_EOL.
         'Example (search-then-execute flow):'.PHP_EOL.
         '- User: "add a contact named Alice"'.PHP_EOL.
         '- Agent: search_operations("add contact")'.PHP_EOL.
-        '- Agent: reviews results, selects best matching operationId'.PHP_EOL.
-        '- Agent: execute_operation(operationId, {name: "Alice"})'.PHP_EOL.
+        '- Agent: reviews results, selects best matching operationId, reads its parameter schema'.PHP_EOL.
+        '- Agent: execute_operation(operationId, {body: {name: "Alice"}})'.PHP_EOL.
+        'Example (path and query parameters):'.PHP_EOL.
+        '- User: "show me contact 42 with their address"'.PHP_EOL.
+        '- Agent: execute_operation("contacts.show", {path: {id: "42"}, query: {include: "address"}})'.PHP_EOL.
         'Example (capability discovery):'.PHP_EOL.
         '- User: "what can I do?"'.PHP_EOL.
         '- Agent: list_applications()'.PHP_EOL.
@@ -132,6 +136,16 @@ return [
         'enabled' => ['decision', 'summary', 'extraction'],
     ],
 
+    // Schema validation for structured (JSON-mode) responses.
+    // Validation only runs when a caller passes a schema; these settings govern
+    // the retry loop that feeds violation details back to the LLM for self-correction.
+    'schema_validation' => [
+        // Times to re-prompt with a correction message before giving up.
+        // Bounded to avoid looping on a model that cannot satisfy the schema.
+        // Per-request override: $options['max_schema_retries'].
+        'max_retries' => 2,
+    ],
+
     // Per-provider defaults
     'providers' => [
         'openai' => [
@@ -140,7 +154,9 @@ return [
         ],
         'anthropic' => [
             'default_model' => env('LLM_ANTHROPIC_DEFAULT_MODEL', 'claude-sonnet-4-20250514'),
-            'api_version' => env('LLM_ANTHROPIC_API_VERSION', '2025-04-14'),
+            // Anthropic's API version header. '2023-06-01' is the current release;
+            // it is not a "latest" date — do not bump it to today's date.
+            'api_version' => env('LLM_ANTHROPIC_API_VERSION', '2023-06-01'),
             'timeout' => env('LLM_ANTHROPIC_TIMEOUT', 240),
         ],
         'llama.cpp' => [

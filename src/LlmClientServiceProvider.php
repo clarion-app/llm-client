@@ -259,25 +259,35 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         // Register OpenAI provider factory
         $registry->register(
             ProviderType::OpenAI,
-            fn (Server $server) => new OpenAiProvider($server, new Client(['timeout' => 240]))
+            fn (Server $server) => new OpenAiProvider($server, $this->httpClientFor(ProviderType::OpenAI))
         );
 
         // Register Anthropic provider factory
         $registry->register(
             ProviderType::Anthropic,
-            fn (Server $server) => new AnthropicProvider($server, new Client(['timeout' => 240]))
+            fn (Server $server) => new AnthropicProvider($server, $this->httpClientFor(ProviderType::Anthropic))
         );
 
         // Register llama.cpp provider factory
         $registry->register(
             ProviderType::LlamaCpp,
-            fn (Server $server) => new LlamaCppProvider($server, new Client(['timeout' => 240]))
+            fn (Server $server) => new LlamaCppProvider($server, $this->httpClientFor(ProviderType::LlamaCpp))
         );
 
         // Set default factory to OpenAI for legacy records
         $registry->default(
-            fn (Server $server) => new OpenAiProvider($server, new Client(['timeout' => 240]))
+            fn (Server $server) => new OpenAiProvider($server, $this->httpClientFor(ProviderType::OpenAI))
         );
+    }
+
+    /**
+     * Build an HTTP client honouring the provider's configured timeout.
+     */
+    protected function httpClientFor(ProviderType $type): Client
+    {
+        $timeout = config('llm-client.providers.'.$type->value.'.timeout', 240);
+
+        return new Client(['timeout' => (int) $timeout]);
     }
 
     /**

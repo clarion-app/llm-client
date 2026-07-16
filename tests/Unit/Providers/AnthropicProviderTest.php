@@ -529,4 +529,59 @@ class AnthropicProviderTest extends TestCase
         // Second request should NOT have JSON instruction
         $this->assertEquals('You are a helpful assistant.', $secondBody['system']);
     }
+
+    // ─── API Version Header ───
+
+    #[Test]
+    public function chat_sends_configured_anthropic_version_header(): void
+    {
+        config(['llm-client.providers.anthropic.api_version' => '2099-01-01']);
+
+        $container = [];
+        $mock = new MockHandler([
+            new Response(200, [], json_encode([
+                'content' => [['type' => 'text', 'text' => 'hi']],
+                'usage' => ['input_tokens' => 1, 'output_tokens' => 1],
+            ])),
+        ]);
+        $handlerStack = HandlerStack::create($mock);
+        $handlerStack->push(\GuzzleHttp\Middleware::history($container));
+        $provider = new AnthropicProvider(
+            $this->createServer(),
+            new Client(['handler' => $handlerStack])
+        );
+
+        $provider->chat([['role' => 'user', 'content' => 'hi']]);
+
+        $this->assertSame(
+            '2099-01-01',
+            $container[0]['request']->getHeaderLine('anthropic-version')
+        );
+    }
+
+    #[Test]
+    public function chat_defaults_to_current_anthropic_version(): void
+    {
+        $container = [];
+        $mock = new MockHandler([
+            new Response(200, [], json_encode([
+                'content' => [['type' => 'text', 'text' => 'hi']],
+                'usage' => ['input_tokens' => 1, 'output_tokens' => 1],
+            ])),
+        ]);
+        $handlerStack = HandlerStack::create($mock);
+        $handlerStack->push(\GuzzleHttp\Middleware::history($container));
+        $provider = new AnthropicProvider(
+            $this->createServer(),
+            new Client(['handler' => $handlerStack])
+        );
+
+        $provider->chat([['role' => 'user', 'content' => 'hi']]);
+
+        // 2023-06-01 is Anthropic's current API version — not a placeholder date.
+        $this->assertSame(
+            '2023-06-01',
+            $container[0]['request']->getHeaderLine('anthropic-version')
+        );
+    }
 }
