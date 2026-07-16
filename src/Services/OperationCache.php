@@ -2,35 +2,144 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use Illuminate\Cache\Repository;
+use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+
 /**
- * In-memory, conversation-scoped LRU cache for operation metadata.
+ * Conversation-scoped LRU cache for operation metadata.
  *
  * Stores operation details (operationId → {summary, method, path, paramSchema})
  * resolved during execute_operation, so subsequent lookups in the same
  * conversation skip ApiManager::getOperationDetails().
  *
  * Features:
- * - Per-conversation isolation (static array keyed by conversation UUID)
+ * - Per-conversation isolation (one cache key per conversation)
  * - LRU eviction at configurable max_entries per conversation
  * - Idempotent puts (duplicate operationId updates existing entry)
  * - getSummaries() for system prompt injection
+ * - Shared across workers via configured Laravel Cache store
  */
 class OperationCache
 {
-    /**
-     * Static cache storage: [$conversationId => [$operationId => $entry]].
-     * PHP arrays preserve insertion/access order for LRU tracking.
-     */
-    private static array $caches = [];
-
     /**
      * Maximum entries per conversation before LRU eviction.
      */
     private int $maxEntries;
 
-    public function __construct(?int $maxEntries = null)
+    /**
+     * Cache repository for shared storage.
+     */
+    private ?Repository $store = null;
+
+    /**
+     * Request-scoped memoization of decoded arrays per conversation.
+     */
+    private array $memo = [];
+
+    /**
+     * @param ?int $maxEntries Maximum entries per conversation (null = config default)
+     * @param ?Repository $store Cache repository (null = resolve from config)
+     */
+    public function __construct(?int $maxEntries = null, ?Repository $store = null)
     {
-        $this->maxEntries = $maxEntries ?? (int) config('llm-client.operation_cache.max_entries', 20);
+        $this->maxEntries = $maxEntries ?? (int) $this->getConfig('llm-client.operation_cache.max_entries', 20);
+        $this->store = $store;
+    }
+
+    /**
+     * Get the cache key for a conversation.
+     */
+    private function keyFor(string $conversationId): string
+    {
+        return 'llm-client:op_cache:'.$conversationId;
+    }
+
+    /**
+     * Execute a callable with graceful degradation.
+     *
+     * Catches Throwable, logs once per request at warning, returns $fallback.
+     */
+    private function safely(callable $fn, mixed $fallback): mixed
+    {
+        try {
+            return $fn();
+        } catch (\Throwable $e) {
+            try {
+                Log::warning('Operation cache backend error', [
+                    'error' => $e->getMessage(),
+                    'class' => $e::class,
+                ]);
+            } catch (\Throwable) {
+                // Log facade unavailable outside container — silently degrade
+            }
+            return $fallback;
+        }
+    }
+
+    /**
+     * Execute a callable under a lock for the given conversation.
+     *
+     * Only lock contention falls through to an unsynchronized run — a lost
+     * concurrent entry costs one re-discovery, while an exception would cost
+     * the user's request. Errors raised by $fn itself propagate to the
+     * caller's safely() wrapper: retrying them here would both duplicate the
+     * callable's side effects and drop the very lock that prevents lost
+     * updates.
+     */
+    private function withLock(string $conversationId, callable $fn): mixed
+    {
+        $repo = $this->resolveStore();
+        if (!$repo) {
+            return null;
+        }
+
+        $lockKey = $this->keyFor($conversationId) . ':lock';
+        $lockSeconds = (int) $this->getConfig('llm-client.operation_cache.lock_seconds', 5);
+        $lockWait = (int) $this->getConfig('llm-client.operation_cache.lock_wait', 3);
+
+        try {
+            $lock = $repo->lock($lockKey, $lockSeconds);
+        } catch (\Throwable) {
+            // Store cannot provide locks (no LockProvider) — run unsynchronized.
+            return $fn();
+        }
+
+        try {
+            return $lock->block($lockWait, $fn);
+        } catch (LockTimeoutException) {
+            return $fn();
+        }
+    }
+
+    /**
+     * Resolve the cache repository (lazy resolution).
+     */
+    private function resolveStore(): ?Repository
+    {
+        if ($this->store) {
+            return $this->store;
+        }
+
+        try {
+            $storeName = config('llm-client.operation_cache.store');
+            return $storeName ? Cache::store($storeName) : Cache::store();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Safe config accessor with fallback (works without container).
+     */
+    private function getConfig(string $key, mixed $default): mixed
+    {
+        try {
+            return config($key, $default);
+        } catch (\Throwable) {
+            return $default;
+        }
     }
 
     /**
@@ -46,31 +155,37 @@ class OperationCache
      */
     public function put(string $conversationId, string $operationId, array $details): void
     {
-        // Initialize conversation cache if needed
-        if (!isset(self::$caches[$conversationId])) {
-            self::$caches[$conversationId] = [];
-        }
-
-        $convCache = &self::$caches[$conversationId];
-
-        // If already exists, remove it first (will be re-added at end)
-        if (isset($convCache[$operationId])) {
-            unset($convCache[$operationId]);
-        }
-
-        // Evict LRU entry if at capacity
-        if (count($convCache) >= $this->maxEntries) {
-            array_shift($convCache);
-        }
-
-        // Add entry at end (most recently used)
-        $convCache[$operationId] = [
+        $entry = [
             'operationId' => $operationId,
             'summary' => $details['summary'] ?? '',
             'method' => strtoupper($details['method'] ?? 'GET'),
             'path' => $details['path'] ?? '',
             'paramSchema' => $details['paramSchema'] ?? null,
         ];
+
+        $this->safely(function () use ($conversationId, $operationId, $entry) {
+            $this->withLock($conversationId, function () use ($conversationId, $operationId, $entry) {
+                $convCache = $this->loadConversation($conversationId);
+
+                // If already exists, remove it first (will be re-added at end)
+                if (isset($convCache[$operationId])) {
+                    unset($convCache[$operationId]);
+                }
+
+                // Evict LRU entry if at capacity
+                if (count($convCache) >= $this->maxEntries) {
+                    array_shift($convCache);
+                }
+
+                // Add entry at end (most recently used)
+                $convCache[$operationId] = $entry;
+
+                $this->saveConversation($conversationId, $convCache);
+            });
+        }, null);
+
+        // The stored array has moved on; drop the memo so the next read reloads.
+        unset($this->memo[$conversationId]);
     }
 
     /**
@@ -84,53 +199,74 @@ class OperationCache
      */
     public function get(string $conversationId, string $operationId): ?array
     {
-        if (!isset(self::$caches[$conversationId])) {
-            return null;
-        }
+        return $this->safely(function () use ($conversationId, $operationId) {
+            // Check memo first (fast path)
+            if (isset($this->memo[$conversationId][$operationId])) {
+                // Promotion under lock (persists across workers)
+                $this->withLock($conversationId, function () use ($conversationId, $operationId) {
+                    $convCache = $this->loadConversation($conversationId);
+                    if (isset($convCache[$operationId])) {
+                        $entry = $convCache[$operationId];
+                        unset($convCache[$operationId]);
+                        $convCache[$operationId] = $entry;
+                        $this->saveConversation($conversationId, $convCache);
+                    }
+                });
+                return $this->memo[$conversationId][$operationId];
+            }
 
-        $convCache = &self::$caches[$conversationId];
+            // Miss — load fresh (no lock needed for read-miss)
+            $convCache = $this->loadConversation($conversationId);
+            if (!isset($convCache[$operationId])) {
+                return null;
+            }
 
-        if (!isset($convCache[$operationId])) {
-            return null;
-        }
+            // Hit — promote and memoize
+            $entry = $convCache[$operationId];
+            unset($convCache[$operationId]);
+            $convCache[$operationId] = $entry;
+            $this->saveConversation($conversationId, $convCache);
+            $this->memo[$conversationId] = $convCache;
 
-        // Move to end (most recently used) — LRU tracking
-        $entry = $convCache[$operationId];
-        unset($convCache[$operationId]);
-        $convCache[$operationId] = $entry;
-
-        return $entry;
+            return $entry;
+        }, null);
     }
 
     /**
      * Get formatted one-line summaries for all cached operations in a conversation.
      *
      * Used for system prompt injection ("Known Operations" section).
+     * No lock, no promotion — hot path. Returns LRU→MRU order.
      *
      * @param string $conversationId Conversation UUID
      * @return string[] Array of formatted summary strings, e.g. "create-contact (POST /contacts)"
      */
     public function getSummaries(string $conversationId): array
     {
-        if (!isset(self::$caches[$conversationId])) {
-            return [];
-        }
+        return $this->safely(function () use ($conversationId) {
+            $convCache = $this->memo[$conversationId] ?? $this->loadConversation($conversationId);
+            if (empty($convCache)) {
+                return [];
+            }
 
-        $summaries = [];
-        foreach (self::$caches[$conversationId] as $entry) {
-            $summaries[] = sprintf(
-                '%s (%s %s)',
-                $entry['operationId'],
-                $entry['method'],
-                $entry['path']
-            );
-        }
+            $summaries = [];
+            foreach ($convCache as $entry) {
+                $summaries[] = sprintf(
+                    '%s (%s %s)',
+                    $entry['operationId'],
+                    $entry['method'],
+                    $entry['path']
+                );
+            }
 
-        return $summaries;
+            return $summaries;
+        }, []);
     }
 
     /**
      * Get full cached entries for a conversation, ordered most-recently-used first.
+     *
+     * No lock, no promotion — reads are cheap. Returns MRU-first order.
      *
      * @param string $conversationId Conversation UUID
      * @param int $limit Maximum entries to return (default 20)
@@ -138,16 +274,19 @@ class OperationCache
      */
     public function getEntries(string $conversationId, int $limit = 20): array
     {
-        if (!isset(self::$caches[$conversationId])) {
-            return [];
-        }
+        return $this->safely(function () use ($conversationId, $limit) {
+            $convCache = $this->memo[$conversationId] ?? $this->loadConversation($conversationId);
+            if (empty($convCache)) {
+                return [];
+            }
 
-        $entries = array_values(self::$caches[$conversationId]);
+            $entries = array_values($convCache);
 
-        // Reverse so most recently used (last in array) comes first
-        $entries = array_reverse($entries);
+            // Reverse so most recently used (last in array) comes first
+            $entries = array_reverse($entries);
 
-        return array_slice($entries, 0, $limit);
+            return array_slice($entries, 0, $limit);
+        }, []);
     }
 
     /**
@@ -158,14 +297,70 @@ class OperationCache
      */
     public function count(string $conversationId): int
     {
-        return count(self::$caches[$conversationId] ?? []);
+        return $this->safely(function () use ($conversationId) {
+            $convCache = $this->memo[$conversationId] ?? $this->loadConversation($conversationId);
+            return count($convCache);
+        }, 0);
     }
 
     /**
-     * Clear all cached data (useful for testing).
+     * Drop every cached operation for a conversation.
+     *
+     * Called when a conversation is deleted so its operations stop
+     * contributing to prompts immediately, rather than lingering until the
+     * TTL elapses.
+     *
+     * @param string $conversationId Conversation UUID
      */
-    public static function flush(): void
+    public function forget(string $conversationId): void
     {
-        self::$caches = [];
+        $this->safely(function () use ($conversationId) {
+            $repo = $this->resolveStore();
+            if ($repo) {
+                $repo->forget($this->keyFor($conversationId));
+            }
+        }, null);
+
+        unset($this->memo[$conversationId]);
+    }
+
+    /**
+     * Load conversation cache array from store.
+     */
+    private function loadConversation(string $conversationId): array
+    {
+        $repo = $this->resolveStore();
+        if (!$repo) {
+            return [];
+        }
+
+        $key = $this->keyFor($conversationId);
+        $value = $repo->get($key);
+
+        if (is_array($value)) {
+            return $value;
+        }
+
+        return [];
+    }
+
+    /**
+     * Save conversation cache array to store.
+     */
+    private function saveConversation(string $conversationId, array $convCache): void
+    {
+        $repo = $this->resolveStore();
+        if (!$repo) {
+            return;
+        }
+
+        $key = $this->keyFor($conversationId);
+        $ttl = (int) $this->getConfig('llm-client.operation_cache.ttl', 86400);
+
+        if (empty($convCache)) {
+            $repo->forget($key);
+        } else {
+            $repo->put($key, $convCache, $ttl);
+        }
     }
 }

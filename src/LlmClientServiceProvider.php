@@ -98,6 +98,11 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return (string) $user->id === (string) $userId;
         });
 
+        // Register Conversation observer for operation cache cleanup
+        \ClarionApp\LlmClient\Models\Conversation::observe(
+            \ClarionApp\LlmClient\Observers\ConversationObserver::class
+        );
+
         // Register Artisan commands
         if ($this->app->runningInConsole()) {
             $this->commands([
@@ -123,7 +128,13 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         );
 
         $this->app->singleton(OperationCache::class, function ($app) {
-            return new OperationCache();
+            // Resolve the store named in config; null falls back to the
+            // application default. Passing $app['cache.store'] here instead
+            // would silently ignore operation_cache.store and can leave the
+            // cache on a per-worker store, reproducing the process-local bug.
+            $storeName = $app['config']->get('llm-client.operation_cache.store');
+
+            return new OperationCache(null, $app['cache']->store($storeName));
         });
 
         $this->app->singleton(ProviderRegistry::class, function () {

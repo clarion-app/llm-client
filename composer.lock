@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "068647d34b9653566355933a05cfde6c",
+    "content-hash": "f4d8423edc2b2f64c964e541aff91323",
     "packages": [
         {
             "name": "brick/math",
@@ -147,7 +147,7 @@
             "dist": {
                 "type": "path",
                 "url": "../backend",
-                "reference": "f588cbdc879521bb1b8344a654df1cdbcf4da9a2"
+                "reference": "1e72d8f584761cc2ce6f66ddcc0654eb8fbb88c9"
             },
             "require": {
                 "clarion-app/eloquent-multichain-bridge": "dev-main",

@@ -82,8 +82,16 @@ return [
     ],
 
     // Operation Cache configuration
+    // Deployment note: the shared-storage guarantee is only as good as the
+    // configured store — 'array' and per-container 'file' stores are NOT shared
+    // across workers and will silently reproduce the original process-local defect.
+    // Only 'database' (or another genuinely shared store) fixes it.
     'operation_cache' => [
         'max_entries' => 20,    // Max cached operations per conversation (LRU eviction)
+        'store'       => null,  // Cache store name; null = application default
+        'ttl'         => 86400, // Seconds; 24h, refreshed on every write
+        'lock_seconds' => 5,    // Lock hold time
+        'lock_wait'    => 3,    // Max block before falling through unsynchronized
     ],
 
     // Memory configuration

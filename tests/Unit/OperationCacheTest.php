@@ -3,6 +3,8 @@
 namespace ClarionApp\LlmClient\Tests\Unit;
 
 use ClarionApp\LlmClient\Services\OperationCache;
+use Illuminate\Cache\ArrayStore;
+use Illuminate\Cache\Repository;
 use PHPUnit\Framework\TestCase;
 
 use PHPUnit\Framework\Attributes\Test;
@@ -10,12 +12,13 @@ use PHPUnit\Framework\Attributes\Test;
 class OperationCacheTest extends TestCase
 {
     private OperationCache $cache;
+    private ArrayStore $store;
 
     protected function setUp(): void
     {
-        // Reset static state before each test
-        $this->resetCache();
-        $this->cache = new OperationCache(25);
+        // Use ArrayStore-backed repository so tests exercise the real store path
+        $this->store = new ArrayStore();
+        $this->cache = new OperationCache(25, new Repository($this->store));
     }
 
     protected function tearDown(): void
@@ -26,11 +29,9 @@ class OperationCacheTest extends TestCase
 
     private function resetCache(): void
     {
-        // Use reflection to reset the static cache property
-        $reflection = new \ReflectionClass(OperationCache::class);
-        $property = $reflection->getProperty('caches');
-        $property->setAccessible(true);
-        $property->setValue(null, []);
+        // Clear the ArrayStore directly — no reflection needed
+        $this->store = new ArrayStore();
+        $this->cache = new OperationCache(25, new Repository($this->store));
     }
 
     #[Test]
@@ -233,10 +234,7 @@ class OperationCacheTest extends TestCase
     public function lru_eviction_respects_access_order()
     {
         // Add 3 entries with max=3
-        $cache = new OperationCache(3);
-        // Reset and reassign
-        $this->resetCache();
-        $this->cache = $cache;
+        $this->cache = new OperationCache(3, new Repository($this->store));
 
         $this->cache->put('conv-1', 'op-a', [
             'operationId' => 'op-a',
@@ -513,9 +511,7 @@ class OperationCacheTest extends TestCase
     public function cache_never_exceeds_max_capacity_with_50_inserts()
     {
         // Use maxEntries=20 to match the new default
-        $cache = new OperationCache(20);
-        $this->resetCache();
-        $this->cache = $cache;
+        $this->cache = new OperationCache(20, new Repository($this->store));
 
         // Insert 50 unique operations
         for ($i = 1; $i <= 50; $i++) {
@@ -557,9 +553,7 @@ class OperationCacheTest extends TestCase
     #[Test]
     public function single_entry_cache_evicts_immediately()
     {
-        $cache = new OperationCache(1);
-        $this->resetCache();
-        $this->cache = $cache;
+        $this->cache = new OperationCache(1, new Repository($this->store));
 
         // Add op-a
         $this->cache->put('conv-1', 'op-a', [
@@ -594,9 +588,7 @@ class OperationCacheTest extends TestCase
     #[Test]
     public function rapid_eviction_cycles_stable()
     {
-        $cache = new OperationCache(20);
-        $this->resetCache();
-        $this->cache = $cache;
+        $this->cache = new OperationCache(20, new Repository($this->store));
 
         // Perform 100 add-evict cycles with unique operations
         for ($i = 1; $i <= 100; $i++) {
@@ -645,9 +637,7 @@ class OperationCacheTest extends TestCase
     #[Test]
     public function readd_evicted_operation_with_new_details()
     {
-        $cache = new OperationCache(3);
-        $this->resetCache();
-        $this->cache = $cache;
+        $this->cache = new OperationCache(3, new Repository($this->store));
 
         // Add op-a, op-b, op-c
         $this->cache->put('conv-1', 'op-a', [
@@ -708,5 +698,138 @@ class OperationCacheTest extends TestCase
         // op-b should be at MRU position (last in getEntries order, first when reversed)
         $entries = $this->cache->getEntries('conv-1');
         $this->assertEquals('op-b', $entries[0]['operationId'], 'op-b should be at MRU position (first in getEntries)');
+    }
+
+    #[Test]
+    public function degrades_gracefully_when_store_throws()
+    {
+        $throwingStore = new class implements \Illuminate\Contracts\Cache\Store {
+            public function get($key) { throw new \RuntimeException('Store unavailable'); }
+            public function many(array $keys) { throw new \RuntimeException('Store unavailable'); }
+            public function put($key, $value, $ttl) { throw new \RuntimeException('Store unavailable'); }
+            public function putMany(array $values, $ttl) { throw new \RuntimeException('Store unavailable'); }
+            public function forever($key, $value) { throw new \RuntimeException('Store unavailable'); }
+            public function forget($key) { throw new \RuntimeException('Store unavailable'); }
+            public function increment($key, $value = 1) { throw new \RuntimeException('Store unavailable'); }
+            public function decrement($key, $value = 1) { throw new \RuntimeException('Store unavailable'); }
+            public function getPrefix() { return ''; }
+            public function lock($name, $seconds = 0, $options = []) { throw new \RuntimeException('Store unavailable'); }
+            public function restoreLock(\Illuminate\Contracts\Cache\Lock $lock) { throw new \RuntimeException('Store unavailable'); }
+            public function flush($regex = '') { throw new \RuntimeException('Store unavailable'); }
+        };
+
+        $repo = new \Illuminate\Cache\Repository($throwingStore);
+        $cache = new OperationCache(3, $repo);
+
+        // FR-009: every operation degrades to an empty cache, none may throw.
+        $cache->put('conv-1', 'op-1', [
+            'operationId' => 'op-1',
+            'summary'     => 'Test operation',
+            'method'      => 'GET',
+            'path'        => '/test',
+            'paramSchema' => null,
+        ]);
+
+        $this->assertNull($cache->get('conv-1', 'op-1'));
+        $this->assertSame([], $cache->getSummaries('conv-1'));
+        $this->assertSame([], $cache->getEntries('conv-1'));
+        $this->assertSame(0, $cache->count('conv-1'));
+
+        $cache->forget('conv-1');
+    }
+
+    #[Test]
+    public function put_applies_ttl_from_config()
+    {
+        // Track TTL values passed to put()
+        $capturedTtls = [];
+        $trackingStore = new class($capturedTtls) implements \Illuminate\Contracts\Cache\Store, \Illuminate\Contracts\Cache\LockProvider {
+            private $capturedTtls;
+
+            public function __construct(&$capturedTtls)
+            {
+                $this->capturedTtls = &$capturedTtls;
+            }
+
+            public function get($key) { return null; }
+            public function many(array $keys) { return []; }
+            public function put($key, $value, $ttl) {
+                $this->capturedTtls[] = $ttl;
+            }
+            public function putMany(array $values, $ttl) { }
+            public function forever($key, $value) { }
+            public function forget($key) { }
+            public function increment($key, $value = 1) { return 0; }
+            public function decrement($key, $value = 1) { return 0; }
+            public function getPrefix() { return ''; }
+            public function lock($name, $seconds = 0, $options = []) {
+                return new \Illuminate\Cache\NoLock($name, $seconds);
+            }
+            public function restoreLock($name, $owner) { }
+            public function flush($regex = '') { }
+        };
+
+        $repo = new \Illuminate\Cache\Repository($trackingStore);
+        $cache = new OperationCache(20, $repo);
+
+        $cache->put('conv-ttl', 'op-ttl', [
+            'operationId' => 'op-ttl',
+            'summary'     => 'TTL test',
+            'method'      => 'GET',
+            'path'        => '/ttl',
+            'paramSchema' => null,
+        ]);
+
+        $this->assertNotEmpty($capturedTtls, 'put() should have called store->put() with a TTL');
+        $expectedTtl = 86400; // default from config
+        $this->assertEquals($expectedTtl, $capturedTtls[0], 'TTL should match config default');
+    }
+
+    #[Test]
+    public function every_write_refreshes_ttl()
+    {
+        // Track call count to put() on the store
+        $putCallCount = 0;
+        $trackingStore = new class($putCallCount) implements \Illuminate\Contracts\Cache\Store, \Illuminate\Contracts\Cache\LockProvider {
+            private $putCallCount;
+
+            public function __construct(&$putCallCount)
+            {
+                $this->putCallCount = &$putCallCount;
+            }
+
+            public function get($key) { return null; }
+            public function many(array $keys) { return []; }
+            public function put($key, $value, $ttl) {
+                $this->putCallCount++;
+            }
+            public function putMany(array $values, $ttl) { }
+            public function forever($key, $value) { }
+            public function forget($key) { }
+            public function increment($key, $value = 1) { return 0; }
+            public function decrement($key, $value = 1) { return 0; }
+            public function getPrefix() { return ''; }
+            public function lock($name, $seconds = 0, $options = []) {
+                return new \Illuminate\Cache\NoLock($name, $seconds);
+            }
+            public function restoreLock($name, $owner) { }
+            public function flush($regex = '') { }
+        };
+
+        $repo = new \Illuminate\Cache\Repository($trackingStore);
+        $cache = new OperationCache(5, $repo);
+
+        // Put 3 different operations — each should trigger a store->put()
+        $cache->put('conv-ttl', 'op-1', [
+            'operationId' => 'op-1', 'summary' => 'Op 1', 'method' => 'GET', 'path' => '/1', 'paramSchema' => null,
+        ]);
+        $cache->put('conv-ttl', 'op-2', [
+            'operationId' => 'op-2', 'summary' => 'Op 2', 'method' => 'GET', 'path' => '/2', 'paramSchema' => null,
+        ]);
+        $cache->put('conv-ttl', 'op-3', [
+            'operationId' => 'op-3', 'summary' => 'Op 3', 'method' => 'GET', 'path' => '/3', 'paramSchema' => null,
+        ]);
+
+        $this->assertEquals(3, $putCallCount, 'Each put() should refresh the TTL via store->put()');
     }
 }
