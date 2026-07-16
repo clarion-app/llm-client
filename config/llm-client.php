@@ -275,5 +275,16 @@ return [
         // Number of days to retain processed feedback signals before purging.
         'signal_retention_days' => 30,
     ],
+
+    // Agent Preferences Injection — assembles stored user preferences and binding rules
+    // into a bounded text block for injection into the agent system prompt on every turn.
+    'preferences_injection' => [
+        // Master toggle. When false, preference injection is skipped entirely.
+        'enabled' => true,
+
+        // Token budget for the entire assembled block (headers included).
+        // Token estimation uses strlen() / 4, consistent with ContextWindowBudgeter.
+        'max_tokens' => 500,
+    ],
 ];
 

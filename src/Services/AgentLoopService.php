@@ -45,6 +45,7 @@ class AgentLoopService
     private ContextWindowBudgeter $contextWindowBudgeter;
     private ?ConversationCondenser $conversationCondenser;
     private ?ToolResultCondenser $toolResultCondenser;
+    private PreferenceInjector $preferenceInjector;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -60,7 +61,8 @@ class AgentLoopService
         ?DeclarativeMemoryServiceContract $declarativeMemoryService = null,
         ?ContextWindowBudgeter $contextWindowBudgeter = null,
         ?ConversationCondenser $conversationCondenser = null,
-        ?ToolResultCondenser $toolResultCondenser = null
+        ?ToolResultCondenser $toolResultCondenser = null,
+        ?PreferenceInjector $preferenceInjector = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -76,6 +78,7 @@ class AgentLoopService
         $this->contextWindowBudgeter = $contextWindowBudgeter ?? new ContextWindowBudgeter();
         $this->conversationCondenser = $conversationCondenser;
         $this->toolResultCondenser = $toolResultCondenser;
+        $this->preferenceInjector = $preferenceInjector ?? new PreferenceInjector();
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -1615,6 +1618,16 @@ class AgentLoopService
         $payload = [];
 
         $systemPrompt = config('llm-client.agent_loop.system_prompt', '');
+
+        // Append "User Preferences" section (binding rules + soft preferences).
+        // conversations.user_id is nullable; an ownerless conversation has no
+        // preferences to inject.
+        if ($conversation->user_id !== null) {
+            $preferenceSection = $this->preferenceInjector->assemble($conversation->user_id);
+            if ($preferenceSection !== null) {
+                $systemPrompt .= $preferenceSection;
+            }
+        }
 
         // Append "Known Operations" section when cache has entries
         $knownOpsSection = $this->buildKnownOperationsSection($conversation);
