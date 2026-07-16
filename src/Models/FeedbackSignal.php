@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Models;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 
 /**
  * FeedbackSignal model.
@@ -14,7 +15,7 @@ use Illuminate\Database\Eloquent\Model;
  */
 class FeedbackSignal extends Model
 {
-    use HasFactory, EloquentMultiChainBridge;
+    use HasFactory, EloquentMultiChainBridge, SoftDeletes;
 
     protected $table = 'feedback_signals';
 
@@ -26,12 +27,10 @@ class FeedbackSignal extends Model
         'signal_type',
         'pattern_key',
         'raw_context',
-        'created_at',
         'processed_at',
     ];
 
     protected $casts = [
-        'created_at' => 'datetime',
         'processed_at' => 'datetime',
     ];
 
@@ -74,24 +73,30 @@ class FeedbackSignal extends Model
 
     /**
      * Get pending signals for a user.
+     *
+     * @return \Illuminate\Database\Eloquent\Collection<int, static>
      */
-    public static function getPendingForUser(string $userId, int $limit = 20): static
+    public static function getPendingForUser(string $userId, int $limit = 20)
     {
         return static::withoutGlobalScope('user')
             ->where('user_id', $userId)
             ->whereNull('processed_at')
             ->limit($limit)
-            ->oldest('created_at');
+            ->oldest('created_at')
+            ->get();
     }
 
     /**
      * Get signals grouped by pattern for threshold aggregation.
+     *
+     * @return \Illuminate\Database\Eloquent\Collection<int, static>
      */
-    public static function getSignalsForPattern(string $userId, string $patternKey): static
+    public static function getSignalsForPattern(string $userId, string $patternKey)
     {
         return static::withoutGlobalScope('user')
             ->where('user_id', $userId)
             ->where('pattern_key', $patternKey)
-            ->whereNull('processed_at');
+            ->whereNull('processed_at')
+            ->get();
     }
 }

@@ -20,8 +20,9 @@ return new class extends Migration
             $table->string('signal_type');
             $table->string('pattern_key')->nullable();
             $table->text('raw_context');
-            $table->timestamp('created_at')->useCurrent();
+            $table->timestamps();
             $table->timestamp('processed_at')->nullable();
+            $table->softDeletes();
 
             $table->unique(['user_id', 'source_event_id']);
             $table->index(['user_id', 'pattern_key', 'processed_at']);

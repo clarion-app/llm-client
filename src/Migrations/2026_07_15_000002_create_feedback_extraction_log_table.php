@@ -22,7 +22,8 @@ return new class extends Migration
             $table->integer('confidence_score');
             $table->string('outcome');
             $table->string('llm_call_id')->nullable();
-            $table->timestamp('created_at')->useCurrent();
+            $table->timestamps();
+            $table->softDeletes();
 
             $table->index('user_id');
             $table->index('declarative_memory_id');

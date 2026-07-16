@@ -80,7 +80,7 @@ class ExtractFeedbackPreferencesJob implements ShouldQueue
 
             // Record each signal in the accumulator
             foreach ($signals as $signal) {
-                $shouldPropose = $accumulator->recordSignal(
+                $accumulator->recordSignal(
                     $this->userId,
                     $patternKey,
                     $signal->signal_type
@@ -109,8 +109,8 @@ class ExtractFeedbackPreferencesJob implements ShouldQueue
                 continue;
             }
 
-            // Check if pattern should be proposed
-            if ($shouldPropose && $accumulator->shouldPropose($this->userId, $patternKey)) {
+            // Check if pattern should be proposed (based on effective count vs threshold)
+            if ($accumulator->shouldPropose($this->userId, $patternKey)) {
                 // Build preference description from signal context
                 $preferenceDescription = $this->buildPreferenceDescription($signals);
                 $confidenceScore = min($signals->count() * 20, 100);

@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Models;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 
 /**
  * FeedbackExtractionLog model.
@@ -14,7 +15,7 @@ use Illuminate\Database\Eloquent\Model;
  */
 class FeedbackExtractionLog extends Model
 {
-    use HasFactory, EloquentMultiChainBridge;
+    use HasFactory, EloquentMultiChainBridge, SoftDeletes;
 
     protected $table = 'feedback_extraction_log';
 
@@ -28,14 +29,12 @@ class FeedbackExtractionLog extends Model
         'confidence_score',
         'outcome',
         'llm_call_id',
-        'created_at',
     ];
 
     protected $casts = [
         'signals_count' => 'integer',
         'signal_ids' => 'array',
         'confidence_score' => 'integer',
-        'created_at' => 'datetime',
     ];
 
     /**
@@ -70,11 +69,14 @@ class FeedbackExtractionLog extends Model
 
     /**
      * Get extraction logs for a specific preference.
+     *
+     * @return \Illuminate\Database\Eloquent\Collection<int, static>
      */
-    public static function getAuditTrail(string $declarativeMemoryId): static
+    public static function getAuditTrail(string $declarativeMemoryId)
     {
         return static::withoutGlobalScope('user')
             ->where('declarative_memory_id', $declarativeMemoryId)
-            ->latest('created_at');
+            ->latest('created_at')
+            ->get();
     }
 }

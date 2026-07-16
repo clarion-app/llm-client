@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Models;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 
 /**
  * FeedbackOptOut model.
@@ -14,7 +15,7 @@ use Illuminate\Database\Eloquent\Model;
  */
 class FeedbackOptOut extends Model
 {
-    use HasFactory, EloquentMultiChainBridge;
+    use HasFactory, EloquentMultiChainBridge, SoftDeletes;
 
     protected $table = 'feedback_opt_outs';
 
@@ -22,11 +23,6 @@ class FeedbackOptOut extends Model
         'id',
         'user_id',
         'pattern_key',
-        'created_at',
-    ];
-
-    protected $casts = [
-        'created_at' => 'datetime',
     ];
 
     /**

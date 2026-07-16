@@ -16,7 +16,8 @@ return new class extends Migration
             $table->uuid('id')->primary();
             $table->uuid('user_id');
             $table->string('pattern_key');
-            $table->timestamp('created_at')->useCurrent();
+            $table->timestamps();
+            $table->softDeletes();
 
             $table->unique(['user_id', 'pattern_key']);
         });
