@@ -17,7 +17,6 @@ use ClarionApp\LlmClient\Contracts\MemoryScope;
 use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
-use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
 use ClarionApp\LlmClient\Services\ConversationCondenser;
 use ClarionApp\LlmClient\Services\ToolResultCondenser;
@@ -83,7 +82,10 @@ class AgentLoopService
 
     public function start(Conversation $conversation, int $iteration = 1): void
     {
-        $conversation->update(['is_processing' => true]);
+        // The user is engaging again, so this session is live: clear any end
+        // marker set by the idle sweep, making the session eligible to end
+        // (and be captured) again once it next goes quiet.
+        $conversation->update(['is_processing' => true, 'ended_at' => null]);
 
         $tools = $this->buildToolsPayload();
         $formattedTools = $this->formatTools($conversation, $tools);
@@ -188,7 +190,10 @@ class AgentLoopService
      */
     public function run(Conversation $conversation, string $message, array $options = []): array
     {
-        $conversation->update(['is_processing' => true]);
+        // The user is engaging again, so this session is live: clear any end
+        // marker set by the idle sweep, making the session eligible to end
+        // (and be captured) again once it next goes quiet.
+        $conversation->update(['is_processing' => true, 'ended_at' => null]);
 
         // Resolve preset schema if a preset name is specified
         $presetName = $options['preset'] ?? null;
@@ -311,10 +316,6 @@ class AgentLoopService
 
                     $conversation->update(['is_processing' => false]);
 
-                    // Fire ConversationEnded for short-term memory cleanup (T018)
-                    \Illuminate\Support\Facades\Event::dispatch(
-                        new ConversationEnded($conversation->id, $agentId)
-                    );
 
                     // Generate title on first exchange
                     if ($conversation->title === null) {
@@ -441,10 +442,6 @@ class AgentLoopService
                     $agentId = $conversation->character ?? $conversation->id;
                     $conversation->update(['is_processing' => false]);
 
-                    // Fire ConversationEnded for short-term memory cleanup (T018)
-                    \Illuminate\Support\Facades\Event::dispatch(
-                        new ConversationEnded($conversation->id, $agentId)
-                    );
 
                     return [
                         'status' => 'completed',
@@ -458,10 +455,6 @@ class AgentLoopService
             $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
 
-            // Fire ConversationEnded for short-term memory cleanup (T018)
-            \Illuminate\Support\Facades\Event::dispatch(
-                new ConversationEnded($conversation->id, $agentId)
-            );
 
             return [
                 'status' => 'error',
@@ -473,10 +466,6 @@ class AgentLoopService
             $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
 
-            // Fire ConversationEnded for short-term memory cleanup (T018)
-            \Illuminate\Support\Facades\Event::dispatch(
-                new ConversationEnded($conversation->id, $agentId)
-            );
 
             throw $e;
         }
@@ -499,10 +488,6 @@ class AgentLoopService
             $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
 
-            // Fire ConversationEnded for short-term memory cleanup (T018)
-            \Illuminate\Support\Facades\Event::dispatch(
-                new ConversationEnded($conversation->id, $agentId)
-            );
 
             throw new \RuntimeException('Confirmation has expired.');
         }
@@ -546,10 +531,6 @@ class AgentLoopService
                 $agentId = $conversation->character ?? $conversation->id;
                 $conversation->update(['is_processing' => false]);
 
-                // Fire ConversationEnded for short-term memory cleanup (T018)
-                \Illuminate\Support\Facades\Event::dispatch(
-                    new ConversationEnded($conversation->id, $agentId)
-                );
 
                 return ['status' => 'error', 'content' => 'No response from LLM', 'message_id' => null];
             }
@@ -570,10 +551,6 @@ class AgentLoopService
                 $agentId = $conversation->character ?? $conversation->id;
                 $conversation->update(['is_processing' => false]);
 
-                // Fire ConversationEnded for short-term memory cleanup (T018)
-                \Illuminate\Support\Facades\Event::dispatch(
-                    new ConversationEnded($conversation->id, $agentId)
-                );
 
                 return [
                     'status' => 'completed',
@@ -679,10 +656,6 @@ class AgentLoopService
         $agentId = $conversation->character ?? $conversation->id;
         $conversation->update(['is_processing' => false]);
 
-        // Fire ConversationEnded for short-term memory cleanup (T018)
-        \Illuminate\Support\Facades\Event::dispatch(
-            new ConversationEnded($conversation->id, $agentId)
-        );
 
         return ['status' => 'error', 'content' => 'Maximum iterations reached', 'message_id' => null];
     }
@@ -714,7 +687,9 @@ class AgentLoopService
                 $model,
                 $providerType,
                 $estimator,
-                $conversation->id
+                $conversation->id,
+                null,
+                $server
             );
         }
 
@@ -1509,12 +1484,60 @@ class AgentLoopService
         return array_slice($foundTopics, 0, 3);
     }
 
-    public function buildMessagesPayload(Conversation $conversation): array
+    /**
+     * Build the conversation history portion of the payload — everything except
+     * the system message.
+     *
+     * Split out from buildMessagesPayload() so background work (chunk
+     * pre-warming) can partition and hash exactly the array the request path
+     * partitions, without paying for system-prompt assembly. Reading the Message
+     * rows directly is not equivalent: tool calls expand into separate tool
+     * result entries here, so a naive read produces different chunk boundaries.
+     *
+     * @return list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}>
+     */
+    public function buildHistoryMessages(Conversation $conversation): array
     {
         $dbMessages = Message::where('conversation_id', $conversation->id)
             ->orderBy('created_at')
             ->get();
 
+        $payload = [];
+
+        foreach ($dbMessages as $msg) {
+            if ($msg->tool_data && !empty($msg->tool_data['tool_calls'])) {
+                // Assistant message with tool calls
+                $assistantMsg = [
+                    'role' => 'assistant',
+                    'content' => $msg->content ?: null,
+                    'tool_calls' => $msg->tool_data['tool_calls'],
+                ];
+                $payload[] = $assistantMsg;
+
+                // Tool result messages
+                if (!empty($msg->tool_data['tool_results'])) {
+                    foreach ($msg->tool_data['tool_results'] as $result) {
+                        $payload[] = [
+                            'role' => 'tool',
+                            'tool_call_id' => $result['tool_call_id'],
+                            'content' => $result['content'],
+                        ];
+                    }
+                }
+            } else {
+                // Regular message (user, assistant text, system)
+                $payload[] = [
+                    'role' => strtolower($msg->role),
+                    'content' => $msg->content,
+                ];
+            }
+        }
+
+        return $payload;
+    }
+
+    public function buildMessagesPayload(Conversation $conversation): array
+    {
         $payload = [];
 
         $systemPrompt = config('llm-client.agent_loop.system_prompt', '');
@@ -1548,36 +1571,7 @@ class AgentLoopService
             ];
         }
 
-        foreach ($dbMessages as $msg) {
-            if ($msg->tool_data && !empty($msg->tool_data['tool_calls'])) {
-                // Assistant message with tool calls
-                $assistantMsg = [
-                    'role' => 'assistant',
-                    'content' => $msg->content ?: null,
-                    'tool_calls' => $msg->tool_data['tool_calls'],
-                ];
-                $payload[] = $assistantMsg;
-
-                // Tool result messages
-                if (!empty($msg->tool_data['tool_results'])) {
-                    foreach ($msg->tool_data['tool_results'] as $result) {
-                        $payload[] = [
-                            'role' => 'tool',
-                            'tool_call_id' => $result['tool_call_id'],
-                            'content' => $result['content'],
-                        ];
-                    }
-                }
-            } else {
-                // Regular message (user, assistant text, system)
-                $payload[] = [
-                    'role' => strtolower($msg->role),
-                    'content' => $msg->content,
-                ];
-            }
-        }
-
-        return $payload;
+        return array_merge($payload, $this->buildHistoryMessages($conversation));
     }
 
     private function dispatchStreamRequest(Conversation $conversation, array $messages, array $tools, int $iteration, string $system = '', ?string $responseFormat = null): void

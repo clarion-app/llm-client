@@ -33,7 +33,10 @@ class CoherenceValidator
      * @param list<array{messages: list<array>, messageIndices: list<int>, estimatedTokens: int}> $units
      *        Turn units.
      * @param list<int> $evictedIndices Unit indices already evicted.
-     * @param list<int> $preservedIndices Unit indices that are preserved (recent pairs).
+     * @param list<int> $preservedIndices Unit indices that are preserved (recent
+     *        pairs and pinned content). Never cascade-dropped: the guarantee that
+     *        the newest exchanges always survive outranks tidying up a reference,
+     *        and the current user turn lives here.
      *
      * @return list<int> Additional unit indices to drop due to dangling references.
      */
@@ -55,14 +58,6 @@ class CoherenceValidator
             }
         }
 
-        // Build preserved message indices set
-        $preservedMessageIndices = [];
-        foreach ($preservedIndices as $unitIdx) {
-            foreach ($units[$unitIdx]['messageIndices'] ?? [] as $msgIdx) {
-                $preservedMessageIndices[$msgIdx] = true;
-            }
-        }
-
         // Cascade drop: find messages referencing evicted content
         $cascadeDropped = [];
         $currentEvicted = $evictedMessageIndices;
@@ -73,6 +68,12 @@ class CoherenceValidator
             foreach ($units as $unitIdx => $unit) {
                 // Skip already evicted or already cascade-dropped units
                 if (in_array($unitIdx, $evictedIndices, true) || isset($cascadeDropped[$unitIdx])) {
+                    continue;
+                }
+
+                // Preserved units are off limits — dropping them would violate the
+                // "recent exchanges are always kept" guarantee.
+                if (in_array($unitIdx, $preservedIndices, true)) {
                     continue;
                 }
 

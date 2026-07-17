@@ -49,6 +49,7 @@ use ClarionApp\LlmClient\Presets\DecisionPreset;
 use ClarionApp\LlmClient\Presets\SummaryPreset;
 use ClarionApp\LlmClient\Presets\ExtractionPreset;
 use GuzzleHttp\Client;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Event;
 
 class LlmClientServiceProvider extends ClarionPackageServiceProvider
@@ -109,8 +110,19 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 ReindexOperationsCommand::class,
                 EmbedMemoryCommand::class,
                 \ClarionApp\LlmClient\Commands\CleanupExpiredEpisodicMemoriesCommand::class,
+                \ClarionApp\LlmClient\Commands\EndIdleConversationsCommand::class,
             ]);
         }
+
+        // Nothing else ends a conversation session, so this sweep is what makes
+        // short-term memory cleanup and episodic capture happen at all. Registered
+        // here rather than left to the host app, because forgetting it does not
+        // fail loudly — memories simply never get captured.
+        $this->callAfterResolving(Schedule::class, function (Schedule $schedule) {
+            $schedule->command('llm-client:end-idle-conversations')
+                ->everyFiveMinutes()
+                ->withoutOverlapping();
+        });
 
         // Populate provider registry with factory callables
         $this->registerProviders();

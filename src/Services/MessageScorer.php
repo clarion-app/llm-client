@@ -31,7 +31,8 @@ class MessageScorer
     /** Pin keywords that mark content as user-pinned (score 1.0, exempt from trimming). */
     private const PIN_PATTERNS = [
         '/\b(remember|keep\s+this\s+in\s+mind)\b/i',
-        '/do[sn]\'\s*t\s*forget/i',
+        // Matches don't / dont / don’t (typographic apostrophe) forget.
+        '/\bdon.?t\s*forget\b/iu',
         '/do\s+not\s+forget/i',
         '/\b(this\s+is\s+important|important:\s|critical:\s|must\s+remember)\b/i',
         '/\b(save\s+this|hold\s+onto\s+this|retain\s+this)\b/i',
@@ -217,16 +218,16 @@ class MessageScorer
      */
     private function analyzeToolRelationships(array $messages, array &$scores): void
     {
-        // Build map: tool_name → list of [index, is_error, tool_call_id]
+        // Build map: tool identity → list of [index, is_error, tool_call_id]
         $toolResults = [];
-        $toolCallChains = []; // tool_call_id → tool_name
+        $toolCallChains = []; // tool_call_id → tool identity
 
         foreach ($messages as $index => $message) {
             // Track assistant tool_calls
             if ($message['role'] === 'assistant' && !empty($message['tool_calls'])) {
                 foreach ($message['tool_calls'] as $call) {
                     $callId = $call['id'] ?? '';
-                    $toolName = $call['function']['name'] ?? '';
+                    $toolName = $this->toolIdentity($call);
                     if ($callId && $toolName) {
                         $toolCallChains[$callId] = $toolName;
                     }
@@ -294,6 +295,34 @@ class MessageScorer
     }
 
     /**
+     * Identify what a tool call actually did, for supersession purposes.
+     *
+     * Keying on the tool name alone is wrong in this harness: nearly every call
+     * goes through the `execute_operation` meta-tool, so one recent success would
+     * mark every earlier operation result — unrelated operations included — as
+     * superseded and evictable. The operationId is the real identity; a repeat of
+     * the *same* operation is what supersedes an earlier result.
+     */
+    private function toolIdentity(array $call): string
+    {
+        $name = $call['function']['name'] ?? '';
+        if ($name === '') {
+            return '';
+        }
+
+        $arguments = $call['function']['arguments'] ?? null;
+        if (is_string($arguments)) {
+            $arguments = json_decode($arguments, true);
+        }
+
+        if (is_array($arguments) && !empty($arguments['operationId'])) {
+            return $name . ':' . $arguments['operationId'];
+        }
+
+        return $name;
+    }
+
+    /**
      * Check if content matches pleasantry patterns.
      */
     private function isPleasantry(string $content): bool
@@ -357,7 +386,15 @@ class MessageScorer
     {
         $parts = [];
         foreach ($messages as $message) {
-            $parts[] = ($message['role'] ?? '') . '|' . ($message['content'] ?? '');
+            // tool_calls and tool_call_id take part in scoring (supersession,
+            // resolved errors), so they must take part in the cache key too —
+            // otherwise histories that score differently share an entry.
+            $parts[] = implode('|', [
+                $message['role'] ?? '',
+                $message['content'] ?? '',
+                isset($message['tool_calls']) ? json_encode($message['tool_calls']) : '',
+                $message['tool_call_id'] ?? '',
+            ]);
         }
 
         return hash('xxh128', implode('||', $parts));

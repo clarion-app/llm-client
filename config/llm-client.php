@@ -113,6 +113,19 @@ return [
         ],
     ],
 
+    // Conversation lifecycle — when a conversation session is considered over.
+    //
+    // A session end is NOT the end of an agent response: the agent answering a
+    // message means the turn finished, not that the user is done. Ending a session
+    // triggers short-term memory cleanup and episodic capture, so treating every
+    // response as an end wipes session memory each turn and captures an episodic
+    // record of only the opening exchange.
+    'conversation_lifecycle' => [
+        // Minutes of inactivity after which `llm-client:end-idle-conversations`
+        // treats a conversation as ended. Run that command on a schedule.
+        'idle_timeout_minutes' => env('LLM_CLIENT_CONVERSATION_IDLE_MINUTES', 30),
+    ],
+
     // Episodic Memory configuration
     'episodic_memory' => [
         'retention_days' => 90,                // Default retention period in days

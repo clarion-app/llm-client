@@ -95,6 +95,81 @@ class MessageScorerTest extends TestCase
     /* Superseded tool result detection                                      */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * Regression: supersession keyed on the tool *name*. In this harness nearly
+     * every call is the `execute_operation` meta-tool, so one recent success
+     * marked every earlier operation result — entirely unrelated operations —
+     * as superseded (score 0.1) and first in line for eviction. Identity must
+     * come from the operationId being invoked.
+     */
+    #[Test]
+    public function different_operations_through_the_same_meta_tool_do_not_supersede_each_other(): void
+    {
+        $messages = [
+            [
+                'role' => 'assistant',
+                'content' => null,
+                'tool_calls' => [[
+                    'id' => 'call_1',
+                    'type' => 'function',
+                    'function' => ['name' => 'execute_operation', 'arguments' => '{"operationId":"contacts.index"}'],
+                ]],
+            ],
+            ['role' => 'tool', 'tool_call_id' => 'call_1', 'content' => '{"contacts": [1, 2]}'],
+            [
+                'role' => 'assistant',
+                'content' => null,
+                'tool_calls' => [[
+                    'id' => 'call_2',
+                    'type' => 'function',
+                    'function' => ['name' => 'execute_operation', 'arguments' => '{"operationId":"weather.forecast"}'],
+                ]],
+            ],
+            ['role' => 'tool', 'tool_call_id' => 'call_2', 'content' => '{"temp": 21}'],
+        ];
+
+        $scores = $this->scorer->computeScores($messages);
+
+        $this->assertEquals(
+            'tool_result',
+            $scores[1]->reason,
+            'A weather lookup does not supersede a contacts lookup just because both went through execute_operation'
+        );
+        $this->assertEquals(0.5, $scores[1]->score);
+    }
+
+    #[Test]
+    public function repeating_the_same_operation_supersedes_the_earlier_result(): void
+    {
+        $messages = [
+            [
+                'role' => 'assistant',
+                'content' => null,
+                'tool_calls' => [[
+                    'id' => 'call_1',
+                    'type' => 'function',
+                    'function' => ['name' => 'execute_operation', 'arguments' => '{"operationId":"contacts.index"}'],
+                ]],
+            ],
+            ['role' => 'tool', 'tool_call_id' => 'call_1', 'content' => '{"contacts": [1]}'],
+            [
+                'role' => 'assistant',
+                'content' => null,
+                'tool_calls' => [[
+                    'id' => 'call_2',
+                    'type' => 'function',
+                    'function' => ['name' => 'execute_operation', 'arguments' => '{"operationId":"contacts.index"}'],
+                ]],
+            ],
+            ['role' => 'tool', 'tool_call_id' => 'call_2', 'content' => '{"contacts": [1, 2]}'],
+        ];
+
+        $scores = $this->scorer->computeScores($messages);
+
+        $this->assertEquals('superseded_tool_result', $scores[1]->reason);
+        $this->assertEquals(0.1, $scores[1]->score);
+    }
+
     #[Test]
     public function earlier_tool_result_marked_superseded_by_later_result(): void
     {

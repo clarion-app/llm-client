@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Events\ConversationCondensed;
 use ClarionApp\LlmClient\Jobs\PreWarmChunkSummaryJob;
 use ClarionApp\LlmClient\Models\ChunkSummary;
+use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Presets\CondensationPreset;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use Illuminate\Support\Facades\Event;
@@ -43,6 +44,9 @@ class ConversationCondenser
      *
      * @param list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}> $messages
      * @param callable(string): int $estimator Token estimator
+     * @param ?Server $server The conversation's server, required to resolve a condensation
+     *                        provider from the registry. Without it (and without an injected
+     *                        provider) condensation cannot run and the budgeter trims instead.
      * @return list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}>
      */
     public function condenseOrTrim(
@@ -51,7 +55,8 @@ class ConversationCondenser
         ProviderType $provider,
         callable $estimator,
         string $conversationId,
-        ?int $historyBudget = null
+        ?int $historyBudget = null,
+        ?Server $server = null
     ): array {
         // Fallback: condensation disabled
         if (!($this->config['enabled'] ?? true)) {
@@ -73,9 +78,10 @@ class ConversationCondenser
             $systemMessage = array_shift($historyMessages);
         }
 
-        // Use provided budget or compute from budgeter
+        // Use provided budget or resolve the model-aware budget from the budgeter.
         if ($historyBudget === null) {
-            $historyBudget = $this->computeHistoryBudget($messages, $model, $provider, $estimator);
+            $systemEstimate = $systemMessage ? $this->estimateMessage($systemMessage, $estimator) : 0;
+            $historyBudget = $this->budgeter->resolveHistoryBudget($model, $provider, $systemEstimate);
         }
 
         // Estimate total tokens for history messages
@@ -135,7 +141,8 @@ class ConversationCondenser
                 $chunkSize,
                 $model,
                 $provider,
-                $estimator
+                $estimator,
+                $server
             );
 
             if ($result !== null) {
@@ -155,6 +162,17 @@ class ConversationCondenser
 
         // Render summaries to text
         $renderedSummaries = $this->renderSummaries(array_values($summaries));
+        $summaryMessage = ['role' => 'system', 'content' => $renderedSummaries];
+        $summaryTokens = $this->estimateMessage($summaryMessage, $estimator);
+
+        // The summaries and the verbatim tail share one budget. The boundary
+        // computed above spent all of it on verbatim messages, so re-derive it
+        // against what is left once the summaries are accounted for; otherwise
+        // the condensed payload overshoots the budget it was meant to satisfy.
+        $verbatimCount = min(
+            $verbatimCount,
+            $this->calculateVerbatimBoundary($historyMessages, max(0, $historyBudget - $summaryTokens), $estimator)
+        );
 
         // Get verbatim recent portion
         $verbatimStart = $totalMessages - $verbatimCount;
@@ -165,22 +183,23 @@ class ConversationCondenser
         if ($systemMessage) {
             $assembled[] = $systemMessage;
         }
-        $assembled[] = ['role' => 'system', 'content' => $renderedSummaries];
+        $assembled[] = $summaryMessage;
         $assembled = array_merge($assembled, $verbatimMessages);
 
-        // Check if assembled fits — compare against the original history cost
-        // (not the budget), since condensation is meant to compress
-        $assembledTokens = 0;
-        foreach ($assembled as $m) {
-            $assembledTokens += $this->estimateMessage($m, $estimator);
+        // The history budget excludes the system message, so measure only the
+        // portion it governs: the summaries plus the verbatim tail.
+        $assembledHistoryTokens = $summaryTokens;
+        foreach ($verbatimMessages as $m) {
+            $assembledHistoryTokens += $this->estimateMessage($m, $estimator);
         }
 
-        // Compression is successful if assembled is smaller than original total
-        if ($assembledTokens <= $totalTokens) {
+        // Condensation succeeded only if it both fits the budget and actually
+        // compressed. Summaries alone can exceed the budget on a pathologically
+        // small context, in which case trimming is the honest answer.
+        if ($assembledHistoryTokens <= $historyBudget && $assembledHistoryTokens <= $totalTokens) {
             return $assembled;
         }
 
-        // Assembled is larger than original (unlikely with proper summaries)
         // Fall back to smart trim, then budgeter as safety net
         $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
         return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId);
@@ -220,7 +239,8 @@ class ConversationCondenser
         int $chunkSize,
         ?string $model,
         ProviderType $provider,
-        callable $estimator
+        callable $estimator,
+        ?Server $server = null
     ): ?ChunkSummary {
         // Build the chunk messages for the LLM
         $chunkMessages = $this->partitioner->partition($messages, $chunkSize);
@@ -236,17 +256,15 @@ class ConversationCondenser
             $transcript .= ($msg['role'] ?? 'user') . ': ' . ($msg['content'] ?? '') . "\n";
         }
 
-        $produce = function () use ($transcript, $conversationId, $chunkIndex, $sourceHash, $chunkContent, $model, $provider, $estimator) {
-            $llmProvider = $this->resolveCondensationProvider($model, $provider);
+        $produce = function () use ($transcript, $conversationId, $chunkIndex, $sourceHash, $chunkContent, $model, $provider, $estimator, $server) {
+            $llmProvider = $this->resolveCondensationProvider($server, $provider);
 
             if (!$llmProvider) {
                 throw new \RuntimeException('No condensation provider available');
             }
 
             $condensationModel = $this->config['model'] ?? $model;
-            $condensationProviderValue = $this->config['provider']
-                ? $this->config['provider']
-                : $provider->value;
+            $condensationProviderValue = ($this->config['provider'] ?? null) ?: $provider->value;
 
             $timeout = (int) ($this->config['timeout_seconds'] ?? 20);
 
@@ -321,47 +339,41 @@ class ConversationCondenser
     }
 
     /**
-     * Compute history budget from the budgeter config.
+     * Resolve the provider that performs condensation.
+     *
+     * The registry keys providers by type and needs the Server for credentials, so
+     * without a Server only an explicitly injected provider can be used. A configured
+     * `condensation.provider` overrides the conversation's own provider — allowing a
+     * cheaper model to do the summarizing — and falls back to it when unresolvable.
      */
-    private function computeHistoryBudget(array $messages, ?string $model, ProviderType $provider, callable $estimator): int
-    {
-        // Default conservative budget (matches budgeter fallback)
-        $context = 8192;
-        $responseReserve = 2048;
-        $headroomRatio = 0.15;
-        $injectedSectionReserve = 1500;
-        $effectiveContext = (int) floor($context * (1.0 - $headroomRatio));
-        $systemMessage = null;
-        if (!empty($messages) && $messages[0]['role'] === 'system') {
-            $systemMessage = $messages[0];
-        }
-        $systemEstimate = $systemMessage ? $this->estimateMessage($systemMessage, $estimator) : 0;
-        return $effectiveContext - $responseReserve - $injectedSectionReserve - $systemEstimate;
-    }
-
-    private function resolveCondensationProvider(?string $model, ProviderType $provider): ?LlmProvider
+    private function resolveCondensationProvider(?Server $server, ProviderType $provider): ?LlmProvider
     {
         if ($this->condensationProvider) {
             return $this->condensationProvider;
         }
 
-        if ($this->providerRegistry) {
-            $condensationProviderType = $this->config['provider'] ?? null;
-            if ($condensationProviderType) {
-                try {
-                    return $this->providerRegistry->resolveByType(ProviderType::from($condensationProviderType), $this->config['model'] ?? null);
-                } catch (\Throwable) {
-                    // Fall through to default provider
-                }
-            }
+        if (!$this->providerRegistry || !$server) {
+            return null;
+        }
+
+        $condensationProviderType = $this->config['provider'] ?? null;
+        if ($condensationProviderType) {
             try {
-                return $this->providerRegistry->resolveByType($provider, $model);
+                return $this->providerRegistry->resolveByType(
+                    ProviderType::from($condensationProviderType),
+                    $server
+                );
             } catch (\Throwable) {
-                return null;
+                // Unknown or unresolvable configured type — fall back to the
+                // conversation's own provider rather than skipping condensation.
             }
         }
 
-        return null;
+        try {
+            return $this->providerRegistry->resolveByType($provider, $server);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**

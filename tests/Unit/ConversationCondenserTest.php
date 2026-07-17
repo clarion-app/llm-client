@@ -130,15 +130,69 @@ class ConversationCondenserTest extends TestCase
             24
         );
 
-        // The verbatim messages should be byte-identical to the input tail
-        // With budget=24, verbatimCount=2, so last 2 messages are verbatim
-        $verbatimTail = array_slice($messages, -2);
-        $resultTail = array_slice($result, -count($verbatimTail));
+        // Result is [original system, summary, ...verbatim tail]. The summary and
+        // the verbatim tail share the history budget, so the tail is whatever
+        // still fits once the summary is paid for — never a fixed count.
+        $this->assertSame('system', $result[0]['role']);
+        $this->assertSame('system', $result[1]['role']);
+        $this->assertStringContainsString('Condensed Context', $result[1]['content']);
 
+        $resultTail = array_slice($result, 2);
+        $this->assertNotEmpty($resultTail, 'At least one verbatim message should survive');
+
+        // Whatever survives must be byte-identical to the corresponding input tail.
+        $verbatimTail = array_slice($messages, -count($resultTail));
         foreach ($verbatimTail as $idx => $msg) {
             $this->assertEquals($msg['role'], $resultTail[$idx]['role']);
             $this->assertEquals($msg['content'], $resultTail[$idx]['content']);
         }
+    }
+
+    #[Test]
+    public function condensed_payload_respects_the_history_budget(): void
+    {
+        $messages = $this->createMessages(8);
+        $systemMsg = ['role' => 'system', 'content' => 'System prompt.'];
+        $fullMessages = array_merge([$systemMsg], $messages);
+
+        ChunkSummary::create([
+            'id' => (string) \Illuminate\Support\Str::uuid(),
+            'conversation_id' => $this->conversationId,
+            'chunk_index' => 0,
+            'source_hash' => $this->partitioner()->computeSourceHash($messages, 0, 4),
+            'source_message_count' => 4,
+            'summary' => ['decisions' => ['cached'], 'constraints' => [], 'open_questions' => [], 'facts' => [], 'commitments' => []],
+            'summary_tokens' => 10,
+            'condensation_model' => 'gpt-4o',
+            'condensation_provider' => 'openai',
+        ]);
+
+        $budgeter = new ContextWindowBudgeter(['enabled' => false]);
+        $condenser = $this->createCondenser($budgeter);
+
+        $estimator = fn(string $text) => strlen($text) / 4;
+        $budget = 24;
+        $result = $condenser->condenseOrTrim(
+            $fullMessages,
+            'gpt-4o',
+            ProviderType::OpenAI,
+            $estimator,
+            $this->conversationId,
+            $budget
+        );
+
+        // The history budget excludes the original system message, so measure
+        // everything the condenser put after it: summary plus verbatim tail.
+        $historyTokens = 0;
+        foreach (array_slice($result, 1) as $m) {
+            $historyTokens += (int) ceil($estimator($m['content'] ?? '') + 4);
+        }
+
+        $this->assertLessThanOrEqual(
+            $budget,
+            $historyTokens,
+            'Condensed payload must fit the history budget it was given'
+        );
     }
 
     #[Test]

@@ -3,10 +3,14 @@
 namespace ClarionApp\LlmClient\Jobs;
 
 use ClarionApp\LlmClient\Contracts\LlmProvider;
+use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Events\ConversationCondensed;
 use ClarionApp\LlmClient\Models\ChunkSummary;
-use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Presets\CondensationPreset;
+use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\ChunkPartitioner;
 use ClarionApp\LlmClient\Services\CondensationSummaryStore;
 use Illuminate\Bus\Queueable;
@@ -53,29 +57,45 @@ class PreWarmChunkSummaryJob implements ShouldQueue
      * Execute the job.
      */
     public function handle(
-        LlmProvider $llmProvider,
+        ProviderRegistry $providerRegistry,
         CondensationSummaryStore $store,
-        CondensationPreset $preset
+        CondensationPreset $preset,
+        AgentLoopService $agentLoopService
     ): void {
         // Resolve config
         $config = function_exists('config') ? config('llm-client.condensation', []) : [];
         $chunkSize = (int) ($config['chunk_size'] ?? 20);
         $condensationModel = $config['model'] ?? null;
-        $condensationProviderValue = $config['provider'] ?? 'openai';
 
-        // Load messages for this conversation
-        $messages = Message::where('conversation_id', $this->conversationId)
-            ->orderBy('id')
-            ->get()
-            ->map(fn ($m) => [
-                'role' => $m->role,
-                'content' => $m->content,
-            ])
-            ->values()
-            ->toArray();
+        $conversation = Conversation::find($this->conversationId);
+        if (!$conversation) {
+            Log::info('Conversation not found for pre-warm chunk summary job', [
+                'conversation_id' => $this->conversationId,
+            ]);
+            return;
+        }
+
+        $condensationProviderValue = ($config['provider'] ?? null)
+            ?: $conversation->effectiveProviderType->value;
+
+        // Build the same history array the synchronous path partitions. Reading
+        // the Message rows directly would produce a different shape (tool calls
+        // are not expanded into their result messages), yielding a source hash
+        // that never matches what the request path looks up — every pre-warmed
+        // summary would be paid for and then missed.
+        $messages = $agentLoopService->buildHistoryMessages($conversation);
 
         if (empty($messages)) {
             Log::info('No messages found for pre-warm chunk summary job', [
+                'conversation_id' => $this->conversationId,
+                'chunk_index' => $this->chunkIndex,
+            ]);
+            return;
+        }
+
+        $llmProvider = $this->resolveProvider($providerRegistry, $conversation, $config);
+        if (!$llmProvider) {
+            Log::warning('No condensation provider available for pre-warm chunk summary job', [
                 'conversation_id' => $this->conversationId,
                 'chunk_index' => $this->chunkIndex,
             ]);
@@ -200,6 +220,40 @@ class PreWarmChunkSummaryJob implements ShouldQueue
             ]);
 
             $store->recordFailure($this->conversationId);
+        }
+    }
+
+    /**
+     * Resolve the provider that performs condensation for this conversation.
+     *
+     * Mirrors ConversationCondenser::resolveCondensationProvider(): a configured
+     * condensation provider wins, falling back to the conversation's own provider.
+     * The registry needs the Server for credentials, so a conversation without one
+     * cannot be condensed.
+     */
+    private function resolveProvider(
+        ProviderRegistry $providerRegistry,
+        Conversation $conversation,
+        array $config
+    ): ?LlmProvider {
+        $server = $conversation->server;
+        if (!$server) {
+            return null;
+        }
+
+        $configuredType = $config['provider'] ?? null;
+        if ($configuredType) {
+            try {
+                return $providerRegistry->resolveByType(ProviderType::from($configuredType), $server);
+            } catch (\Throwable) {
+                // Unknown or unresolvable configured type — fall back below.
+            }
+        }
+
+        try {
+            return $providerRegistry->resolveByType($conversation->effectiveProviderType, $server);
+        } catch (\Throwable) {
+            return null;
         }
     }
 

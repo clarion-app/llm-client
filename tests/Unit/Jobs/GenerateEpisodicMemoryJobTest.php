@@ -96,6 +96,53 @@ class GenerateEpisodicMemoryJobTest extends TestCase
         $this->assertEquals(1, EpisodicMemory::withoutGlobalScope('user')->count());
     }
 
+    /**
+     * A conversation can end more than once — it goes idle, the user returns, it
+     * goes idle again. The existing record then covers only a prefix of the
+     * conversation. The old guard skipped on mere existence, so the memory of a
+     * long conversation was frozen at whatever had been said the first time it
+     * fell quiet, and everything after it was never remembered.
+     */
+    #[Test]
+    public function job_regenerates_when_the_conversation_continued_past_the_existing_record()
+    {
+        $existing = EpisodicMemory::create([
+            'user_id' => $this->user->id,
+            'conversation_id' => $this->conversation->id,
+            'summary' => 'Summary of the opening exchange only',
+            'topics' => ['early'],
+            'word_count' => 5, // captured when the conversation was much shorter
+            'summary_word_count' => 3,
+        ]);
+
+        // The conversation carried on well past that point.
+        $this->createMessages(['user', 'assistant', 'user', 'assistant']);
+
+        $providerMock = Mockery::mock(LlmProvider::class);
+        $providerMock->shouldReceive('chat')->once()->andReturn([
+            'choices' => [['message' => ['content' => json_encode([
+                'summary' => 'The full conversation, including what came later.',
+                'topics' => ['complete'],
+            ])]]],
+        ]);
+
+        $registryMock = Mockery::mock(ProviderRegistry::class);
+        $registryMock->shouldReceive('resolve')->andReturn($providerMock);
+
+        $embeddingMock = Mockery::mock(EmbeddingService::class);
+        $embeddingMock->shouldReceive('isEnabled')->andReturn(false);
+
+        $job = new GenerateEpisodicMemoryJob($this->conversation->id, 'test-agent-id');
+        $job->handle($registryMock, $embeddingMock);
+
+        // Updated in place — one conversation keeps exactly one record.
+        $this->assertEquals(1, EpisodicMemory::withoutGlobalScope('user')->count());
+
+        $existing->refresh();
+        $this->assertStringContainsString('what came later', $existing->summary);
+        $this->assertGreaterThan(5, (int) $existing->word_count);
+    }
+
     #[Test]
     public function job_skips_conversation_with_fewer_than_three_meaningful_exchanges()
     {
@@ -163,8 +210,18 @@ class GenerateEpisodicMemoryJobTest extends TestCase
         $this->assertEquals(0, EpisodicMemory::withoutGlobalScope('user')->count());
     }
 
+    /**
+     * Behaviour corrected 2026-07-16: this previously asserted that an
+     * unresolvable provider stores a "[Memory capture skipped]" placeholder.
+     * A provider outage says nothing about the conversation, and the placeholder
+     * was written with the full transcript word_count — so it permanently stood
+     * in for the user's memory of that conversation and suppressed every later
+     * regeneration attempt. Spec 040 reserves minimal records for conversations
+     * with no extractable events, and directs that summarizer failures raise a
+     * non-blocking notification instead.
+     */
     #[Test]
-    public function job_stores_placeholder_when_provider_resolution_fails()
+    public function job_broadcasts_failure_when_provider_resolution_fails()
     {
         $this->createMessages(['user', 'assistant', 'user']);
 
@@ -173,6 +230,12 @@ class GenerateEpisodicMemoryJobTest extends TestCase
 
         $embeddingMock = Mockery::mock(EmbeddingService::class);
 
+        $failureFired = false;
+        Event::listen(\ClarionApp\LlmClient\Events\EpisodicMemoryGenerationFailed::class, function ($e) use (&$failureFired) {
+            $failureFired = true;
+            $this->assertEquals($this->conversation->id, $e->conversationId);
+        });
+
         $job = new GenerateEpisodicMemoryJob(
             $this->conversation->id,
             'test-agent-id'
@@ -180,13 +243,12 @@ class GenerateEpisodicMemoryJobTest extends TestCase
 
         $job->handle($registryMock, $embeddingMock);
 
-        // Should create a placeholder memory
-        $this->assertEquals(1, EpisodicMemory::withoutGlobalScope('user')->count());
-
-        $memory = EpisodicMemory::withoutGlobalScope('user')->first();
-        $this->assertStringContainsString('Memory capture skipped', $memory->summary);
-        $this->assertStringContainsString('LLM provider unavailable', $memory->summary);
-        $this->assertEquals(['skipped'], $memory->topics);
+        $this->assertEquals(
+            0,
+            EpisodicMemory::withoutGlobalScope('user')->count(),
+            'An infrastructure failure must not be recorded as the memory of the conversation'
+        );
+        $this->assertTrue($failureFired, 'EpisodicMemoryGenerationFailed should be broadcast when no provider is available');
     }
 
     #[Test]

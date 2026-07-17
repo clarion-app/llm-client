@@ -56,6 +56,7 @@ class PreWarmChunkSummaryJobTest extends TestCase
             $table->string('provider_type')->nullable();
             $table->text('token')->nullable();
             $table->timestamps();
+            $table->softDeletes();
         });
 
         // conversations table
@@ -70,6 +71,7 @@ class PreWarmChunkSummaryJobTest extends TestCase
             $table->boolean('is_processing')->default(false);
             $table->string('channel')->nullable();
             $table->timestamps();
+            $table->softDeletes();
         });
 
         // messages table
@@ -215,6 +217,7 @@ class PreWarmChunkSummaryJobTest extends TestCase
         // Create provider registry with mock
         $registry = Mockery::mock(ProviderRegistry::class);
         $registry->shouldReceive('resolve')->andReturn($mockProvider);
+        $registry->shouldReceive('resolveByType')->andReturn($mockProvider);
         $this->app->instance(ProviderRegistry::class, $registry);
 
         // Configure condensation
@@ -231,11 +234,8 @@ class PreWarmChunkSummaryJobTest extends TestCase
 
         // Execute job directly (sync)
         $job = new PreWarmChunkSummaryJob($conversationId, 0);
-        $job->handle(
-            $this->app[LlmProvider::class],
-            $this->app[CondensationSummaryStore::class],
-            $this->app[CondensationPreset::class]
-        );
+        // Invoke through the container so the job's real dependency resolution runs.
+        $this->app->call([$job, 'handle']);
 
         // Assert ChunkSummary was created
         $summary = ChunkSummary::where('conversation_id', $conversationId)
@@ -279,6 +279,8 @@ class PreWarmChunkSummaryJobTest extends TestCase
         $this->app->bind(LlmProvider::class, fn () => $mockProvider);
 
         $registry = Mockery::mock(ProviderRegistry::class);
+        $registry->shouldReceive('resolve')->andReturn($mockProvider);
+        $registry->shouldReceive('resolveByType')->andReturn($mockProvider);
         $this->app->instance(ProviderRegistry::class, $registry);
 
         config(['llm-client.condensation' => [
@@ -294,11 +296,8 @@ class PreWarmChunkSummaryJobTest extends TestCase
 
         // Execute job directly (sync)
         $job = new PreWarmChunkSummaryJob($conversationId, 0);
-        $job->handle(
-            $this->app[LlmProvider::class],
-            $this->app[CondensationSummaryStore::class],
-            $this->app[CondensationPreset::class]
-        );
+        // Invoke through the container so the job's real dependency resolution runs.
+        $this->app->call([$job, 'handle']);
 
         // Assert only one ChunkSummary exists (the pre-populated one)
         $count = ChunkSummary::where('conversation_id', $conversationId)
@@ -320,6 +319,7 @@ class PreWarmChunkSummaryJobTest extends TestCase
 
         $registry = Mockery::mock(ProviderRegistry::class);
         $registry->shouldReceive('resolve')->andReturn($mockProvider);
+        $registry->shouldReceive('resolveByType')->andReturn($mockProvider);
         $this->app->instance(ProviderRegistry::class, $registry);
 
         config(['llm-client.condensation' => [
@@ -336,11 +336,8 @@ class PreWarmChunkSummaryJobTest extends TestCase
         Event::fake(ConversationCondensed::class);
 
         $job = new PreWarmChunkSummaryJob($conversationId, 0);
-        $job->handle(
-            $this->app[LlmProvider::class],
-            $this->app[CondensationSummaryStore::class],
-            $this->app[CondensationPreset::class]
-        );
+        // Invoke through the container so the job's real dependency resolution runs.
+        $this->app->call([$job, 'handle']);
 
         Event::assertDispatched(ConversationCondensed::class, function ($event) use ($conversationId) {
             return $event->conversationId === $conversationId

@@ -85,8 +85,9 @@ class SmartHistoryTrimmer
             return $result;
         }
 
-        // Score messages
-        $scores = $this->scorer->computeScores($historyMessages);
+        // Score messages. Goes through scoreMessages() rather than computeScores()
+        // so the score cache is actually consulted on this, the hot path.
+        $scores = $this->scorer->scoreMessages($historyMessages, $conversationId);
 
         // Group into turn units (reuse ContextWindowBudgeter logic via local implementation)
         $units = $this->groupIntoTurnUnits($historyMessages, $estimator);
@@ -187,7 +188,42 @@ class SmartHistoryTrimmer
             );
         }
 
-        // Build retained decisions for non-evicted units
+        // If coherence validator is available, check for dangling references.
+        // This runs before the retained decisions are built so a cascade-dropped
+        // unit is not also recorded as retained.
+        if ($this->coherenceValidator && !empty($evictedIndices)) {
+            // Pinned units are protected from cascade dropping just as preserved
+            // ones are — the user asked for that content to be kept, and a
+            // dangling phrase inside it is not a reason to discard it.
+            $protectedIndices = $preservedIndices;
+            foreach ($unitScores as $unitIndex => $meta) {
+                if ($meta['pinned']) {
+                    $protectedIndices[] = $unitIndex;
+                }
+            }
+            $protectedIndices = array_values(array_unique($protectedIndices));
+
+            $cascadeIndices = $this->coherenceValidator->validate(
+                $historyMessages,
+                $units,
+                $evictedIndices,
+                $protectedIndices,
+            );
+
+            foreach ($cascadeIndices as $cascadeIdx) {
+                $decisions[] = new TrimDecision(
+                    messageIndex: $cascadeIdx,
+                    action: 'dropped_cascade',
+                    score: $unitScores[$cascadeIdx]['score'] ?? 0.5,
+                    reason: 'dangling_reference_cascade',
+                    tokenSavings: $units[$cascadeIdx]['estimatedTokens'] ?? 0,
+                );
+            }
+
+            $evictedIndices = array_values(array_unique([...$evictedIndices, ...$cascadeIndices]));
+        }
+
+        // Build retained decisions for everything still standing
         foreach ($units as $unitIndex => $unit) {
             if (!in_array($unitIndex, $evictedIndices, true)) {
                 $decisions[] = new TrimDecision(
@@ -196,30 +232,6 @@ class SmartHistoryTrimmer
                     score: $unitScores[$unitIndex]['score'],
                     reason: 'retained',
                 );
-            }
-        }
-
-        // If coherence validator is available, check for dangling references
-        if ($this->coherenceValidator && !empty($evictedIndices)) {
-            $cascadeIndices = $this->coherenceValidator->validate(
-                $historyMessages,
-                $units,
-                $evictedIndices,
-                $preservedIndices,
-            );
-            $evictedIndices = array_values(array_unique([...$evictedIndices, ...$cascadeIndices]));
-
-            // Add cascade decisions
-            foreach ($cascadeIndices as $cascadeIdx) {
-                if (!in_array($cascadeIdx, $evictedIndices, true) || true) {
-                    $decisions[] = new TrimDecision(
-                        messageIndex: $cascadeIdx,
-                        action: 'dropped_cascade',
-                        score: $unitScores[$cascadeIdx]['score'] ?? 0.5,
-                        reason: 'dangling_reference_cascade',
-                        tokenSavings: $units[$cascadeIdx]['estimatedTokens'] ?? 0,
-                    );
-                }
             }
         }
 

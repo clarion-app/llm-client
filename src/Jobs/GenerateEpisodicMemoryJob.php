@@ -54,16 +54,13 @@ class GenerateEpisodicMemoryJob implements ShouldQueue
         ProviderRegistry $providerRegistry,
         EmbeddingService $embeddingService
     ): void {
-        // Deduplicate: skip if EpisodicMemory already exists for this conversation
-        if (EpisodicMemory::withoutGlobalScope('user')
+        // A conversation can end more than once: it goes idle, the user returns,
+        // and it goes idle again. An existing record is only authoritative if it
+        // already covers everything said — otherwise it summarises a prefix of the
+        // conversation and must be regenerated over the full transcript.
+        $existing = EpisodicMemory::withoutGlobalScope('user')
             ->where('conversation_id', $this->conversationId)
-            ->exists()
-        ) {
-            Log::info('EpisodicMemory already exists for conversation, skipping generation', [
-                'conversation_id' => $this->conversationId,
-            ]);
-            return;
-        }
+            ->first();
 
         // Load conversation to get user_id and server_id
         $conversation = Conversation::find($this->conversationId);
@@ -103,6 +100,17 @@ class GenerateEpisodicMemoryJob implements ShouldQueue
             return;
         }
 
+        // Nothing has been said since the existing record was captured — it is
+        // already a complete summary of this conversation.
+        if ($existing && (int) $existing->word_count >= $wordCount) {
+            Log::info('EpisodicMemory already covers this conversation, skipping generation', [
+                'conversation_id' => $this->conversationId,
+                'captured_word_count' => (int) $existing->word_count,
+                'transcript_word_count' => $wordCount,
+            ]);
+            return;
+        }
+
         // Calculate max summary word count (20% of original)
         $maxSummaryWords = max(10, (int) ($wordCount * config('llm-client.episodic_memory.summary_max_ratio', 0.20)));
 
@@ -121,8 +129,12 @@ class GenerateEpisodicMemoryJob implements ShouldQueue
         }
 
         if (!$provider) {
-            // Store minimal placeholder when LLM is unavailable
-            $this->storePlaceholder($userId, $this->conversationId, $wordCount, 'LLM provider unavailable');
+            // An unavailable provider is an infrastructure failure, not a verdict
+            // about the conversation. Recording a placeholder would permanently
+            // stand in for the user's memory of it (and, being a full-length
+            // word_count record, would suppress every later regeneration), so
+            // surface the failure and leave the conversation uncaptured instead.
+            $this->broadcastFailure($userId, 'LLM provider unavailable');
             return;
         }
 
@@ -147,15 +159,24 @@ class GenerateEpisodicMemoryJob implements ShouldQueue
             return;
         }
 
-        // Store EpisodicMemory record
-        $memory = EpisodicMemory::create([
-            'user_id' => $userId,
-            'conversation_id' => $this->conversationId,
+        // Store the EpisodicMemory record, replacing any earlier partial capture
+        // of this conversation in place so a conversation keeps exactly one record.
+        $attributes = [
             'summary' => $summaryResult['summary'],
             'topics' => $summaryResult['topics'] ?? ['general'],
             'word_count' => $wordCount,
             'summary_word_count' => $summaryWordCount,
-        ]);
+        ];
+
+        if ($existing) {
+            $existing->update($attributes);
+            $memory = $existing;
+        } else {
+            $memory = EpisodicMemory::create($attributes + [
+                'user_id' => $userId,
+                'conversation_id' => $this->conversationId,
+            ]);
+        }
 
         // Generate embedding (best effort, non-blocking)
         $this->generateEmbedding($memory, $embeddingService);

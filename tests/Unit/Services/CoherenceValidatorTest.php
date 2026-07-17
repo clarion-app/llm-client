@@ -173,7 +173,17 @@ class CoherenceValidatorTest extends TestCase
     }
 
     #[Test]
-    public function preserved_units_with_dangling_refs_cascade_dropped(): void
+    /**
+     * Precedence corrected 2026-07-16: this previously asserted that preserved
+     * units are cascade-dropped anyway. The preserved window holds the newest
+     * exchanges — including the user's current question — and a dangling
+     * reference only needs *any* earlier eviction to trigger, so "Based on the
+     * output above, what next?" had the live question deleted from the prompt and
+     * the agent was left with nothing to answer. Spec 2.2.4 states "the most
+     * recent exchanges are always kept" and scopes coherence to "what remains",
+     * so preservation wins; a stale phrase in recent context is the cheaper cost.
+     */
+    public function preserved_units_with_dangling_refs_are_not_cascade_dropped(): void
     {
         $validator = $this->makeValidator();
 
@@ -187,9 +197,30 @@ class CoherenceValidatorTest extends TestCase
 
         $cascade = $validator->validate($messages, $units, [1], [2]);
 
-        // Unit 2 is preserved but references evicted content — cascade-dropped anyway
-        $this->assertCount(1, $cascade);
-        $this->assertContains(2, $cascade);
+        $this->assertSame([], $cascade, 'Preserved units must survive the coherence stage');
+    }
+
+    #[Test]
+    public function the_current_user_question_is_never_cascade_dropped(): void
+    {
+        $validator = $this->makeValidator();
+
+        $messages = [
+            $this->userMessage('Search the docs'),                        // 0
+            ...$this->toolCallUnit('search', 'a big result'),             // 1-2 (evicted)
+            $this->userMessage('Based on the output above, what next?'),  // 3 (live question)
+        ];
+
+        $units = $this->buildUnits($messages);
+
+        // Unit 2 is the live question and sits in the preserved window.
+        $cascade = $validator->validate($messages, $units, [1], [2]);
+
+        $this->assertNotContains(
+            2,
+            $cascade,
+            'Dropping the question being answered leaves the agent nothing to respond to'
+        );
     }
 
     #[Test]

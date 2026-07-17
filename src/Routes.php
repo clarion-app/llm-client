@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\Controllers\FeedbackController;
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
     Route::post('conversation/{id}/generate-title', [ConversationController::class, "generateTitle"]);
+    Route::post('conversation/{id}/end', [ConversationController::class, "end"]);
     Route::post('conversation/{id}/confirm-api-call', [ConversationController::class, "confirmApiCall"]);
     Route::get('user/{id}/conversation', [ConversationController::class, "userConversations"]);
     Route::post('agent', AgentController::class);

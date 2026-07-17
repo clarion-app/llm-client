@@ -73,9 +73,13 @@ class SmartTrimCondensationInteractionTest extends TestCase
             $this->assistantMessage('Noted, API endpoint saved'),
         ];
 
+        // preserved_pairs=1 keeps the dangling-reference message outside the
+        // preserved window so the coherence stage is free to drop it. Preserved
+        // units are protected from cascade dropping (that window holds the user's
+        // current question), so a wider window would assert nothing here.
         $trimmer = $this->makeTrimmer([
             'enabled' => true,
-            'preserved_pairs' => 2,
+            'preserved_pairs' => 1,
             'emit_events' => true,
         ]);
 

@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Services\ConversationLifecycleService;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\LanguageModel;
 use ClarionApp\LlmClient\Models\Server;
@@ -174,6 +175,30 @@ class ConversationController extends Controller
         $conversation->delete();
 
         return response()->noContent();
+    }
+
+    /**
+     * Explicitly end a conversation session.
+     *
+     * The idle sweep ends sessions eventually; this lets a client end one now,
+     * releasing session memory and capturing the episodic record immediately.
+     * Idempotent — ending an already-ended session is a no-op.
+     */
+    public function end($id, ConversationLifecycleService $lifecycle)
+    {
+        $conversation = Conversation::findOrFail($id);
+
+        if ($conversation->user_id !== Auth::id()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $ended = $lifecycle->end($conversation);
+
+        return response()->json([
+            'id' => $conversation->id,
+            'ended' => $ended,
+            'ended_at' => $conversation->ended_at,
+        ], 200);
     }
 
     public function generateTitle($id)

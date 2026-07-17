@@ -51,6 +51,44 @@ class MemoryLifecycleTest extends TestCase
         $this->assertEquals('key3', $remaining->key);
     }
 
+    /**
+     * Regression: cleanup filtered on turn_id alone. turn_id is not unique across
+     * conversations ("1" is everyone's first turn) and MemoryEntry has no per-user
+     * global scope, so finishing turn 1 of one conversation deleted turn-1 scratch
+     * memory belonging to every other conversation — and every other user.
+     */
+    public function test_scratch_cleanup_does_not_cross_conversations_or_users(): void
+    {
+        $service = $this->getService();
+        $turnId = '1';
+
+        $agentA = (string) \Illuminate\Support\Str::uuid();
+        $userA  = (string) \Illuminate\Support\Str::uuid();
+        $convA  = (string) \Illuminate\Support\Str::uuid();
+
+        $agentB = (string) \Illuminate\Support\Str::uuid();
+        $userB  = (string) \Illuminate\Support\Str::uuid();
+        $convB  = (string) \Illuminate\Support\Str::uuid();
+
+        // Same turn_id, different conversations and different users.
+        $service->create(MemoryScope::SCRATCH, $agentA, $userA, $convA, $turnId, 'a_key', 'a content');
+        $service->create(MemoryScope::SCRATCH, $agentB, $userB, $convB, $turnId, 'b_key', 'b content');
+
+        // Conversation A finishes its turn 1.
+        EventFacade::dispatch(new AgentTurnCompleted($turnId, $convA));
+
+        $this->assertEquals(
+            0,
+            MemoryEntry::where('scope', MemoryScope::SCRATCH->value)->where('conversation_id', $convA)->count(),
+            'Own conversation scratch should be cleaned'
+        );
+        $this->assertEquals(
+            1,
+            MemoryEntry::where('scope', MemoryScope::SCRATCH->value)->where('conversation_id', $convB)->count(),
+            'Another user\'s scratch memory must never be deleted by this conversation\'s turn'
+        );
+    }
+
     public function test_scratch_cleanup_only_affects_scratch_scope(): void
     {
         $service = $this->getService();

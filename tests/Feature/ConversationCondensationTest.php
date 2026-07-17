@@ -482,4 +482,56 @@ class ConversationCondensationTest extends TestCase
 
         \Mockery::close();
     }
+
+    /**
+     * Regression: the condenser resolved its provider with
+     * resolveByType($providerType, $model) — passing a model string (or null)
+     * where the registry requires a Server. The resulting TypeError was
+     * swallowed by a catch(Throwable), so the container-wired condenser silently
+     * resolved no provider and every conversation fell back to plain trimming
+     * forever. Tests missed it because they all injected a provider directly,
+     * bypassing resolution. This asserts against the real registry.
+     */
+    #[Test]
+    public function condensation_provider_resolves_against_the_real_registry(): void
+    {
+        $condenser = new ConversationCondenser(
+            new ChunkPartitioner(),
+            new CondensationSummaryStore($this->app['cache.store']),
+            new ContextWindowBudgeter(),
+            new CondensationPreset(),
+            null,
+            null,                                     // no injected provider — force resolution
+            $this->app->make(ProviderRegistry::class) // the real registry
+        );
+
+        $resolve = new \ReflectionMethod($condenser, 'resolveCondensationProvider');
+        $resolve->setAccessible(true);
+
+        $provider = $resolve->invoke($condenser, $this->server, ProviderType::OpenAI);
+
+        $this->assertInstanceOf(
+            LlmProvider::class,
+            $provider,
+            'Condenser must resolve a real provider from the registry; returning null here means condensation silently never runs.'
+        );
+    }
+
+    /**
+     * Regression: the container factory for ConversationCondenser passes no
+     * provider, so production always depends on registry resolution working.
+     */
+    #[Test]
+    public function container_resolved_condenser_can_resolve_a_provider(): void
+    {
+        $condenser = $this->app->make(ConversationCondenser::class);
+
+        $resolve = new \ReflectionMethod($condenser, 'resolveCondensationProvider');
+        $resolve->setAccessible(true);
+
+        $this->assertInstanceOf(
+            LlmProvider::class,
+            $resolve->invoke($condenser, $this->server, ProviderType::OpenAI)
+        );
+    }
 }

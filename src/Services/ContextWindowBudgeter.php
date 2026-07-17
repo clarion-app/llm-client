@@ -89,16 +89,11 @@ final class ContextWindowBudgeter
         // Resolve budget.
         $resolved = $this->resolveBudget($model, $provider);
         $context = $resolved['context'];
-        $responseReserve = $resolved['responseReserve'];
         $source = $resolved['source'];
 
         // Compute history budget.
-        $headroomRatio = (float) ($this->config['headroom_ratio'] ?? 0.15);
-        $injectedSectionReserve = (int) ($this->config['injected_section_reserve'] ?? 1500);
-
-        $effectiveContext = (int) floor($context * (1.0 - $headroomRatio));
         $systemEstimate = $systemMessage ? $this->estimateMessage($systemMessage, $estimator) : 0;
-        $historyBudget = $effectiveContext - $responseReserve - $injectedSectionReserve - $systemEstimate;
+        $historyBudget = $this->resolveHistoryBudget($model, $provider, $systemEstimate);
 
         // Group history messages into turn units.
         $units = $this->groupIntoTurnUnits($historyMessages, $estimator);
@@ -237,6 +232,32 @@ final class ContextWindowBudgeter
         }
 
         return $estimator($text) + self::PER_MESSAGE_ENVELOPE;
+    }
+
+    /**
+     * Resolve the token budget available to conversation history.
+     *
+     * Exposed so other context-management stages (condensation, smart trimming)
+     * size themselves against the same model-aware budget this budgeter enforces,
+     * rather than each carrying its own copy of the arithmetic.
+     *
+     * @param string|null $model Conversation model (null → provider default).
+     * @param ProviderType $provider Effective provider type.
+     * @param int $systemTokens Estimated cost of the system message, which shares the budget.
+     *
+     * @return int Tokens available for history. May be ≤ 0 when the system prompt
+     *             plus reserves already exhaust the context.
+     */
+    public function resolveHistoryBudget(?string $model, ProviderType $provider, int $systemTokens = 0): int
+    {
+        $resolved = $this->resolveBudget($model, $provider);
+
+        $headroomRatio = (float) ($this->config['headroom_ratio'] ?? 0.15);
+        $injectedSectionReserve = (int) ($this->config['injected_section_reserve'] ?? 1500);
+
+        $effectiveContext = (int) floor($resolved['context'] * (1.0 - $headroomRatio));
+
+        return $effectiveContext - $resolved['responseReserve'] - $injectedSectionReserve - $systemTokens;
     }
 
     /**
