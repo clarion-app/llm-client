@@ -11,17 +11,19 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::create('conversations', function (Blueprint $table) {
-            $table->uuid('id')->primary();
-            $table->uuid('server_id')->nullable();
-            $table->foreign('server_id')->references('id')->on('llm_servers')->onDelete('set null');
-            $table->timestamps();
-            $table->softDeletes();
-            $table->uuid('user_id')->nullable();
-            $table->string('title')->nullable();
-            $table->string('model');
-            $table->string('character');
-        });
+        if (!Schema::hasTable('conversations')) {
+            Schema::create('conversations', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('server_id')->nullable();
+                $table->foreign('server_id')->references('id')->on('llm_servers')->onDelete('set null');
+                $table->timestamps();
+                $table->softDeletes();
+                $table->uuid('user_id')->nullable();
+                $table->string('title')->nullable();
+                $table->string('model');
+                $table->string('character');
+            });
+        }
     }
 
     /**

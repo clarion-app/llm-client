@@ -8,9 +8,11 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::table('messages', function (Blueprint $table) {
-            $table->json('tool_data')->nullable()->after('content');
-        });
+        if (!Schema::hasColumn('messages', 'tool_data')) {
+            Schema::table('messages', function (Blueprint $table) {
+                $table->json('tool_data')->nullable()->after('content');
+            });
+        }
     }
 
     public function down(): void

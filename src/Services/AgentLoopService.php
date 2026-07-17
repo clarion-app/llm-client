@@ -17,6 +17,8 @@ use ClarionApp\LlmClient\Contracts\MemoryScope;
 use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
+use ClarionApp\LlmClient\Services\MetricsRecorder;
+use ClarionApp\LlmClient\ValueObjects\ToolFailureCategory;
 use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
 use ClarionApp\LlmClient\Services\ConversationCondenser;
 use ClarionApp\LlmClient\Services\ToolResultCondenser;
@@ -45,6 +47,7 @@ class AgentLoopService
     private ?ConversationCondenser $conversationCondenser;
     private ?ToolResultCondenser $toolResultCondenser;
     private PreferenceInjector $preferenceInjector;
+    private ?MetricsRecorder $metricsRecorder;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -61,7 +64,8 @@ class AgentLoopService
         ?ContextWindowBudgeter $contextWindowBudgeter = null,
         ?ConversationCondenser $conversationCondenser = null,
         ?ToolResultCondenser $toolResultCondenser = null,
-        ?PreferenceInjector $preferenceInjector = null
+        ?PreferenceInjector $preferenceInjector = null,
+        ?MetricsRecorder $metricsRecorder = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -78,6 +82,7 @@ class AgentLoopService
         $this->conversationCondenser = $conversationCondenser;
         $this->toolResultCondenser = $toolResultCondenser;
         $this->preferenceInjector = $preferenceInjector ?? new PreferenceInjector();
+        $this->metricsRecorder = $metricsRecorder;
     }
 
     public function start(Conversation $conversation, int $iteration = 1): void
@@ -240,6 +245,9 @@ class AgentLoopService
 
         try {
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
+                // Generate attempt group ID for this turn (shared across LLM calls, retries, and tool calls)
+                $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+
                 $rawMessages = $this->buildMessagesPayload($conversation);
                 $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
                 $formatted = $this->formatMessages($conversation, $trimmed);
@@ -251,6 +259,9 @@ class AgentLoopService
                     $systemPrompt = $systemPrompt . "\n\n" . $presetSystemPrompt;
                 }
                 $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $systemPrompt);
+
+                // Record LLM usage metrics (fire-and-forget, never throws)
+                $this->recordUsageMetric($conversation, $attemptGroupId, $response, $formatted['messages']);
 
                 $choice = $response['choices'][0] ?? null;
                 if (!$choice) {
@@ -408,6 +419,9 @@ class AgentLoopService
                         ];
                     }
 
+                    // Tool executed (not a confirmation pause) — record its outcome.
+                    $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
+
                     // Condense tool result if oversized
                     $toolResultEntry = $this->condenseToolResult($result, $conversation->id);
                     $toolResults[] = [
@@ -494,6 +508,10 @@ class AgentLoopService
 
         $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
 
+        // Shared attempt group ID for this resumed turn (confirmed call + any
+        // follow-on LLM calls and tool invocations in the continuation loop).
+        $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+
         if ($approved) {
             $resultContent = $this->executeApiCall(
                 $pending['operationId'],
@@ -502,6 +520,15 @@ class AgentLoopService
                 $pending['arguments'] ?? [],
                 $conversation
             );
+
+            // Record the confirmed operation's outcome (fire-and-forget).
+            $this->recordToolMetric(
+                $conversation,
+                $attemptGroupId,
+                $pending['tool_name'] ?? 'execute_operation',
+                json_decode($resultContent, true),
+            );
+
             $toolData['tool_results'] = [
                 ['tool_call_id' => $toolCallId, 'content' => $resultContent],
             ];
@@ -525,6 +552,9 @@ class AgentLoopService
             $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
             $formatted = $this->formatMessages($conversation, $trimmed);
             $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $formatted['system']);
+
+            // Record LLM usage metrics (fire-and-forget, never throws)
+            $this->recordUsageMetric($conversation, $attemptGroupId, $response, $formatted['messages']);
 
             $choice = $response['choices'][0] ?? null;
             if (!$choice) {
@@ -630,6 +660,9 @@ class AgentLoopService
                         'confirmation' => $confirmationPayload,
                     ];
                 }
+
+                // Tool executed (not a confirmation pause) — record its outcome.
+                $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
 
                 $toolResultEntry = $this->condenseToolResult($result, $conversation->id);
                 $toolResults[] = [
@@ -976,6 +1009,68 @@ class AgentLoopService
             ],
             'required' => ['operationId'],
         ];
+    }
+
+    /**
+     * Record LLM usage for a completed request (fire-and-forget; never throws).
+     *
+     * @param array $response  Unified LLM response (may include a 'usage' key)
+     * @param array $messages  The formatted request messages, for estimation fallback
+     */
+    private function recordUsageMetric(Conversation $conversation, string $attemptGroupId, array $response, array $messages): void
+    {
+        if ($this->metricsRecorder === null) {
+            return;
+        }
+
+        $this->metricsRecorder->recordUsage(
+            conversationId: $conversation->id,
+            userId: (string) $conversation->user_id,
+            attemptGroupId: $attemptGroupId,
+            providerUsage: $response['usage'] ?? [],
+            inputText: $this->concatMessageText($messages),
+            outputText: $response['choices'][0]['message']['content'] ?? '',
+            model: $conversation->model,
+            providerType: $conversation->effectiveProviderType?->value,
+        );
+    }
+
+    /**
+     * Record the outcome of a single tool invocation (fire-and-forget; never throws).
+     *
+     * Success/failure is derived from the decoded tool result: meta tools signal
+     * failure by returning a JSON payload containing an "error" key.
+     *
+     * @param mixed $decoded  The json_decode()'d tool result
+     */
+    private function recordToolMetric(Conversation $conversation, string $attemptGroupId, string $toolName, mixed $decoded): void
+    {
+        if ($this->metricsRecorder === null) {
+            return;
+        }
+
+        $error = (is_array($decoded) && isset($decoded['error'])) ? (string) $decoded['error'] : null;
+
+        $this->metricsRecorder->recordToolInvocation(
+            conversationId: $conversation->id,
+            userId: (string) $conversation->user_id,
+            attemptGroupId: $attemptGroupId,
+            toolName: $toolName,
+            success: $error === null,
+            failureCategory: $error === null ? null : ToolFailureCategory::fromErrorMessage($error),
+        );
+    }
+
+    /**
+     * Concatenate message text for token estimation. Non-string content
+     * (e.g. multimodal parts) contributes nothing to the character count.
+     */
+    private function concatMessageText(array $messages): string
+    {
+        return implode("\n", array_map(
+            fn ($m) => is_string($m['content'] ?? null) ? $m['content'] : '',
+            $messages
+        ));
     }
 
     public function executeMetaTool(string $toolName, array $arguments, Conversation $conversation): string

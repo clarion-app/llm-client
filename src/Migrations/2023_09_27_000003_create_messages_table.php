@@ -8,21 +8,23 @@ return new class extends Migration
 {
     public function up()
     {
-        Schema::create('messages', function (Blueprint $table) {
-            $table->uuid('id')->primary();
-            $table->uuid('conversation_id');
-            $table->longText('content');
-            $table->enum('role', ['assistant', 'user', 'system']);
-            $table->string('user');
-            $table->unsignedInteger('responseTime')->nullable();
-            $table->timestamps();
-            $table->softDeletes();
+        if (!Schema::hasTable('messages')) {
+            Schema::create('messages', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id');
+                $table->longText('content');
+                $table->enum('role', ['assistant', 'user', 'system']);
+                $table->string('user');
+                $table->unsignedInteger('responseTime')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
 
-            $table->foreign('conversation_id')
-                  ->references('id')
-                  ->on('conversations')
-                  ->onDelete('cascade');
-        });
+                $table->foreign('conversation_id')
+                      ->references('id')
+                      ->on('conversations')
+                      ->onDelete('cascade');
+            });
+        }
     }
 
     public function down()

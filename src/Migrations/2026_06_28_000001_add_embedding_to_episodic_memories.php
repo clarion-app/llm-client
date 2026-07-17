@@ -12,6 +12,10 @@ return new class extends Migration
      */
     public function up(): void
     {
+        if (Schema::hasColumn('episodic_memories', 'embedding')) {
+            return;
+        }
+
         Schema::table('episodic_memories', function (Blueprint $table) {
             $driver = DB::getDriverName();
 

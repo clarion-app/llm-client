@@ -9,6 +9,10 @@ return new class extends Migration
 {
     public function up(): void
     {
+        if (Schema::hasColumn('operation_search_index', 'type')) {
+            return;
+        }
+
         Schema::table('operation_search_index', function (Blueprint $table) {
             // Add type column with default 'operation' for backward compatibility
             $table->string('type', 20)->default('operation')->after('id');

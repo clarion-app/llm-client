@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
 use ClarionApp\LlmClient\Services\ToolResultCondenser;
+use ClarionApp\LlmClient\Services\MetricsRecorder;
 use Illuminate\Support\Facades\Log;
 
 class AgentLoopStreamHandler extends HandleHttpStreamResponse
@@ -23,10 +24,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
     public ?Message $message = null;
     public array $toolCalls = [];
     private ?ToolResultCondenser $toolResultCondenser = null;
+    private ?MetricsRecorder $metricsRecorder = null;
+    private string $attemptGroupId = '';
 
-    public function __construct(?ToolResultCondenser $toolResultCondenser = null)
+    public function __construct(?ToolResultCondenser $toolResultCondenser = null, ?MetricsRecorder $metricsRecorder = null)
     {
         $this->toolResultCondenser = $toolResultCondenser;
+        $this->metricsRecorder = $metricsRecorder;
     }
 
     public function handle($content, $data, $seconds)
@@ -123,6 +127,43 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         if (!$conversation) return;
 
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
+
+        // Generate attempt group ID for this turn (if not already set)
+        if ($this->attemptGroupId === '') {
+            $this->attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+        }
+
+        // Record LLM usage metrics for the final chunk (fire-and-forget, never throws)
+        // Streaming responses may have usage in the final SSE chunk
+        if ($this->metricsRecorder !== null) {
+            $providerUsage = $parsedData['usage'] ?? [];
+
+            // Only rebuild the input payload when the provider omitted usage and
+            // input tokens must be estimated — avoids the cost on the common path.
+            $inputText = '';
+            if (empty($providerUsage) || empty($providerUsage['prompt_tokens'])) {
+                try {
+                    $messages = app(AgentLoopService::class)->buildMessagesPayload($conversation);
+                    $inputText = implode("\n", array_map(
+                        fn ($m) => is_string($m['content'] ?? null) ? $m['content'] : '',
+                        $messages
+                    ));
+                } catch (\Throwable $e) {
+                    $inputText = '';
+                }
+            }
+
+            $this->metricsRecorder->recordUsage(
+                conversationId: $conversation->id,
+                userId: (string) $conversation->user_id,
+                attemptGroupId: $this->attemptGroupId,
+                providerUsage: $providerUsage,
+                inputText: $inputText,
+                outputText: $this->reply,
+                model: $conversation->model,
+                providerType: $conversation->effectiveProviderType?->value,
+            );
+        }
 
         // If we have tool calls to execute
         if (!empty($this->toolCalls)) {
@@ -324,6 +365,25 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             ] + array_filter($toolResultEntry, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
 
             event(new ToolExecutionEvent($conversationId, $toolName, 'completed'));
+
+            // Record tool invocation metrics (fire-and-forget, never throws).
+            // Success/failure derived from the tool result: meta tools signal
+            // failure with a JSON payload containing an "error" key.
+            if ($this->metricsRecorder !== null) {
+                $resultDecoded = json_decode($result, true);
+                $error = (is_array($resultDecoded) && isset($resultDecoded['error']))
+                    ? (string) $resultDecoded['error']
+                    : null;
+
+                $this->metricsRecorder->recordToolInvocation(
+                    conversationId: $conversation->id,
+                    userId: (string) $conversation->user_id,
+                    attemptGroupId: $this->attemptGroupId,
+                    toolName: $toolName,
+                    success: $error === null,
+                    failureCategory: $error === null ? null : \ClarionApp\LlmClient\ValueObjects\ToolFailureCategory::fromErrorMessage($error),
+                );
+            }
         }
 
         // Store tool calls and results in message tool_data

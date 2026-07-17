@@ -15,10 +15,12 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::table('conversations', function (Blueprint $table) {
-            $table->timestamp('ended_at')->nullable()->after('is_processing');
-            $table->index(['ended_at', 'updated_at']);
-        });
+        if (!Schema::hasColumn('conversations', 'ended_at')) {
+            Schema::table('conversations', function (Blueprint $table) {
+                $table->timestamp('ended_at')->nullable()->after('is_processing');
+                $table->index(['ended_at', 'updated_at']);
+            });
+        }
     }
 
     public function down(): void

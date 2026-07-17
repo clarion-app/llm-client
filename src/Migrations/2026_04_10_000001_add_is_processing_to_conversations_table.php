@@ -8,9 +8,11 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::table('conversations', function (Blueprint $table) {
-            $table->boolean('is_processing')->default(false);
-        });
+        if (!Schema::hasColumn('conversations', 'is_processing')) {
+            Schema::table('conversations', function (Blueprint $table) {
+                $table->boolean('is_processing')->default(false);
+            });
+        }
     }
 
     public function down(): void

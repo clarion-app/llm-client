@@ -11,9 +11,11 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::table('conversations', function (Blueprint $table) {
-            $table->string('provider_override', 50)->nullable()->after('channel');
-        });
+        if (!Schema::hasColumn('conversations', 'provider_override')) {
+            Schema::table('conversations', function (Blueprint $table) {
+                $table->string('provider_override', 50)->nullable()->after('channel');
+            });
+        }
     }
 
     /**

@@ -8,10 +8,12 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::table('conversations', function (Blueprint $table) {
-            $table->string('channel', 50)->nullable()->after('is_processing');
-            $table->index(['user_id', 'channel', 'updated_at'], 'conversations_user_channel_updated_index');
-        });
+        if (!Schema::hasColumn('conversations', 'channel')) {
+            Schema::table('conversations', function (Blueprint $table) {
+                $table->string('channel', 50)->nullable()->after('is_processing');
+                $table->index(['user_id', 'channel', 'updated_at'], 'conversations_user_channel_updated_index');
+            });
+        }
     }
 
     public function down(): void

@@ -14,11 +14,13 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::table('llm_servers', function (Blueprint $table) {
-            $table->string('provider_type')
-                ->default('openai')
-                ->after('token');
-        });
+        if (!Schema::hasColumn('llm_servers', 'provider_type')) {
+            Schema::table('llm_servers', function (Blueprint $table) {
+                $table->string('provider_type')
+                    ->default('openai')
+                    ->after('token');
+            });
+        }
     }
 
     /**
