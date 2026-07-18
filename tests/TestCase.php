@@ -253,5 +253,48 @@ abstract class TestCase extends BaseTestCase
             });
         }
 
+        // context_management_records table (for context management metrics tests).
+        if (!Schema::hasTable('context_management_records')) {
+            Schema::create('context_management_records', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id');
+                $table->uuid('user_id');
+                $table->uuid('attempt_group_id')->nullable();
+                $table->enum('mechanism', ['trim', 'smart_trim', 'condense', 'none']);
+                $table->integer('history_budget')->nullable();
+                $table->integer('context_capacity')->nullable();
+                $table->integer('tokens_before')->default(0);
+                $table->integer('tokens_after')->default(0);
+                $table->integer('tokens_saved')->default(0);
+                $table->string('model', 128)->nullable();
+                $table->string('provider_type', 32)->nullable();
+                $table->string('error', 256)->nullable();
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index('conversation_id');
+                $table->index(['user_id', 'created_at']);
+                $table->index('attempt_group_id');
+                $table->index(['mechanism', 'created_at']);
+            });
+        }
+
+        // context_management_summaries table (for context management metrics tests).
+        if (!Schema::hasTable('context_management_summaries')) {
+            Schema::create('context_management_summaries', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->enum('entity_type', ['conversation', 'user']);
+                $table->uuid('entity_id');
+                $table->bigInteger('trim_activations')->default(0);
+                $table->bigInteger('smart_trim_activations')->default(0);
+                $table->bigInteger('condense_activations')->default(0);
+                $table->bigInteger('total_tokens_saved')->default(0);
+                $table->bigInteger('total_requests')->default(0);
+                $table->timestamp('updated_at')->useCurrent();
+
+                $table->unique(['entity_type', 'entity_id']);
+                $table->index(['entity_type', 'updated_at']);
+            });
+        }
+
     }
 }

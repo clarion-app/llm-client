@@ -323,5 +323,17 @@ return [
         // Token estimation uses strlen() / 4, consistent with ContextWindowBudgeter.
         'max_tokens' => 500,
     ],
+
+    // Context Management Metrics — captures context utilization and mechanism activation
+    // telemetry for every LLM request. Recording is fire-and-forget at the
+    // applyContextWindowTrim() boundary; failures are logged and never block requests.
+    'context_management_metrics' => [
+        // Master toggle. When false, context management recording is skipped entirely.
+        'enabled' => true,
+
+        // Number of days to retain detail records and conversation summaries.
+        // User summaries are lifetime rollups and are never purged.
+        'retention_days' => 90,
+    ],
 ];
 
