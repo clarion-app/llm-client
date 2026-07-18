@@ -137,12 +137,32 @@ class ConversationCondenser
 
         if (empty($sealedChunks)) {
             // No sealed chunks to condense — try smart trim, then budgeter as safety net
+            $smartTrimTokensBefore = $this->sumMessageTokens($messages, $estimator);
             $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-            return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+            $smartTrimTokensAfter = $this->sumMessageTokens($afterSmartTrim, $estimator);
+            $result = $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+            if ($outcome !== null && $smartTrimTokensAfter < $smartTrimTokensBefore) {
+                $steps = $outcome->getSteps();
+                $outcome = new ContextManagementOutcome(
+                    contextCapacity: $outcome->contextCapacity,
+                    historyBudget: $outcome->historyBudget,
+                    tokensBefore: $smartTrimTokensBefore,
+                    tokensAfter: $outcome->tokensAfter,
+                    model: $outcome->model,
+                    providerType: $outcome->providerType,
+                );
+                $outcome->addStep(ContextManagementStep::smartTrim($smartTrimTokensBefore, $smartTrimTokensAfter));
+                foreach ($steps as $s) {
+                    $outcome->addStep($s);
+                }
+            }
+            return $result;
         }
 
-        // Look up or produce summaries for each sealed chunk
+        // Look up or produce summaries for each sealed chunk.
+        // Track which chunks are cached vs fresh for outcome step population.
         $summaries = [];
+        $cachedChunkIndices = [];
         $condensationNeeded = [];
 
         foreach ($sealedChunks as $chunkIndex) {
@@ -151,6 +171,7 @@ class ConversationCondenser
 
             if ($cached) {
                 $summaries[$chunkIndex] = $cached;
+                $cachedChunkIndices[] = $chunkIndex;
             } else {
                 $condensationNeeded[] = ['chunkIndex' => $chunkIndex, 'sourceHash' => $sourceHash];
             }
@@ -174,8 +195,26 @@ class ConversationCondenser
                 $summaries[$missing['chunkIndex']] = $result;
             } else {
                 // Condensation failed — try smart trim, then budgeter as safety net
+                $smartTrimTokensBefore = $this->sumMessageTokens($messages, $estimator);
                 $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-                return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+                $smartTrimTokensAfter = $this->sumMessageTokens($afterSmartTrim, $estimator);
+                $result = $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+                if ($outcome !== null && $smartTrimTokensAfter < $smartTrimTokensBefore) {
+                    $steps = $outcome->getSteps();
+                    $outcome = new ContextManagementOutcome(
+                        contextCapacity: $outcome->contextCapacity,
+                        historyBudget: $outcome->historyBudget,
+                        tokensBefore: $smartTrimTokensBefore,
+                        tokensAfter: $outcome->tokensAfter,
+                        model: $outcome->model,
+                        providerType: $outcome->providerType,
+                    );
+                    $outcome->addStep(ContextManagementStep::smartTrim($smartTrimTokensBefore, $smartTrimTokensAfter));
+                    foreach ($steps as $s) {
+                        $outcome->addStep($s);
+                    }
+                }
+                return $result;
             }
         }
 
@@ -235,10 +274,16 @@ class ConversationCondenser
                 );
 
                 // Add condense steps for each summary.
-                foreach ($summaries as $s) {
-                    $sourceChunkTokens = $s['source_message_count'] ?? 0;
-                    $summaryTokens = $s['summary_tokens'] ?? 0;
-                    $outcome->addStep(ContextManagementStep::condense($sourceChunkTokens, $summaryTokens));
+                foreach ($summaries as $chunkIndex => $s) {
+                    $summaryTokens = (int) ($s->summary_tokens ?? 0);
+                    if (in_array($chunkIndex, $cachedChunkIndices, true)) {
+                        // Cached replay: source tokens unknown, tokens_saved = 0.
+                        $outcome->addStep(ContextManagementStep::condense(0, $summaryTokens));
+                    } else {
+                        // Fresh condensation: estimate source chunk tokens from history messages.
+                        $sourceChunkTokens = $this->estimateChunkTokens($historyMessages, $chunkIndex, $chunkSize, $estimator);
+                        $outcome->addStep(ContextManagementStep::condense($sourceChunkTokens, $summaryTokens));
+                    }
                 }
             }
 
@@ -246,8 +291,26 @@ class ConversationCondenser
         }
 
         // Fall back to smart trim, then budgeter as safety net
+        $smartTrimTokensBefore = $this->sumMessageTokens($messages, $estimator);
         $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-        return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+        $smartTrimTokensAfter = $this->sumMessageTokens($afterSmartTrim, $estimator);
+        $result = $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+        if ($outcome !== null && $smartTrimTokensAfter < $smartTrimTokensBefore) {
+            $steps = $outcome->getSteps();
+            $outcome = new ContextManagementOutcome(
+                contextCapacity: $outcome->contextCapacity,
+                historyBudget: $outcome->historyBudget,
+                tokensBefore: $smartTrimTokensBefore,
+                tokensAfter: $outcome->tokensAfter,
+                model: $outcome->model,
+                providerType: $outcome->providerType,
+            );
+            $outcome->addStep(ContextManagementStep::smartTrim($smartTrimTokensBefore, $smartTrimTokensAfter));
+            foreach ($steps as $s) {
+                $outcome->addStep($s);
+            }
+        }
+        return $result;
     }
 
     /**
@@ -481,6 +544,32 @@ class ConversationCondenser
         }
 
         return (int) ceil($tokens);
+    }
+
+    /**
+     * Sum token estimates for an array of messages.
+     */
+    private function sumMessageTokens(array $messages, callable $estimator): int
+    {
+        $total = 0;
+        foreach ($messages as $m) {
+            $total += $this->estimateMessage($m, $estimator);
+        }
+        return $total;
+    }
+
+    /**
+     * Estimate the token count for a single chunk of history messages.
+     */
+    private function estimateChunkTokens(array $historyMessages, int $chunkIndex, int $chunkSize, callable $estimator): int
+    {
+        $startIdx = $chunkIndex * $chunkSize;
+        $endIdx = min(($chunkIndex + 1) * $chunkSize, count($historyMessages));
+        $total = 0;
+        for ($i = $startIdx; $i < $endIdx; $i++) {
+            $total += $this->estimateMessage($historyMessages[$i], $estimator);
+        }
+        return $total;
     }
 
     private function calculateVerbatimBoundary(array $historyMessages, int $historyBudget, callable $estimator): int
