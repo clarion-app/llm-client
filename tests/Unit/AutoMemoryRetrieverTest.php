@@ -68,9 +68,9 @@ class AutoMemoryRetrieverTest extends TestCase
         // Default config
         config([
             'llm-client.auto_memory_retrieval.enabled' => true,
-            'llm-client.auto_memory_retrieval.max_tokens' => 4096,
+            'llm-client.auto_memory_retrieval.max_tokens' => 1000,
             'llm-client.auto_memory_retrieval.relevance_threshold' => 0.3,
-            'llm-client.auto_memory_retrieval.max_results_per_store' => 10,
+            'llm-client.auto_memory_retrieval.max_results_per_store' => 5,
             'llm-client.auto_memory_retrieval.stores' => ['declarative', 'episodic', 'long-term'],
         ]);
 

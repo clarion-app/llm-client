@@ -345,17 +345,20 @@ return [
 
         // Token budget for the entire injected memory text block.
         // Prevents retrieved memories from consuming excessive context space.
-        'max_tokens' => 4096,
+        // 1000 tokens × 4 chars/token = 4000 chars hard limit.
+        'max_tokens' => 1000,
 
         // Minimum cosine similarity (0.0–1.0) for a memory to be included in results.
         // Lower values cast a wider net; higher values are more selective.
         'relevance_threshold' => 0.3,
 
         // Maximum number of entries to retrieve per memory kind (declarative, episodic, etc.).
-        'max_results_per_store' => 10,
+        // Rules are exempt from this cap.
+        'max_results_per_store' => 5,
 
         // Timeout in milliseconds for embedding generation during retrieval.
-        'embedding_timeout_ms' => 5000,
+        // This is the only real interrupt in the synchronous pipeline.
+        'embedding_timeout_ms' => 500,
 
         // Which memory stores to query during auto-retrieval.
         // Options: 'declarative', 'episodic', 'long-term'.
