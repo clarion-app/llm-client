@@ -265,6 +265,7 @@ abstract class TestCase extends BaseTestCase
                 $table->integer('context_capacity')->nullable();
                 $table->integer('tokens_before')->default(0);
                 $table->integer('tokens_after')->default(0);
+                $table->integer('request_tokens_before')->default(0);
                 $table->integer('tokens_saved')->default(0);
                 $table->string('model', 128)->nullable();
                 $table->string('provider_type', 32)->nullable();

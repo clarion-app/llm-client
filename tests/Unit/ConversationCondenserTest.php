@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Services\CondensationSummaryStore;
 use ClarionApp\LlmClient\Services\ConversationCondenser;
 use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
 use ClarionApp\LlmClient\Presets\CondensationPreset;
+use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Cache;
 use Tests\TestCase;
@@ -421,6 +422,122 @@ class ConversationCondenserTest extends TestCase
                 && $event->condensationModel === 'gpt-4o'
                 && $event->condensationProvider === 'openai';
         });
+    }
+
+    /**
+     * A failed condensation must surface as a recorded `condense` step carrying the error,
+     * not vanish behind the trim it falls back to. Otherwise operators cannot distinguish
+     * "condensation was never needed" from "condensation broke every request".
+     */
+    #[Test]
+    public function failed_condensation_records_a_condense_step_with_the_error(): void
+    {
+        $messages = $this->createMessages(8);
+        $systemMsg = ['role' => 'system', 'content' => 'System prompt.'];
+        $fullMessages = array_merge([$systemMsg], $messages);
+
+        $fakeProvider = $this->createMock(LlmProvider::class);
+        $fakeProvider->method('chat')->willThrowException(
+            new \RuntimeException('condensation upstream exploded')
+        );
+
+        $budgeter = new ContextWindowBudgeter(['enabled' => false]);
+        $condenser = $this->createCondenser($budgeter, $fakeProvider);
+
+        $estimator = fn (string $text) => strlen($text) / 4;
+        $outcome = new ContextManagementOutcome();
+
+        $condenser->condenseOrTrim(
+            $fullMessages,
+            'gpt-4o',
+            ProviderType::OpenAI,
+            $estimator,
+            $this->conversationId,
+            24,
+            null,
+            $outcome
+        );
+
+        $condenseSteps = array_values(array_filter(
+            $outcome->getSteps(),
+            fn ($s) => $s->mechanism === 'condense'
+        ));
+
+        $this->assertCount(1, $condenseSteps, 'The failed condensation attempt must be recorded');
+        $this->assertNotNull($condenseSteps[0]->error, 'The condense step must carry the failure reason');
+        $this->assertStringContainsString('condensation upstream exploded', $condenseSteps[0]->error);
+        $this->assertSame(0, $condenseSteps[0]->tokensSaved, 'A failed condensation saves nothing');
+    }
+
+    /**
+     * The budgeter runs after the condenser's own mechanisms and must not clobber the steps
+     * they already recorded — the whole point of the outcome accumulating rather than being
+     * replaced.
+     */
+    #[Test]
+    public function steps_from_earlier_mechanisms_survive_the_budgeter(): void
+    {
+        $messages = $this->createMessages(8);
+        $systemMsg = ['role' => 'system', 'content' => 'System prompt.'];
+        $fullMessages = array_merge([$systemMsg], $messages);
+
+        $fakeProvider = $this->createMock(LlmProvider::class);
+        $fakeProvider->method('chat')->willThrowException(new \RuntimeException('boom'));
+
+        // An enabled budgeter so it actually runs (and populates) after the failure.
+        $budgeter = new ContextWindowBudgeter();
+        $condenser = $this->createCondenser($budgeter, $fakeProvider);
+
+        $estimator = fn (string $text) => strlen($text) / 4;
+        $outcome = new ContextManagementOutcome();
+
+        $condenser->condenseOrTrim(
+            $fullMessages,
+            'gpt-4o',
+            ProviderType::OpenAI,
+            $estimator,
+            $this->conversationId,
+            24,
+            null,
+            $outcome
+        );
+
+        $mechanisms = array_map(fn ($s) => $s->mechanism, $outcome->getSteps());
+        $this->assertContains(
+            'condense',
+            $mechanisms,
+            'The condense failure step must survive the subsequent budgeter call'
+        );
+        $this->assertSame(
+            'condense',
+            $mechanisms[0],
+            'Steps must stay in execution order, earliest mechanism first'
+        );
+    }
+
+    /**
+     * Utilization must be measured against what entered the request, not what happened to
+     * reach the budgeter after an upstream mechanism already shrank the payload.
+     */
+    #[Test]
+    public function request_tokens_before_is_claimed_by_the_first_mechanism(): void
+    {
+        $outcome = new ContextManagementOutcome();
+
+        $outcome->recordRequestTokensBefore(5000);
+        // A later mechanism reports its own, smaller input.
+        $outcome->recordContext(
+            contextCapacity: 128000,
+            historyBudget: 90000,
+            tokensBefore: 1200,
+            tokensAfter: 900,
+            model: 'gpt-4o',
+            providerType: 'openai',
+        );
+
+        $this->assertSame(5000, $outcome->tokensBefore, 'tokensBefore is first-writer-wins');
+        $this->assertSame(900, $outcome->tokensAfter, 'tokensAfter is last-writer-wins');
+        $this->assertSame(128000, $outcome->contextCapacity);
     }
 
     private function createMessages(int $count): array

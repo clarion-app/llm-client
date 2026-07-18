@@ -20,8 +20,13 @@ return new class extends Migration
             $table->enum('mechanism', ['trim', 'smart_trim', 'condense', 'none']);
             $table->integer('history_budget')->nullable();
             $table->integer('context_capacity')->nullable();
+            // Step-level: tokens entering/leaving *this mechanism*.
             $table->integer('tokens_before')->default(0);
             $table->integer('tokens_after')->default(0);
+            // Request-level utilization numerator, duplicated onto every row so utilization is
+            // answerable from any single row. Distinct from tokens_before, which on a second
+            // step is post-upstream-mechanism and on a condense step is source-chunk tokens.
+            $table->integer('request_tokens_before')->default(0);
             $table->integer('tokens_saved')->default(0);
             $table->string('model', 128)->nullable();
             $table->string('provider_type', 32)->nullable();

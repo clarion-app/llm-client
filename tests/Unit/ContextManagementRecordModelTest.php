@@ -123,12 +123,13 @@ class ContextManagementRecordModelTest extends TestCase
         $convId = (string) Str::uuid();
         $userId = (string) Str::uuid();
 
-        // High utilization: tokens_before / context_capacity > 0.8
+        // High utilization: request_tokens_before / context_capacity > 0.8
         ContextManagementRecord::create([
             'conversation_id' => $convId,
             'user_id' => $userId,
             'mechanism' => 'none',
             'tokens_before' => 120000,
+            'request_tokens_before' => 120000,
             'context_capacity' => 128000,
         ]);
 
@@ -138,12 +139,13 @@ class ContextManagementRecordModelTest extends TestCase
             'user_id' => $userId,
             'mechanism' => 'none',
             'tokens_before' => 5000,
+            'request_tokens_before' => 5000,
             'context_capacity' => 128000,
         ]);
 
         $highUtilRecords = ContextManagementRecord::withHighUtilization(0.8)->get();
         $this->assertCount(1, $highUtilRecords);
-        $this->assertEquals(120000, $highUtilRecords->first()->tokens_before);
+        $this->assertEquals(120000, $highUtilRecords->first()->request_tokens_before);
     }
 
     #[Test]
@@ -154,6 +156,7 @@ class ContextManagementRecordModelTest extends TestCase
             'user_id' => (string) Str::uuid(),
             'mechanism' => 'none',
             'tokens_before' => 50000,
+            'request_tokens_before' => 50000,
             'context_capacity' => null,
         ]);
 

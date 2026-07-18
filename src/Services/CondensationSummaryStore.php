@@ -15,6 +15,13 @@ class CondensationSummaryStore
     private bool $failureRecorded = false;
 
     /**
+     * Message from the most recent condensation failure, so callers can surface *why*
+     * condensation fell back instead of only that it did. Null when the last attempt
+     * succeeded or none has run.
+     */
+    private ?string $lastError = null;
+
+    /**
      * @param CacheRepository $cache Cache repository for distributed locks
      * @param array<string, mixed> $config The 'condensation' config block
      */
@@ -69,12 +76,15 @@ class CondensationSummaryStore
             return $existing;
         }
 
+        $this->lastError = null;
+
         $lockKey = "condense:{$conversationId}:{$chunkIndex}";
         $lock = $this->cache->lock($lockKey, 30);
 
         try {
             $lock->block(5);
         } catch (LockTimeoutException) {
+            $this->lastError = 'Condensation lock timeout';
             return null;
         }
 
@@ -122,6 +132,7 @@ class CondensationSummaryStore
             return $summary;
         } catch (\Throwable $e) {
             $this->failureRecorded = true;
+            $this->lastError = $e->getMessage();
             $this->recordFailure($conversationId);
             return null;
         } finally {
@@ -191,5 +202,13 @@ class CondensationSummaryStore
     public function recordFailureWasCalled(): bool
     {
         return $this->failureRecorded;
+    }
+
+    /**
+     * Message from the most recent failed remember() call, or null if it succeeded.
+     */
+    public function getLastError(): ?string
+    {
+        return $this->lastError;
     }
 }

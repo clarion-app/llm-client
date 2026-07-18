@@ -20,6 +20,7 @@ class ContextManagementRecord extends Model
         'context_capacity',
         'tokens_before',
         'tokens_after',
+        'request_tokens_before',
         'tokens_saved',
         'model',
         'provider_type',
@@ -59,13 +60,17 @@ class ContextManagementRecord extends Model
     }
 
     /**
-     * Filter records with high utilization (tokens_before / context_capacity > threshold).
+     * Filter records with high utilization (request_tokens_before / context_capacity > threshold).
+     *
+     * Uses the request-level numerator, not the step-level `tokens_before`: on a second step
+     * that value is already post-upstream-mechanism, and on a `condense` step it is source-chunk
+     * tokens — neither is a utilization numerator.
      *
      * @param float $threshold Utilization threshold (0.0-1.0), default 0.8 (80%).
      */
     public function scopeWithHighUtilization($query, float $threshold = 0.8)
     {
         return $query->where('context_capacity', '>', 0)
-            ->whereRaw('tokens_before > context_capacity * ?', [$threshold]);
+            ->whereRaw('request_tokens_before > context_capacity * ?', [$threshold]);
     }
 }

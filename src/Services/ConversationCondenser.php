@@ -100,10 +100,11 @@ class ConversationCondenser
             $result = $systemMessage ? [$systemMessage, ...$historyMessages] : $historyMessages;
             if ($outcome !== null) {
                 $resolved = $this->budgeter->resolveEffectiveContext($model, $provider);
-                $outcome = ContextManagementOutcome::none(
+                $outcome->recordContext(
                     contextCapacity: $resolved,
                     historyBudget: $historyBudget,
                     tokensBefore: $totalTokens,
+                    tokensAfter: $totalTokens,
                     model: $model,
                     providerType: $provider->value,
                 );
@@ -121,10 +122,11 @@ class ConversationCondenser
             $result = $systemMessage ? [$systemMessage, ...$historyMessages] : $historyMessages;
             if ($outcome !== null) {
                 $resolved = $this->budgeter->resolveEffectiveContext($model, $provider);
-                $outcome = ContextManagementOutcome::none(
+                $outcome->recordContext(
                     contextCapacity: $resolved,
                     historyBudget: $historyBudget,
                     tokensBefore: $totalTokens,
+                    tokensAfter: $totalTokens,
                     model: $model,
                     providerType: $provider->value,
                 );
@@ -137,26 +139,15 @@ class ConversationCondenser
 
         if (empty($sealedChunks)) {
             // No sealed chunks to condense — try smart trim, then budgeter as safety net
-            $smartTrimTokensBefore = $this->sumMessageTokens($messages, $estimator);
-            $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-            $smartTrimTokensAfter = $this->sumMessageTokens($afterSmartTrim, $estimator);
-            $result = $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
-            if ($outcome !== null && $smartTrimTokensAfter < $smartTrimTokensBefore) {
-                $steps = $outcome->getSteps();
-                $outcome = new ContextManagementOutcome(
-                    contextCapacity: $outcome->contextCapacity,
-                    historyBudget: $outcome->historyBudget,
-                    tokensBefore: $smartTrimTokensBefore,
-                    tokensAfter: $outcome->tokensAfter,
-                    model: $outcome->model,
-                    providerType: $outcome->providerType,
-                );
-                $outcome->addStep(ContextManagementStep::smartTrim($smartTrimTokensBefore, $smartTrimTokensAfter));
-                foreach ($steps as $s) {
-                    $outcome->addStep($s);
-                }
-            }
-            return $result;
+            return $this->smartTrimThenBudget(
+                $messages,
+                $model,
+                $provider,
+                $estimator,
+                $conversationId,
+                $historyBudget,
+                $outcome
+            );
         }
 
         // Look up or produce summaries for each sealed chunk.
@@ -194,27 +185,25 @@ class ConversationCondenser
             if ($result !== null) {
                 $summaries[$missing['chunkIndex']] = $result;
             } else {
-                // Condensation failed — try smart trim, then budgeter as safety net
-                $smartTrimTokensBefore = $this->sumMessageTokens($messages, $estimator);
-                $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-                $smartTrimTokensAfter = $this->sumMessageTokens($afterSmartTrim, $estimator);
-                $result = $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
-                if ($outcome !== null && $smartTrimTokensAfter < $smartTrimTokensBefore) {
-                    $steps = $outcome->getSteps();
-                    $outcome = new ContextManagementOutcome(
-                        contextCapacity: $outcome->contextCapacity,
-                        historyBudget: $outcome->historyBudget,
-                        tokensBefore: $smartTrimTokensBefore,
-                        tokensAfter: $outcome->tokensAfter,
-                        model: $outcome->model,
-                        providerType: $outcome->providerType,
-                    );
-                    $outcome->addStep(ContextManagementStep::smartTrim($smartTrimTokensBefore, $smartTrimTokensAfter));
-                    foreach ($steps as $s) {
-                        $outcome->addStep($s);
-                    }
+                // Condensation failed. Record the attempt and its error before falling back,
+                // so the failure is visible in metrics rather than silently appearing as a
+                // plain trim (spec edge case: failures are captured, not skipped).
+                if ($outcome !== null) {
+                    $outcome->addStep(ContextManagementStep::condenseError(
+                        $this->store->getLastError() ?? 'Condensation failed'
+                    ));
                 }
-                return $result;
+
+                // Fall back to smart trim, then budgeter as safety net
+                return $this->smartTrimThenBudget(
+                    $messages,
+                    $model,
+                    $provider,
+                    $estimator,
+                    $conversationId,
+                    $historyBudget,
+                    $outcome
+                );
             }
         }
 
@@ -264,7 +253,7 @@ class ConversationCondenser
             // Populate outcome for successful condensation.
             if ($outcome !== null) {
                 $resolved = $this->budgeter->resolveEffectiveContext($model, $provider);
-                $outcome = new ContextManagementOutcome(
+                $outcome->recordContext(
                     contextCapacity: $resolved,
                     historyBudget: $historyBudget,
                     tokensBefore: $totalTokens,
@@ -291,26 +280,52 @@ class ConversationCondenser
         }
 
         // Fall back to smart trim, then budgeter as safety net
+        return $this->smartTrimThenBudget(
+            $messages,
+            $model,
+            $provider,
+            $estimator,
+            $conversationId,
+            $historyBudget,
+            $outcome
+        );
+    }
+
+    /**
+     * Shared fallback path: smart trim, then the budgeter as a safety net.
+     *
+     * Every branch that cannot condense funnels through here so the outcome is assembled
+     * identically. The smart_trim step is appended *before* the budgeter runs, which is what
+     * keeps the steps in execution order — the outcome accumulates rather than being replaced,
+     * so the budgeter's own trim step lands after this one without any re-ordering.
+     *
+     * @param list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}> $messages
+     * @param callable(string): int $estimator
+     * @return list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}>
+     */
+    private function smartTrimThenBudget(
+        array $messages,
+        ?string $model,
+        ProviderType $provider,
+        callable $estimator,
+        string $conversationId,
+        int $historyBudget,
+        ?ContextManagementOutcome &$outcome = null
+    ): array {
         $smartTrimTokensBefore = $this->sumMessageTokens($messages, $estimator);
+
+        // Claim the request-level numerator before smart trimming shrinks the payload, so
+        // utilization reflects what entered the request rather than what reached the budgeter.
+        $outcome?->recordRequestTokensBefore($smartTrimTokensBefore);
+
         $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
         $smartTrimTokensAfter = $this->sumMessageTokens($afterSmartTrim, $estimator);
-        $result = $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+
         if ($outcome !== null && $smartTrimTokensAfter < $smartTrimTokensBefore) {
-            $steps = $outcome->getSteps();
-            $outcome = new ContextManagementOutcome(
-                contextCapacity: $outcome->contextCapacity,
-                historyBudget: $outcome->historyBudget,
-                tokensBefore: $smartTrimTokensBefore,
-                tokensAfter: $outcome->tokensAfter,
-                model: $outcome->model,
-                providerType: $outcome->providerType,
-            );
             $outcome->addStep(ContextManagementStep::smartTrim($smartTrimTokensBefore, $smartTrimTokensAfter));
-            foreach ($steps as $s) {
-                $outcome->addStep($s);
-            }
         }
-        return $result;
+
+        return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
     }
 
     /**

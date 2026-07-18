@@ -252,6 +252,7 @@ class MetricsRecorder
                     'context_capacity' => $outcome->contextCapacity,
                     'tokens_before' => $outcome->tokensBefore,
                     'tokens_after' => $outcome->tokensAfter,
+                    'request_tokens_before' => $outcome->tokensBefore,
                     'tokens_saved' => 0,
                     'model' => $outcome->model,
                     'provider_type' => $outcome->providerType,
@@ -283,6 +284,8 @@ class MetricsRecorder
                     'context_capacity' => $outcome->contextCapacity,
                     'tokens_before' => $step->tokensBefore,
                     'tokens_after' => $step->tokensAfter,
+                    // Request-level numerator, identical on every row of this request.
+                    'request_tokens_before' => $outcome->tokensBefore,
                     'tokens_saved' => $step->tokensSaved,
                     'model' => $outcome->model,
                     'provider_type' => $outcome->providerType,

@@ -131,6 +131,7 @@ class ContextManagementSummaryScopeTest extends TestCase
             'user_id' => $userId,
             'mechanism' => 'none',
             'tokens_before' => 115200,
+            'request_tokens_before' => 115200,
             'context_capacity' => 128000,
         ]);
 
@@ -140,6 +141,7 @@ class ContextManagementSummaryScopeTest extends TestCase
             'user_id' => $userId,
             'mechanism' => 'trim',
             'tokens_before' => 70400,
+            'request_tokens_before' => 70400,
             'context_capacity' => 128000,
         ]);
 
@@ -149,13 +151,14 @@ class ContextManagementSummaryScopeTest extends TestCase
             'user_id' => $userId,
             'mechanism' => 'none',
             'tokens_before' => 12800,
+            'request_tokens_before' => 12800,
             'context_capacity' => 128000,
         ]);
 
         // Default threshold 0.8 (80%)
         $highUtil = ContextManagementRecord::withHighUtilization()->get();
         $this->assertCount(1, $highUtil);
-        $this->assertEquals(115200, $highUtil->first()->tokens_before);
+        $this->assertEquals(115200, $highUtil->first()->request_tokens_before);
 
         // Custom threshold 0.5: both records (90% and 55% both > 50%)
         $mediumUtil = ContextManagementRecord::withHighUtilization(0.5)->get();
@@ -263,6 +266,7 @@ class ContextManagementSummaryScopeTest extends TestCase
             'user_id' => $userId,
             'mechanism' => 'trim',
             'tokens_before' => 120000,
+            'request_tokens_before' => 120000,
             'context_capacity' => 128000,
         ]);
 
@@ -272,6 +276,7 @@ class ContextManagementSummaryScopeTest extends TestCase
             'user_id' => $userId,
             'mechanism' => 'none',
             'tokens_before' => 10000,
+            'request_tokens_before' => 10000,
             'context_capacity' => 128000,
         ]);
 

@@ -522,4 +522,32 @@ class ContextWindowBudgeterTest extends TestCase
         // Small model trims significantly
         $this->assertLessThan(count($messages), count($resultSmall));
     }
+
+    /**
+     * Regression: the disabled-passthrough branch still has to populate the outcome.
+     * Metrics recording always passes one, so a fault here fatals every request in any
+     * deployment that turns the budgeter off.
+     */
+    #[Test]
+    public function disabled_budgeter_populates_outcome_without_erroring(): void
+    {
+        $messages = [$this->systemMessage(0), $this->userMessage(16)];
+
+        $budgeter = new ContextWindowBudgeter(['enabled' => false]);
+        $outcome = new \ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome();
+
+        $result = $budgeter->trim(
+            $messages,
+            'test-model',
+            ProviderType::OpenAI,
+            $this->estimator(...),
+            'test-conv-id',
+            $outcome
+        );
+
+        $this->assertSame($messages, $result, 'Disabled budgeter passes messages through untouched');
+        $this->assertTrue($outcome->isNone(), 'A disabled budgeter takes no action');
+        $this->assertGreaterThan(0, $outcome->tokensBefore, 'Utilization is still measured when disabled');
+        $this->assertSame($outcome->tokensBefore, $outcome->tokensAfter);
+    }
 }

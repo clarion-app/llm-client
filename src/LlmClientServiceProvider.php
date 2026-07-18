@@ -111,6 +111,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 EmbedMemoryCommand::class,
                 \ClarionApp\LlmClient\Commands\CleanupExpiredEpisodicMemoriesCommand::class,
                 \ClarionApp\LlmClient\Commands\EndIdleConversationsCommand::class,
+                \ClarionApp\LlmClient\Commands\PurgeExpiredContextManagementMetricsCommand::class,
             ]);
         }
 
@@ -121,6 +122,12 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->callAfterResolving(Schedule::class, function (Schedule $schedule) {
             $schedule->command('llm-client:end-idle-conversations')
                 ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Purge expired context management metrics daily.
+            // User summaries are lifetime rollups and are always exempted.
+            $schedule->command('llm-client:purge-context-metrics')
+                ->daily()
                 ->withoutOverlapping();
         });
 

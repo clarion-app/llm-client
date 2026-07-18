@@ -75,10 +75,15 @@ final class ContextWindowBudgeter
         // Check master toggle — passthrough when disabled.
         if (!($this->config['enabled'] ?? true)) {
             if ($outcome !== null) {
-                $outcome = ContextManagementOutcome::none(
+                $passthroughTokens = 0;
+                foreach ($messages as $m) {
+                    $passthroughTokens += $this->estimateMessage($m, $estimator);
+                }
+                $outcome->recordContext(
                     contextCapacity: 0,
                     historyBudget: 0,
-                    tokensBefore: $this->sumTokens($messages, $estimator),
+                    tokensBefore: $passthroughTokens,
+                    tokensAfter: $passthroughTokens,
                     model: $model,
                     providerType: $provider->value,
                 );
@@ -116,10 +121,11 @@ final class ContextWindowBudgeter
         if (empty($units)) {
             $result = $systemMessage ? [$systemMessage] : [];
             if ($outcome !== null) {
-                $outcome = ContextManagementOutcome::none(
+                $outcome->recordContext(
                     contextCapacity: $context,
                     historyBudget: $historyBudget,
                     tokensBefore: $tokensBefore,
+                    tokensAfter: $tokensBefore,
                     model: $model,
                     providerType: $provider->value,
                 );
@@ -137,10 +143,11 @@ final class ContextWindowBudgeter
         if ($totalHistoryCost <= $historyBudget) {
             $result = $systemMessage ? [$systemMessage, ...$historyMessages] : $historyMessages;
             if ($outcome !== null) {
-                $outcome = ContextManagementOutcome::none(
+                $outcome->recordContext(
                     contextCapacity: $context,
                     historyBudget: $historyBudget,
                     tokensBefore: $tokensBefore,
+                    tokensAfter: $tokensBefore,
                     model: $model,
                     providerType: $provider->value,
                 );
@@ -215,7 +222,7 @@ final class ContextWindowBudgeter
 
         // Populate outcome if requested.
         if ($outcome !== null) {
-            $outcome = new ContextManagementOutcome(
+            $outcome->recordContext(
                 contextCapacity: $context,
                 historyBudget: $historyBudget,
                 tokensBefore: $tokensBefore,
