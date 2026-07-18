@@ -10,6 +10,8 @@ use ClarionApp\LlmClient\Models\ChunkSummary;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Presets\CondensationPreset;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
+use ClarionApp\LlmClient\ValueObjects\ContextManagementStep;
 use Illuminate\Support\Facades\Event;
 
 class ConversationCondenser
@@ -47,6 +49,8 @@ class ConversationCondenser
      * @param ?Server $server The conversation's server, required to resolve a condensation
      *                        provider from the registry. Without it (and without an injected
      *                        provider) condensation cannot run and the budgeter trims instead.
+     * @param ContextManagementOutcome|null $outcome Optional out-parameter populated with capacity,
+     *        budget, tokens before/after, and mechanism steps.
      * @return list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}>
      */
     public function condenseOrTrim(
@@ -56,16 +60,17 @@ class ConversationCondenser
         callable $estimator,
         string $conversationId,
         ?int $historyBudget = null,
-        ?Server $server = null
+        ?Server $server = null,
+        ?ContextManagementOutcome &$outcome = null
     ): array {
         // Fallback: condensation disabled
         if (!($this->config['enabled'] ?? true)) {
-            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId);
+            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId, $outcome);
         }
 
         // Fallback: in cooldown
         if ($this->store->inCooldown($conversationId)) {
-            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId);
+            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId, $outcome);
         }
 
         // Deep-copy to avoid mutation
@@ -93,6 +98,16 @@ class ConversationCondenser
         // If total fits within budget, no condensation needed
         if ($totalTokens <= $historyBudget) {
             $result = $systemMessage ? [$systemMessage, ...$historyMessages] : $historyMessages;
+            if ($outcome !== null) {
+                $resolved = $this->budgeter->resolveEffectiveContext($model, $provider);
+                $outcome = ContextManagementOutcome::none(
+                    contextCapacity: $resolved,
+                    historyBudget: $historyBudget,
+                    tokensBefore: $totalTokens,
+                    model: $model,
+                    providerType: $provider->value,
+                );
+            }
             return $result;
         }
 
@@ -104,6 +119,16 @@ class ConversationCondenser
         // If all messages fit in verbatim, no condensation needed
         if ($verbatimCount >= $totalMessages) {
             $result = $systemMessage ? [$systemMessage, ...$historyMessages] : $historyMessages;
+            if ($outcome !== null) {
+                $resolved = $this->budgeter->resolveEffectiveContext($model, $provider);
+                $outcome = ContextManagementOutcome::none(
+                    contextCapacity: $resolved,
+                    historyBudget: $historyBudget,
+                    tokensBefore: $totalTokens,
+                    model: $model,
+                    providerType: $provider->value,
+                );
+            }
             return $result;
         }
 
@@ -113,7 +138,7 @@ class ConversationCondenser
         if (empty($sealedChunks)) {
             // No sealed chunks to condense — try smart trim, then budgeter as safety net
             $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-            return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId);
+            return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
         }
 
         // Look up or produce summaries for each sealed chunk
@@ -150,7 +175,7 @@ class ConversationCondenser
             } else {
                 // Condensation failed — try smart trim, then budgeter as safety net
                 $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-                return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId);
+                return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
             }
         }
 
@@ -197,12 +222,32 @@ class ConversationCondenser
         // compressed. Summaries alone can exceed the budget on a pathologically
         // small context, in which case trimming is the honest answer.
         if ($assembledHistoryTokens <= $historyBudget && $assembledHistoryTokens <= $totalTokens) {
+            // Populate outcome for successful condensation.
+            if ($outcome !== null) {
+                $resolved = $this->budgeter->resolveEffectiveContext($model, $provider);
+                $outcome = new ContextManagementOutcome(
+                    contextCapacity: $resolved,
+                    historyBudget: $historyBudget,
+                    tokensBefore: $totalTokens,
+                    tokensAfter: $assembledHistoryTokens,
+                    model: $model,
+                    providerType: $provider->value,
+                );
+
+                // Add condense steps for each summary.
+                foreach ($summaries as $s) {
+                    $sourceChunkTokens = $s['source_message_count'] ?? 0;
+                    $summaryTokens = $s['summary_tokens'] ?? 0;
+                    $outcome->addStep(ContextManagementStep::condense($sourceChunkTokens, $summaryTokens));
+                }
+            }
+
             return $assembled;
         }
 
         // Fall back to smart trim, then budgeter as safety net
         $afterSmartTrim = $this->applySmartTrim($messages, $historyBudget, $estimator, $conversationId);
-        return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId);
+        return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
     }
 
     /**

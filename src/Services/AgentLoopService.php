@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServic
 use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
+use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
 use ClarionApp\LlmClient\ValueObjects\ToolFailureCategory;
 use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
 use ClarionApp\LlmClient\Services\ConversationCondenser;
@@ -95,7 +96,7 @@ class AgentLoopService
         $tools = $this->buildToolsPayload();
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
-        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
         $formatted = $this->formatMessages($conversation, $trimmed);
 
         $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system']);
@@ -180,7 +181,7 @@ class AgentLoopService
         $tools = $this->buildToolsPayload();
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
-        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
         $formatted = $this->formatMessages($conversation, $trimmed);
         $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system']);
     }
@@ -249,7 +250,7 @@ class AgentLoopService
                 $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
 
                 $rawMessages = $this->buildMessagesPayload($conversation);
-                $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+                $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId);
                 $formatted = $this->formatMessages($conversation, $trimmed);
                 // Inject preset system prompt into the base system prompt if present
                 // NOTE: the preset system prompt appended below is covered by the
@@ -549,7 +550,7 @@ class AgentLoopService
 
         for (; $iteration <= $maxIterations; $iteration++) {
             $rawMessages = $this->buildMessagesPayload($conversation);
-            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages);
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId);
             $formatted = $this->formatMessages($conversation, $trimmed);
             $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $formatted['system']);
 
@@ -703,7 +704,7 @@ class AgentLoopService
      * @param array $messages Canonical OpenAI-shaped message array from buildMessagesPayload().
      * @return array Trimmed canonical message array.
      */
-    private function applyContextWindowTrim(Conversation $conversation, array $messages): array
+    private function applyContextWindowTrim(Conversation $conversation, array $messages, ?string $attemptGroupId = null): array
     {
         $providerType = $conversation->effectiveProviderType;
         $server = $conversation->server;
@@ -713,26 +714,49 @@ class AgentLoopService
         $model = $conversation->model;
         $estimator = fn (string $text) => $provider->countTokens($text, $model);
 
+        /** @var \ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome $outcome */
+        $outcome = new ContextManagementOutcome(
+            contextCapacity: 0,
+            historyBudget: 0,
+            tokensBefore: 0,
+            tokensAfter: 0,
+            model: null,
+            providerType: null,
+        );
+
         // Try condensation first if available, then fall back to trimming
         if ($this->conversationCondenser) {
-            return $this->conversationCondenser->condenseOrTrim(
+            $result = $this->conversationCondenser->condenseOrTrim(
                 $messages,
                 $model,
                 $providerType,
                 $estimator,
                 $conversation->id,
                 null,
-                $server
+                $server,
+                $outcome
+            );
+        } else {
+            $result = $this->contextWindowBudgeter->trim(
+                $messages,
+                $model,
+                $providerType,
+                $estimator,
+                $conversation->id,
+                $outcome
             );
         }
 
-        return $this->contextWindowBudgeter->trim(
-            $messages,
-            $model,
-            $providerType,
-            $estimator,
-            $conversation->id
-        );
+        // Record context management metrics (fire-and-forget, never throws).
+        if ($this->metricsRecorder !== null) {
+            $this->recordContextManagementMetric(
+                $conversation,
+                $attemptGroupId,
+                $outcome
+            );
+        }
+
+        return $result;
     }
 
     /**
@@ -1058,6 +1082,30 @@ class AgentLoopService
             toolName: $toolName,
             success: $error === null,
             failureCategory: $error === null ? null : ToolFailureCategory::fromErrorMessage($error),
+        );
+    }
+
+    /**
+     * Record context management outcome (fire-and-forget; never throws).
+     *
+     * Skipped entirely when the `context_management_metrics.enabled` config
+     * flag is false, or when the MetricsRecorder is not injected.
+     */
+    private function recordContextManagementMetric(Conversation $conversation, ?string $attemptGroupId, ContextManagementOutcome $outcome): void
+    {
+        if ($this->metricsRecorder === null) {
+            return;
+        }
+
+        if (!(config('llm-client.context_management_metrics.enabled', true))) {
+            return;
+        }
+
+        $this->metricsRecorder->recordContextManagement(
+            conversationId: $conversation->id,
+            userId: (string) $conversation->user_id,
+            attemptGroupId: $attemptGroupId,
+            outcome: $outcome,
         );
     }
 

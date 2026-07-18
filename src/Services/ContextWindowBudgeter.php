@@ -4,6 +4,8 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Events\ContextWindowTrimmed;
+use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
+use ClarionApp\LlmClient\ValueObjects\ContextManagementStep;
 use Illuminate\Support\Facades\Event;
 
 /**
@@ -56,6 +58,8 @@ final class ContextWindowBudgeter
      * @param ProviderType $provider Effective provider type.
      * @param callable(string): int $estimator Token estimator, e.g. $provider->countTokens(...).
      * @param string $conversationId For the event payload.
+     * @param ContextManagementOutcome|null $outcome Optional out-parameter populated with capacity, budget,
+     *        tokens before/after, and a trim step when trimming occurs.
      *
      * @return list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}>
      *         Trimmed array (system pinned; newest kept, possibly truncated).
@@ -65,10 +69,20 @@ final class ContextWindowBudgeter
         ?string $model,
         ProviderType $provider,
         callable $estimator,
-        string $conversationId
+        string $conversationId,
+        ?ContextManagementOutcome &$outcome = null
     ): array {
         // Check master toggle — passthrough when disabled.
         if (!($this->config['enabled'] ?? true)) {
+            if ($outcome !== null) {
+                $outcome = ContextManagementOutcome::none(
+                    contextCapacity: 0,
+                    historyBudget: 0,
+                    tokensBefore: $this->sumTokens($messages, $estimator),
+                    model: $model,
+                    providerType: $provider->value,
+                );
+            }
             return $messages;
         }
 
@@ -101,6 +115,15 @@ final class ContextWindowBudgeter
         // If no history units, return as-is.
         if (empty($units)) {
             $result = $systemMessage ? [$systemMessage] : [];
+            if ($outcome !== null) {
+                $outcome = ContextManagementOutcome::none(
+                    contextCapacity: $context,
+                    historyBudget: $historyBudget,
+                    tokensBefore: $tokensBefore,
+                    model: $model,
+                    providerType: $provider->value,
+                );
+            }
             return $result;
         }
 
@@ -113,6 +136,15 @@ final class ContextWindowBudgeter
         // If total fits, passthrough — no trimming needed.
         if ($totalHistoryCost <= $historyBudget) {
             $result = $systemMessage ? [$systemMessage, ...$historyMessages] : $historyMessages;
+            if ($outcome !== null) {
+                $outcome = ContextManagementOutcome::none(
+                    contextCapacity: $context,
+                    historyBudget: $historyBudget,
+                    tokensBefore: $tokensBefore,
+                    model: $model,
+                    providerType: $provider->value,
+                );
+            }
             return $result;
         }
 
@@ -179,6 +211,21 @@ final class ContextWindowBudgeter
         $tokensAfter = 0;
         foreach ($result as $m) {
             $tokensAfter += $this->estimateMessage($m, $estimator);
+        }
+
+        // Populate outcome if requested.
+        if ($outcome !== null) {
+            $outcome = new ContextManagementOutcome(
+                contextCapacity: $context,
+                historyBudget: $historyBudget,
+                tokensBefore: $tokensBefore,
+                tokensAfter: $tokensAfter,
+                model: $model,
+                providerType: $provider->value,
+            );
+            if ($unitsDropped > 0 || $truncated) {
+                $outcome->addStep(ContextManagementStep::trim($tokensBefore, $tokensAfter));
+            }
         }
 
         // Dispatch event when trimming or truncation occurred.
@@ -258,6 +305,20 @@ final class ContextWindowBudgeter
         $effectiveContext = (int) floor($resolved['context'] * (1.0 - $headroomRatio));
 
         return $effectiveContext - $resolved['responseReserve'] - $injectedSectionReserve - $systemTokens;
+    }
+
+    /**
+     * Resolve the full model context window (before any headroom or reserves).
+     *
+     * Exposed so the condenser can populate `context_capacity` in outcomes.
+     *
+     * @return int Full context window for the model/provider.
+     */
+    public function resolveEffectiveContext(?string $model, ProviderType $provider): int
+    {
+        $resolved = $this->resolveBudget($model, $provider);
+
+        return $resolved['context'];
     }
 
     /**
