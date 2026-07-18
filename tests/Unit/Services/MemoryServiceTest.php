@@ -288,4 +288,76 @@ class MemoryServiceTest extends TestCase
         $this->assertNotNull($read);
         $this->assertEquals($entry->id, $read->id);
     }
+
+    /* ------------------------------------------------------------------ */
+    /*  T009c: Embedding reuse tests                                       */
+    /* ------------------------------------------------------------------ */
+
+    public function test_semantic_search_skips_generate_when_embedding_supplied(): void
+    {
+        $embeddingMock = \Mockery::mock(\ClarionApp\LlmClient\Services\EmbeddingService::class);
+        $embeddingMock->shouldReceive('getProvider')->andReturn(new class implements \ClarionApp\LlmClient\Contracts\LlmProvider {
+            public function chat(array $messages, array $tools = [], array $options = []): array { return []; }
+            public function stream(array $messages, array $tools = [], array $options = []): \Generator { yield []; }
+            public function embed(array $inputs, array $options = []): array { return ['embeddings' => []]; }
+            public function countTokens(string $text, ?string $model = null): int { return 0; }
+            public function listModels(): array { return []; }
+        });
+        // generate() should NOT be called when embedding is pre-supplied
+        $embeddingMock->shouldNotReceive('generate');
+
+        $service = new \ClarionApp\LlmClient\Services\MemoryService(
+            null,
+            $embeddingMock
+        );
+
+        $agentId = (string) \Illuminate\Support\Str::uuid();
+
+        // With no entries in DB, fallback search returns empty
+        // The key assertion is that generate() was not called
+        $results = $service->search(
+            MemoryScope::LONG_TERM,
+            $agentId,
+            'test query',
+            'semantic',
+            20,
+            null,
+            [0.1, 0.2, 0.3]
+        );
+
+        $this->assertIsArray($results);
+    }
+
+    public function test_semantic_search_calls_generate_when_embedding_omitted(): void
+    {
+        $embeddingMock = \Mockery::mock(\ClarionApp\LlmClient\Services\EmbeddingService::class);
+        $embeddingMock->shouldReceive('getProvider')->andReturn(new class implements \ClarionApp\LlmClient\Contracts\LlmProvider {
+            public function chat(array $messages, array $tools = [], array $options = []): array { return []; }
+            public function stream(array $messages, array $tools = [], array $options = []): \Generator { yield []; }
+            public function embed(array $inputs, array $options = []): array { return ['embeddings' => []]; }
+            public function countTokens(string $text, ?string $model = null): int { return 0; }
+            public function listModels(): array { return []; }
+        });
+        $embeddingMock->shouldReceive('generate')
+            ->once()
+            ->with('test query')
+            ->andThrow(new \RuntimeException('No provider available'));
+
+        $service = new \ClarionApp\LlmClient\Services\MemoryService(
+            null,
+            $embeddingMock
+        );
+
+        $agentId = (string) \Illuminate\Support\Str::uuid();
+
+        $this->expectException(\ClarionApp\LlmClient\Exceptions\SemanticSearchException::class);
+
+        $service->search(
+            MemoryScope::LONG_TERM,
+            $agentId,
+            'test query',
+            'semantic',
+            20
+        );
+    }
 }

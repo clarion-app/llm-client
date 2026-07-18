@@ -107,7 +107,8 @@ class MemoryService implements MemoryServiceContract
         string $query,
         string $mode = 'key_prefix',
         int $limit = 20,
-        ?float $min_score = null
+        ?float $min_score = null,
+        ?array $queryEmbedding = null
     ): array {
         // Validate mode
         $allowedModes = ['key_prefix', 'content', 'semantic'];
@@ -131,7 +132,7 @@ class MemoryService implements MemoryServiceContract
 
         // Handle semantic search mode
         if ($mode === 'semantic') {
-            return $this->searchSemantic($scope, $agent_id, $query, $limit, $min_score);
+            return $this->searchSemantic($scope, $agent_id, $query, $limit, $min_score, $queryEmbedding);
         }
 
         // Keyword-based search modes
@@ -158,10 +159,11 @@ class MemoryService implements MemoryServiceContract
      * @param string $query Natural language search query
      * @param int $limit Maximum results to return
      * @param float|null $min_score Minimum similarity threshold (0.0-1.0)
+     * @param float[]|null $queryEmbedding Pre-computed embedding vector (optional — skips internal generate() call when supplied)
      * @return MemoryEntry[] Results with similarity_score attribute attached
      * @throws SemanticSearchException If embedding provider is unavailable or generation fails
      */
-    private function searchSemantic(MemoryScope $scope, string $agent_id, string $query, int $limit, ?float $min_score = null): array
+    private function searchSemantic(MemoryScope $scope, string $agent_id, string $query, int $limit, ?float $min_score = null, ?array $queryEmbedding = null): array
     {
         // Check embedding service and provider availability
         if ($this->embeddingService === null || $this->embeddingService->getProvider() === null) {
@@ -171,15 +173,17 @@ class MemoryService implements MemoryServiceContract
             );
         }
 
-        // Generate embedding for the search query
-        try {
-            $queryEmbedding = $this->embeddingService->generate($query);
-        } catch (RuntimeException $e) {
-            throw new SemanticSearchException(
-                'embedding_generation_failed',
-                $e->getMessage(),
-                previous: $e
-            );
+        // Use pre-computed embedding if supplied, otherwise generate one
+        if ($queryEmbedding === null) {
+            try {
+                $queryEmbedding = $this->embeddingService->generate($query);
+            } catch (RuntimeException $e) {
+                throw new SemanticSearchException(
+                    'embedding_generation_failed',
+                    $e->getMessage(),
+                    previous: $e
+                );
+            }
         }
 
         // Use native vector search for MySQL/MariaDB, fallback to application-side for others

@@ -66,22 +66,27 @@ class EpisodicMemorySearchService
     /**
      * Semantic search using cosine similarity on embedding vectors.
      *
+     * @param string $userId User to search memories for
+     * @param string $query Search query string
+     * @param int $limit Maximum results to return
+     * @param float[]|null $queryEmbedding Pre-computed embedding vector (optional — skips internal generate() call when supplied)
      * @throws \InvalidArgumentException If embeddings are unavailable
      */
-    public function semanticSearch(string $userId, string $query, int $limit = 20): array
+    public function semanticSearch(string $userId, string $query, int $limit = 20, ?array $queryEmbedding = null): array
     {
         if (!$this->embeddingService->isEnabled()) {
             throw new \InvalidArgumentException('Semantic search unavailable. Embedding generation is disabled.');
         }
 
-        // Generate embedding for the query
-        $queryEmbedding = null;
-        try {
-            $queryEmbedding = $this->embeddingService->generate($query);
-        } catch (\RuntimeException $e) {
-            throw new \InvalidArgumentException(
-                'Semantic search unavailable: '.$e->getMessage()
-            );
+        // Use pre-computed embedding if supplied, otherwise generate one
+        if ($queryEmbedding === null) {
+            try {
+                $queryEmbedding = $this->embeddingService->generate($query);
+            } catch (\RuntimeException $e) {
+                throw new \InvalidArgumentException(
+                    'Semantic search unavailable: '.$e->getMessage()
+                );
+            }
         }
 
         // Check if user has any entries with embeddings
@@ -148,13 +153,18 @@ class EpisodicMemorySearchService
     /**
      * Hybrid search combining keyword and semantic results with recency tiebreaking.
      * Auto-degrades to keyword-only if embeddings are unavailable.
+     *
+     * @param string $userId User to search memories for
+     * @param string $query Search query string
+     * @param int $limit Maximum results to return
+     * @param float[]|null $queryEmbedding Pre-computed embedding vector (optional — skips internal generate() call when supplied)
      */
-    public function hybridSearch(string $userId, string $query, int $limit = 20): array
+    public function hybridSearch(string $userId, string $query, int $limit = 20, ?array $queryEmbedding = null): array
     {
         // Try semantic search first
         $semanticResults = [];
         try {
-            $semanticResults = $this->semanticSearch($userId, $query, $limit);
+            $semanticResults = $this->semanticSearch($userId, $query, $limit, $queryEmbedding);
         } catch (\InvalidArgumentException) {
             // Embeddings unavailable, fall back to keyword-only
             return $this->keywordSearch($userId, $query, $limit);

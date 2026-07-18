@@ -335,5 +335,31 @@ return [
         // User summaries are lifetime rollups and are never purged.
         'retention_days' => 90,
     ],
+
+    // Auto Memory Retrieval — automatically retrieves relevant memories from multiple
+    // memory stores (declarative, episodic, long-term) based on the current user input
+    // and injects them into the agent context before each LLM call.
+    'auto_memory_retrieval' => [
+        // Master toggle. When false, auto-retrieval is skipped entirely.
+        'enabled' => true,
+
+        // Token budget for the entire injected memory text block.
+        // Prevents retrieved memories from consuming excessive context space.
+        'max_tokens' => 4096,
+
+        // Minimum cosine similarity (0.0–1.0) for a memory to be included in results.
+        // Lower values cast a wider net; higher values are more selective.
+        'relevance_threshold' => 0.3,
+
+        // Maximum number of entries to retrieve per memory kind (declarative, episodic, etc.).
+        'max_results_per_store' => 10,
+
+        // Timeout in milliseconds for embedding generation during retrieval.
+        'embedding_timeout_ms' => 5000,
+
+        // Which memory stores to query during auto-retrieval.
+        // Options: 'declarative', 'episodic', 'long-term'.
+        'stores' => ['declarative', 'episodic', 'long-term'],
+    ],
 ];
 

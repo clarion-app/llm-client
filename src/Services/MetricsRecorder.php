@@ -376,4 +376,51 @@ class MetricsRecorder
                 'updated_at' => now(),
             ]);
     }
+
+    /**
+     * Record memory retrieval metrics for a single retrieval operation.
+     *
+     * Log-only recording — writes structured info to the Laravel log.
+     * Follows the same try-catch/log-on-fail, never-throws pattern as other
+     * record* methods.
+     *
+     * @param string  $userId           User UUID (attribution)
+     * @param string  $agentId          Agent/character ID
+     * @param string  $conversationId   Conversation UUID
+     * @param float   $latencyMs        Retrieval latency in milliseconds
+     * @param int     $tokensAdded      Total tokens added to context
+     * @param int     $hitCount         Number of memory hits returned
+     * @param array   $hitsByStore      Count of hits per store (e.g., ['declarative' => 3, 'episodic' => 1])
+     * @param array   $degradationEvents List of degradation event strings
+     */
+    public function recordMemoryRetrieval(
+        string $userId,
+        string $agentId,
+        string $conversationId,
+        float $latencyMs,
+        int $tokensAdded,
+        int $hitCount,
+        array $hitsByStore,
+        array $degradationEvents,
+    ): void {
+        try {
+            Log::info('Memory retrieval recorded', [
+                'user_id' => $userId,
+                'agent_id' => $agentId,
+                'conversation_id' => $conversationId,
+                'latency_ms' => round($latencyMs, 2),
+                'tokens_added' => $tokensAdded,
+                'hit_count' => $hitCount,
+                'hits_by_store' => $hitsByStore,
+                'degradation_events' => $degradationEvents,
+                'degradation_count' => count($degradationEvents),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('MetricsRecorder: failed to record memory retrieval', [
+                'conversation_id' => $conversationId,
+                'user_id' => $userId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
 }

@@ -48,6 +48,7 @@ interface MemoryService
      * @param string $mode Search mode: 'key_prefix', 'content', or 'semantic'
      * @param int $limit Maximum results (bounded by search_max_limit)
      * @param float|null $min_score Minimum similarity_score threshold for semantic mode (0.0-1.0, null = no filtering)
+     * @param float[]|null $queryEmbedding Pre-computed embedding vector (optional — skips internal generate() call when supplied and mode is 'semantic')
      * @return MemoryEntry[] Results may include a 'similarity_score' attribute (0.0-1.0) when mode is 'semantic'
      * @throws InvalidArgumentException If $mode is not a valid search mode
      * @throws SemanticSearchException If mode is 'semantic' but scope is not LONG_TERM, or embedding provider is unavailable
@@ -58,7 +59,8 @@ interface MemoryService
         string $query,
         string $mode = 'key_prefix',
         int $limit = 20,
-        ?float $min_score = null
+        ?float $min_score = null,
+        ?array $queryEmbedding = null
     ): array;
 
     /**

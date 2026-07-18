@@ -202,7 +202,10 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 null,
                 null,
                 $app->make(ContextWindowBudgeter::class),
-                $app->make(ConversationCondenser::class)
+                $app->make(ConversationCondenser::class),
+                null,
+                null,
+                $app->make(\ClarionApp\LlmClient\Services\AutoMemoryRetriever::class)
             );
         });
 
@@ -265,6 +268,18 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         // Register feedback signal accumulator
         $this->app->singleton(FeedbackSignalAccumulatorContract::class, function () {
             return new FeedbackSignalAccumulatorImpl();
+        });
+
+        // Register auto memory retriever
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AutoMemoryRetriever::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\AutoMemoryRetriever(
+                $app->make(DeclarativeMemoryServiceContract::class),
+                $app->make(EpisodicMemorySearchService::class),
+                $app->make(MemoryServiceContract::class),
+                $app->make(EmbeddingService::class),
+                $app->make(\ClarionApp\LlmClient\Services\PreferenceInjector::class),
+                $app->make(\ClarionApp\LlmClient\Services\MetricsRecorder::class)
+            );
         });
     }
 

@@ -228,4 +228,83 @@ class EpisodicMemorySearchServiceTest extends TestCase
         $this->assertCount(1, $results);
         $this->assertEquals('conv-1', $results[0]['conversation_id']);
     }
+
+    /* ------------------------------------------------------------------ */
+    /*  T009c: Embedding reuse tests                                       */
+    /* ------------------------------------------------------------------ */
+
+    #[Test]
+    public function semanticSearch_skips_generate_when_embedding_supplied()
+    {
+        // Enable embeddings for this test
+        $embeddingMock = \Mockery::mock(EmbeddingService::class);
+        $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
+        // generate() should NOT be called when embedding is pre-supplied
+        $embeddingMock->shouldNotReceive('generate');
+
+        $service = new EpisodicMemorySearchService($embeddingMock);
+
+        // We expect an InvalidArgumentException because there are no entries with embeddings
+        // but the key assertion is that generate() was never called
+        $this->expectException(\InvalidArgumentException::class);
+
+        $service->semanticSearch($this->user->id, 'test query', 20, [0.1, 0.2, 0.3]);
+    }
+
+    #[Test]
+    public function hybridSearch_skips_generate_when_embedding_supplied()
+    {
+        // Enable embeddings for this test
+        $embeddingMock = \Mockery::mock(EmbeddingService::class);
+        $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
+        // generate() should NOT be called when embedding is pre-supplied
+        $embeddingMock->shouldNotReceive('generate');
+
+        $service = new EpisodicMemorySearchService($embeddingMock);
+
+        // hybridSearch catches InvalidArgumentException from semanticSearch (no embeddings in DB)
+        // and falls back to keywordSearch — no exception propagates.
+        // The key assertion is that generate() was never called.
+        $results = $service->hybridSearch($this->user->id, 'test query', 20, [0.1, 0.2, 0.3]);
+        // Falls back to keyword search which returns empty
+        $this->assertIsArray($results);
+    }
+
+    #[Test]
+    public function semanticSearch_calls_generate_when_embedding_omitted()
+    {
+        $embeddingMock = \Mockery::mock(EmbeddingService::class);
+        $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
+        $embeddingMock->shouldReceive('generate')
+            ->once()
+            ->with('test query')
+            ->andThrow(new \RuntimeException('No provider'));
+
+        $service = new EpisodicMemorySearchService($embeddingMock);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Semantic search unavailable');
+
+        $service->semanticSearch($this->user->id, 'test query', 20);
+    }
+
+    #[Test]
+    public function hybridSearch_calls_generate_when_embedding_omitted()
+    {
+        $embeddingMock = \Mockery::mock(EmbeddingService::class);
+        $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
+        $embeddingMock->shouldReceive('generate')
+            ->once()
+            ->with('test query')
+            ->andThrow(new \RuntimeException('No provider'));
+
+        $service = new EpisodicMemorySearchService($embeddingMock);
+
+        // hybridSearch should degrade to keyword when semantic fails
+        // and semantic fails because generate() throws
+        $results = $service->hybridSearch($this->user->id, 'test query', 20);
+
+        // Falls back to keyword search which returns empty
+        $this->assertIsArray($results);
+    }
 }
