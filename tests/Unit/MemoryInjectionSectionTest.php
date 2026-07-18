@@ -79,6 +79,34 @@ class MemoryInjectionSectionTest extends TestCase
     }
 
     #[Test]
+    public function fromRetrievalResult_rendersEpisodicDateAndTopics()
+    {
+        $result = new MemoryRetrievalResult();
+        $result->addHit(MemoryHit::fromEpisodic('e-1', 'Debugged the rollout', 0.6, [
+            'date' => 'Jan 15, 2025',
+            'topics' => ['deployment', 'kubernetes'],
+        ]));
+
+        $section = MemoryInjectionSection::fromRetrievalResult($result);
+
+        $this->assertStringContainsString(
+            "- **Jan 15, 2025** (topics: deployment, kubernetes)\n  - Debugged the rollout",
+            $section->rawText
+        );
+    }
+
+    #[Test]
+    public function fromRetrievalResult_episodicFallsBackToPlainBullet_withoutDateOrTopics()
+    {
+        $result = new MemoryRetrievalResult();
+        $result->addHit(MemoryHit::fromEpisodic('e-1', 'Discussed deployment', 0.6));
+
+        $section = MemoryInjectionSection::fromRetrievalResult($result);
+
+        $this->assertStringContainsString('- [episodic] Discussed deployment', $section->rawText);
+    }
+
+    #[Test]
     public function fromRetrievalResult_groups_by_kind_subsections()
     {
         $result = new MemoryRetrievalResult();

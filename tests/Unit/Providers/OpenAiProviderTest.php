@@ -471,6 +471,41 @@ class OpenAiProviderTest extends TestCase
         $this->assertArrayNotHasKey('response_format', $secondBody);
     }
 
+    // ─── Embed ───
+
+    #[Test]
+    public function embed_threads_timeoutMs_into_request_options(): void
+    {
+        $body = json_encode(['data' => [['embedding' => [0.1, 0.2]]]]);
+        $mock = new MockHandler([new Response(200, [], $body)]);
+        $provider = $this->createProvider($this->createServer(), $mock);
+
+        $result = $provider->embed(['Hello world'], ['timeout_ms' => 500]);
+
+        $this->assertEquals([0.1, 0.2], $result['embeddings'][0]);
+
+        // Converted to Guzzle's seconds. Connect is bounded too, otherwise an
+        // unreachable host hangs regardless of the total budget.
+        $options = $mock->getLastOptions();
+        $this->assertEquals(0.5, $options['timeout']);
+        $this->assertEquals(0.5, $options['connect_timeout']);
+    }
+
+    #[Test]
+    public function embed_omitsTimeout_whenNotSupplied(): void
+    {
+        $body = json_encode(['data' => [['embedding' => [0.1, 0.2]]]]);
+        $mock = new MockHandler([new Response(200, [], $body)]);
+        $provider = $this->createProvider($this->createServer(), $mock);
+
+        $provider->embed(['Hello world']);
+
+        // Background callers keep the client default rather than inheriting a
+        // hot-path budget.
+        $options = $mock->getLastOptions();
+        $this->assertArrayNotHasKey('connect_timeout', $options);
+    }
+
     // ─── Tear Down ───
 
     protected function tearDown(): void

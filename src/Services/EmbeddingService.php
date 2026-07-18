@@ -76,10 +76,15 @@ class EmbeddingService
     /**
      * Generate an embedding for the given text.
      *
+     * @param int|null $timeoutMs Bound the provider request to this many
+     *                            milliseconds. Callers on a latency budget (the
+     *                            synchronous retrieval hot path) must pass this;
+     *                            background callers should omit it and take the
+     *                            client default, which is far more generous.
      * @return float[] Embedding vector
      * @throws RuntimeException If embedding generation fails
      */
-    public function generate(string $content): array
+    public function generate(string $content, ?int $timeoutMs = null): array
     {
         $provider = $this->getProvider();
         if ($provider === null) {
@@ -95,6 +100,9 @@ class EmbeddingService
         $options = [];
         if ($model !== null && $model !== '') {
             $options['model'] = $model;
+        }
+        if ($timeoutMs !== null && $timeoutMs > 0) {
+            $options['timeout_ms'] = $timeoutMs;
         }
 
         $result = $provider->embed([$input], $options);

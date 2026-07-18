@@ -36,6 +36,32 @@ class LlamaCppProvider implements LlmProvider
     /**
      * Extract the base URL from the server_url.
      */
+    /**
+     * Translate an optional `timeout_ms` option into Guzzle request options.
+     *
+     * Both the connect and total budgets are set: the client default is 240s, so
+     * without this a caller on a sub-second budget can block for minutes, and an
+     * unreachable host would otherwise hang on connect indefinitely.
+     *
+     * @param array<string, mixed> $options
+     * @return array<string, float>
+     */
+    private function buildTimeoutOptions(array $options): array
+    {
+        $timeoutMs = $options['timeout_ms'] ?? null;
+
+        if (!is_numeric($timeoutMs) || $timeoutMs <= 0) {
+            return [];
+        }
+
+        $seconds = $timeoutMs / 1000;
+
+        return [
+            'timeout' => $seconds,
+            'connect_timeout' => $seconds,
+        ];
+    }
+
     private function getBaseUrl(): string
     {
         $url = $this->server->server_url;
@@ -262,11 +288,16 @@ class LlamaCppProvider implements LlmProvider
             $body['model'] = $options['model'];
         }
 
+        $requestOptions = [
+            'headers' => $this->buildHeaders('application/json'),
+            'json' => $body,
+        ];
+
         try {
-            $response = $this->client->post($embeddingsUrl, [
-                'headers' => $this->buildHeaders('application/json'),
-                'json' => $body,
-            ]);
+            $response = $this->client->post(
+                $embeddingsUrl,
+                $requestOptions + $this->buildTimeoutOptions($options)
+            );
 
             $result = json_decode($response->getBody()->getContents(), true);
 

@@ -147,8 +147,14 @@ interface LlmProvider
      * Generate embeddings for input text(s).
      *
      * @param non-empty-list<string> $inputs Array of input text strings to embed.
-     * @param array<string, mixed> $options Optional provider-specific configuration
-     *                                     (e.g., model selection).
+     * @param array<string, mixed> $options Optional provider-specific configuration:
+     *                                     - `model` (string): model selection.
+     *                                     - `timeout_ms` (int): bound this request's
+     *                                       connect and total time instead of using the
+     *                                       client default. Callers on a latency budget
+     *                                       must pass this — it is the only real
+     *                                       interrupt available to them, since elapsed
+     *                                       time cannot abort a blocking HTTP call.
      *
      * @return array{
      *     embeddings: list<float[]>,

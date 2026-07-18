@@ -35,6 +35,32 @@ class OpenAiProvider implements LlmProvider
      * The server_url may be a full endpoint URL (e.g., /v1/chat/completions)
      * or a base URL. This method extracts the base for constructing other endpoints.
      */
+    /**
+     * Translate an optional `timeout_ms` option into Guzzle request options.
+     *
+     * Both the connect and total budgets are set: the client default is 240s, so
+     * without this a caller on a sub-second budget can block for minutes, and an
+     * unreachable host would otherwise hang on connect indefinitely.
+     *
+     * @param array<string, mixed> $options
+     * @return array<string, float>
+     */
+    private function buildTimeoutOptions(array $options): array
+    {
+        $timeoutMs = $options['timeout_ms'] ?? null;
+
+        if (!is_numeric($timeoutMs) || $timeoutMs <= 0) {
+            return [];
+        }
+
+        $seconds = $timeoutMs / 1000;
+
+        return [
+            'timeout' => $seconds,
+            'connect_timeout' => $seconds,
+        ];
+    }
+
     private function getBaseUrl(): string
     {
         $url = $this->server->server_url;
@@ -267,15 +293,20 @@ class OpenAiProvider implements LlmProvider
             $body['model'] = $options['model'];
         }
 
+        $requestOptions = [
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+                'Authorization' => 'Bearer ' . $this->server->token,
+            ],
+            'json' => $body,
+        ];
+
         try {
-            $response = $this->client->post($embeddingsUrl, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
-                'json' => $body,
-            ]);
+            $response = $this->client->post(
+                $embeddingsUrl,
+                $requestOptions + $this->buildTimeoutOptions($options)
+            );
 
             $result = json_decode($response->getBody()->getContents(), true);
 

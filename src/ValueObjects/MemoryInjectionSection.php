@@ -80,6 +80,11 @@ final class MemoryInjectionSection
             $lines[] = '';
 
             foreach ($byKind[$kind] as $hit) {
+                if ($kind === 'episodic') {
+                    $lines[] = self::formatEpisodicBullet($hit);
+                    continue;
+                }
+
                 $lines[] = "- [{$hit->source}] {$hit->content}";
             }
 
@@ -94,6 +99,29 @@ final class MemoryInjectionSection
             count($result->hits),
             $truncated,
         );
+    }
+
+    /**
+     * Episodic hits carry provenance the other kinds don't. When a date or
+     * topic list is present it is rendered above the summary so the model can
+     * tell when the recalled conversation happened and what it covered.
+     */
+    private static function formatEpisodicBullet(MemoryHit $hit): string
+    {
+        $date = $hit->metadata['date'] ?? null;
+        $topics = $hit->metadata['topics'] ?? [];
+        $topics = is_array($topics) ? array_filter(array_map('strval', $topics)) : [];
+
+        if ($date === null && $topics === []) {
+            return "- [{$hit->source}] {$hit->content}";
+        }
+
+        $heading = '- ' . ($date !== null ? "**{$date}**" : '**Past conversation**');
+        if ($topics !== []) {
+            $heading .= ' (topics: ' . implode(', ', $topics) . ')';
+        }
+
+        return $heading . "\n  - {$hit->content}";
     }
 
     /**

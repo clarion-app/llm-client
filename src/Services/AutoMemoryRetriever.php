@@ -73,17 +73,22 @@ class AutoMemoryRetriever
         $result = new MemoryRetrievalResult();
 
         // Get config values
-        $maxTokens = (int) config('llm-client.auto_memory_retrieval.max_tokens', 4096);
+        $maxTokens = (int) config('llm-client.auto_memory_retrieval.max_tokens', 1000);
         $maxChars = $maxTokens * 4;
         $relevanceThreshold = (float) config('llm-client.auto_memory_retrieval.relevance_threshold', 0.3);
-        $maxResultsPerStore = (int) config('llm-client.auto_memory_retrieval.max_results_per_store', 10);
+        $maxResultsPerStore = (int) config('llm-client.auto_memory_retrieval.max_results_per_store', 5);
         $stores = config('llm-client.auto_memory_retrieval.stores', ['declarative', 'episodic', 'long-term']);
+        $timeoutMs = (int) config('llm-client.auto_memory_retrieval.timeout_ms', 2000);
+        $embeddingTimeoutMs = (int) config('llm-client.auto_memory_retrieval.embedding_timeout_ms', 500);
 
-        // T011: Generate a single query embedding (reused across all stores)
+        // Generate a single query embedding (reused across all stores).
+        // The timeout is passed down to the provider's HTTP client: it is the
+        // pipeline's only true interrupt, since the pre-stage gates below can
+        // measure elapsed time but cannot abort a blocking call already running.
         $queryEmbedding = null;
         try {
             if ($this->embeddingService->isEnabled()) {
-                $queryEmbedding = $this->embeddingService->generate($query);
+                $queryEmbedding = $this->embeddingService->generate($query, $embeddingTimeoutMs);
             }
         } catch (\RuntimeException $e) {
             // Embedding generation failed — track as degradation event
@@ -95,10 +100,20 @@ class AutoMemoryRetriever
             ]);
         }
 
-        // T012: Declarative retrieval
+        // T012: Declarative retrieval.
+        // Not gated on the pipeline budget: this is the only store carrying
+        // binding rules, which are injected unconditionally (FR-011). Its
+        // scoring pass is gated internally instead.
         if (in_array('declarative', $stores, true)) {
             try {
-                $this->retrieveDeclarative($result, $userId, $queryEmbedding, $relevanceThreshold, $maxResultsPerStore);
+                $this->retrieveDeclarative(
+                    $result,
+                    $userId,
+                    $queryEmbedding,
+                    $relevanceThreshold,
+                    $maxResultsPerStore,
+                    $this->hasBudgetLeft($startTime, $timeoutMs),
+                );
             } catch (\RuntimeException | \InvalidArgumentException $e) {
                 $result->addDegradationEvent(sprintf('declarative_retrieval_failed: %s', $e->getMessage()));
                 Log::warning('AutoMemoryRetriever: declarative retrieval failed', [
@@ -110,8 +125,10 @@ class AutoMemoryRetriever
 
         // T013: Episodic retrieval
         if (in_array('episodic', $stores, true)) {
-            // Pre-stage budget gate: skip if budget already spent
-            if ($this->getUsedChars($result) < $maxChars || count($result->hits) === 0) {
+            // Pre-stage budget gate: skip if the pipeline budget is already spent
+            if (!$this->hasBudgetLeft($startTime, $timeoutMs)) {
+                $result->addDegradationEvent('episodic_skipped_budget_exhausted');
+            } else {
                 try {
                     $this->retrieveEpisodic($result, $userId, $query, $queryEmbedding, $relevanceThreshold, $maxResultsPerStore);
                 } catch (\RuntimeException | \InvalidArgumentException $e) {
@@ -126,8 +143,10 @@ class AutoMemoryRetriever
 
         // T014: Long-term retrieval
         if (in_array('long-term', $stores, true)) {
-            // Pre-stage budget gate: skip if budget already spent
-            if ($this->getUsedChars($result) < $maxChars || count($result->hits) === 0) {
+            // Pre-stage budget gate: skip if the pipeline budget is already spent
+            if (!$this->hasBudgetLeft($startTime, $timeoutMs)) {
+                $result->addDegradationEvent('long_term_skipped_budget_exhausted');
+            } else {
                 try {
                     $this->retrieveLongTerm($result, $agentId, $query, $queryEmbedding, $relevanceThreshold, $maxResultsPerStore);
                 } catch (SemanticSearchException $e) {
@@ -235,6 +254,7 @@ class AutoMemoryRetriever
         ?array $queryEmbedding,
         float $relevanceThreshold,
         int $maxResultsPerStore,
+        bool $budgetLeft = true,
     ): void {
         // Get all declarative memories for this user
         $entries = DeclarativeMemory::withoutGlobalScope('user')
@@ -248,6 +268,7 @@ class AutoMemoryRetriever
         $factsAndPrefs = $entries->whereIn('type', ['fact', 'preference']);
 
         // Rules: unconditional inclusion (no scoring, no threshold, no cap)
+        $ruleContents = [];
         foreach ($rules as $entry) {
             $hit = MemoryHit::fromRule(
                 $entry->id,
@@ -256,6 +277,14 @@ class AutoMemoryRetriever
                 ['updated_at' => $entry->updated_at?->toIso8601String()],
             );
             $result->addHit($hit);
+            $ruleContents[mb_strtolower(trim($entry->content))] = true;
+        }
+
+        // Scoring the fact/preference tier is the gated part of this store —
+        // rules above are already placed and are never skipped.
+        if (!$budgetLeft) {
+            $result->addDegradationEvent('declarative_scoring_skipped_budget_exhausted');
+            return;
         }
 
         // Facts/preferences: cosine scan if embedding available, else fallback
@@ -312,6 +341,15 @@ class AutoMemoryRetriever
                 foreach ($lines as $line) {
                     if (str_starts_with($line, '- ')) {
                         $content = substr($line, 2);
+
+                        // assemble() emits rules *and* preferences. The rules were
+                        // already injected unconditionally above, so re-adding their
+                        // bullets here would duplicate every binding rule on the
+                        // no-embedding path.
+                        if (isset($ruleContents[mb_strtolower(trim($content))])) {
+                            continue;
+                        }
+
                         $hit = MemoryHit::fromDeclarative(
                             'fallback_' . md5($content),
                             $content,
@@ -361,9 +399,27 @@ class AutoMemoryRetriever
                 [
                     'conversation_id' => $entry['conversation_id'] ?? null,
                     'topics' => $entry['topics'] ?? [],
+                    'date' => $this->formatEpisodicDate($entry['created_at'] ?? null),
                 ],
             );
             $result->addHit($hit);
+        }
+    }
+
+    /**
+     * Render an episodic memory's timestamp as the human-readable date the
+     * injection section shows ("Jan 15, 2025"). Null when unparseable.
+     */
+    private function formatEpisodicDate(mixed $createdAt): ?string
+    {
+        if ($createdAt === null || $createdAt === '') {
+            return null;
+        }
+
+        try {
+            return \Illuminate\Support\Carbon::parse($createdAt)->format('M j, Y');
+        } catch (\Throwable) {
+            return null;
         }
     }
 
@@ -391,7 +447,8 @@ class AutoMemoryRetriever
         );
 
         foreach ($searchResults as $entry) {
-            $score = $entry->getAttribute('similarity_score', 0.5);
+            // Eloquent's getAttribute() takes no default argument — coalesce instead.
+            $score = $entry->getAttribute('similarity_score') ?? 0.5;
 
             // Apply relevance threshold
             if ($score < $relevanceThreshold) {
@@ -627,15 +684,18 @@ class AutoMemoryRetriever
     }
 
     /**
-     * Get total characters used by current hits (for budget gates).
+     * Pre-stage budget gate: is there pipeline time left to start another store?
+     *
+     * Budgets are gates, not interrupts — synchronous PHP cannot abort a store
+     * already in flight, so elapsed time is only ever checked between stages.
      */
-    private function getUsedChars(MemoryRetrievalResult $result): int
+    private function hasBudgetLeft(float $startTime, int $timeoutMs): bool
     {
-        $chars = 0;
-        foreach ($result->hits as $hit) {
-            $chars += $hit->contentLength();
+        if ($timeoutMs <= 0) {
+            return true;
         }
-        return $chars;
+
+        return ((microtime(true) - $startTime) * 1000) < $timeoutMs;
     }
 
     /**

@@ -360,6 +360,12 @@ return [
         // This is the only real interrupt in the synchronous pipeline.
         'embedding_timeout_ms' => 500,
 
+        // Hard budget in milliseconds for the entire retrieval pipeline.
+        // Enforced as a pre-stage gate: a store that has not started yet is
+        // skipped once the budget is spent. A store already in flight runs to
+        // completion — synchronous PHP cannot abort it.
+        'timeout_ms' => 2000,
+
         // Which memory stores to query during auto-retrieval.
         // Options: 'declarative', 'episodic', 'long-term'.
         'stores' => ['declarative', 'episodic', 'long-term'],

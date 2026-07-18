@@ -72,6 +72,8 @@ class AutoMemoryRetrieverTest extends TestCase
             'llm-client.auto_memory_retrieval.relevance_threshold' => 0.3,
             'llm-client.auto_memory_retrieval.max_results_per_store' => 5,
             'llm-client.auto_memory_retrieval.stores' => ['declarative', 'episodic', 'long-term'],
+            'llm-client.auto_memory_retrieval.embedding_timeout_ms' => 500,
+            'llm-client.auto_memory_retrieval.timeout_ms' => 2000,
         ]);
 
         $this->retriever = new AutoMemoryRetriever(
@@ -117,9 +119,11 @@ class AutoMemoryRetrieverTest extends TestCase
         // Embedding service: enabled, returns one embedding
         $embedding = [0.1, 0.2, 0.3];
         $this->embeddingService->shouldReceive('isEnabled')->andReturn(true);
+        // The configured embedding budget is threaded down to the provider —
+        // it is the pipeline's only real interrupt.
         $this->embeddingService->shouldReceive('generate')
             ->once()
-            ->with('test query')
+            ->with('test query', 500)
             ->andReturn($embedding);
 
         // Episodic: return empty results
@@ -402,6 +406,39 @@ class AutoMemoryRetrieverTest extends TestCase
         $this->assertCount(2, $prefHits);
     }
 
+    #[Test]
+    public function declarative_fallback_doesNotDuplicate_rulesAlreadyInjected(): void
+    {
+        // PreferenceInjector::assemble() emits rules *and* preferences. Rules are
+        // already injected unconditionally, so the fallback must not re-add them.
+        $this->embeddingService->shouldReceive('isEnabled')->andReturn(false);
+
+        $this->preferenceInjector->shouldReceive('assemble')
+            ->once()
+            ->andReturn("- Always answer in metric units\n- I prefer concise responses");
+
+        $this->episodicMemorySearchService->shouldReceive('hybridSearch')->once()->andReturn([]);
+        $this->memoryService->shouldReceive('search')->once()->andReturn([]);
+
+        $user = \ClarionApp\Backend\Models\User::factory()->create();
+        DeclarativeMemory::withoutGlobalScope('user')->create([
+            'id' => Str::uuid()->toString(),
+            'user_id' => $user->id,
+            'type' => 'rule',
+            'content' => 'Always answer in metric units',
+            'source' => 'user_stated',
+            'embedding' => null,
+        ]);
+
+        $result = $this->retriever->retrieve('conv-1:msg-1', $user->id, 'agent-1', 'test');
+
+        // The rule appears exactly once, as a rule — not echoed as a preference.
+        $this->assertCount(1, $result->hitsByType('rule'));
+        $prefHits = $result->hitsByType('preference');
+        $this->assertCount(1, $prefHits);
+        $this->assertEquals('I prefer concise responses', $prefHits[0]->content);
+    }
+
     /* ------------------------------------------------------------------ */
     /* Episodic retrieval with embedding                                    */
     /* ------------------------------------------------------------------ */
@@ -498,7 +535,7 @@ class AutoMemoryRetrieverTest extends TestCase
         $entry->key = 'theme_preference';
         $entry->last_accessed_at = null;
         $entry->shouldReceive('getAttribute')
-            ->with('similarity_score', 0.5)
+            ->with('similarity_score')
             ->andReturn(0.92);
 
         $this->memoryService->shouldReceive('search')
@@ -588,10 +625,11 @@ class AutoMemoryRetrieverTest extends TestCase
                 ['id' => 'ep-1', 'summary' => str_repeat('X', 200), 'similarity_score' => 0.9],
             ]);
 
-        // Long-term store is skipped by the pre-stage budget gate because
-        // the episodic hit (200 chars) already exceeds the budget (120 chars).
+        // The char budget is enforced after retrieval by enforceBudget(), not by
+        // gating stores — long-term is still queried and then dropped if it does not fit.
         $this->memoryService->shouldReceive('search')
-            ->never();
+            ->once()
+            ->andReturn([]);
 
         $user = \ClarionApp\Backend\Models\User::factory()->create();
         // Create a short rule (always kept) and a long episodic hit
@@ -725,39 +763,70 @@ class AutoMemoryRetrieverTest extends TestCase
     #[Test]
     public function preStageBudgetGate_skips_store_when_budget_exhausted(): void
     {
+        // The pipeline budget is a *time* budget, not a character budget: a store
+        // that has not started is skipped once elapsed time exceeds timeout_ms.
+        config(['llm-client.auto_memory_retrieval.timeout_ms' => 1]);
+
         $embedding = [0.1, 0.2, 0.3];
         $this->embeddingService->shouldReceive('isEnabled')->andReturn(true);
         $this->embeddingService->shouldReceive('generate')
             ->once()
-            ->andReturn($embedding);
-
-        // Tiny budget (10 tokens = 40 chars)
-        config(['llm-client.auto_memory_retrieval.max_tokens' => 10]);
+            ->andReturnUsing(function () use ($embedding) {
+                // Burn the 1ms budget inside the one stage that can really block.
+                usleep(10_000);
+                return $embedding;
+            });
 
         $user = \ClarionApp\Backend\Models\User::factory()->create();
-        // Create a rule that fills the budget
         DeclarativeMemory::withoutGlobalScope('user')->create([
             'id' => Str::uuid()->toString(),
             'user_id' => $user->id,
             'type' => 'rule',
-            'content' => str_repeat('X', 100), // 100 chars > 40 char budget
+            'content' => 'Always answer in metric units',
             'source' => 'user_stated',
             'embedding' => null,
         ]);
 
-        // Episodic should NOT be called because budget is exhausted
-        // The pre-stage gate: getUsedChars >= maxChars AND count(result->hits) > 0
-        // 100 chars >= 40 chars AND hits count > 0 => skip episodic
+        // Both remaining stores are gated out before being started.
         $this->episodicMemorySearchService->shouldNotReceive('hybridSearch');
-
-        // Long-term should also be skipped
         $this->memoryService->shouldNotReceive('search');
 
         $result = $this->retriever->retrieve('conv-1:msg-1', $user->id, 'agent-1', 'test');
 
-        // Only the rule should be present (rules are never truncated by budget)
-        $ruleHits = $result->hitsByType('rule');
-        $this->assertCount(1, $ruleHits);
+        // Rules are injected unconditionally even when the budget is spent.
+        $this->assertCount(1, $result->hitsByType('rule'));
+        $this->assertContains('episodic_skipped_budget_exhausted', $result->degradationEvents);
+        $this->assertContains('long_term_skipped_budget_exhausted', $result->degradationEvents);
+    }
+
+    #[Test]
+    public function preStageBudgetGate_doesNotSkipStores_whenOnlyCharBudgetIsSmall(): void
+    {
+        // Regression: a single long rule used to suppress every other store,
+        // because the gate compared accumulated characters instead of elapsed
+        // time. Rules are exempt from the char budget, so they must never gate.
+        config(['llm-client.auto_memory_retrieval.max_tokens' => 10]);
+
+        $embedding = [0.1, 0.2, 0.3];
+        $this->embeddingService->shouldReceive('isEnabled')->andReturn(true);
+        $this->embeddingService->shouldReceive('generate')->once()->andReturn($embedding);
+
+        $user = \ClarionApp\Backend\Models\User::factory()->create();
+        DeclarativeMemory::withoutGlobalScope('user')->create([
+            'id' => Str::uuid()->toString(),
+            'user_id' => $user->id,
+            'type' => 'rule',
+            'content' => str_repeat('X', 100), // far over the 40-char budget
+            'source' => 'user_stated',
+            'embedding' => null,
+        ]);
+
+        $this->episodicMemorySearchService->shouldReceive('hybridSearch')->once()->andReturn([]);
+        $this->memoryService->shouldReceive('search')->once()->andReturn([]);
+
+        $result = $this->retriever->retrieve('conv-1:msg-1', $user->id, 'agent-1', 'test');
+
+        $this->assertCount(1, $result->hitsByType('rule'));
     }
 
     /* ------------------------------------------------------------------ */
@@ -787,7 +856,7 @@ class AutoMemoryRetrieverTest extends TestCase
         $ltEntry->key = 'some_key';
         $ltEntry->last_accessed_at = null;
         $ltEntry->shouldReceive('getAttribute')
-            ->with('similarity_score', 0.5)
+            ->with('similarity_score')
             ->andReturn(0.7);
 
         $this->memoryService->shouldReceive('search')
@@ -1184,9 +1253,11 @@ class AutoMemoryRetrieverTest extends TestCase
                 ['id' => 'ep-1', 'summary' => str_repeat('X', 100), 'similarity_score' => 0.9],
             ]);
 
-        // Long-term will be skipped by pre-stage gate (budget exhausted by episodic)
+        // The char budget is enforced after retrieval by enforceBudget(), not by
+        // gating stores — long-term is still queried and then dropped if it does not fit.
         $this->memoryService->shouldReceive('search')
-            ->never();
+            ->once()
+            ->andReturn([]);
 
         $user = \ClarionApp\Backend\Models\User::factory()->create();
         $result = $this->retriever->retrieve('conv-1:msg-1', $user->id, 'agent-1', 'test');
@@ -1328,9 +1399,11 @@ class AutoMemoryRetrieverTest extends TestCase
                 ['id' => 'ep-1', 'summary' => str_repeat('X', 200), 'similarity_score' => 0.9],
             ]);
 
-        // Long-term will be skipped by pre-stage gate
+        // The char budget is enforced after retrieval by enforceBudget(), not by
+        // gating stores — long-term is still queried and then dropped if it does not fit.
         $this->memoryService->shouldReceive('search')
-            ->never();
+            ->once()
+            ->andReturn([]);
 
         $user = \ClarionApp\Backend\Models\User::factory()->create();
         // Create a rule (always kept)
@@ -1377,9 +1450,11 @@ class AutoMemoryRetrieverTest extends TestCase
                 ['id' => 'ep-2', 'summary' => 'More episodic content', 'similarity_score' => 0.8],
             ]);
 
-        // Long-term will be skipped by pre-stage gate
+        // The char budget is enforced after retrieval by enforceBudget(), not by
+        // gating stores — long-term is still queried and then dropped if it does not fit.
         $this->memoryService->shouldReceive('search')
-            ->never();
+            ->once()
+            ->andReturn([]);
 
         $user = \ClarionApp\Backend\Models\User::factory()->create();
         // Create a short rule
@@ -1418,9 +1493,11 @@ class AutoMemoryRetrieverTest extends TestCase
                 ['id' => 'ep-1', 'summary' => str_repeat('Z', 300), 'similarity_score' => 0.9],
             ]);
 
-        // Long-term will be skipped by pre-stage gate
+        // The char budget is enforced after retrieval by enforceBudget(), not by
+        // gating stores — long-term is still queried and then dropped if it does not fit.
         $this->memoryService->shouldReceive('search')
-            ->never();
+            ->once()
+            ->andReturn([]);
 
         $user = \ClarionApp\Backend\Models\User::factory()->create();
         DeclarativeMemory::withoutGlobalScope('user')->create([
@@ -1639,7 +1716,7 @@ class AutoMemoryRetrieverTest extends TestCase
         $ltEntry->key = 'some_key';
         $ltEntry->last_accessed_at = null;
         $ltEntry->shouldReceive('getAttribute')
-            ->with('similarity_score', 0.5)
+            ->with('similarity_score')
             ->andReturn(0.8);
 
         $this->memoryService->shouldReceive('search')

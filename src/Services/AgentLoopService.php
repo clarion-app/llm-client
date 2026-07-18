@@ -1510,11 +1510,18 @@ class AgentLoopService
 
         if ($this->autoMemoryRetriever && $this->autoMemoryRetriever->isEnabled() && $lastUserMessage) {
             $userId = (string) $conversation->user_id;
-            $agentId = (string) ($conversation->character ?? 'default');
+            // Must match how every other memory call site derives agent_id
+            // (:1162, :1208, :1245, :1279) — MemoryService::search() filters on
+            // agent_id alone, so a shared literal like 'default' would both miss
+            // entries written under the conversation-id fallback and pool every
+            // characterless conversation, across users, under one key.
+            $agentId = (string) ($conversation->character ?? $conversation->id);
             $turnKey = sprintf('%s:%s', $conversation->id, $lastUserMessage->id);
             $query = $lastUserMessage->content;
 
-            $result = $this->autoMemoryRetriever->retrieve($turnKey, $userId, $agentId, $query);
+            // retrieveWithMetrics() delegates to retrieve() and records latency,
+            // tokens, and degradation events on cache misses only.
+            $result = $this->autoMemoryRetriever->retrieveWithMetrics($turnKey, $userId, $agentId, $query);
             $section = $this->autoMemoryRetriever->formatInjectionSection($result);
 
             if (!$section->isEmpty()) {
