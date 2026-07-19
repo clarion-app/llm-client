@@ -205,7 +205,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(ConversationCondenser::class),
                 null,
                 null,
-                $app->make(\ClarionApp\LlmClient\Services\AutoMemoryRetriever::class)
+                $app->make(\ClarionApp\LlmClient\Services\AutoMemoryRetriever::class),
+                $app->make(\ClarionApp\LlmClient\Services\MetricsRecorder::class)
             );
         });
 
@@ -319,9 +320,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
      */
     protected function httpClientFor(ProviderType $type): Client
     {
-        $timeout = config('llm-client.providers.'.$type->value.'.timeout', 240);
+        $config = ['timeout' => (int) config('llm-client.providers.'.$type->value.'.timeout', 240)];
 
-        return new Client(['timeout' => (int) $timeout]);
+        // Test-only seam: nothing binds this in production.
+        if ($this->app->bound('llm-client.http_handler')) {
+            $config['handler'] = $this->app->make('llm-client.http_handler');
+        }
+
+        return new Client($config);
     }
 
     /**

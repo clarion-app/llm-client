@@ -154,7 +154,7 @@ class AgentLoopService
                     $resultContent = json_encode(['error' => 'Declarative memory service not available']);
                 }
 
-                $condensed = $this->condenseToolResult($resultContent, $conversation->id);
+                $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'declarative_memory');
                 $toolData['tool_results'] = [
                     ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
                 ];
@@ -168,7 +168,7 @@ class AgentLoopService
                     $conversation
                 );
 
-                $condensed = $this->condenseToolResult($resultContent, $conversation->id);
+                $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
                 $toolData['tool_results'] = [
                     ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
                 ];
@@ -429,7 +429,7 @@ class AgentLoopService
                     $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
 
                     // Condense tool result if oversized
-                    $toolResultEntry = $this->condenseToolResult($result, $conversation->id);
+                    $toolResultEntry = $this->condenseToolResult($result, $conversation->id, $toolName);
                     $toolResults[] = [
                         'tool_call_id' => $toolCallId,
                         'content' => $toolResultEntry['content'],
@@ -670,7 +670,7 @@ class AgentLoopService
                 // Tool executed (not a confirmation pause) — record its outcome.
                 $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
 
-                $toolResultEntry = $this->condenseToolResult($result, $conversation->id);
+                $toolResultEntry = $this->condenseToolResult($result, $conversation->id, $toolName);
                 $toolResults[] = [
                     'tool_call_id' => $toolCall['id'] ?? '',
                     'content' => $toolResultEntry['content'],
@@ -1740,13 +1740,13 @@ class AgentLoopService
      * Condense a tool result if it exceeds the configured token threshold.
      * Returns an array with 'content' and optional metadata fields.
      */
-    private function condenseToolResult(string $result, string $conversationId): array
+    private function condenseToolResult(string $result, string $conversationId, string $toolName = 'unknown'): array
     {
         if (!$this->toolResultCondenser || !config('llm-client.tool_result_condensation.enabled', false)) {
             return ['content' => $result];
         }
 
-        $condensed = $this->toolResultCondenser->condense($result, $conversationId);
+        $condensed = $this->toolResultCondenser->condense($conversationId, $toolName, $result);
 
         return [
             'content' => $condensed['content'],

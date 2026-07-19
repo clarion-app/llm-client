@@ -73,7 +73,7 @@ class ToolInvocationRecord extends Model
     /**
      * Calculate failure rate for a given scope (returns float 0.0-1.0).
      */
-    public static function failureRate(string $conversationId = null, string $userId = null, string $toolName = null): float
+    public static function failureRate(?string $conversationId = null, ?string $userId = null, ?string $toolName = null): float
     {
         $query = static::query();
         if ($conversationId) $query->where('conversation_id', $conversationId);
@@ -92,7 +92,7 @@ class ToolInvocationRecord extends Model
      *
      * @return array<string, int>
      */
-    public static function groupByFailureCategory(string $conversationId = null, string $userId = null): array
+    public static function groupByFailureCategory(?string $conversationId = null, ?string $userId = null): array
     {
         $query = static::query()->where('outcome', 'failure');
         if ($conversationId) $query->where('conversation_id', $conversationId);

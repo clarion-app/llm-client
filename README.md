@@ -38,3 +38,30 @@ The store holds both user-stated entries and patterns learned on the user's beha
 `applyAgentWrite()` accepts an optional `$confidenceLevel` parameter; the confirmation gate still throws before any DB access when the write is not confirmed.
 
 See `specs/041-declarative-memory-store/quickstart.md` for base API usage and `specs/046-learned-patterns-store/quickstart.md` for learned-pattern behavior verification.
+
+## Testing
+
+### Test Suites
+
+The package maintains three test suites:
+
+- **Unit** — Fast unit tests for individual classes.
+- **Feature** — Feature-level tests with mocked dependencies.
+- **Integration** — Assembled-system tests that exercise the full stack (container-resolved services, real database, scripted HTTP boundary) without mocks on `llm-client` classes.
+
+### Running Tests
+
+```bash
+# All suites
+composer test
+
+# Specific suite
+./vendor/bin/phpunit --testsuite Integration
+
+# Single test file
+./vendor/bin/phpunit tests/Integration/ToolUseJourneyTest.php
+```
+
+### Integration Suite
+
+The Integration suite verifies end-to-end behavior through the container-wired composition chain. One rule: **no mocks on `llm-client` classes** — the suite exercises real services through a scripted HTTP boundary. This catches wiring defects, missing service registrations, and integration failures that unit tests with mocks cannot detect.

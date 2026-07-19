@@ -297,5 +297,21 @@ abstract class TestCase extends BaseTestCase
             });
         }
 
+        // operation_cache table (for operation search cache).
+        if (!Schema::hasTable('operation_cache')) {
+            Schema::create('operation_cache', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id');
+                $table->string('operation_id');
+                $table->string('method');
+                $table->string('path');
+                $table->text('summary')->nullable();
+                $table->json('param_schema')->nullable();
+                $table->timestamps();
+
+                $table->index('conversation_id');
+            });
+        }
+
     }
 }

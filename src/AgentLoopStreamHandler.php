@@ -358,7 +358,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             }
 
             // Condense tool result if oversized
-            $toolResultEntry = $this->condenseToolResult($result, $conversationId);
+            $toolResultEntry = $this->condenseToolResult($result, $conversationId, $toolName);
             $toolResults[] = [
                 'tool_call_id' => $toolCallId,
                 'content' => $toolResultEntry['content'],
@@ -462,13 +462,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
     /**
      * Condense a tool result if it exceeds the configured token threshold.
      */
-    private function condenseToolResult(string $result, string $conversationId): array
+    private function condenseToolResult(string $result, string $conversationId, string $toolName = 'unknown'): array
     {
         if (!$this->toolResultCondenser || !config('llm-client.tool_result_condensation.enabled', false)) {
             return ['content' => $result];
         }
 
-        $condensed = $this->toolResultCondenser->condense($result, $conversationId);
+        $condensed = $this->toolResultCondenser->condense($conversationId, $toolName, $result);
 
         return [
             'content' => $condensed['content'],
