@@ -81,16 +81,33 @@ class OpenAiProvider implements LlmProvider
     }
 
     /**
+     * Build headers array — includes Authorization only if token is set.
+     *
+     * OpenAI-compatible servers running locally (llama.cpp server, Ollama, vLLM)
+     * accept unauthenticated requests, so a null token is a valid configuration
+     * rather than an error.
+     */
+    private function buildHeaders(string $accept): array
+    {
+        $headers = [
+            'Content-Type' => 'application/json',
+            'Accept' => $accept,
+        ];
+
+        if ($this->server->token !== null) {
+            $headers['Authorization'] = 'Bearer ' . $this->server->token;
+        }
+
+        return $headers;
+    }
+
+    /**
      * Synchronous non-streaming chat completion.
      */
     public function chat(array $messages, array $tools = [], array $options = []): array
     {
         if ($this->server->server_url === null) {
             throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
-        }
-
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
 
         $body = [
@@ -125,11 +142,7 @@ class OpenAiProvider implements LlmProvider
 
         try {
             $response = $this->client->post($this->server->server_url, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
+                'headers' => $this->buildHeaders('application/json'),
                 'json' => $body,
             ]);
 
@@ -153,10 +166,6 @@ class OpenAiProvider implements LlmProvider
     {
         if ($this->server->server_url === null) {
             throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
-        }
-
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
 
         $body = [
@@ -188,11 +197,7 @@ class OpenAiProvider implements LlmProvider
 
         try {
             $response = $this->client->post($this->server->server_url, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'text/event-stream',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
+                'headers' => $this->buildHeaders('text/event-stream'),
                 'json' => $body,
                 'stream' => true,
             ]);
@@ -278,10 +283,6 @@ class OpenAiProvider implements LlmProvider
             throw new RuntimeException('Server URL is not configured. Cannot make embedding request.');
         }
 
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
-        }
-
         $baseUrl = $this->getBaseUrl();
         $embeddingsUrl = $baseUrl . '/v1/embeddings';
 
@@ -294,11 +295,7 @@ class OpenAiProvider implements LlmProvider
         }
 
         $requestOptions = [
-            'headers' => [
-                'Content-Type' => 'application/json',
-                'Accept' => 'application/json',
-                'Authorization' => 'Bearer ' . $this->server->token,
-            ],
+            'headers' => $this->buildHeaders('application/json'),
             'json' => $body,
         ];
 
@@ -350,20 +347,12 @@ class OpenAiProvider implements LlmProvider
             throw new RuntimeException('Server URL is not configured. Cannot list models.');
         }
 
-        if ($this->server->token === null) {
-            throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
-        }
-
         $baseUrl = $this->getBaseUrl();
         $modelsUrl = $baseUrl . '/v1/models';
 
         try {
             $response = $this->client->get($modelsUrl, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $this->server->token,
-                ],
+                'headers' => $this->buildHeaders('application/json'),
             ]);
 
             $result = json_decode($response->getBody()->getContents(), true);

@@ -10,6 +10,7 @@ use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\Psr7\Stream;
 use GuzzleHttp\Psr7\Request as PsrRequest;
@@ -154,15 +155,55 @@ class OpenAiProviderTest extends TestCase
     }
 
     #[Test]
-    public function chat_throws_on_null_token(): void
+    public function chat_omits_authorization_header_when_token_is_null(): void
     {
-        $server = $this->createServer(['server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => null]);
-        $provider = new OpenAiProvider($server);
+        // Local OpenAI-compatible servers (llama.cpp server, Ollama, vLLM) run
+        // without an API key — a null token must send an unauthenticated request
+        // rather than fail before the call is made.
+        $body = json_encode([
+            'choices' => [
+                ['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'Hi'], 'finish_reason' => 'stop'],
+            ],
+        ]);
 
-        $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessageMatches('/token.*not configured/i');
+        $mock = new MockHandler([new Response(200, [], $body)]);
+        $handlerStack = HandlerStack::create($mock);
+        $requests = [];
+        $handlerStack->push(Middleware::history($requests));
+        $client = new Client(['handler' => $handlerStack]);
+
+        $server = $this->createServer(['server_url' => 'http://localhost:8081/v1/chat/completions', 'token' => null]);
+        $provider = new OpenAiProvider($server, $client);
+
+        $result = $provider->chat([['role' => 'user', 'content' => 'Hi']]);
+
+        $this->assertEquals('Hi', $result['choices'][0]['message']['content']);
+        $this->assertCount(1, $requests);
+        $this->assertFalse($requests[0]['request']->hasHeader('Authorization'));
+    }
+
+    #[Test]
+    public function chat_sends_bearer_authorization_header_when_token_is_set(): void
+    {
+        $body = json_encode([
+            'choices' => [
+                ['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'Hi'], 'finish_reason' => 'stop'],
+            ],
+        ]);
+
+        $mock = new MockHandler([new Response(200, [], $body)]);
+        $handlerStack = HandlerStack::create($mock);
+        $requests = [];
+        $handlerStack->push(Middleware::history($requests));
+        $client = new Client(['handler' => $handlerStack]);
+
+        $server = $this->createServer(['token' => 'sk-test-token']);
+        $provider = new OpenAiProvider($server, $client);
 
         $provider->chat([['role' => 'user', 'content' => 'Hi']]);
+
+        $this->assertCount(1, $requests);
+        $this->assertEquals('Bearer sk-test-token', $requests[0]['request']->getHeaderLine('Authorization'));
     }
 
     #[Test]
