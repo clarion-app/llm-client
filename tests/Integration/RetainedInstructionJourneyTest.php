@@ -39,25 +39,15 @@ use Tests\Integration\Harness\Responses;
  * smart-trim path, so PIN_PATTERNS is load-bearing: removing `remember` from
  * MessageScorer::PIN_PATTERNS now makes these tests fail.
  *
- * A second, deeper gap surfaced while closing the first one: even once a
- * reduction genuinely takes the smart-trim fallback, PIN_PATTERNS *still*
- * never ran, because `LlmClientServiceProvider`'s `ConversationCondenser`
- * binding always passes `null` for the `$smartTrimmer` constructor
- * argument — `SmartHistoryTrimmer` (and therefore `MessageScorer` and
- * `PIN_PATTERNS`) is unreachable through the real container. That is a
- * production wiring gap outside this task's scope (fixing it means editing
- * `src/LlmClientServiceProvider.php`, and this feature touches no
- * production file), so it is worked around here the same way T036's
- * `OperationRecallJourneyTest::setUp()` substitutes a test double for a
- * fixture seam: `setUp()` below rebinds the `ConversationCondenser`
- * singleton with a real, *unmodified* `SmartHistoryTrimmer` wired in, so
- * the mechanism these tests claim to verify is the one that actually runs.
- * Every class involved (`ConversationCondenser`, `SmartHistoryTrimmer`,
- * `MessageScorer`) is real, production `src/` code — only the container's
- * wiring is different from what ships. Recommended follow-up (out of this
- * task's scope): wire `SmartHistoryTrimmer` into `ConversationCondenser` in
- * `LlmClientServiceProvider` so `PIN_PATTERNS` is reachable in production,
- * not just under this test's rebinding.
+ * A second, deeper gap surfaced while closing the first one, and has since
+ * been fixed in production: `LlmClientServiceProvider`'s `ConversationCondenser`
+ * binding used to pass `null` for the `$smartTrimmer` constructor argument,
+ * making `SmartHistoryTrimmer` (and therefore `MessageScorer`/`PIN_PATTERNS`)
+ * unreachable through the real container. The provider now wires a real
+ * `SmartHistoryTrimmer` (backed by `MessageScorer` and `CoherenceValidator`,
+ * both bound as singletons) into `ConversationCondenser`, so this test needs
+ * no container rebinding — it exercises the exact object graph the running
+ * application assembles.
  */
 class RetainedInstructionJourneyTest extends MultiTurnTestCase
 {
@@ -88,28 +78,6 @@ class RetainedInstructionJourneyTest extends MultiTurnTestCase
      * where PIN_PATTERNS is what decides its fate.
      */
     private const REDUCTIONS_TO_EXHAUST_CHEAP_TIER = 6;
-
-    protected function setUp(): void
-    {
-        parent::setUp();
-
-        // Declared deviation (test-only container rebinding, no src/ change):
-        // see the class docblock. LlmClientServiceProvider never wires
-        // SmartHistoryTrimmer into ConversationCondenser in the real
-        // container, so without this, PIN_PATTERNS could never be load-bearing
-        // through AgentLoopService no matter how the scenario is shaped.
-        $this->app->singleton(\ClarionApp\LlmClient\Services\ConversationCondenser::class, function ($app) {
-            return new \ClarionApp\LlmClient\Services\ConversationCondenser(
-                $app->make(\ClarionApp\LlmClient\Services\ChunkPartitioner::class),
-                $app->make(\ClarionApp\LlmClient\Services\CondensationSummaryStore::class),
-                $app->make(\ClarionApp\LlmClient\Services\ContextWindowBudgeter::class),
-                $app->make(\ClarionApp\LlmClient\Presets\CondensationPreset::class),
-                $app->make(\ClarionApp\LlmClient\Services\SmartHistoryTrimmer::class),
-                null,
-                $app->make(\ClarionApp\LlmClient\Providers\ProviderRegistry::class)
-            );
-        });
-    }
 
     /* --------------------------------------------------------------------------
      * T030: Kept information survives reduction

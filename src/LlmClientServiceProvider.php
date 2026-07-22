@@ -172,13 +172,28 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new \ClarionApp\LlmClient\Services\CondensationSummaryStore($app['cache.store']);
         });
 
+        $this->app->singleton(\ClarionApp\LlmClient\Services\MessageScorer::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\MessageScorer();
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\CoherenceValidator::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\CoherenceValidator();
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\SmartHistoryTrimmer::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\SmartHistoryTrimmer(
+                $app->make(\ClarionApp\LlmClient\Services\MessageScorer::class),
+                $app->make(\ClarionApp\LlmClient\Services\CoherenceValidator::class)
+            );
+        });
+
         $this->app->singleton(ConversationCondenser::class, function ($app) {
             return new ConversationCondenser(
                 $app->make(\ClarionApp\LlmClient\Services\ChunkPartitioner::class),
                 $app->make(\ClarionApp\LlmClient\Services\CondensationSummaryStore::class),
                 $app->make(ContextWindowBudgeter::class),
                 $app->make(\ClarionApp\LlmClient\Presets\CondensationPreset::class),
-                null,
+                $app->make(\ClarionApp\LlmClient\Services\SmartHistoryTrimmer::class),
                 null,
                 $app->make(ProviderRegistry::class)
             );
