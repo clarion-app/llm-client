@@ -25,6 +25,8 @@ class ScriptedTransport
     private array $history;
     /** @var array<string, string> Body content cached by request object hash */
     private array $bodyCache;
+    /** @var int Current 1-based turn number for lane-aware serving (S2) */
+    private int $turnIndex;
 
     private HandlerStack $handlerStack;
 
@@ -34,6 +36,7 @@ class ScriptedTransport
         $this->embedder = $embedder;
         $this->history = [];
         $this->bodyCache = [];
+        $this->turnIndex = 0;
 
         // Build handler stack with a callable handler (not MockHandler)
         // This allows dynamic routing based on request path
@@ -136,6 +139,38 @@ class ScriptedTransport
     }
 
     /**
+     * Captured payloads for a specific lane (S2).
+     *
+     * Filters chat payloads by the lane classification derived from the request body.
+     *
+     * @param RequestLane $lane The lane to filter by.
+     * @return CapturedPayload[]
+     */
+    public function capturedPayloadsForLane(RequestLane $lane): array
+    {
+        return array_values(array_filter(
+            $this->capturedChatPayloads(),
+            fn (CapturedPayload $payload) => $payload->lane() === $lane
+        ));
+    }
+
+    /**
+     * Get the current turn index.
+     */
+    public function getTurnIndex(): int
+    {
+        return $this->turnIndex;
+    }
+
+    /**
+     * Reset the turn index (for re-use between conversations).
+     */
+    public function reset(): void
+    {
+        $this->turnIndex = 0;
+    }
+
+    /**
      * Check if there are unconsumed steps remaining in the script.
      */
     public function hasUnconsumedSteps(): bool
@@ -169,6 +204,10 @@ class ScriptedTransport
 
     /**
      * Handle a chat completion request.
+     *
+     * Classifies the request into a lane (S2), evaluates rules for that lane,
+     * then serves the next step from the lane's queue (or the legacy steps array
+     * for agent_turn).
      */
     private function handleChatRequest(RequestInterface $request): Response
     {
@@ -181,14 +220,24 @@ class ScriptedTransport
             'tool_names' => $this->extractToolNames($body['messages'] ?? []),
         ];
 
+        // Build a captured payload for rule evaluation and lane classification
+        $payload = CapturedPayload::fromGuzzleBody(
+            json_encode($body),
+            'chat'
+        );
+
+        // Classify the lane from the payload
+        $lane = RequestLane::classify($payload);
+
+        // Increment turn index on each chat request
+        $this->turnIndex++;
+
         try {
-            $responseBody = $this->script->serve($requestInfo);
+            $responseBody = $this->script->serveFor($lane, $payload, $this->turnIndex);
         } catch (RuntimeException $e) {
             // Re-throw as ScriptExhaustedError (harness error, not network error)
-            $lastServed = $this->script->cursor - 1;
-            $totalSteps = count($this->script->steps);
             throw new ScriptExhaustedError(
-                $e->getMessage() . "\n\nLast served step: {$lastServed} of {$totalSteps}",
+                $e->getMessage() . "\n\nTurn: {$this->turnIndex}, Lane: {$lane->value}",
                 0,
                 $e
             );

@@ -178,4 +178,14 @@ class CapturedPayload
         }
         return -1;
     }
+
+    /**
+     * Return the lane this payload belongs to.
+     *
+     * Delegates to RequestLane::classify() for S1 compliance.
+     */
+    public function lane(): RequestLane
+    {
+        return RequestLane::classify($this);
+    }
 }

@@ -109,6 +109,15 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->boolean('protected')->default(false);
                 $table->unsignedInteger('word_count');
                 $table->unsignedInteger('summary_word_count');
+                // Mirrors 2026_06_28_000001_add_embedding_to_episodic_memories.php
+                // (SQLite fallback branch: json). Without this column,
+                // EpisodicMemory::update(['embedding' => ...]) — which
+                // GenerateEpisodicMemoryJob::generateEmbedding() performs for
+                // real once a summary is captured — fails at the SQL layer
+                // ("no such column: embedding"), a genuine schema-bootstrap gap
+                // this suite hadn't exercised before Story 4 (060) started
+                // driving conversations all the way through a real end().
+                $table->json('embedding')->nullable();
                 $table->timestamps();
                 $table->softDeletes();
 
@@ -144,6 +153,23 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->unsignedInteger('consecutive_failures')->default(0);
                 $table->timestamp('cooldown_until')->nullable();
                 $table->timestamps();
+            });
+        }
+
+        // mcp_sessions table (for MCP session tracking during tool execution).
+        if (!Schema::hasTable('mcp_sessions')) {
+            Schema::create('mcp_sessions', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id');
+                $table->string('protocol_version');
+                $table->string('client_name')->nullable();
+                $table->string('client_version')->nullable();
+                $table->json('capabilities')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index('user_id');
+                $table->index('deleted_at');
             });
         }
     }

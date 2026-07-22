@@ -13,6 +13,8 @@ use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\ContextWindowBudgeter;
 use Illuminate\Support\Facades\Event;
+use Tests\Integration\Harness\LaneRule;
+use Tests\Integration\Harness\RequestLane;
 
 /**
  * End-to-end context management scenarios through the container-resolved agent loop.
@@ -264,12 +266,20 @@ class ContextManagementJourneyTest extends AssembledSystemTestCase
         $fixture = $this->fixture()->build();
         $this->seedOverBudgetHistory($fixture->conversation);
 
-        // Script: one response for the agent (condensation may or may not call LLM)
-        // If condensation attempts an LLM call, we need a response for it.
-        // If it falls back immediately (no sealed chunks), only one call.
-        // To be safe, script two responses.
+        // Script: condensation rule (will fail and trigger fallback to trim)
+        // + one response for the agent turn.
+        // Condensation requests are now classified as Condensation lane (R2a),
+        // so we need a rule for that lane. The rule throws to simulate condensation
+        // failure, which triggers the fallback to trimming.
         $this->script()
-            ->finalAnswer('{"summary": [{"text": "Previous conversation summary"}]}')
+            ->addRule(
+                new LaneRule(
+                    lane: RequestLane::Condensation,
+                    predicate: fn () => true,
+                    respond: function () { throw new \RuntimeException('Condensation failed - no sealed chunks'); },
+                    label: 'condensation_fail'
+                )
+            )
             ->finalAnswer('Hello!');
 
         // Drive the sync path

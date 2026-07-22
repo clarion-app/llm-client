@@ -171,4 +171,28 @@ class ScriptedStream
             $this->capturedRequests
         );
     }
+
+    /**
+     * Captured payloads for a specific lane (S2).
+     *
+     * Filters payloads by the lane classification derived from the request body.
+     *
+     * @param RequestLane $lane The lane to filter by.
+     * @return CapturedPayload[]
+     */
+    public function capturedPayloadsForLane(RequestLane $lane): array
+    {
+        return array_values(array_filter(
+            $this->capturedPayloads(),
+            fn (CapturedPayload $payload) => $payload->lane() === $lane
+        ));
+    }
+
+    /**
+     * Return the cumulative count of captured requests (turns).
+     */
+    public function turnCount(): int
+    {
+        return count($this->capturedRequests);
+    }
 }

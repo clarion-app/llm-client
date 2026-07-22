@@ -9,14 +9,26 @@ use RuntimeException;
  *
  * Steps produce provider-shaped wire responses (OpenAI format) so the real
  * provider parsing code runs — never LlmProvider::chat() return values.
+ *
+ * Extended with lane-scoped ordered queues (S5/S6): toolRequest/finalAnswer
+ * fill the agent_turn lane; serveFor() evaluates rules then ordered steps per lane.
  */
 class ResponseScript
 {
-    /** @var list<array<string, mixed>> */
+    /** @var list<array<string, mixed>> Legacy steps list (agent_turn lane). */
     public array $steps = [];
 
     /** @var int Current position in the steps list. */
     public int $cursor = 0;
+
+    /** @var array<string, list<array<string, mixed>>> Lane-scoped ordered step queues (keyed by lane value). */
+    private array $laneQueues = [];
+
+    /** @var array<string, int> Cursor per lane (keyed by lane value). */
+    private array $laneCursors = [];
+
+    /** @var list<LaneRule> Rules evaluated before ordered steps (S2). */
+    private array $rules = [];
 
     /**
      * Start a new script.
@@ -131,6 +143,7 @@ class ResponseScript
     /**
      * Serve the next step and advance the cursor.
      *
+     * S5: This delegates to the agent_turn lane, keeping backward compat.
      * If the cursor is past the end, throws a RuntimeException with the
      * request info rendered (never empty, default, or repeated).
      *
@@ -139,6 +152,7 @@ class ResponseScript
      */
     public function serve(array $requestInfo = []): array
     {
+        // S5: serve() delegates to agent_turn lane
         if ($this->cursor >= count($this->steps)) {
             throw $this->buildExhaustionError($requestInfo);
         }
@@ -147,19 +161,172 @@ class ResponseScript
     }
 
     /**
-     * Check if there are unconsumed steps remaining.
+     * Serve the next step for a specific lane (S2).
+     *
+     * Evaluates rules for that lane first, then falls through to the
+     * lane's ordered step queue. On no match, fails loudly (S4).
+     *
+     * @param RequestLane $lane The lane to serve for.
+     * @param CapturedPayload $payload The captured request payload.
+     * @param int $turn The current 1-based turn number.
+     * @return array<string, mixed> The response body.
      */
-    public function hasUnconsumedSteps(): bool
+    public function serveFor(RequestLane $lane, CapturedPayload $payload, int $turn): array
     {
-        return $this->cursor < count($this->steps);
+        // S2: Evaluate rules for this lane first
+        foreach ($this->rules as $rule) {
+            if ($rule->lane === $lane && $rule->matches($payload, $turn)) {
+                $this->recordRuleFired($turn, $rule->label);
+                return $rule->respond($payload, $turn);
+            }
+        }
+
+        // Fall through to ordered steps for this lane
+        if ($lane === RequestLane::AgentTurn) {
+            // S5: agent_turn uses the legacy steps array
+            if ($this->cursor >= count($this->steps)) {
+                throw $this->buildLaneExhaustionError($lane, $payload, $turn);
+            }
+            return $this->steps[$this->cursor++];
+        }
+
+        // Other lanes use lane-scoped queues
+        $laneKey = $lane->value;
+        $queue = $this->laneQueues[$laneKey] ?? [];
+        $cursor = $this->laneCursors[$laneKey] ?? 0;
+
+        if ($cursor >= count($queue)) {
+            throw $this->buildLaneExhaustionError($lane, $payload, $turn);
+        }
+
+        $this->laneCursors[$laneKey] = $cursor + 1;
+        return $queue[$cursor];
+    }
+
+    /** @var array<int, array<string>> Map of turn number to rule labels that fired. */
+    private array $rulesFiredByTurn = [];
+
+    /**
+     * Add a rule to be evaluated before ordered steps (S2).
+     */
+    public function addRule(LaneRule $rule): self
+    {
+        $this->rules[] = $rule;
+        return $this;
     }
 
     /**
-     * Count of remaining (unconsumed) steps.
+     * Get the rule labels that fired for a specific turn.
+     *
+     * @param int $turn The 1-based turn number.
+     * @return array<string> List of rule labels that fired.
+     */
+    public function getRulesFiredForTurn(int $turn): array
+    {
+        return $this->rulesFiredByTurn[$turn] ?? [];
+    }
+
+    /**
+     * Record that a rule fired for a specific turn.
+     *
+     * @param int $turn The 1-based turn number.
+     * @param string $label The rule label.
+     */
+    public function recordRuleFired(int $turn, string $label): void
+    {
+        if (!array_key_exists($turn, $this->rulesFiredByTurn)) {
+            $this->rulesFiredByTurn[$turn] = [];
+        }
+        $this->rulesFiredByTurn[$turn][] = $label;
+    }
+
+    /**
+     * Reset the rules fired tracking.
+     */
+    public function resetRulesFired(): void
+    {
+        $this->rulesFiredByTurn = [];
+    }
+
+    /**
+     * Push a step onto a specific lane's queue.
+     *
+     * @param RequestLane $lane The target lane.
+     * @param array<string, mixed> $step The wire-shaped response.
+     */
+    public function pushStep(RequestLane $lane, array $step): self
+    {
+        if (!array_key_exists($lane->value, $this->laneQueues)) {
+            $this->laneQueues[$lane->value] = [];
+        }
+        $this->laneQueues[$lane->value][] = $step;
+        return $this;
+    }
+
+    /**
+     * Check if there are unconsumed steps remaining on any lane (S6).
+     *
+     * Aggregates leftovers across every lane so the existing 053 tearDown
+     * check catches a leftover on any lane and names it.
+     */
+    public function hasUnconsumedSteps(): bool
+    {
+        // Check legacy agent_turn steps
+        if ($this->cursor < count($this->steps)) {
+            return true;
+        }
+
+        // Check lane-scoped queues
+        foreach ($this->laneQueues as $laneKey => $queue) {
+            $cursor = $this->laneCursors[$laneKey] ?? 0;
+            if ($cursor < count($queue)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Count of remaining (unconsumed) steps across all lanes (S6).
      */
     public function unconsumedSteps(): int
     {
-        return max(0, count($this->steps) - $this->cursor);
+        $total = max(0, count($this->steps) - $this->cursor);
+
+        foreach ($this->laneQueues as $laneKey => $queue) {
+            $cursor = $this->laneCursors[$laneKey] ?? 0;
+            $total += max(0, count($queue) - $cursor);
+        }
+
+        return $total;
+    }
+
+    /**
+     * Get unconsumed steps detail per lane (S6).
+     *
+     * @return array<string, int> Lane name => unconsumed count.
+     */
+    public function unconsumedStepsDetail(): array
+    {
+        $detail = [];
+
+        // Legacy agent_turn steps
+        $agentUnconsumed = max(0, count($this->steps) - $this->cursor);
+        if ($agentUnconsumed > 0) {
+            $detail[RequestLane::AgentTurn->value] = $agentUnconsumed;
+        }
+
+        // Lane-scoped queues
+        foreach ($this->laneQueues as $laneKey => $queue) {
+            $cursor = $this->laneCursors[$laneKey] ?? 0;
+            $unconsumed = max(0, count($queue) - $cursor);
+            if ($unconsumed > 0) {
+                $detail[$laneKey] = $unconsumed;
+            }
+        }
+
+        return $detail;
     }
 
     /**
@@ -190,6 +357,35 @@ class ResponseScript
         }
 
         $parts[] = 'Scripted steps: ' . count($this->steps) . ' (all consumed).';
+
+        return new RuntimeException(implode("\n", $parts));
+    }
+
+    /**
+     * Build a lane-specific exhaustion error (S4).
+     *
+     * @param RequestLane $lane The lane that ran out.
+     * @param CapturedPayload $payload The payload that triggered the error.
+     * @param int $turn The 1-based turn number.
+     */
+    private function buildLaneExhaustionError(RequestLane $lane, CapturedPayload $payload, int $turn): RuntimeException
+    {
+        $msgCount = count($payload->messages);
+        $modelHint = $payload->model ? " (model: {$payload->model})" : '';
+        $parts = [
+            "Response script exhausted on lane '{$lane->value}' — no more steps to serve.",
+            "Turn {$turn}, {$msgCount} messages{$modelHint}.",
+        ];
+
+        $detail = $this->unconsumedStepsDetail();
+        if (empty($detail)) {
+            $parts[] = 'All lanes fully consumed.';
+        } else {
+            $parts[] = 'Unconsumed steps by lane:';
+            foreach ($detail as $laneName => $count) {
+                $parts[] = "  {$laneName}: {$count}";
+            }
+        }
 
         return new RuntimeException(implode("\n", $parts));
     }

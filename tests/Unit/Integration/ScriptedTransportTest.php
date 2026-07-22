@@ -128,9 +128,9 @@ class ScriptedTransportTest extends TestCase
             $client->send($request2);
         } catch (\RuntimeException $e) {
             $message = $e->getMessage();
-            // Check for rich error info
-            $this->assertStringContainsString('message_count', $message);
-            $this->assertStringContainsString('entry_path', $message);
+            // Check for rich error info - includes lane and turn number
+            $this->assertStringContainsString('agent_turn', $message);
+            $this->assertStringContainsString('Turn:', $message);
             throw $e;
         }
     }

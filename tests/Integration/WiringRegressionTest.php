@@ -8,6 +8,9 @@ use ClarionApp\LlmClient\Models\ContextManagementRecord;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use Illuminate\Support\Facades\Event;
+use Tests\Integration\Harness\LaneRule;
+use Tests\Integration\Harness\RequestLane;
+use Tests\Integration\Harness\Responses;
 
 /**
  * Regression anchor tests — pin the specific defects that motivated the
@@ -47,11 +50,18 @@ class WiringRegressionTest extends AssembledSystemTestCase
         $fixture = $this->fixture()->build();
         $seededCount = $this->seedOverBudgetHistory($fixture->conversation);
 
-        // Script: condensation LLM call (summary JSON) then main conversation call.
-        // The condenser calls the LLM for fresh condensation (if sealed chunks exist),
-        // then the main conversation call happens. Both go through the same HTTP client.
+        // Script: condensation rule (Condensation lane) + agent response (agent_turn lane).
+        // Condensation requests are classified as Condensation lane (R2a),
+        // so we need a rule for that lane.
         $this->script()
-            ->finalAnswer('{"summary": [{"text": "Previous conversation context summarized"}]}')
+            ->addRule(
+                new LaneRule(
+                    lane: RequestLane::Condensation,
+                    predicate: fn () => true,
+                    respond: fn () => Responses::condensationSummary('Previous conversation context summarized'),
+                    label: 'condensation_summary'
+                )
+            )
             ->finalAnswer('Hello! How can I help?');
 
         // Drive the container-wired loop
