@@ -47,13 +47,12 @@ class OperationRecallJourneyTest extends MultiTurnTestCase
     {
         parent::setUp();
 
-        // Skip gracefully when a sibling Unit test (ApiCallValidatorTest /
-        // McpToolRegistryTest) has replaced ApiManager with a Mockery
-        // alias/overload double earlier in this process: this story drives the
+        // Skip gracefully if any test earlier in this process has replaced
+        // ApiManager with a Mockery alias/overload double: this story drives the
         // real OpenAPI catalogue seam (OperationCatalogue::seed()), which is
-        // unavailable against a mock. Under the canonical `phpunit tests/`
-        // order Integration runs before those Unit mocks and the seam is
-        // present; only a Unit-first ordering reaches here.
+        // unavailable against a mock. No test does that today (the ones that
+        // once did now seed $apiDocsCache directly), so this never fires — it is
+        // a regression safety-net.
         if (! $this->operations()->isSeamAvailable()) {
             $this->markTestSkipped(
                 'ApiManager has been replaced by a Mockery alias/overload mock '

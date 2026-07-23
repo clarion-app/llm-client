@@ -14,6 +14,16 @@ class McpToolRegistryTest extends TestCase
 {
     protected function tearDown(): void
     {
+        // Reset every static this test seeds so nothing leaks into later tests
+        // (the same isolation guarantee OperationCatalogue gives the harness).
+        $this->seedApiDocsCache(null);
+        $reflector = new \ReflectionClass(ClarionPackageServiceProvider::class);
+        foreach (['packageDescriptions', 'packageOperations', 'customPrompts'] as $name) {
+            $prop = $reflector->getProperty($name);
+            $prop->setAccessible(true);
+            $prop->setValue(null, []);
+        }
+
         Mockery::close();
         parent::tearDown();
     }
@@ -646,7 +656,7 @@ class McpToolRegistryTest extends TestCase
             $descriptions[$pkg] = ['description' => "Description for {$pkg}"];
         }
 
-        // Use reflection to set static properties instead of alias mock (class already exists)
+        // Seed ClarionPackageServiceProvider statics by reflection (no mock).
         $reflector = new \ReflectionClass(ClarionPackageServiceProvider::class);
 
         $descProp = $reflector->getProperty('packageDescriptions');
@@ -661,17 +671,39 @@ class McpToolRegistryTest extends TestCase
         $customPromptsProp->setAccessible(true);
         $customPromptsProp->setValue(null, []);
 
-        // Mock ApiManager with alias (concrete class, not abstract)
-        $apiMock = Mockery::mock('alias:' . ApiManager::class);
-        foreach ($operationDetailsMap as $opId => $details) {
-            $apiMock->shouldReceive('getOperationDetails')
-                ->with($opId)
-                ->andReturn($details);
+        // Seed ApiManager's real static $apiDocsCache built from
+        // $operationDetailsMap, so the *real* ApiManager::getOperationDetails()
+        // returns each mapped {path, method, details} — and (object)[] for
+        // anything absent, exactly as the old byDefault() mock did. This
+        // replaces a Mockery `alias:` mock, which fails with "class already
+        // exists" once the real ApiManager has been autoloaded earlier in the
+        // process (e.g. by the Integration suite, whose OperationCatalogue
+        // drives the same static). getOperationDetails() matches on
+        // details['operationId'], so it is forced to $opId here.
+        $paths = [];
+        foreach ($operationDetailsMap as $opId => $entry) {
+            if (! is_array($entry) || ! isset($entry['path'], $entry['method'])) {
+                // Malformed/empty entry: leave it unmapped so the real method
+                // returns (object)[] for this opId (the byDefault() case).
+                continue;
+            }
+            $details = (array) ($entry['details'] ?? []);
+            $details['operationId'] = $opId;
+            $paths[$entry['path']][$entry['method']] = $details;
         }
+        $this->seedApiDocsCache(['paths' => $paths]);
+    }
 
-        // For operations called without specific matching
-        $apiMock->shouldReceive('getOperationDetails')
-            ->andReturn((object) [])
-            ->byDefault();
+    /**
+     * Write (or clear, with null) ApiManager's static $apiDocsCache by
+     * reflection — the same seam OperationCatalogue uses in the Integration
+     * harness, chosen over a Mockery alias mock so these tests are independent
+     * of whether the real ApiManager class was already autoloaded.
+     */
+    private function seedApiDocsCache(?array $doc): void
+    {
+        $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
+        $prop->setAccessible(true);
+        $prop->setValue(null, $doc);
     }
 }

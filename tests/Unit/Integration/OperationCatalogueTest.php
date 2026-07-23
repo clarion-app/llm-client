@@ -20,16 +20,15 @@ class OperationCatalogueTest extends TestCase
     {
         parent::setUp();
 
-        // Skip gracefully when a sibling Unit test (ApiCallValidatorTest /
-        // McpToolRegistryTest) has replaced ApiManager with a Mockery
-        // `alias:`/`overload:` double earlier in this process: the double has
+        // Skip gracefully if any test earlier in this process has replaced
+        // ApiManager with a Mockery `alias:`/`overload:` double: the double has
         // no $apiDocsCache property, so the seam this test exercises is gone.
-        // Under the canonical `phpunit tests/` order this test runs before
-        // those mocks and the property is present; only a Unit-first ordering
-        // (explicit path list, or a defects-first result cache) reaches here.
-        // Skipping is honest — there is nothing real left to assert against —
-        // and avoids a confusing `ReflectionException: Property ... does not
-        // exist` masquerading as a failure of this test.
+        // No test does that today (ApiCallValidatorTest/McpToolRegistryTest,
+        // which once did, now seed $apiDocsCache directly), so this never fires
+        // — it is a regression safety-net. Skipping is honest — there would be
+        // nothing real left to assert against — and avoids a confusing
+        // `ReflectionException: Property ... does not exist` masquerading as a
+        // failure of this test.
         if (! (new ReflectionClass(ApiManager::class))->hasProperty('apiDocsCache')) {
             $this->markTestSkipped(
                 'ApiManager has been replaced by a Mockery alias/overload mock '

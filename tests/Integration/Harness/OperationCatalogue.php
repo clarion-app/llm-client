@@ -19,9 +19,11 @@ class OperationCatalogue
      * Whether the ApiManager seam this catalogue drives is still present —
      * i.e. the real class (with its `$apiDocsCache` property) has not been
      * replaced by a Mockery `alias:`/`overload:` double earlier in the same
-     * process (as `ApiCallValidatorTest`/`McpToolRegistryTest` do). Scenarios
-     * that seed the catalogue should skip gracefully when this is false; under
-     * the canonical `phpunit tests/` order it is always true.
+     * process. No test in this suite does that today (the ones that used to —
+     * `ApiCallValidatorTest`/`McpToolRegistryTest` — now seed `$apiDocsCache`
+     * directly instead), so this is always true; it remains a regression
+     * safety-net so a reintroduced alias mock would make dependent scenarios
+     * skip gracefully rather than error.
      */
     public function isSeamAvailable(): bool
     {
@@ -47,15 +49,12 @@ class OperationCatalogue
      * Called unconditionally in tearDown to prevent leak across tests.
      *
      * Degrades gracefully when `ApiManager` no longer carries `$apiDocsCache`:
-     * a prior test in the same process may have replaced the class with a
-     * Mockery `alias:`/`overload:` double (as `ApiCallValidatorTest` and
-     * `McpToolRegistryTest` do), which has no such property. Under the
-     * canonical `phpunit tests/` order Integration runs before Unit so this
-     * never happens, but a Unit-first ordering (explicit path list, or a
-     * defects-first result cache) would otherwise crash every multi-turn
-     * tearDown with `ReflectionException: Property ... does not exist`. There
-     * is no real cache to clear in that case — the class the seam targets is
-     * gone — so skipping the reset is both correct and safe.
+     * a prior test in the same process could have replaced the class with a
+     * Mockery `alias:`/`overload:` double, which has no such property. No test
+     * does that today, but were one reintroduced this would otherwise crash
+     * every multi-turn tearDown with `ReflectionException: Property ... does
+     * not exist`. There is no real cache to clear in that case — the class the
+     * seam targets is gone — so skipping the reset is both correct and safe.
      */
     public function reset(): void
     {
