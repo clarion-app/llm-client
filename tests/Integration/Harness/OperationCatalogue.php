@@ -16,6 +16,19 @@ use ReflectionClass;
 class OperationCatalogue
 {
     /**
+     * Whether the ApiManager seam this catalogue drives is still present —
+     * i.e. the real class (with its `$apiDocsCache` property) has not been
+     * replaced by a Mockery `alias:`/`overload:` double earlier in the same
+     * process (as `ApiCallValidatorTest`/`McpToolRegistryTest` do). Scenarios
+     * that seed the catalogue should skip gracefully when this is false; under
+     * the canonical `phpunit tests/` order it is always true.
+     */
+    public function isSeamAvailable(): bool
+    {
+        return (new ReflectionClass(ApiManager::class))->hasProperty('apiDocsCache');
+    }
+
+    /**
      * Seed the API docs cache with an OpenAPI-shaped document.
      *
      * @param array $openApiDoc OpenAPI 3.0 document array.
@@ -32,10 +45,24 @@ class OperationCatalogue
      * Reset the API docs cache to null.
      *
      * Called unconditionally in tearDown to prevent leak across tests.
+     *
+     * Degrades gracefully when `ApiManager` no longer carries `$apiDocsCache`:
+     * a prior test in the same process may have replaced the class with a
+     * Mockery `alias:`/`overload:` double (as `ApiCallValidatorTest` and
+     * `McpToolRegistryTest` do), which has no such property. Under the
+     * canonical `phpunit tests/` order Integration runs before Unit so this
+     * never happens, but a Unit-first ordering (explicit path list, or a
+     * defects-first result cache) would otherwise crash every multi-turn
+     * tearDown with `ReflectionException: Property ... does not exist`. There
+     * is no real cache to clear in that case — the class the seam targets is
+     * gone — so skipping the reset is both correct and safe.
      */
     public function reset(): void
     {
         $ref = new ReflectionClass(ApiManager::class);
+        if (! $ref->hasProperty('apiDocsCache')) {
+            return;
+        }
         $prop = $ref->getProperty('apiDocsCache');
         $prop->setAccessible(true);
         $prop->setValue(null, null);

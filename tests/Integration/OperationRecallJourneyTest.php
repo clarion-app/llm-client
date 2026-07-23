@@ -47,6 +47,22 @@ class OperationRecallJourneyTest extends MultiTurnTestCase
     {
         parent::setUp();
 
+        // Skip gracefully when a sibling Unit test (ApiCallValidatorTest /
+        // McpToolRegistryTest) has replaced ApiManager with a Mockery
+        // alias/overload double earlier in this process: this story drives the
+        // real OpenAPI catalogue seam (OperationCatalogue::seed()), which is
+        // unavailable against a mock. Under the canonical `phpunit tests/`
+        // order Integration runs before those Unit mocks and the seam is
+        // present; only a Unit-first ordering reaches here.
+        if (! $this->operations()->isSeamAvailable()) {
+            $this->markTestSkipped(
+                'ApiManager has been replaced by a Mockery alias/overload mock '
+                . 'by an earlier test in this process; the OpenAPI catalogue seam '
+                . 'this story drives is unavailable. Runs cleanly under the '
+                . 'canonical `phpunit tests/` order.'
+            );
+        }
+
         // McpToolExecutor resolves API tokens via Laravel Passport in
         // production. The test doubles that with a fixed per-user token
         // string that the scripted host API (fakeHostApi below) never
