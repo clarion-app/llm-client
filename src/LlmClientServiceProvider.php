@@ -30,6 +30,7 @@ use ClarionApp\LlmClient\Services\ToolFormatter;
 use ClarionApp\LlmClient\Services\MemoryService;
 use ClarionApp\LlmClient\Services\MemoryEvictionService;
 use ClarionApp\LlmClient\Services\EmbeddingService;
+use ClarionApp\LlmClient\Services\RoleResolver;
 use ClarionApp\LlmClient\Services\DeclarativeMemoryService as DeclarativeMemoryServiceImpl;
 use ClarionApp\LlmClient\Services\EpisodicMemoryService;
 use ClarionApp\LlmClient\Services\EpisodicMemorySearchService;
@@ -265,7 +266,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         $this->app->singleton(EmbeddingService::class, function ($app) {
             return new EmbeddingService(
-                $app->make(ProviderRegistry::class)
+                $app->make(ProviderRegistry::class),
+                $app->make(RoleResolver::class)
             );
         });
 

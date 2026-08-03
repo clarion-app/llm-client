@@ -357,7 +357,9 @@ class GenerateEpisodicMemoryJobTest extends TestCase
 
         $embeddingMock = Mockery::mock(EmbeddingService::class);
         $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
-        $embeddingMock->shouldReceive('generate')->once()->with('Team agreed on canary deployments for web services and blue-green for internal services.')->andReturn([0.1, 0.2, 0.3]);
+        $embeddingMock->shouldReceive('generate')->once()
+            ->with('Team agreed on canary deployments for web services and blue-green for internal services.', null, Mockery::type('string'))
+            ->andReturn([0.1, 0.2, 0.3]);
 
         $job = new GenerateEpisodicMemoryJob(
             $this->conversation->id,

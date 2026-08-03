@@ -67,7 +67,7 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
         // Best-effort re-embed
         if ($this->embeddingService->isEnabled()) {
             try {
-                $entry->embedding = $this->embeddingService->generate($content);
+                $entry->embedding = $this->embeddingService->generate($content, null, $userId);
             } catch (\Throwable $e) {
                 Log::warning('Embedding generation failed during declarative memory update', [
                     'user_id' => $userId,
@@ -209,7 +209,7 @@ class DeclarativeMemoryService implements DeclarativeMemoryServiceContract
 
         if ($this->embeddingService->isEnabled()) {
             try {
-                $newEmbedding = $this->embeddingService->generate($content);
+                $newEmbedding = $this->embeddingService->generate($content, null, $userId);
                 $embeddingAvailable = true;
             } catch (\Throwable $e) {
                 Log::warning('Embedding generation failed for declarative memory, falling back to normalized exact match', [

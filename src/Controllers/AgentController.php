@@ -4,9 +4,9 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Conversation;
-use ClarionApp\LlmClient\Models\LanguageModel;
-use ClarionApp\LlmClient\Models\UserSetting;
 use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\RoleResolver;
+use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Http\Request;
 use Auth;
 use Illuminate\Support\Facades\Log;
@@ -59,26 +59,21 @@ class AgentController extends Controller
                 ->first();
 
             if (!$conversation) {
-                // Resolve server/model defaults
+                // Resolve server/model via RoleResolver
                 $serverId = null;
                 $modelName = null;
 
-                $userSetting = UserSetting::where('user_id', $user->id)->first();
-                if ($userSetting) {
-                    $serverId = $userSetting->server_id;
-                    $modelName = $userSetting->model;
+                $resolution = app(RoleResolver::class)->resolve(ModelRole::Inference, $user->id);
+                if ($resolution->hasEffectiveModel()) {
+                    $serverId = $resolution->server->id;
+                    $modelName = $resolution->model;
                 }
 
                 if (!$serverId || !$modelName) {
-                    $model = LanguageModel::whereHas('server')->first();
-                    if (!$model) {
-                        return response()->json([
-                            'error' => 'No server or model available',
-                            'code' => 'no_server',
-                        ], 422);
-                    }
-                    $serverId = $serverId ?: $model->server_id;
-                    $modelName = $modelName ?: $model->name;
+                    return response()->json([
+                        'error' => 'No inference model is assigned',
+                        'code' => 'no_server',
+                    ], 422);
                 }
 
                 $conversation = Conversation::create([

@@ -53,8 +53,8 @@ class EmbedMemoryCommand extends Command
             return self::FAILURE;
         }
 
-        // Check provider availability
-        if ($this->embeddingService->getProvider() === null) {
+        // Check provider availability (CLI runs at installation scope, so userId is null)
+        if ($this->embeddingService->getProvider(null) === null) {
             $this->error('No embedding provider available. Configure memory.embedding.server_id.');
             return self::FAILURE;
         }

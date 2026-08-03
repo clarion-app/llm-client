@@ -174,7 +174,7 @@ class MemoryService implements MemoryServiceContract
         // Check embedding service availability only when we need to generate an embedding.
         // If a pre-computed embedding is provided, the service is not needed.
         if ($queryEmbedding === null) {
-            if ($this->embeddingService === null || $this->embeddingService->getProvider() === null) {
+            if ($this->embeddingService === null || $this->embeddingService->getProvider($user_id) === null) {
                 throw new SemanticSearchException(
                     'embedding_provider_unavailable',
                     suggestion: 'Use key_prefix or content mode, or configure memory.embedding.server_id'
@@ -185,7 +185,7 @@ class MemoryService implements MemoryServiceContract
         // Use pre-computed embedding if supplied, otherwise generate one
         if ($queryEmbedding === null) {
             try {
-                $queryEmbedding = $this->embeddingService->generate($query);
+                $queryEmbedding = $this->embeddingService->generate($query, null, $user_id);
             } catch (RuntimeException $e) {
                 throw new SemanticSearchException(
                     'embedding_generation_failed',

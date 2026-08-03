@@ -88,7 +88,7 @@ class AutoMemoryRetriever
         $queryEmbedding = null;
         try {
             if ($this->embeddingService->isEnabled()) {
-                $queryEmbedding = $this->embeddingService->generate($query, $embeddingTimeoutMs);
+                $queryEmbedding = $this->embeddingService->generate($query, $embeddingTimeoutMs, $userId);
             }
         } catch (\RuntimeException $e) {
             // Embedding generation failed — track as degradation event

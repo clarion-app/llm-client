@@ -81,7 +81,7 @@ class EpisodicMemorySearchService
         // Use pre-computed embedding if supplied, otherwise generate one
         if ($queryEmbedding === null) {
             try {
-                $queryEmbedding = $this->embeddingService->generate($query);
+                $queryEmbedding = $this->embeddingService->generate($query, null, $userId);
             } catch (\RuntimeException $e) {
                 throw new \InvalidArgumentException(
                     'Semantic search unavailable: '.$e->getMessage()

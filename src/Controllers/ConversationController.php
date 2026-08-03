@@ -6,9 +6,8 @@ use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\ConversationLifecycleService;
 use ClarionApp\LlmClient\Models\Message;
-use ClarionApp\LlmClient\Models\LanguageModel;
-use ClarionApp\LlmClient\Models\Server;
-use ClarionApp\LlmClient\Models\UserSetting;
+use ClarionApp\LlmClient\Services\RoleResolver;
+use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Http\Request;
 use Auth;
 use Illuminate\Support\Facades\Log;
@@ -79,25 +78,22 @@ class ConversationController extends Controller
         $validatedData['character'] = "Clarion";
         $validatedData['channel'] = $validatedData['channel'] ?? 'web';
 
-        // Use validated server_id/model if provided, otherwise fall back to UserSetting, then first available
+        // Use validated server_id/model if provided, otherwise resolve via RoleResolver
         $serverId = $validatedData['server_id'] ?? null;
         $modelName = $validatedData['model'] ?? null;
 
         if (!$serverId || !$modelName) {
-            $userSetting = UserSetting::where('user_id', Auth::id())->first();
-            if ($userSetting) {
-                $serverId = $serverId ?: $userSetting->server_id;
-                $modelName = $modelName ?: $userSetting->model;
+            $resolution = app(RoleResolver::class)->resolve(ModelRole::Inference, Auth::id());
+            if ($resolution->hasEffectiveModel()) {
+                $serverId = $serverId ?: $resolution->server->id;
+                $modelName = $modelName ?: $resolution->model;
             }
         }
 
         if (!$serverId || !$modelName) {
-            $model = LanguageModel::whereHas('server')->first();
-            if (!$model) {
-                return response()->json(['message' => 'No server or model available. Please configure a server first.'], 422);
-            }
-            $serverId = $serverId ?: $model->server_id;
-            $modelName = $modelName ?: $model->name;
+            return response()->json([
+                'message' => 'No inference model is assigned. Configure one in LLM settings, or a server first if none exist.',
+            ], 422);
         }
 
         $validatedData['server_id'] = $serverId;

@@ -185,7 +185,7 @@ class GenerateEpisodicMemoryJob implements ShouldQueue
         }
 
         // Generate embedding (best effort, non-blocking)
-        $this->generateEmbedding($memory, $embeddingService);
+        $this->generateEmbedding($memory, $embeddingService, $userId);
     }
 
     /**
@@ -274,14 +274,14 @@ PROMPT;
     /**
      * Generate embedding for the memory entry (best effort).
      */
-    protected function generateEmbedding(EpisodicMemory $memory, EmbeddingService $embeddingService): void
+    protected function generateEmbedding(EpisodicMemory $memory, EmbeddingService $embeddingService, string $userId): void
     {
         if (!$embeddingService->isEnabled()) {
             return;
         }
 
         try {
-            $embedding = $embeddingService->generate($memory->summary);
+            $embedding = $embeddingService->generate($memory->summary, null, $userId);
             $memory->update(['embedding' => $embedding]);
         } catch (\Exception $e) {
             // Embedding generation failure is non-blocking

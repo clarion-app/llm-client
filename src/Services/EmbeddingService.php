@@ -4,9 +4,13 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Contracts\MemoryScope;
+use ClarionApp\LlmClient\Exceptions\RoleAssignmentFailedException;
 use ClarionApp\LlmClient\Models\MemoryEntry;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\Services\RoleResolver;
+use ClarionApp\LlmClient\ValueObjects\ModelRole;
+use ClarionApp\LlmClient\ValueObjects\RoleResolutionStatus;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
@@ -25,7 +29,8 @@ class EmbeddingService
     private const MAX_INPUT_LENGTH = 8000;
 
     public function __construct(
-        private readonly ProviderRegistry $providerRegistry
+        private readonly ProviderRegistry $providerRegistry,
+        private readonly RoleResolver $roleResolver
     ) {}
 
     /**
@@ -40,17 +45,34 @@ class EmbeddingService
      * Resolve the embedding provider.
      *
      * Priority:
-     * 1. Dedicated embedding server (configured via memory.embedding.server_id)
-     * 2. Chat provider (fallback, if it supports embeddings)
+     * 1. RoleResolver embedding role assignment (user, then installation scope)
+     * 2. Dedicated embedding server (configured via memory.embedding.server_id)
      * 3. Null (no provider available)
+     *
+     * @throws RoleAssignmentFailedException If the role is broken (model vanished)
      */
-    public function getProvider(): ?LlmProvider
+    public function getProvider(?string $userId = null): ?LlmProvider
     {
         if (!$this->isEnabled()) {
             return null;
         }
 
-        // Try dedicated embedding server first
+        // Try role-based resolution first
+        $resolution = $this->roleResolver->resolve(ModelRole::Embedding, $userId);
+
+        if ($resolution->status === RoleResolutionStatus::Broken) {
+            throw new RoleAssignmentFailedException(
+                ModelRole::Embedding,
+                $resolution->model ?? 'unknown',
+                $resolution->brokenReason,
+            );
+        }
+
+        if ($resolution->hasEffectiveModel()) {
+            return $this->providerRegistry->resolve($resolution->server);
+        }
+
+        // Unassigned — fall back to config-file values (FR-017)
         $serverId = config('llm-client.memory.embedding.server_id', null);
         if ($serverId !== null) {
             $server = Server::find($serverId);
@@ -68,25 +90,42 @@ class EmbeddingService
 
         // No dedicated embedding provider available.
         // Return null — callers should handle this gracefully.
-        // We do NOT fall back to chat provider here as that would require
-        // knowing the agent's chat server context which EmbeddingService doesn't have.
         return null;
     }
 
     /**
      * Generate an embedding for the given text.
      *
+     * @param string $content Text to embed
      * @param int|null $timeoutMs Bound the provider request to this many
      *                            milliseconds. Callers on a latency budget (the
      *                            synchronous retrieval hot path) must pass this;
      *                            background callers should omit it and take the
      *                            client default, which is far more generous.
+     * @param string|null $userId User ID for role-based resolution (optional)
      * @return float[] Embedding vector
      * @throws RuntimeException If embedding generation fails
+     * @throws RoleAssignmentFailedException If the embedding role is broken
      */
-    public function generate(string $content, ?int $timeoutMs = null): array
+    public function generate(string $content, ?int $timeoutMs = null, ?string $userId = null): array
     {
-        $provider = $this->getProvider();
+        // Resolve provider and determine which model name to use
+        $resolution = $this->roleResolver->resolve(ModelRole::Embedding, $userId);
+        $roleModel = null;
+
+        if ($resolution->status === RoleResolutionStatus::Broken) {
+            throw new RoleAssignmentFailedException(
+                ModelRole::Embedding,
+                $resolution->model ?? 'unknown',
+                $resolution->brokenReason,
+            );
+        }
+
+        if ($resolution->hasEffectiveModel()) {
+            $roleModel = $resolution->model;
+        }
+
+        $provider = $this->getProvider($userId);
         if ($provider === null) {
             throw new RuntimeException(
                 'No embedding provider available. Configure memory.embedding.server_id or disable semantic search.'
@@ -96,7 +135,8 @@ class EmbeddingService
         // Truncate content if too long
         $input = $this->truncateForEmbedding($content);
 
-        $model = config('llm-client.memory.embedding.model', null);
+        // Use role-assigned model if resolved, otherwise fall back to config
+        $model = $roleModel ?? config('llm-client.memory.embedding.model', null);
         $options = [];
         if ($model !== null && $model !== '') {
             $options['model'] = $model;
@@ -136,7 +176,7 @@ class EmbeddingService
         }
 
         // Skip if no provider available
-        if ($this->getProvider() === null) {
+        if ($this->getProvider($entry->user_id) === null) {
             Log::warning('Skipping embedding generation: no embedding provider available', [
                 'entry_id' => $entry->id,
                 'key' => $entry->key,
@@ -145,7 +185,7 @@ class EmbeddingService
         }
 
         try {
-            $embedding = $this->generate($entry->content);
+            $embedding = $this->generate($entry->content, null, $entry->user_id);
             $entry->embedding = $embedding;
             $entry->save();
             return true;
