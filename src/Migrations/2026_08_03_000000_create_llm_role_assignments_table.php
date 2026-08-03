@@ -6,29 +6,28 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
     public function up(): void
     {
-        if (Schema::hasTable('language_models')) {
+        if (Schema::hasTable('llm_role_assignments')) {
             return;
         }
 
-        Schema::create('language_models', function (Blueprint $table) {
+        Schema::create('llm_role_assignments', function (Blueprint $table) {
             $table->uuid('id')->primary();
+            $table->string('role', 20);
+            $table->uuid('user_id');
             $table->uuid('server_id');
-            $table->string('name');
+            $table->string('model', 255);
             $table->timestamps();
             $table->softDeletes();
+
+            $table->unique(['role', 'user_id']);
+            $table->index('server_id');
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
-        Schema::dropIfExists('language_models');
+        Schema::dropIfExists('llm_role_assignments');
     }
 };

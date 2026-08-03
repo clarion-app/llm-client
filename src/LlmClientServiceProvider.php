@@ -319,6 +319,19 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Services\RunTraceQuery::class, function () {
             return new \ClarionApp\LlmClient\Services\RunTraceQuery();
         });
+
+        // Register role resolution services
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RoleResolver::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\RoleResolver(
+                $app->make(ProviderRegistry::class)
+            );
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RoleAssignmentService::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\RoleAssignmentService(
+                $app->make(\ClarionApp\LlmClient\Services\RoleResolver::class)
+            );
+        });
     }
 
     /**

@@ -4,13 +4,14 @@ namespace ClarionApp\LlmClient\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 
 class LanguageModel extends Model
 {
-    use HasFactory, EloquentMultiChainBridge;
+    use HasFactory, EloquentMultiChainBridge, SoftDeletes;
 
     protected $fillable = ['name', 'server_id'];
 

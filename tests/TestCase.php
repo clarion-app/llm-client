@@ -371,5 +371,34 @@ abstract class TestCase extends BaseTestCase
             });
         }
 
+        // language_models table (for model role resolver broken-check tests).
+        if (!Schema::hasTable('language_models')) {
+            Schema::create('language_models', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('server_id');
+                $table->string('name');
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index('server_id');
+            });
+        }
+
+        // llm_role_assignments table (for model role assignment feature).
+        if (!Schema::hasTable('llm_role_assignments')) {
+            Schema::create('llm_role_assignments', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('role', 20);
+                $table->uuid('user_id');
+                $table->uuid('server_id');
+                $table->string('model', 255);
+                $table->timestamps();
+                $table->timestamp('deleted_at')->nullable();
+
+                $table->unique(['role', 'user_id']);
+                $table->index('server_id');
+            });
+        }
+
     }
 }
