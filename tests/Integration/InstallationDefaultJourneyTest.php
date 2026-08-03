@@ -19,8 +19,8 @@ use PHPUnit\Framework\Attributes\After;
 /**
  * Integration tests for installation-wide default assignments.
  *
- * Validates SC-004 (immediate effect without restart) and SC-005 (isolation
- * across roles and users), plus all five US2 acceptance scenarios.
+ * Validates immediate effect without restart and isolation across roles
+ * and users, plus all five US2 acceptance scenarios.
  */
 class InstallationDefaultJourneyTest extends TestCase
 {
@@ -33,7 +33,7 @@ class InstallationDefaultJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
-    // SC-005: Two users, one override — isolation across all three roles
+    // Two users, one override — isolation across all three roles
     // -----------------------------------------------------------------------
 
     #[Test]
@@ -105,7 +105,7 @@ class InstallationDefaultJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
-    // SC-004: Installation assignment change takes effect immediately
+    // Installation assignment change takes effect immediately
     // -----------------------------------------------------------------------
 
     #[Test]
