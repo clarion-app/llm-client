@@ -113,6 +113,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\EndIdleConversationsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredContextManagementMetricsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand::class,
+                \ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand::class,
             ]);
         }
 
@@ -134,6 +135,11 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // Resolve abandoned (stale in_progress) agent runs every five minutes.
             $schedule->command('llm-client:resolve-abandoned-runs')
                 ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Purge expired agent run traces daily.
+            $schedule->command('llm-client:purge-run-traces')
+                ->daily()
                 ->withoutOverlapping();
         });
 

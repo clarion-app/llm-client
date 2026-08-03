@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Tests\Unit;
 
+use ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand;
 use ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand;
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\LlmClientServiceProvider;
@@ -142,6 +143,71 @@ class LlmClientServiceProviderTest extends TestCase
         // Assert the event uses withoutOverlapping.
         $this->assertTrue(
             $abandonedRunsEvent->withoutOverlapping,
+            'Schedule should use withoutOverlapping'
+        );
+    }
+
+    /**
+     * T082: PurgeExpiredRunTracesCommand is registered in the commands array.
+     */
+    #[Test]
+    public function purgeExpiredRunTracesCommand_is_registered()
+    {
+        // Assert the command is registered via Artisan.
+        $commands = Artisan::all();
+
+        $this->assertArrayHasKey(
+            'llm-client:purge-run-traces',
+            $commands,
+            'PurgeExpiredRunTracesCommand should be registered'
+        );
+
+        // Assert the command instance is the correct class.
+        $command = $commands['llm-client:purge-run-traces'];
+        $this->assertInstanceOf(
+            PurgeExpiredRunTracesCommand::class,
+            $command,
+            'Command should be PurgeExpiredRunTracesCommand instance'
+        );
+    }
+
+    /**
+     * T082: The purge schedule lives in the existing callAfterResolving block
+     * and runs daily without overlapping.
+     */
+    #[Test]
+    public function purgeExpiredRunTracesCommand_is_scheduled()
+    {
+        $schedule = $this->app->make(Schedule::class);
+
+        // Get all scheduled events.
+        $events = $schedule->events();
+
+        // Find the purge-run-traces event.
+        $purgeTracesEvent = null;
+        foreach ($events as $event) {
+            $command = $event->command ?? '';
+            if (str_contains($command, 'purge-run-traces')) {
+                $purgeTracesEvent = $event;
+                break;
+            }
+        }
+
+        $this->assertNotNull(
+            $purgeTracesEvent,
+            'Schedule should contain purge-run-traces command'
+        );
+
+        // Assert the event runs daily (cron: 0 0 * * *).
+        $this->assertSame(
+            '0 0 * * *',
+            (string) $purgeTracesEvent->expression,
+            'Schedule should run daily'
+        );
+
+        // Assert the event uses withoutOverlapping.
+        $this->assertTrue(
+            $purgeTracesEvent->withoutOverlapping,
             'Schedule should use withoutOverlapping'
         );
     }

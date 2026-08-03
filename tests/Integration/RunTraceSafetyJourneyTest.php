@@ -403,6 +403,101 @@ class RunTraceSafetyJourneyTest extends AssembledSystemTestCase
     }
 
     /**
+     * T083 [US3]: SC-013 determinism — ten consecutive runs of the same
+     * deterministic conversation yield an identical step sequence.
+     *
+     * Proves that the trace recording is deterministic for the same input,
+     * not affected by timing noise or non-deterministic ordering.
+     */
+    public function test_sc013_determinism_ten_consecutive_runs(): void
+    {
+        $this->scenario = 'sc013_determinism';
+        $this->entryPath = 'sync';
+
+        $fixture = $this->fixture()->build();
+
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+
+        $runCounts = [];
+        $stepCounts = [];
+        $stepPositions = [];
+        $stepEndStates = [];
+        $iterations = 10;
+
+        for ($i = 0; $i < $iterations; $i++) {
+            $this->rebindScript();
+            Message::where('conversation_id', $fixture->conversation->id)->delete();
+            $this->cleanTraceTables();
+
+            $this->script()
+                ->finalAnswer('Deterministic response for SC-013 test.');
+
+            $this->app->make(AgentLoopService::class)->run(
+                $fixture->conversation,
+                'Deterministic input for SC-013'
+            );
+
+            // Query the trace for this run.
+            $runs = DB::table('agent_runs')
+                ->where('user_id', $fixture->user->id)
+                ->orderByDesc('started_at')
+                ->get();
+            $runCounts[] = $runs->count();
+
+            if ($runs->count() > 0) {
+                $latestRun = $runs->first();
+                $steps = DB::table('agent_run_steps')
+                    ->where('run_id', $latestRun->id)
+                    ->orderBy('position')
+                    ->get();
+                $stepCounts[] = $steps->count();
+                $stepPositions[] = $steps->pluck('position')->toArray();
+                $stepEndStates[] = $steps->pluck('end_state')->toArray();
+            }
+        }
+
+        // All runs should have the same number of run records.
+        $firstRunCount = $runCounts[0];
+        foreach ($runCounts as $idx => $count) {
+            $this->assertSame(
+                $firstRunCount,
+                $count,
+                "Iteration {$idx}: run count differs from iteration 0"
+            );
+        }
+
+        // All runs should have the same number of steps.
+        $firstStepCount = $stepCounts[0];
+        foreach ($stepCounts as $idx => $count) {
+            $this->assertSame(
+                $firstStepCount,
+                $count,
+                "Iteration {$idx}: step count differs from iteration 0"
+            );
+        }
+
+        // All step positions should be identical.
+        $firstPositions = $stepPositions[0];
+        foreach ($stepPositions as $idx => $positions) {
+            $this->assertSame(
+                $firstPositions,
+                $positions,
+                "Iteration {$idx}: step positions differ from iteration 0"
+            );
+        }
+
+        // All step end states should be identical.
+        $firstEndStates = $stepEndStates[0];
+        foreach ($stepEndStates as $idx => $endStates) {
+            $this->assertSame(
+                $firstEndStates,
+                $endStates,
+                "Iteration {$idx}: step end states differ from iteration 0"
+            );
+        }
+    }
+
+    /**
      * Drop trace tables so every DB::table() call on them fails.
      * Uses raw SQL because SQLite's Schema builder lacks dropTable.
      */
