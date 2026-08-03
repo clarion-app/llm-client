@@ -223,4 +223,40 @@ class ConversationInferenceRoleTest extends TestCase
         $this->assertNotEquals($requestModel, $resolution->model);
         $this->assertNotEquals($requestServerId, $resolution->server->id);
     }
+
+    /* -----------------------------------------------------------------
+     * Broken inference returns 422 (not a 500)
+     * ----------------------------------------------------------------- */
+
+    #[Test]
+    public function broken_inference_returns_no_model(): void
+    {
+        $user = User::factory()->create();
+        $server = Server::forceCreate([
+            'id' => (string) Str::uuid(),
+            'name' => 'Inference Server',
+            'server_url' => 'https://inference.example.com',
+            'provider_type' => 'openai',
+        ]);
+
+        // Create a user-scoped inference assignment.
+        RoleAssignment::create([
+            'role' => 'inference',
+            'user_id' => $user->id,
+            'server_id' => $server->id,
+            'model' => 'gpt-4-turbo',
+        ]);
+
+        // Soft delete the server — assignment becomes broken.
+        $server->delete();
+
+        // Resolve via RoleResolver.
+        $resolver = $this->app->make(RoleResolver::class);
+        $resolution = $resolver->resolve(ModelRole::Inference, $user->id);
+
+        // Resolution returns broken — the controller should return 422 (not a 500).
+        $this->assertFalse($resolution->hasEffectiveModel());
+        $this->assertEquals('broken', $resolution->status->value);
+        $this->assertNotNull($resolution->brokenReason);
+    }
 }

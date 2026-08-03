@@ -264,4 +264,58 @@ class RoleResolverTest extends TestCase
         $this->assertEquals('installation', $result->scope);
         $this->assertNotNull($result->brokenReason);
     }
+
+    // ========== Broken for image role (server deleted) ==========
+
+    #[Test]
+    public function broken_image_role_when_server_deleted(): void
+    {
+        $resolver = $this->app->make(RoleResolver::class);
+        $userId = (string) Str::uuid();
+
+        $server = Server::forceCreate(['id' => (string) Str::uuid(), 'name' => 'Image Server']);
+
+        RoleAssignment::create([
+            'role' => 'image',
+            'user_id' => $userId,
+            'server_id' => $server->id,
+            'model' => 'dall-e-3',
+        ]);
+
+        // Soft delete the server
+        $server->delete();
+
+        $result = $resolver->resolve(ModelRole::Image, $userId);
+
+        $this->assertEquals(RoleResolutionStatus::Broken, $result->status);
+        $this->assertNotNull($result->brokenReason);
+        $this->assertFalse($result->hasEffectiveModel());
+    }
+
+    // ========== Broken for embedding role (server deleted) ==========
+
+    #[Test]
+    public function broken_embedding_role_when_server_deleted(): void
+    {
+        $resolver = $this->app->make(RoleResolver::class);
+        $userId = (string) Str::uuid();
+
+        $server = Server::forceCreate(['id' => (string) Str::uuid(), 'name' => 'Embedding Server']);
+
+        RoleAssignment::create([
+            'role' => 'embedding',
+            'user_id' => $userId,
+            'server_id' => $server->id,
+            'model' => 'text-embedding-3-small',
+        ]);
+
+        // Soft delete the server
+        $server->delete();
+
+        $result = $resolver->resolve(ModelRole::Embedding, $userId);
+
+        $this->assertEquals(RoleResolutionStatus::Broken, $result->status);
+        $this->assertNotNull($result->brokenReason);
+        $this->assertFalse($result->hasEffectiveModel());
+    }
 }
