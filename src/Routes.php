@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\Controllers\UserSettingController;
 use ClarionApp\LlmClient\Controllers\McpServerController;
 use ClarionApp\LlmClient\Controllers\EpisodicMemoryController;
 use ClarionApp\LlmClient\Controllers\FeedbackController;
+use ClarionApp\LlmClient\Controllers\RoleAssignmentController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -57,6 +58,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::patch('feedback/preferences/{id}', [FeedbackController::class, "update"]);
     Route::delete('feedback/preferences/{id}', [FeedbackController::class, "destroy"]);
     Route::get('feedback/audit/{preference_id}', [FeedbackController::class, "audit"]);
+
+    // Role Assignment endpoints (model roles: inference, embedding, image)
+    Route::get('role-assignment', [RoleAssignmentController::class, "show"]);
+    Route::put('role-assignment', [RoleAssignmentController::class, "update"]);
+    Route::delete('role-assignment', [RoleAssignmentController::class, "destroy"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
