@@ -115,6 +115,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\PurgeExpiredContextManagementMetricsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand::class,
+                \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
             ]);
         }
 
