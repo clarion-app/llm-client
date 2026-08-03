@@ -1,0 +1,99 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, '061-**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  fast-suite:
+    name: Fast Suite (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ['8.2', '8.4']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '${{ matrix.php }}'
+          coverage: none
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-php${{ matrix.php }}-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            composer-php${{ matrix.php }}-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress
+
+      - name: Run fast suite
+        run: composer test
+
+  real-db:
+    name: Real-Database Suite
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: rootpassword
+          MARIADB_DATABASE: clarion_realdb_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mariadb-admin ping --password=rootpassword"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-php84-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            composer-php84-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress
+
+      - name: Wait for MariaDB
+        run: |
+          for i in $(seq 1 30); do
+            if mysql -h 127.0.0.1 -P 3306 -u root -prootpassword -e 'SELECT 1' >/dev/null 2>&1; then
+              echo "MariaDB is ready"
+              break
+            fi
+            echo "Waiting for MariaDB... ($i/30)"
+            sleep 2
+          done
+          mysql -h 127.0.0.1 -P 3306 -u root -prootpassword -e 'SELECT 1'
+
+      - name: Run real-database suite
+        env:
+          LLM_CLIENT_REAL_DB_ALLOW_SUPPLIED: '1'
+          LLM_CLIENT_REAL_DB_HOST: 127.0.0.1
+          LLM_CLIENT_REAL_DB_PORT: '3306'
+          LLM_CLIENT_REAL_DB_DATABASE: clarion_realdb_ci
+          LLM_CLIENT_REAL_DB_USERNAME: root
+          LLM_CLIENT_REAL_DB_PASSWORD: rootpassword
+          LLM_CLIENT_REAL_DB_STRICT: '1'
+        run: composer test:real-db -- --fail-on-skipped

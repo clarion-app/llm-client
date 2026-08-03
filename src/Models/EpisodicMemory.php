@@ -3,8 +3,10 @@
 namespace ClarionApp\LlmClient\Models;
 
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
+use ClarionApp\LlmClient\Casts\VectorEmbeddingCast;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 
 class EpisodicMemory extends Model
 {
@@ -27,19 +29,29 @@ class EpisodicMemory extends Model
     protected $casts = [
         'topics' => 'array',
         'protected' => 'boolean',
-        'embedding' => 'json',
+        'embedding' => VectorEmbeddingCast::class,
     ];
 
     /**
-     * Register the per-user global scope.
+     * Register the per-user global scope and VECTOR write handling.
      */
     protected static function booted(): void
     {
         // Global scope: enforce per-user filtering at model level.
-        // All queries automatically filter by authenticated user_id.
         static::addGlobalScope('user', function ($query) {
             if (function_exists('auth') && auth()->check()) {
                 $query->where('user_id', auth()->id());
+            }
+        });
+
+        // D4 fix: On MySQL/MariaDB, wrap embedding with VEC_FromText().
+        static::saving(function ($entry) {
+            if ($entry->isDirty('embedding')) {
+                $attrs = $entry->getAttributes();
+                $raw = $attrs['embedding'] ?? null;
+                if ($raw !== null && DB::getDriverName() === 'mysql') {
+                    $entry->setAttribute('embedding', DB::raw("VEC_FromText('{$raw}')"));
+                }
             }
         });
     }

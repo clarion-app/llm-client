@@ -118,15 +118,31 @@ class EpisodicMemorySearchService
                 ->limit($limit)
                 ->get();
         } elseif ($driver === 'mysql') {
-            // MySQL: use VECTOR cosine similarity
+            // MySQL/MariaDB: use VEC_DISTANCE_COSINE with VEC_FromText
+            // D1 fix: VECTOR_COSINE_SIMILARITY does not exist on MariaDB.
+            // VEC_DISTANCE_COSINE returns cosine distance (lower = more similar).
+            // Order ascending by distance, then convert to similarity score.
+            $embeddingValues = array_map(function ($v) {
+                return sprintf('%.8f', $v);
+            }, $queryEmbedding);
+            $embeddingVector = '[' . implode(',', $embeddingValues) . ']';
+
             $results = EpisodicMemory::withoutGlobalScope('user')
                 ->where('user_id', $userId)
                 ->whereNotNull('embedding')
-                ->select('episodic_memories.*')
-                ->selectRaw('VECTOR_COSINE_SIMILARITY(embedding, ?) as similarity_score', [$queryEmbeddingJson])
-                ->orderByRaw('similarity_score DESC')
+                ->selectRaw('episodic_memories.*, VEC_ToText(embedding), VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS similarity_raw', [$embeddingVector])
+                ->orderBy('similarity_raw', 'asc')
                 ->limit($limit)
                 ->get();
+
+            // Convert raw distance to caller-facing similarity score
+            foreach ($results as $memory) {
+                $rawDistance = $memory->getAttribute('similarity_raw');
+                $similarity = 1.0 - (float) $rawDistance;
+                // Normalize to [0, 1] range (same as EmbeddingService::normalizeSimilarity)
+                $normalized = ($similarity + 1.0) / 2.0;
+                $memory->setAttribute('similarity_score', round($normalized, 4));
+            }
         } else {
             // SQLite fallback: manual cosine similarity computation
             $memories = EpisodicMemory::withoutGlobalScope('user')

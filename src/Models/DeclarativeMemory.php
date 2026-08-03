@@ -3,8 +3,10 @@
 namespace ClarionApp\LlmClient\Models;
 
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
+use ClarionApp\LlmClient\Casts\VectorEmbeddingCast;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 
 /**
  * DeclarativeMemory model.
@@ -31,7 +33,7 @@ class DeclarativeMemory extends Model
 
     protected $casts = [
         'confidence_level' => 'integer',
-        'embedding' => 'json',
+        'embedding' => VectorEmbeddingCast::class,
     ];
 
     /**
@@ -67,6 +69,17 @@ class DeclarativeMemory extends Model
         static::addGlobalScope('user', function ($query) {
             if (function_exists('auth') && auth()->check()) {
                 $query->where('user_id', auth()->id());
+            }
+        });
+
+        // D4 fix: On MySQL/MariaDB, wrap embedding with VEC_FromText().
+        static::saving(function ($entry) {
+            if ($entry->isDirty('embedding')) {
+                $attrs = $entry->getAttributes();
+                $raw = $attrs['embedding'] ?? null;
+                if ($raw !== null && DB::getDriverName() === 'mysql') {
+                    $entry->setAttribute('embedding', DB::raw("VEC_FromText('{$raw}')"));
+                }
             }
         });
     }

@@ -52,7 +52,8 @@
     },
     "minimum-stability": "dev",
     "scripts": {
-        "test": "./vendor/bin/phpunit tests/ ${1:-}"
+        "test": "./vendor/bin/phpunit tests/ --exclude-group real-db ${1:-}",
+        "test:real-db": "./vendor/bin/phpunit tests/RealDatabase --group real-db --fail-on-empty-test-suite ${1:-}"
     },
     "config": {
         "allow-plugins": {

@@ -108,7 +108,8 @@ class MemoryService implements MemoryServiceContract
         string $mode = 'key_prefix',
         int $limit = 20,
         ?float $min_score = null,
-        ?array $queryEmbedding = null
+        ?array $queryEmbedding = null,
+        ?string $user_id = null
     ): array {
         // Validate mode
         $allowedModes = ['key_prefix', 'content', 'semantic'];
@@ -132,12 +133,16 @@ class MemoryService implements MemoryServiceContract
 
         // Handle semantic search mode
         if ($mode === 'semantic') {
-            return $this->searchSemantic($scope, $agent_id, $query, $limit, $min_score, $queryEmbedding);
+            return $this->searchSemantic($scope, $agent_id, $query, $limit, $min_score, $queryEmbedding, $user_id);
         }
 
         // Keyword-based search modes
         $queryBuilder = MemoryEntry::where('scope', $scope->value)
             ->where('agent_id', $agent_id);
+
+        if ($user_id !== null) {
+            $queryBuilder->where('user_id', $user_id);
+        }
 
         if ($mode === 'key_prefix') {
             $queryBuilder->where('key', 'LIKE', $query . '%');
@@ -160,17 +165,21 @@ class MemoryService implements MemoryServiceContract
      * @param int $limit Maximum results to return
      * @param float|null $min_score Minimum similarity threshold (0.0-1.0)
      * @param float[]|null $queryEmbedding Pre-computed embedding vector (optional — skips internal generate() call when supplied)
+     * @param string|null $user_id Optional user filter for isolation
      * @return MemoryEntry[] Results with similarity_score attribute attached
      * @throws SemanticSearchException If embedding provider is unavailable or generation fails
      */
-    private function searchSemantic(MemoryScope $scope, string $agent_id, string $query, int $limit, ?float $min_score = null, ?array $queryEmbedding = null): array
+    private function searchSemantic(MemoryScope $scope, string $agent_id, string $query, int $limit, ?float $min_score = null, ?array $queryEmbedding = null, ?string $user_id = null): array
     {
-        // Check embedding service and provider availability
-        if ($this->embeddingService === null || $this->embeddingService->getProvider() === null) {
-            throw new SemanticSearchException(
-                'embedding_provider_unavailable',
-                suggestion: 'Use key_prefix or content mode, or configure memory.embedding.server_id'
-            );
+        // Check embedding service availability only when we need to generate an embedding.
+        // If a pre-computed embedding is provided, the service is not needed.
+        if ($queryEmbedding === null) {
+            if ($this->embeddingService === null || $this->embeddingService->getProvider() === null) {
+                throw new SemanticSearchException(
+                    'embedding_provider_unavailable',
+                    suggestion: 'Use key_prefix or content mode, or configure memory.embedding.server_id'
+                );
+            }
         }
 
         // Use pre-computed embedding if supplied, otherwise generate one
@@ -190,9 +199,9 @@ class MemoryService implements MemoryServiceContract
         $driver = DB::getDriverName();
 
         if ($driver === 'mysql') {
-            $results = $this->searchSemanticNative($agent_id, $queryEmbedding, $limit);
+            $results = $this->searchSemanticNative($agent_id, $queryEmbedding, $limit, $user_id);
         } else {
-            $results = $this->searchSemanticFallback($scope, $agent_id, $queryEmbedding, $limit);
+            $results = $this->searchSemanticFallback($scope, $agent_id, $queryEmbedding, $limit, $user_id);
         }
 
         // Apply min_score filter if specified
@@ -213,9 +222,10 @@ class MemoryService implements MemoryServiceContract
      * @param string $agent_id Agent identifier
      * @param float[] $queryEmbedding Embedding vector for the search query
      * @param int $limit Maximum results
+     * @param string|null $user_id Optional user filter for isolation
      * @return MemoryEntry[] Results with similarity_score attribute
      */
-    private function searchSemanticNative(string $agent_id, array $queryEmbedding, int $limit): array
+    private function searchSemanticNative(string $agent_id, array $queryEmbedding, int $limit, ?string $user_id = null): array
     {
         // Convert embedding array to VECTOR format string for raw SQL
         // MariaDB VECTOR format: '[f1,f2,f3,...]'
@@ -224,17 +234,23 @@ class MemoryService implements MemoryServiceContract
         }, $queryEmbedding);
         $embeddingVector = '[' . implode(',', $embeddingValues) . ']';
 
-        $results = MemoryEntry::where('scope', MemoryScope::LONG_TERM->value)
+        $queryBuilder = MemoryEntry::where('scope', MemoryScope::LONG_TERM->value)
             ->where('agent_id', $agent_id)
-            ->whereNotNull('embedding')
-            ->selectRaw('*, VECTOR_COSINE_DISTANCE(embedding, CAST(? AS VECTOR(' . count($queryEmbedding) . '))) AS similarity_raw', [$embeddingVector])
-            ->orderByDesc('similarity_raw')
+            ->whereNotNull('embedding');
+
+        if ($user_id !== null) {
+            $queryBuilder->where('user_id', $user_id);
+        }
+
+        $results = $queryBuilder
+            ->selectRaw('*, VEC_ToText(embedding), VEC_DISTANCE_COSINE(embedding, VEC_FromText(?)) AS similarity_raw', [$embeddingVector])
+            ->orderBy('similarity_raw', 'asc')
             ->limit($limit)
             ->get();
 
         // Attach normalized similarity_score to each result
         foreach ($results as $entry) {
-            // VECTOR_COSINE_DISTANCE returns distance (lower = more similar)
+            // VEC_DISTANCE_COSINE returns cosine distance (lower = more similar)
             // Convert to similarity score: similarity = 1 - distance
             // Then normalize to [0, 1] range
             $rawDistance = $entry->getAttribute('similarity_raw');
@@ -254,17 +270,22 @@ class MemoryService implements MemoryServiceContract
      * @param string $agent_id Agent identifier
      * @param float[] $queryEmbedding Embedding vector for the search query
      * @param int $limit Maximum results
+     * @param string|null $user_id Optional user filter for isolation
      * @return MemoryEntry[] Results with similarity_score attribute
      */
-    private function searchSemanticFallback(MemoryScope $scope, string $agent_id, array $queryEmbedding, int $limit): array
+    private function searchSemanticFallback(MemoryScope $scope, string $agent_id, array $queryEmbedding, int $limit, ?string $user_id = null): array
     {
         // Fetch entries with non-null embeddings (fetch more than limit to sort then trim)
         $fetchLimit = config('llm-client.memory.search_max_limit', 100);
-        $candidates = MemoryEntry::where('scope', $scope->value)
+        $queryBuilder = MemoryEntry::where('scope', $scope->value)
             ->where('agent_id', $agent_id)
-            ->whereNotNull('embedding')
-            ->limit($fetchLimit)
-            ->get();
+            ->whereNotNull('embedding');
+
+        if ($user_id !== null) {
+            $queryBuilder->where('user_id', $user_id);
+        }
+
+        $candidates = $queryBuilder->limit($fetchLimit)->get();
 
         // Compute similarity scores and sort
         $scored = [];
