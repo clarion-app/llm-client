@@ -20,7 +20,6 @@ use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\Test;
 
 /**
- * End-to-end journey tests for US1 acceptance scenarios.
  *
  * Validates the complete role resolution flow against the assembled system:
  * migration from UserSetting, assignment recording, inference usage in
@@ -139,7 +138,6 @@ class RoleResolutionJourneyTest extends AssembledSystemTestCase
     }
 
     // ========================================================================
-    // US1 Acceptance Scenario 1:
     // Saved UserSetting appears as inference assignment post-migration.
     // ========================================================================
 
@@ -206,7 +204,6 @@ class RoleResolutionJourneyTest extends AssembledSystemTestCase
     }
 
     // ========================================================================
-    // US1 Acceptance Scenario 2:
     // User assigns an embedding model and it is recorded and reported back.
     // ========================================================================
 
@@ -264,7 +261,6 @@ class RoleResolutionJourneyTest extends AssembledSystemTestCase
     }
 
     // ========================================================================
-    // US1 Acceptance Scenario 3:
     // New conversation without explicit model uses the inference assignment.
     // ========================================================================
 
@@ -330,7 +326,6 @@ class RoleResolutionJourneyTest extends AssembledSystemTestCase
     }
 
     // ========================================================================
-    // US1 Acceptance Scenario 4:
     // Embedding call uses the assigned embedding model and its server.
     // ========================================================================
 
@@ -395,7 +390,6 @@ class RoleResolutionJourneyTest extends AssembledSystemTestCase
     }
 
     // ========================================================================
-    // US1 Acceptance Scenario 5:
     // Clearing an assignment falls back to installation, or unassigned.
     // ========================================================================
 
@@ -462,7 +456,6 @@ class RoleResolutionJourneyTest extends AssembledSystemTestCase
     }
 
     // ========================================================================
-    // US1 Acceptance Scenario 6:
     // Unassigned role shows what breaks.
     // ========================================================================
 
