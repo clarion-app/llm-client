@@ -72,10 +72,14 @@ class CapabilityProbe
         try {
             $pdo->exec('DROP TABLE IF EXISTS _cap_probe_vector');
             $pdo->exec('CREATE TABLE _cap_probe_vector (id INT PRIMARY KEY, embedding VECTOR(4))');
-            $pdo->exec('DROP TABLE _cap_probe_vector');
             return true;
         } catch (PDOException) {
             return false;
+        } finally {
+            // FR-024: the probe leaves the schema as it found it, including
+            // when it fails part-way — the isolation guard has already declared
+            // this schema empty, and the next class's guard will check again.
+            $this->dropQuietly($pdo, '_cap_probe_vector');
         }
     }
 
@@ -91,10 +95,11 @@ class CapabilityProbe
             $result = $pdo->query(
                 "SELECT VEC_DISTANCE_COSINE(embedding, VEC_FromText('[1,0,0,0]')) FROM _cap_probe_vec_dist WHERE id = 1"
             )->fetchColumn();
-            $pdo->exec('DROP TABLE _cap_probe_vec_dist');
             return is_numeric($result);
         } catch (PDOException) {
             return false;
+        } finally {
+            $this->dropQuietly($pdo, '_cap_probe_vec_dist');
         }
     }
 
@@ -110,10 +115,21 @@ class CapabilityProbe
             $result = $pdo->query(
                 "SELECT COUNT(*) FROM _cap_probe_fulltext WHERE MATCH(content) AGAINST('capability' IN NATURAL LANGUAGE MODE)"
             )->fetchColumn();
-            $pdo->exec('DROP TABLE _cap_probe_fulltext');
             return (int) $result > 0;
         } catch (PDOException) {
             return false;
+        } finally {
+            $this->dropQuietly($pdo, '_cap_probe_fulltext');
+        }
+    }
+
+    private function dropQuietly(PDO $pdo, string $table): void
+    {
+        try {
+            $pdo->exec('DROP TABLE IF EXISTS ' . $table);
+        } catch (PDOException) {
+            // Nothing left to do — a probe table that will not drop is
+            // reported by the next isolation check, not swallowed here.
         }
     }
 }

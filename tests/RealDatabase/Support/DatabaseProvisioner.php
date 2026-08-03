@@ -54,6 +54,26 @@ class DatabaseProvisioner
     }
 
     /**
+     * The database name this provisioner is entitled to use, independent of
+     * what the resolved ConnectionSpec claims.
+     *
+     * P5's second check compares the two: for an ephemeral instance this is the
+     * name this run generated, and for a supplied one it is the name the
+     * environment names. Reading it back off the spec would make the check
+     * compare a value with itself and pass unconditionally.
+     */
+    public function expectedDatabaseName(): string
+    {
+        if ($this->databaseName !== '') {
+            return $this->databaseName;
+        }
+
+        $supplied = getenv('LLM_CLIENT_REAL_DB_DATABASE');
+
+        return $supplied === false ? '' : (string) $supplied;
+    }
+
+    /**
      * Tear down any ephemeral container started by this provisioner.
      */
     public function teardown(): void

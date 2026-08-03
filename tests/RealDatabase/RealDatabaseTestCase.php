@@ -6,6 +6,8 @@ use ClarionApp\LlmClient\LlmClientServiceProvider;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Orchestra\Testbench\TestCase as BaseTestCase;
+use PDO;
+use PDOException;
 use Tests\RealDatabase\Support\CapabilityProbe;
 use Tests\RealDatabase\Support\ConnectionSpec;
 use Tests\RealDatabase\Support\DatabaseProvisioner;
@@ -15,17 +17,20 @@ use Tests\RealDatabase\Support\ProvisionOutcome;
 use Tests\RealDatabase\Support\SkipReport;
 
 use PHPUnit\Framework\Attributes\Before;
-use PHPUnit\Framework\Attributes\After;
 
 /**
  * Base class for real-database tests.
  *
  * Extends Orchestra\Testbench\TestCase directly (not Tests\TestCase).
- * Provisions infrastructure in #[Before], tears down in #[After].
  * Points database.default at the 'mysql' connection in getEnvironmentSetUp().
  *
- * One instance per test class; migrations run once per class.
- * Each test truncates the seeded tables before seeding.
+ * Contract P7: one instance per test class, migrations once per class, and
+ * truncation per test. PHPUnit builds a fresh TestCase object per test method,
+ * so the provisioned database is held in per-class static state and released in
+ * tearDownAfterClass() — not in a per-test #[After], which would start (and pay
+ * for) a container per test and, on a supplied instance, make the isolation
+ * guard refuse every test after the first because the previous test's
+ * migrations left tables behind.
  */
 abstract class RealDatabaseTestCase extends BaseTestCase
 {
@@ -38,6 +43,21 @@ abstract class RealDatabaseTestCase extends BaseTestCase
 
     /** Tables that this test class seeds, for per-test truncation. */
     protected array $seedTables = [];
+
+    /** The class the static state below belongs to; null when unprovisioned. */
+    private static ?string $stateOwner = null;
+    private static ?DatabaseProvisioner $sharedProvisioner = null;
+    private static ?ProvisionOutcome $sharedOutcome = null;
+    private static ?ConnectionSpec $sharedSpec = null;
+    private static ?IsolationVerdict $sharedVerdict = null;
+    private static bool $sharedMigrated = false;
+
+    /**
+     * A class-level failure that every test in the class must report: a
+     * configuration error (P2), an incapable database (G4/FR-019), or an
+     * isolation refusal (P5). Distinct from Unavailable, which skips.
+     */
+    private static ?string $sharedFailure = null;
 
     protected function getPackageProviders($app): array
     {
@@ -87,64 +107,109 @@ abstract class RealDatabaseTestCase extends BaseTestCase
     #[Before]
     protected function provisionDatabase(): void
     {
-        // SkipReport registration (once per process).
         SkipReport::registerFlush();
 
-        // If the class was already skipped, no need to re-provision.
-        if ($this->skippedClass) {
-            return;
+        // P7: acquire once per class. Every later test in the class reuses the
+        // same instance, the same migrations, and the same verdict.
+        if (self::$stateOwner !== static::class) {
+            self::resetClassState();
+            self::$stateOwner = static::class;
+            self::acquireDatabase();
         }
 
-        $this->provisioner = new DatabaseProvisioner();
-        $this->provisioner->registerShutdownHandler();
+        $this->provisioner = self::$sharedProvisioner;
+        $this->outcome    = self::$sharedOutcome;
+        $this->spec       = self::$sharedSpec;
+        $this->verdict    = self::$sharedVerdict;
+        $this->migrated   = self::$sharedMigrated;
 
-        try {
-            $this->outcome = $this->provisioner->provision();
-        } catch (\RuntimeException $e) {
-            // Configuration failure (e.g., T006a: details without opt-in).
-            $this->outcome = ProvisionOutcome::unavailable($e->getMessage());
+        // A class-level failure is reported by every test in the class: an
+        // incapable database, an isolation refusal, or a configuration error
+        // are never skips (G4, P2, P5).
+        if (self::$sharedFailure !== null) {
+            $this->skippedClass = true;
+            $this->fail(self::$sharedFailure);
+            return;
         }
 
         if ($this->outcome === null || !$this->outcome->isAvailable()) {
             $this->handleUnavailable();
+        }
+    }
+
+    /**
+     * Obtain, verify, and record a database for the current test class.
+     *
+     * Writes only to the static state; the skip-versus-fail decision belongs to
+     * the per-test hook, because PHPUnit can only mark the test it is running.
+     */
+    private static function acquireDatabase(): void
+    {
+        self::$sharedProvisioner = new DatabaseProvisioner();
+        self::$sharedProvisioner->registerShutdownHandler();
+
+        try {
+            self::$sharedOutcome = self::$sharedProvisioner->provision();
+        } catch (\RuntimeException $e) {
+            // P2: explicit details without the opt-in flag is a named
+            // configuration failure. Not a skip, and not a fall-through to
+            // starting a container behind the developer's back.
+            self::$sharedFailure = 'Real-database configuration error: ' . $e->getMessage();
             return;
         }
 
-        $this->spec = $this->outcome->spec();
+        if (!self::$sharedOutcome->isAvailable()) {
+            return; // Unavailable → per-test skip, or fail under strict mode.
+        }
 
-        // Isolation guard (P5).
+        self::$sharedSpec = self::$sharedOutcome->spec();
+
+        // P5/FR-022a: the isolation guard runs before anything writes to the
+        // resolved instance — including the capability probe, which creates and
+        // drops tables of its own.
         $guard = new IsolationGuard();
-        $this->verdict = $guard->check($this->spec, $this->spec->database);
+        self::$sharedVerdict = $guard->check(
+            self::$sharedSpec,
+            self::$sharedProvisioner->expectedDatabaseName()
+        );
 
-        if (!$this->verdict->isolated) {
-            $this->handleIsolationRefusal();
+        if (!self::$sharedVerdict->isolated) {
+            self::$sharedFailure = 'Isolation guard refused: ' . self::$sharedVerdict->refusalMessage;
             return;
         }
 
-        // Capability probe (P4).
+        if (self::$sharedSpec->origin === 'supplied') {
+            // P8: an interrupted run must not leave a supplied schema populated
+            // for the next class — or the next run — to trip over. Bound by
+            // value, because the static state belongs to the next class by the
+            // time the process exits.
+            $spec = self::$sharedSpec;
+            register_shutdown_function(static fn () => self::dropAllTables($spec));
+        }
+
+        // P4: capability is probed functionally. A version string is not
+        // evidence — MySQL 8 reports a plausible one and has none of this.
         $probe = new CapabilityProbe();
         try {
-            $report = $probe->probe($this->spec);
+            $report = $probe->probe(self::$sharedSpec);
         } catch (\RuntimeException $e) {
-            $this->outcome = ProvisionOutcome::unavailable($e->getMessage());
-            $this->handleUnavailable();
+            self::$sharedOutcome = ProvisionOutcome::unavailable($e->getMessage());
+            self::$sharedSpec = null;
             return;
         }
 
         if (!$report->isCapable()) {
             $missing = implode(', ', $report->missingCapabilities());
-            $this->outcome = ProvisionOutcome::incapable(
+            self::$sharedOutcome = ProvisionOutcome::incapable(
                 "missing capabilities: {$missing}",
                 "server version: {$report->serverVersion}"
             );
-            // Incapable always fails, never skips.
-            $this->skippedClass = true;
-            $this->fail($this->outcome->diagnostic());
-            return;
+            // G4/FR-019: incapable always fails, never skips.
+            self::$sharedFailure = self::$sharedOutcome->diagnostic();
         }
 
-        // Migrations are deferred to setUp() after the app is booted.
-        // They need config() and Artisan which require the container.
+        // Migrations are deferred to setUp(), which runs after the app is
+        // booted: config() and Artisan need the container.
     }
 
     protected function getEnvironmentSetUpAtBootstrap(): void
@@ -166,11 +231,12 @@ abstract class RealDatabaseTestCase extends BaseTestCase
         parent::setUp();
         $this->getEnvironmentSetUpAtBootstrap();
 
-        // Run migrations after the app is booted (P6).
+        // Run migrations after the app is booted (P6), once per class.
         // config() and Artisan require the container to be available.
-        if (!$this->skippedClass && !$this->migrated) {
+        if (!$this->skippedClass && !self::$sharedMigrated) {
             $this->runMigrations();
         }
+        $this->migrated = self::$sharedMigrated;
 
         // Per-test truncation (P7).
         if (!$this->skippedClass && $this->migrated) {
@@ -178,11 +244,74 @@ abstract class RealDatabaseTestCase extends BaseTestCase
         }
     }
 
-    #[After]
-    protected function teardownDatabase(): void
+    /**
+     * P7/P8/FR-024: release the class's database when the class is done —
+     * stop an ephemeral container, or return a supplied schema to the empty
+     * state the isolation guard requires and this run found it in.
+     */
+    public static function tearDownAfterClass(): void
     {
-        if ($this->provisioner !== null) {
-            $this->provisioner->teardown();
+        self::releaseDatabase();
+
+        parent::tearDownAfterClass();
+    }
+
+    private static function releaseDatabase(): void
+    {
+        $spec = self::$sharedSpec;
+
+        if ($spec !== null && $spec->origin === 'supplied' && self::$sharedVerdict?->isolated) {
+            self::dropAllTables($spec);
+        }
+
+        self::$sharedProvisioner?->teardown();
+        self::resetClassState();
+    }
+
+    private static function resetClassState(): void
+    {
+        self::$stateOwner        = null;
+        self::$sharedProvisioner = null;
+        self::$sharedOutcome     = null;
+        self::$sharedSpec        = null;
+        self::$sharedVerdict     = null;
+        self::$sharedMigrated    = false;
+        self::$sharedFailure     = null;
+    }
+
+    /**
+     * Drop every table in a supplied schema.
+     *
+     * Safe because the isolation guard confirmed the schema was empty before
+     * the first migration, so everything present was created by this run.
+     */
+    private static function dropAllTables(ConnectionSpec $spec): void
+    {
+        try {
+            $pdo = new PDO(
+                "mysql:host={$spec->host};port={$spec->port};dbname={$spec->database}",
+                $spec->username,
+                $spec->password,
+                [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+            );
+
+            $tables = $pdo->query(
+                'SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES '
+                . "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'"
+            )->fetchAll(PDO::FETCH_COLUMN);
+
+            if ($tables === []) {
+                return;
+            }
+
+            $pdo->exec('SET FOREIGN_KEY_CHECKS = 0');
+            foreach ($tables as $table) {
+                $pdo->exec('DROP TABLE IF EXISTS `' . str_replace('`', '', (string) $table) . '`');
+            }
+            $pdo->exec('SET FOREIGN_KEY_CHECKS = 1');
+        } catch (PDOException) {
+            // Best effort: the next class's isolation guard reports a schema
+            // that was not cleared, which is the diagnostic that matters.
         }
     }
 
@@ -203,10 +332,12 @@ abstract class RealDatabaseTestCase extends BaseTestCase
 
         if ($exitCode !== 0) {
             $this->skippedClass = true;
-            $this->fail('Migration failed: ' . Artisan::output());
+            self::$sharedFailure = 'Migration failed: ' . Artisan::output();
+            $this->fail(self::$sharedFailure);
             return;
         }
 
+        self::$sharedMigrated = true;
         $this->migrated = true;
     }
 
@@ -258,6 +389,10 @@ abstract class RealDatabaseTestCase extends BaseTestCase
         if (!$this->migrated) {
             $this->fail('Inconclusive: migrations did not run successfully.');
         }
+
+        // FR-017/G6: a run states how many checks actually reached the engine,
+        // so "ran and passed" is distinguishable from "skipped and green".
+        SkipReport::recordExecuted();
     }
 
     /**
@@ -267,23 +402,15 @@ abstract class RealDatabaseTestCase extends BaseTestCase
     {
         $this->skippedClass = true;
         $reason = $this->outcome ? $this->outcome->diagnostic() : 'Database unavailable';
-        SkipReport::recordSkipped($reason);
 
         $strict = getenv('LLM_CLIENT_REAL_DB_STRICT');
         if ($strict === '1' || $strict === 'true') {
+            // G5: strict mode removes the skip, so the run must not report one.
             $this->fail("Strict mode: {$reason}");
-        } else {
-            $this->markTestSkipped($reason);
         }
-    }
 
-    /**
-     * Handle an isolation guard refusal.
-     */
-    private function handleIsolationRefusal(): void
-    {
-        $this->skippedClass = true;
-        $this->fail('Isolation guard refused: ' . $this->verdict->refusalMessage);
+        SkipReport::recordSkipped($reason);
+        $this->markTestSkipped($reason);
     }
 
     /**

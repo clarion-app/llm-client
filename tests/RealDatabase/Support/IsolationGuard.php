@@ -39,7 +39,16 @@ class IsolationGuard
             $refusals[] = "database name '{$spec->database}' does not match expected '{$expectedDatabase}'";
         }
 
-        // Check 3: Schema must be empty (no tables the harness did not create).
+        // Check 3: A supplied instance carries the opt-in flag. The provisioner
+        // enforces this too; the guard repeats it because it is the last thing
+        // standing between a run and somebody's database.
+        $optInOk = $spec->origin !== 'supplied' || $this->suppliedOptInPresent();
+        $checks['supplied_opt_in_present'] = $optInOk;
+        if (!$optInOk) {
+            $refusals[] = 'supplied instance without LLM_CLIENT_REAL_DB_ALLOW_SUPPLIED';
+        }
+
+        // Check 4: Schema must be empty (no tables the harness did not create).
         $schemaEmpty = $this->checkSchemaEmpty($spec);
         $checks['schema_is_empty'] = $schemaEmpty;
         if (!$schemaEmpty) {
@@ -52,6 +61,13 @@ class IsolationGuard
         }
 
         return IsolationVerdict::isolated();
+    }
+
+    private function suppliedOptInPresent(): bool
+    {
+        $flag = getenv('LLM_CLIENT_REAL_DB_ALLOW_SUPPLIED');
+
+        return $flag === '1' || $flag === 'true';
     }
 
     /**

@@ -12,8 +12,9 @@ use PHPUnit\Framework\Attributes\Test;
 /**
  * T024-T029: Operation discovery search on the real engine.
  *
- * Seeds the index through direct inserts (simulating the product's own
- * indexing path), then searches through OperationsSearchService.
+ * Builds the index by running the product's own indexer (ReindexOperationsJob)
+ * over a known catalogue, then searches through OperationsSearchService, so
+ * index population is under test alongside querying (FR-001, FR-004).
  */
 #[Group('real-db')]
 class OperationDiscoverySearchTest extends RealDatabaseTestCase
@@ -26,6 +27,13 @@ class OperationDiscoverySearchTest extends RealDatabaseTestCase
     {
         parent::setUp();
         $this->searchService = new OperationsSearchService();
+    }
+
+    protected function tearDown(): void
+    {
+        OperationIndexFixture::reset();
+
+        parent::tearDown();
     }
 
     /**
@@ -273,6 +281,21 @@ class OperationDiscoverySearchTest extends RealDatabaseTestCase
             $operationIdsAfter[0],
             "After revision, 'contacts.store' should be the best match for 'postal zip code' "
             . '(query: search for "postal zip code" after revision, position 0)'
+        );
+
+        // FR-007's other half: results no longer reflect superseded content.
+        // The revision drops "create" and the singular "contact" from
+        // contacts.store, so the query that matched it before must not now.
+        $supersededResults = $this->searchService->search('create contact');
+        $supersededIds = array_map(fn ($r) => $r->operationId, $supersededResults);
+
+        $this->assertNotContains(
+            'contacts.store',
+            $supersededIds,
+            "After revision, 'contacts.store' should no longer match 'create contact' — "
+            . 'the re-index must drop superseded content, not merely add new content. '
+            . 'Results: ' . json_encode($supersededIds)
+            . ' (query: search for "create contact" after revision)'
         );
     }
 }

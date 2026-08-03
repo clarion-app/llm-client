@@ -85,6 +85,8 @@ The `ALLOW_SUPPLIED=1` opt-in flag is **required**. Supplying connection details
 
 The harness will refuse a database that already contains tables it did not create — it runs migrations, and a schema it does not own is treated as somebody's data.
 
+Because of that refusal, a supplied schema is returned to empty when each test class finishes: the harness drops the tables it created. Every class provisions once, migrates once, and truncates between tests, so a supplied instance is left exactly as it was found and the next class's isolation guard sees the empty schema it requires.
+
 ### Strict Mode
 
 ```bash
@@ -116,19 +118,23 @@ Runs that each start their own Docker container are isolated by construction —
 #[Group('real-db')]
 final class MyRealDatabaseTest extends RealDatabaseTestCase
 {
+    /** Truncated before every test in this class. */
+    protected array $seedTables = ['llm_memory_entries'];
+
     public function test_something_on_the_real_engine(): void
     {
-        // Base class has already: resolved a database, probed capabilities,
-        // verified isolation, run the real migrations, and truncated.
-        // It has also asserted the driver is mysql — a scenario that lands on
+        // Base class has already: resolved a database, verified isolation,
+        // probed capabilities, run the real migrations, and truncated.
+        // assertReady() asserts the driver is mysql — a scenario that lands on
         // SQLite fails as inconclusive rather than passing against the fallback.
+        $this->assertReady();
 
-        $fixture = EmbeddingFixture::orthogonalSet(dimension: 8);
-        $fixture->seed();
+        EmbeddingFixture::seedRaw($agentId, $userId, $rawVectors);
 
-        $results = app(MemoryService::class)->searchSemantic(/* ... */);
+        $results = app(MemoryServiceContract::class)->search(/* ... */);
 
-        $this->assertRankingMatches($fixture->expectedOrder(), $results);
+        $this->assertRankingMatches($results, EmbeddingFixture::expectedOrder(), 'context');
+        $this->assertAgreesWithReference($results, EmbeddingFixture::expectedScores(), 1e-4);
     }
 }
 ```

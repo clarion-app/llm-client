@@ -13,6 +13,7 @@ class SkipReport
     private static int $executed = 0;
     private static int $skipped = 0;
     private static array $skipReasons = [];
+    private static bool $flushRegistered = false;
 
     public static function recordExecuted(): void
     {
@@ -55,9 +56,17 @@ class SkipReport
 
     /**
      * Register the flush as a shutdown function.
+     *
+     * Idempotent: called from every test's #[Before], but the report is stated
+     * once per run, not once per test.
      */
     public static function registerFlush(): void
     {
+        if (self::$flushRegistered) {
+            return;
+        }
+
+        self::$flushRegistered = true;
         register_shutdown_function([self::class, 'flush']);
     }
 
@@ -69,6 +78,7 @@ class SkipReport
         self::$executed = 0;
         self::$skipped = 0;
         self::$skipReasons = [];
+        self::$flushRegistered = false;
     }
 
     public static function getExecuted(): int

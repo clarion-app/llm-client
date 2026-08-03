@@ -27,6 +27,13 @@ class FulltextMatchingRulesTest extends RealDatabaseTestCase
         $this->searchService = new OperationsSearchService();
     }
 
+    protected function tearDown(): void
+    {
+        OperationIndexFixture::reset();
+
+        parent::tearDown();
+    }
+
     /**
      * Sub-token-floor term (2 chars) matches nothing.
      *
