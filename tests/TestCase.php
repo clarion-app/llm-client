@@ -313,5 +313,63 @@ abstract class TestCase extends BaseTestCase
             });
         }
 
+        // agent_runs table (for agent run trace).
+        if (!Schema::hasTable('agent_runs')) {
+            Schema::create('agent_runs', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->enum('kind', ['interactive', 'system_initiated']);
+                $table->uuid('user_id');
+                $table->uuid('conversation_id')->nullable();
+                $table->string('source', 64)->nullable();
+                $table->enum('end_state', ['in_progress', 'completed', 'failed', 'stopped_early', 'abandoned'])->default('in_progress');
+                $table->string('end_reason', 256)->nullable();
+                $table->timestamp('started_at', 6);
+                $table->timestamp('ended_at', 6)->nullable();
+                $table->unsignedBigInteger('duration_ms')->nullable();
+                $table->unsignedInteger('step_count')->default(0);
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index('conversation_id');
+                $table->index(['user_id', 'started_at']);
+                $table->index(['end_state', 'started_at']);
+            });
+        }
+
+        // agent_run_steps table (for agent run trace).
+        if (!Schema::hasTable('agent_run_steps')) {
+            Schema::create('agent_run_steps', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('run_id');
+                $table->unsignedInteger('position');
+                $table->uuid('attempt_group_id')->nullable();
+                $table->enum('end_state', ['in_progress', 'completed', 'failed', 'stopped_early', 'abandoned'])->default('in_progress');
+                $table->string('end_reason', 256)->nullable();
+                $table->timestamp('started_at', 6);
+                $table->timestamp('ended_at', 6)->nullable();
+                $table->unsignedBigInteger('duration_ms')->nullable();
+                $table->unsignedBigInteger('wait_ms')->nullable();
+                $table->unsignedSmallInteger('attempt_count')->default(1);
+
+                $table->unique(['run_id', 'position']);
+                $table->index('attempt_group_id');
+                $table->index(['run_id', 'started_at']);
+            });
+        }
+
+        // agent_run_messages table (for agent run trace).
+        if (!Schema::hasTable('agent_run_messages')) {
+            Schema::create('agent_run_messages', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('run_id');
+                $table->uuid('message_id');
+                $table->enum('relation', ['trigger', 'reply']);
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->unique(['run_id', 'relation']);
+                $table->index('message_id');
+                $table->index('run_id');
+            });
+        }
+
     }
 }

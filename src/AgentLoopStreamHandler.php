@@ -25,12 +25,19 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
     public array $toolCalls = [];
     private ?ToolResultCondenser $toolResultCondenser = null;
     private ?MetricsRecorder $metricsRecorder = null;
+    private ?\ClarionApp\LlmClient\Services\RunTraceRecorder $runTraceRecorder = null;
     private string $attemptGroupId = '';
+    private ?string $runId = null;
+    private ?string $stepId = null;
 
-    public function __construct(?ToolResultCondenser $toolResultCondenser = null, ?MetricsRecorder $metricsRecorder = null)
-    {
+    public function __construct(
+        ?ToolResultCondenser $toolResultCondenser = null,
+        ?MetricsRecorder $metricsRecorder = null,
+        ?\ClarionApp\LlmClient\Services\RunTraceRecorder $runTraceRecorder = null,
+    ) {
         $this->toolResultCondenser = $toolResultCondenser;
         $this->metricsRecorder = $metricsRecorder;
+        $this->runTraceRecorder = $runTraceRecorder;
     }
 
     public function handle($content, $data, $seconds)
@@ -123,14 +130,45 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $conversationId = $parsedData['conversation_id'] ?? null;
         $iteration = $parsedData['iteration'] ?? 1;
 
+        // Read run_id and step_id from payload (contracts §3.1).
+        // A pre-feature payload has no run_id — mint a fresh run instead.
+        $this->runId = $parsedData['run_id'] ?? null;
+        $this->stepId = $parsedData['step_id'] ?? null;
+
         $conversation = Conversation::find($conversationId);
         if (!$conversation) return;
 
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
 
+        // Ensure we have a runTraceRecorder (resolve from container if not injected).
+        if ($this->runTraceRecorder === null) {
+            try {
+                $this->runTraceRecorder = app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class);
+            } catch (\Throwable $e) {
+                $this->runTraceRecorder = null;
+            }
+        }
+
         // Generate attempt group ID for this turn (if not already set)
         if ($this->attemptGroupId === '') {
             $this->attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+        }
+
+        // If no run_id was provided in the payload, mint a fresh run (contracts §3.3).
+        if ($this->runId === null && $this->runTraceRecorder !== null) {
+            $this->runId = $this->runTraceRecorder->openRun(
+                \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+                (string) $conversation->user_id,
+                $conversation->id,
+            );
+            // If we minted a run but have no step_id, open one now.
+            if ($this->runId !== null && $this->stepId === null) {
+                $this->stepId = $this->runTraceRecorder->openStep(
+                    $this->runId,
+                    null,
+                    $this->attemptGroupId,
+                );
+            }
         }
 
         // Record LLM usage metrics for the final chunk (fire-and-forget, never throws)
@@ -173,6 +211,9 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 return;
             }
 
+            // The step is closed inside handleToolCalls(), once it is known whether
+            // this round resolved or suspended for a confirmation — a suspended step
+            // stays open across the pause so its duration covers the human wait.
             $this->handleToolCalls($conversation, $iteration);
             return;
         }
@@ -210,6 +251,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $this->message->content = $this->reply;
         $this->message->responseTime = $seconds;
         $this->message->save();
+
+        // Close the step and run for the plain-reply branch.
+        $this->closeCurrentStep(\ClarionApp\LlmClient\ValueObjects\RunEndState::Completed);
+        $this->closeRun(
+            \ClarionApp\LlmClient\ValueObjects\RunEndState::Completed,
+            $this->message->id,
+        );
 
         event(new FinishOpenAIConversationResponseEvent($conversationId, $this->reply));
 
@@ -283,6 +331,9 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                             'tool_results' => null,
                             'iteration' => $iteration,
                             'pending_confirmation' => $pendingConfirmation,
+                            'run_id' => $this->runId,
+                            'step_id' => $this->stepId,
+                            'paused_at' => now()->toIso8601String(),
                         ];
 
                         $this->message->update([
@@ -337,6 +388,9 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         'tool_results' => null,
                         'iteration' => $iteration,
                         'pending_confirmation' => $pendingConfirmation,
+                        'run_id' => $this->runId,
+                        'step_id' => $this->stepId,
+                        'paused_at' => now()->toIso8601String(),
                     ];
 
                     $this->message->update([
@@ -399,20 +453,39 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             'tool_data' => $toolData,
         ]);
 
+        // The round resolved without suspending — close its step. The next
+        // iteration's step is opened by dispatchStreamRequest().
+        $this->closeCurrentStep(\ClarionApp\LlmClient\ValueObjects\RunEndState::Completed);
+
         // If all tool calls were successful execute_operation calls,
         // finish the conversation — no need for a summary response from the LLM.
         $agentLoopService = app(AgentLoopService::class);
         if ($agentLoopService->allExecuteOperationsSucceeded($this->toolCalls, $toolResults)) {
+            // The response ends here, so the run ends here too — matching the
+            // synchronous path's equivalent exit (FR-005, FR-008).
+            $this->closeRun(
+                \ClarionApp\LlmClient\ValueObjects\RunEndState::Completed,
+                $this->message->id,
+            );
+
             event(new FinishOpenAIConversationResponseEvent($conversationId, ''));
             $conversation->update(['is_processing' => false]);
             $this->checkForUnprocessedMessages($conversation);
             return;
         }
 
-        // Dispatch next iteration (requires a server for the LLM API call)
+        // Dispatch next iteration (requires a server for the LLM API call).
+        // Carry the run_id forward so the same run continues across iterations.
         if ($conversation->server_id !== null) {
-            $agentLoopService->start($conversation, $iteration + 1);
+            $agentLoopService->start($conversation, $iteration + 1, $this->runId);
         } else {
+            // No server to continue against: the run stops here rather than
+            // staying in progress until the abandonment sweep finds it.
+            $this->closeRun(
+                \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+                null,
+                'No server configured to continue the agent loop',
+            );
             $conversation->update(['is_processing' => false]);
         }
     }
@@ -435,6 +508,17 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         } else {
             $this->message->update(['content' => $errorContent]);
         }
+
+        // Close the step and run as stopped_early.
+        $this->closeCurrentStep(
+            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+            'Maximum iterations reached',
+        );
+        $this->closeRun(
+            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+            null,
+            'Maximum iterations reached',
+        );
 
         event(new FinishOpenAIConversationResponseEvent($conversation->id, $errorContent));
         $conversation->update(['is_processing' => false]);
@@ -478,5 +562,31 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             'method' => $condensed['method'] ?? null,
             'condensed' => $condensed['condensed'] ?? false,
         ];
+    }
+
+    /**
+     * Close the current step if one is open. Never throws (delegates to recorder).
+     */
+    private function closeCurrentStep(
+        \ClarionApp\LlmClient\ValueObjects\RunEndState $endState,
+        ?string $reason = null,
+    ): void {
+        if ($this->runTraceRecorder !== null && $this->stepId !== null) {
+            $this->runTraceRecorder->closeStep($this->stepId, $endState, $reason);
+        }
+    }
+
+    /**
+     * Close the current run if one is open. Links the reply message if provided.
+     * Never throws (delegates to recorder).
+     */
+    private function closeRun(
+        \ClarionApp\LlmClient\ValueObjects\RunEndState $endState,
+        ?string $replyMessageId = null,
+        ?string $reason = null,
+    ): void {
+        if ($this->runTraceRecorder !== null && $this->runId !== null) {
+            $this->runTraceRecorder->closeRun($this->runId, $endState, $reason, $replyMessageId);
+        }
     }
 }

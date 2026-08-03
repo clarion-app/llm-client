@@ -51,6 +51,7 @@ class ScriptedStream
         // freely without duplicating captures.
         $this->capturedRequests = [];
         $this->capturedData = [];
+        $this->handlers = []; // Clear handlers cache as slot indices change
 
         Queue::pushed(SendHttpStreamRequest::class, function (SendHttpStreamRequest $job) {
             $reflector = new \ReflectionClass($job);
@@ -125,6 +126,16 @@ class ScriptedStream
     }
 
     /**
+     * Set the current request slot to a specific index.
+     *
+     * @param int $slot The slot index to set.
+     */
+    public function setCurrentSlot(int $slot): void
+    {
+        $this->currentSlot = $slot;
+    }
+
+    /**
      * Reset state for a new test run.
      */
     public function reset(): void
@@ -194,5 +205,15 @@ class ScriptedStream
     public function turnCount(): int
     {
         return count($this->capturedRequests);
+    }
+
+    /**
+     * Return the captured data payloads per slot.
+     *
+     * @return array<int, array> Data payloads (conversation_id, iteration, run_id, step_id) per slot.
+     */
+    public function capturedData(): array
+    {
+        return $this->capturedData;
     }
 }

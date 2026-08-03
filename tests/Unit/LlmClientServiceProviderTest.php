@@ -2,11 +2,14 @@
 
 namespace ClarionApp\LlmClient\Tests\Unit;
 
+use ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand;
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\LlmClientServiceProvider;
 use GuzzleHttp\Client;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Psr7\Response;
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Support\Facades\Artisan;
 use Orchestra\Testbench\TestCase;
 use PHPUnit\Framework\Attributes\Test;
 
@@ -15,6 +18,15 @@ class LlmClientServiceProviderTest extends TestCase
     protected function getPackageProviders($app): array
     {
         return [LlmClientServiceProvider::class];
+    }
+
+    protected function defineEnvironment($app): void
+    {
+        // Create a stub App\Http\Controllers\Controller class if it doesn't exist.
+        // The package routes/controllers extend this base Laravel app class.
+        if (!class_exists('App\Http\Controllers\Controller')) {
+            eval('namespace App\Http\Controllers { class Controller { } }');
+        }
     }
 
     protected function getEnvironmentSetUp($app): void
@@ -67,6 +79,71 @@ class LlmClientServiceProviderTest extends TestCase
         // Guzzle's default handler is a HandlerStack, not a MockHandler.
         $handler = $client->getConfig('handler');
         $this->assertNotInstanceOf(MockHandler::class, $handler);
+    }
+
+    /**
+     * T068 [US5]: ResolveAbandonedRunsCommand is registered in the commands array.
+     */
+    #[Test]
+    public function resolveAbandonedRunsCommand_is_registered()
+    {
+        // Assert the command is registered via Artisan.
+        $commands = Artisan::all();
+
+        $this->assertArrayHasKey(
+            'llm-client:resolve-abandoned-runs',
+            $commands,
+            'ResolveAbandonedRunsCommand should be registered'
+        );
+
+        // Assert the command instance is the correct class.
+        $command = $commands['llm-client:resolve-abandoned-runs'];
+        $this->assertInstanceOf(
+            ResolveAbandonedRunsCommand::class,
+            $command,
+            'Command should be ResolveAbandonedRunsCommand instance'
+        );
+    }
+
+    /**
+     * T068 [US5]: The schedule lives in the existing callAfterResolving block
+     * and runs every five minutes without overlapping.
+     */
+    #[Test]
+    public function resolveAbandonedRunsCommand_is_scheduled()
+    {
+        $schedule = $this->app->make(Schedule::class);
+
+        // Get all scheduled events.
+        $events = $schedule->events();
+
+        // Find the resolve-abandoned-runs event.
+        $abandonedRunsEvent = null;
+        foreach ($events as $event) {
+            $command = $event->command ?? '';
+            if (str_contains($command, 'resolve-abandoned-runs')) {
+                $abandonedRunsEvent = $event;
+                break;
+            }
+        }
+
+        $this->assertNotNull(
+            $abandonedRunsEvent,
+            'Schedule should contain resolve-abandoned-runs command'
+        );
+
+        // Assert the event runs every five minutes (cron: */5 * * * *).
+        $this->assertSame(
+            '*/5 * * * *',
+            (string) $abandonedRunsEvent->expression,
+            'Schedule should run every five minutes'
+        );
+
+        // Assert the event uses withoutOverlapping.
+        $this->assertTrue(
+            $abandonedRunsEvent->withoutOverlapping,
+            'Schedule should use withoutOverlapping'
+        );
     }
 }
 

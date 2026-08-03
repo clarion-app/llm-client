@@ -27,6 +27,9 @@ class ConversationDriver
     /** @var string|null Stop reason if the loop exited early. */
     private ?string $stoppedBecause = null;
 
+    /** @var int Current stream slot for streaming turns (advances per turn). */
+    private int $streamSlot = 0;
+
     public function __construct(
         private readonly \Tests\Integration\MultiTurnTestCase $test,
         private readonly ResponseScript $script,
@@ -55,6 +58,7 @@ class ConversationDriver
     {
         $this->turnRecords = [];
         $this->stoppedBecause = null;
+        $this->streamSlot = 0;
 
         // Install rules from the script into the ResponseScript
         foreach ($script->rules as $rule) {
@@ -257,8 +261,11 @@ class ConversationDriver
         // Start the stream — this dispatches a SendHttpStreamRequest
         $agentLoop->start($conversation);
 
-        // Extract and drive the dispatched job
+        // Extract dispatched jobs from the fake queue.
+        // The fake queue accumulates jobs across turns, so we track which
+        // slot to process via $this->streamSlot (one slot per turn).
         $this->stream->extractDispatchedJobs();
+        $this->stream->setCurrentSlot($this->streamSlot);
         $capturedRequests = $this->stream->capturedRequests();
 
         if (empty($capturedRequests)) {
@@ -270,6 +277,9 @@ class ConversationDriver
         $sseChunks = $this->buildSseChunks($response);
         $this->stream->emit($sseChunks);
         $this->stream->finish();
+
+        // Advance to the next slot for the next turn.
+        $this->streamSlot++;
 
         return ['status' => 'completed', 'content' => ''];
     }

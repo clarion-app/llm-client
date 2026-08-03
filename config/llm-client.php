@@ -370,5 +370,24 @@ return [
         // Options: 'declarative', 'episodic', 'long-term'.
         'stores' => ['declarative', 'episodic', 'long-term'],
     ],
+
+    // Agent Run Trace — records a step-by-step trace of how each agent response
+    // was produced. Every agent response (synchronous or streamed) and every
+    // background model-driven job produces a run record with ordered steps.
+    // Recording is fire-and-forget: if the record cannot be written, the
+    // response still proceeds normally and the failure is logged.
+    'run_trace' => [
+        // Master toggle. When false, all recording is skipped entirely.
+        'enabled' => true,
+
+        // Number of days to retain run trace records.
+        // Matches context_management_metrics.retention_days for a single purge policy.
+        'retention_days' => 90,
+
+        // Minutes of inactivity before an in-progress run is considered abandoned.
+        // 60 minutes is conservative against false abandonment of slow queued work
+        // and comfortably exceeds the 300-second confirmation timeout.
+        'abandonment_minutes' => 60,
+    ],
 ];
 

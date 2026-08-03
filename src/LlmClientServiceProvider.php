@@ -112,6 +112,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\CleanupExpiredEpisodicMemoriesCommand::class,
                 \ClarionApp\LlmClient\Commands\EndIdleConversationsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredContextManagementMetricsCommand::class,
+                \ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand::class,
             ]);
         }
 
@@ -128,6 +129,11 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // User summaries are lifetime rollups and are always exempted.
             $schedule->command('llm-client:purge-context-metrics')
                 ->daily()
+                ->withoutOverlapping();
+
+            // Resolve abandoned (stale in_progress) agent runs every five minutes.
+            $schedule->command('llm-client:resolve-abandoned-runs')
+                ->everyFiveMinutes()
                 ->withoutOverlapping();
         });
 
@@ -221,7 +227,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 null,
                 null,
                 $app->make(\ClarionApp\LlmClient\Services\AutoMemoryRetriever::class),
-                $app->make(\ClarionApp\LlmClient\Services\MetricsRecorder::class)
+                $app->make(\ClarionApp\LlmClient\Services\MetricsRecorder::class),
+                $app->make(\ClarionApp\LlmClient\Services\RunTraceRecorder::class)
             );
         });
 
@@ -296,6 +303,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\PreferenceInjector::class),
                 $app->make(\ClarionApp\LlmClient\Services\MetricsRecorder::class)
             );
+        });
+
+        // Register run trace services
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RunTraceRecorder::class, function () {
+            return new \ClarionApp\LlmClient\Services\RunTraceRecorder();
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RunTraceQuery::class, function () {
+            return new \ClarionApp\LlmClient\Services\RunTraceQuery();
         });
     }
 

@@ -28,6 +28,10 @@ use ClarionApp\LlmClient\ValueObjects\MemoryInjectionSection;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
+use ClarionApp\LlmClient\ValueObjects\RunEndState;
+use ClarionApp\LlmClient\ValueObjects\RunKind;
+use ClarionApp\LlmClient\ValueObjects\RunRelation;
+use Illuminate\Support\Str;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
@@ -52,6 +56,7 @@ class AgentLoopService
     private PreferenceInjector $preferenceInjector;
     private ?AutoMemoryRetriever $autoMemoryRetriever;
     private ?MetricsRecorder $metricsRecorder;
+    private ?RunTraceRecorder $runTraceRecorder;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -70,7 +75,8 @@ class AgentLoopService
         ?ToolResultCondenser $toolResultCondenser = null,
         ?PreferenceInjector $preferenceInjector = null,
         ?AutoMemoryRetriever $autoMemoryRetriever = null,
-        ?MetricsRecorder $metricsRecorder = null
+        ?MetricsRecorder $metricsRecorder = null,
+        ?RunTraceRecorder $runTraceRecorder = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -89,14 +95,62 @@ class AgentLoopService
         $this->preferenceInjector = $preferenceInjector ?? new PreferenceInjector();
         $this->autoMemoryRetriever = $autoMemoryRetriever;
         $this->metricsRecorder = $metricsRecorder;
+        $this->runTraceRecorder = $runTraceRecorder;
     }
 
-    public function start(Conversation $conversation, int $iteration = 1): void
+    /**
+     * Milliseconds a step spent waiting on a human confirmation (FR-004, SC-012).
+     *
+     * Derived from the `paused_at` stamp written beside the pending confirmation.
+     * Pre-`paused_at` messages fall back to the message's own creation time, which
+     * is exact on the synchronous path — there the message is created at the pause.
+     */
+    private function confirmationWaitMs(array $toolData, Message $message): ?int
     {
+        if (($toolData['step_id'] ?? null) === null) {
+            return null;
+        }
+
+        $pausedAt = isset($toolData['paused_at'])
+            ? Carbon::parse($toolData['paused_at'])
+            : $message->created_at;
+
+        if ($pausedAt === null) {
+            return null;
+        }
+
+        return max(0, (int) round($pausedAt->diffInMilliseconds(now(), false)));
+    }
+
+    public function start(
+        Conversation $conversation,
+        int $iteration = 1,
+        ?string $runId = null,
+        ?string $triggerMessageId = null,
+    ): void {
         // The user is engaging again, so this session is live: clear any end
         // marker set by the idle sweep, making the session eligible to end
         // (and be captured) again once it next goes quiet.
         $conversation->update(['is_processing' => true, 'ended_at' => null]);
+
+        // Open or continue a run trace. A null $runId mints a new run (contracts §3.3).
+        if ($this->runTraceRecorder !== null) {
+            if ($runId === null) {
+                $runId = $this->runTraceRecorder->openRun(
+                    RunKind::Interactive,
+                    (string) $conversation->user_id,
+                    $conversation->id,
+                );
+                // Link the trigger message when minting a new run.
+                if ($triggerMessageId !== null && $runId !== null) {
+                    $this->runTraceRecorder->linkMessage(
+                        $runId,
+                        $triggerMessageId,
+                        RunRelation::Trigger,
+                    );
+                }
+            }
+        }
 
         $tools = $this->buildToolsPayload();
         $formattedTools = $this->formatTools($conversation, $tools);
@@ -104,13 +158,14 @@ class AgentLoopService
         $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
         $formatted = $this->formatMessages($conversation, $trimmed);
 
-        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system']);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId);
     }
 
     public function resume(Conversation $conversation, Message $message, bool $approved): void
     {
         $toolData = $message->tool_data;
         $pending = $toolData['pending_confirmation'] ?? null;
+        $runId = $toolData['run_id'] ?? null;
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
@@ -125,6 +180,20 @@ class AgentLoopService
 
         $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
         $iteration = ($toolData['iteration'] ?? 1) + 1;
+
+        // Close the step that spanned the confirmation pause, recording the human
+        // wait portion (FR-004, SC-012). The continuation's own step is opened by
+        // dispatchStreamRequest() below, so the streamed path records the same
+        // shape the synchronous path does (FR-008).
+        $pendingStepId = $toolData['step_id'] ?? null;
+        if ($this->runTraceRecorder !== null && $pendingStepId !== null) {
+            $this->runTraceRecorder->closeStep(
+                $pendingStepId,
+                RunEndState::Completed,
+                null,
+                $this->confirmationWaitMs($toolData, $message),
+            );
+        }
 
         $confirmationType = $pending['confirmation_type'] ?? 'api_call';
 
@@ -188,7 +257,7 @@ class AgentLoopService
         $rawMessages = $this->buildMessagesPayload($conversation);
         $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
         $formatted = $this->formatMessages($conversation, $trimmed);
-        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system']);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId);
     }
 
     /**
@@ -205,6 +274,16 @@ class AgentLoopService
         // marker set by the idle sweep, making the session eligible to end
         // (and be captured) again once it next goes quiet.
         $conversation->update(['is_processing' => true, 'ended_at' => null]);
+
+        // Open a run trace record immediately after is_processing update.
+        $runId = null;
+        if ($this->runTraceRecorder !== null) {
+            $runId = $this->runTraceRecorder->openRun(
+                \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+                (string) $conversation->user_id,
+                $conversation->id,
+            );
+        }
 
         // Resolve preset schema if a preset name is specified
         $presetName = $options['preset'] ?? null;
@@ -239,6 +318,15 @@ class AgentLoopService
             'responseTime' => 0,
         ]);
 
+        // Link the trigger message after it is created (not at openRun).
+        if ($this->runTraceRecorder !== null && $runId !== null) {
+            $this->runTraceRecorder->linkMessage(
+                $runId,
+                $userMessage->id,
+                RunRelation::Trigger,
+            );
+        }
+
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
         $tools = $this->buildToolsPayload();
         $formattedTools = $this->formatTools($conversation, $tools);
@@ -249,10 +337,25 @@ class AgentLoopService
         $schemaRetryCount = 0;
         $correctionPromptBuilder = new CorrectionPromptBuilder();
 
+        // Step tracking for run trace — position is a step ordinal, not $iteration.
+        // A schema-validation retry consumes an iteration without opening a step.
+        $stepOrdinal = 0;
+        $currentStepId = null;
+
         try {
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
                 // Generate attempt group ID for this turn (shared across LLM calls, retries, and tool calls)
                 $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+
+                // Open a step only when no step is currently open for this run.
+                if ($this->runTraceRecorder !== null && $runId !== null && $currentStepId === null) {
+                    $stepOrdinal++;
+                    $currentStepId = $this->runTraceRecorder->openStep(
+                        $runId,
+                        $stepOrdinal,
+                        $attemptGroupId,
+                    );
+                }
 
                 $rawMessages = $this->buildMessagesPayload($conversation);
                 $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId);
@@ -295,6 +398,12 @@ class AgentLoopService
                             if ($retryOnValidationFailure && $schemaRetryCount < $maxSchemaRetries && !$e->isRetryExhausted()) {
                                 $schemaRetryCount++;
 
+                                // Record the retry attempt but keep the step open —
+                                // a retried round stays one step (FR-011).
+                                if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                                    $this->runTraceRecorder->recordStepAttempt($currentStepId);
+                                }
+
                                 // Build correction prompt and inject as user message
                                 $correctionPrompt = $correctionPromptBuilder->build(
                                     $e->withRetryInfo($schemaRetryCount, $maxSchemaRetries)
@@ -309,7 +418,7 @@ class AgentLoopService
                                     'responseTime' => 0,
                                 ]);
 
-                                // Continue the loop to retry
+                                // Continue the loop to retry — step stays open.
                                 continue;
                             }
 
@@ -333,6 +442,21 @@ class AgentLoopService
 
                     $conversation->update(['is_processing' => false]);
 
+                    // Close the current step and the run as completed.
+                    if ($this->runTraceRecorder !== null && $runId !== null) {
+                        if ($currentStepId !== null) {
+                            $this->runTraceRecorder->closeStep(
+                                $currentStepId,
+                                RunEndState::Completed,
+                            );
+                        }
+                        $this->runTraceRecorder->closeRun(
+                            $runId,
+                            RunEndState::Completed,
+                            null,
+                            $assistantMessage->id,
+                        );
+                    }
 
                     // Generate title on first exchange
                     if ($conversation->title === null) {
@@ -402,7 +526,10 @@ class AgentLoopService
                             ];
                         }
 
-                        // Store message with pending confirmation
+                        // Store message with pending confirmation. The step stays
+                        // open across the pause; step_id and paused_at let the
+                        // resuming process close it with its human-wait portion
+                        // (contracts §3.2, FR-004).
                         $assistantMessage = Message::create([
                             'conversation_id' => $conversation->id,
                             'content' => $content ?: '',
@@ -414,6 +541,9 @@ class AgentLoopService
                                 'tool_results' => null,
                                 'iteration' => $iteration,
                                 'pending_confirmation' => $pendingConfirmation,
+                                'run_id' => $runId,
+                                'step_id' => $currentStepId,
+                                'paused_at' => now()->toIso8601String(),
                             ],
                         ]);
 
@@ -456,12 +586,35 @@ class AgentLoopService
                     new AgentTurnCompleted((string)$iteration, $conversation->id)
                 );
 
+                // Close the current step before continuing to the next iteration.
+                // A new step will be opened at the top of the next loop iteration.
+                if ($this->runTraceRecorder !== null && $runId !== null && $currentStepId !== null) {
+                    $this->runTraceRecorder->closeStep(
+                        $currentStepId,
+                        RunEndState::Completed,
+                    );
+                    $currentStepId = null;
+                }
+
                 // If all tool calls were successful execute_operation calls,
                 // stop the loop — no need for a summary response from the LLM.
                 if ($this->allExecuteOperationsSucceeded($toolCalls, $toolResults)) {
                     $agentId = $conversation->character ?? $conversation->id;
                     $conversation->update(['is_processing' => false]);
 
+                    // Close any open step and the run as completed.
+                    if ($this->runTraceRecorder !== null && $runId !== null) {
+                        if ($currentStepId !== null) {
+                            $this->runTraceRecorder->closeStep(
+                                $currentStepId,
+                                RunEndState::Completed,
+                            );
+                        }
+                        $this->runTraceRecorder->closeRun(
+                            $runId,
+                            RunEndState::Completed,
+                        );
+                    }
 
                     return [
                         'status' => 'completed',
@@ -475,6 +628,20 @@ class AgentLoopService
             $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
 
+            // Close the run as stopped_early.
+            if ($this->runTraceRecorder !== null && $runId !== null) {
+                if ($currentStepId !== null) {
+                    $this->runTraceRecorder->closeStep(
+                        $currentStepId,
+                        RunEndState::StoppedEarly,
+                    );
+                }
+                $this->runTraceRecorder->closeRun(
+                    $runId,
+                    RunEndState::StoppedEarly,
+                    'Maximum iterations reached',
+                );
+            }
 
             return [
                 'status' => 'error',
@@ -485,6 +652,21 @@ class AgentLoopService
         } catch (\Throwable $e) {
             $agentId = $conversation->character ?? $conversation->id;
             $conversation->update(['is_processing' => false]);
+
+            // Close the run as failed. The recorder catches errors, so this is safe before rethrow.
+            if ($this->runTraceRecorder !== null && $runId !== null) {
+                if ($currentStepId !== null) {
+                    $this->runTraceRecorder->closeStep(
+                        $currentStepId,
+                        RunEndState::Failed,
+                    );
+                }
+                $this->runTraceRecorder->closeRun(
+                    $runId,
+                    RunEndState::Failed,
+                    Str::limit($e->getMessage(), 500),
+                );
+            }
 
 
             throw $e;
@@ -498,6 +680,7 @@ class AgentLoopService
     {
         $toolData = $message->tool_data;
         $pending = $toolData['pending_confirmation'] ?? null;
+        $runId = $toolData['run_id'] ?? null;
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
@@ -513,10 +696,48 @@ class AgentLoopService
         }
 
         $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
+        $pendingStepId = $toolData['step_id'] ?? null;
 
         // Shared attempt group ID for this resumed turn (confirmed call + any
         // follow-on LLM calls and tool invocations in the continuation loop).
         $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+
+        // Recover run_id and step_id from tool_data.
+        // If step_id is present, close it with wait_ms (T059) — the step spans
+        // the confirmation pause. If run_id is null (pre-feature), mint a fresh run.
+        $currentStepId = null;
+        $waitMs = $this->confirmationWaitMs($toolData, $message);
+        if ($this->runTraceRecorder !== null) {
+            if ($runId !== null) {
+                // Close the step that spanned the confirmation pause (T059).
+                if ($pendingStepId !== null) {
+                    $this->runTraceRecorder->closeStep(
+                        $pendingStepId,
+                        RunEndState::Completed,
+                        null,
+                        $waitMs, // wait_ms for the human wait portion
+                    );
+                }
+                // Open a new step for the resumed work.
+                $currentStepId = $this->runTraceRecorder->openStep(
+                    $runId,
+                    null, // position auto-assigned
+                    $attemptGroupId,
+                );
+            } else {
+                // Pre-feature tool_data — mint a fresh run for the resumed portion.
+                $runId = $this->runTraceRecorder->openRun(
+                    \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+                    (string) $conversation->user_id,
+                    $conversation->id,
+                );
+                $currentStepId = $this->runTraceRecorder->openStep(
+                    $runId,
+                    null, // position auto-assigned
+                    $attemptGroupId,
+                );
+            }
+        }
 
         if ($approved) {
             $resultContent = $this->executeApiCall(
@@ -576,6 +797,20 @@ class AgentLoopService
             $toolCalls = $responseMessage['tool_calls'] ?? [];
 
             if (empty($toolCalls)) {
+                // Close the step and run on completion.
+                if ($this->runTraceRecorder !== null && $runId !== null) {
+                    if ($currentStepId !== null) {
+                        $this->runTraceRecorder->closeStep(
+                            $currentStepId,
+                            RunEndState::Completed,
+                        );
+                    }
+                    $this->runTraceRecorder->closeRun(
+                        $runId,
+                        RunEndState::Completed,
+                    );
+                }
+
                 $assistantMessage = Message::create([
                     'conversation_id' => $conversation->id,
                     'content' => $content,
@@ -645,6 +880,11 @@ class AgentLoopService
                         ];
                     }
 
+                    // The step stays open across the pause — its duration includes
+                    // the human wait (FR-004), and the resuming process closes it
+                    // with the wait portion recorded. Closing it here instead would
+                    // leave a second pause in the same run with no wait_ms at all,
+                    // since the resumed close would hit the terminal guard.
                     $assistantMessage = Message::create([
                         'conversation_id' => $conversation->id,
                         'content' => $content ?: '',
@@ -656,6 +896,9 @@ class AgentLoopService
                             'tool_results' => null,
                             'iteration' => $iteration,
                             'pending_confirmation' => $pendingConfirmation,
+                            'run_id' => $runId,
+                            'step_id' => $currentStepId,
+                            'paused_at' => now()->toIso8601String(),
                         ],
                     ]);
 
@@ -677,6 +920,15 @@ class AgentLoopService
                 ] + array_filter($toolResultEntry, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
             }
 
+            // Close the step before continuing to the next iteration.
+            if ($this->runTraceRecorder !== null && $runId !== null && $currentStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $currentStepId,
+                    RunEndState::Completed,
+                );
+                $currentStepId = null;
+            }
+
             Message::create([
                 'conversation_id' => $conversation->id,
                 'content' => $content ?: '',
@@ -690,6 +942,31 @@ class AgentLoopService
                     'pending_confirmation' => null,
                 ],
             ]);
+
+            // Open a new step for the next iteration.
+            if ($this->runTraceRecorder !== null && $runId !== null) {
+                $currentStepId = $this->runTraceRecorder->openStep(
+                    $runId,
+                    null, // position auto-assigned
+                    $attemptGroupId,
+                );
+            }
+        }
+
+        // Close the run on exit — stopped early due to max iterations (FR-010).
+        if ($this->runTraceRecorder !== null && $runId !== null) {
+            if ($currentStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $currentStepId,
+                    RunEndState::StoppedEarly,
+                    'Maximum iterations reached',
+                );
+            }
+            $this->runTraceRecorder->closeRun(
+                $runId,
+                RunEndState::StoppedEarly,
+                'Maximum iterations reached',
+            );
         }
 
         $agentId = $conversation->character ?? $conversation->id;
@@ -1630,8 +1907,15 @@ class AgentLoopService
         return array_merge($payload, $this->buildHistoryMessages($conversation));
     }
 
-    private function dispatchStreamRequest(Conversation $conversation, array $messages, array $tools, int $iteration, string $system = '', ?string $responseFormat = null): void
-    {
+    private function dispatchStreamRequest(
+        Conversation $conversation,
+        array $messages,
+        array $tools,
+        int $iteration,
+        string $system = '',
+        ?string $responseFormat = null,
+        ?string $runId = null,
+    ): void {
         $server = Server::find($conversation->server_id);
 
         $body = new \stdClass();
@@ -1673,9 +1957,21 @@ class AgentLoopService
             'body' => json_encode($body, JSON_PRETTY_PRINT),
         ]);
 
+        // Open a step for this streaming model call — the single funnel every
+        // streaming dispatch passes through. This deliberately includes queue
+        // wait in the step's duration.
+        $stepId = null;
+        $attemptGroupId = (string) Str::uuid();
+        if ($this->runTraceRecorder !== null && $runId !== null) {
+            // Derive step position from 1 + COUNT(*) for the run.
+            $stepId = $this->runTraceRecorder->openStep($runId, null, $attemptGroupId);
+        }
+
         $data = json_encode([
             'conversation_id' => $conversation->id,
             'iteration' => $iteration,
+            'run_id' => $runId,
+            'step_id' => $stepId,
         ]);
 
         SendHttpStreamRequest::dispatch(

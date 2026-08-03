@@ -53,7 +53,7 @@ class MessageController extends Controller
 
         if (!$conversation->is_processing) {
             $agentLoopService = app(AgentLoopService::class);
-            $agentLoopService->start($conversation);
+            $agentLoopService->start($conversation, 1, null, $message->id);
         }
 
         return response()->json($message, 201);
