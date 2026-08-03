@@ -353,4 +353,73 @@ class PurgeExpiredRunTracesCommandTest extends TestCase
 
         $this->assertEquals(0, DB::table('agent_runs')->where('id', $expiredRunId)->count());
     }
+
+    /**
+     * Contract §5: the purge deletes in chunks. Every other test here fits inside
+     * a single pass, so none of them would notice one unbounded `whereIn` holding
+     * every expired id in memory and binding it in a single statement.
+     *
+     * The bound is asserted on the statements themselves rather than by overflowing
+     * a driver limit — SQLite's parameter cap is high enough that a "too many ids"
+     * test would pass against the unbounded version and prove nothing.
+     */
+    #[Test]
+    public function purge_deletes_in_bounded_chunks()
+    {
+        $userId = (string) Str::uuid();
+        $expiredTime = CarbonImmutable::now()->subDays(100);
+        $recentRunId = (string) Str::uuid();
+
+        // Comfortably past the 500-run chunk size, so at least three passes run.
+        $expiredCount = 1100;
+        for ($i = 0; $i < $expiredCount; $i++) {
+            $runId = (string) Str::uuid();
+            $this->insertRun($runId, $userId, RunEndState::Completed->value,
+                $expiredTime->format('Y-m-d H:i:s.u'),
+                $expiredTime->addHour()->format('Y-m-d H:i:s.u'),
+                3600000,
+                1);
+            $this->insertStep((string) Str::uuid(), $runId, 1, RunEndState::Completed->value,
+                $expiredTime->format('Y-m-d H:i:s.u'),
+                $expiredTime->addHour()->format('Y-m-d H:i:s.u'),
+                3600000);
+            $this->insertAssociation($runId, (string) Str::uuid(), RunRelation::Reply->value);
+        }
+
+        // One run inside retention, to prove the loop stops at the cutoff rather
+        // than draining the table.
+        $this->insertRun($recentRunId, $userId, RunEndState::Completed->value,
+            CarbonImmutable::now()->subDays(1)->format('Y-m-d H:i:s.u'),
+            CarbonImmutable::now()->subDays(1)->addHour()->format('Y-m-d H:i:s.u'),
+            3600000,
+            0);
+
+        $widestBinding = 0;
+        $deleteStatements = 0;
+        DB::listen(function ($query) use (&$widestBinding, &$deleteStatements) {
+            if (stripos($query->sql, 'delete') === 0) {
+                $deleteStatements++;
+                $widestBinding = max($widestBinding, count($query->bindings));
+            }
+        });
+
+        $exitCode = Artisan::call('llm-client:purge-run-traces');
+
+        $this->assertSame(0, $exitCode);
+
+        // Everything expired is gone, and the one run inside retention survives —
+        // the loop stops at the cutoff rather than draining the table.
+        $this->assertEquals(1, DB::table('agent_runs')->count());
+        $this->assertEquals($recentRunId, DB::table('agent_runs')->value('id'));
+        $this->assertEquals(0, DB::table('agent_run_steps')->count());
+        $this->assertEquals(0, DB::table('agent_run_messages')->count());
+
+        // 1100 runs across three tables cannot have been three statements.
+        $this->assertGreaterThanOrEqual(9, $deleteStatements);
+        $this->assertLessThanOrEqual(
+            500,
+            $widestBinding,
+            'No single delete may bind more ids than the chunk size',
+        );
+    }
 }

@@ -303,4 +303,124 @@ abstract class AssembledSystemTestCase extends TestCase
 
         return '';
     }
+
+    /**
+     * Build SSE chunks for a tool-call response.
+     */
+    protected function buildToolCallSseChunks(array $response): array
+    {
+        $toolCalls = $response['choices'][0]['message']['tool_calls'] ?? [];
+        $chunks = [];
+
+        foreach ($toolCalls as $tc) {
+            // Tool call ID chunk
+            $data = json_encode([
+                'choices' => [
+                    [
+                        'delta' => [
+                            'tool_calls' => [
+                                [
+                                    'index' => 0,
+                                    'id' => $tc['id'],
+                                    'type' => $tc['type'],
+                                ],
+                            ],
+                        ],
+                        'finish_reason' => null,
+                    ],
+                ],
+            ]);
+            $chunks[] = "data: {$data}\n\n";
+
+            // Function name chunk
+            $data = json_encode([
+                'choices' => [
+                    [
+                        'delta' => [
+                            'tool_calls' => [
+                                [
+                                    'index' => 0,
+                                    'function' => [
+                                        'name' => $tc['function']['name'],
+                                    ],
+                                ],
+                            ],
+                        ],
+                        'finish_reason' => null,
+                    ],
+                ],
+            ]);
+            $chunks[] = "data: {$data}\n\n";
+
+            // Function arguments chunk
+            $data = json_encode([
+                'choices' => [
+                    [
+                        'delta' => [
+                            'tool_calls' => [
+                                [
+                                    'index' => 0,
+                                    'function' => [
+                                        'arguments' => $tc['function']['arguments'],
+                                    ],
+                                ],
+                            ],
+                        ],
+                        'finish_reason' => null,
+                    ],
+                ],
+            ]);
+            $chunks[] = "data: {$data}\n\n";
+        }
+
+        // Final chunk with finish_reason
+        $finishReason = $response['choices'][0]['finish_reason'] ?? 'tool_calls';
+        $finalData = json_encode([
+            'choices' => [
+                [
+                    'delta' => [],
+                    'finish_reason' => $finishReason,
+                ],
+            ],
+        ]);
+        $chunks[] = "data: {$finalData}\n\n";
+
+        return $chunks;
+    }
+
+    /**
+     * Build SSE chunks from a scripted response (text content).
+     */
+    protected function buildSseChunks(array $response): array
+    {
+        $content = $response['choices'][0]['message']['content'] ?? '';
+        $finishReason = $response['choices'][0]['finish_reason'] ?? 'stop';
+
+        $chunks = [];
+        $chunkSize = 10;
+        for ($i = 0; $i < strlen($content); $i += $chunkSize) {
+            $piece = substr($content, $i, $chunkSize);
+            $data = json_encode([
+                'choices' => [
+                    [
+                        'delta' => ['content' => $piece],
+                        'finish_reason' => null,
+                    ],
+                ],
+            ]);
+            $chunks[] = "data: {$data}\n\n";
+        }
+
+        $finalData = json_encode([
+            'choices' => [
+                [
+                    'delta' => [],
+                    'finish_reason' => $finishReason,
+                ],
+            ],
+        ]);
+        $chunks[] = "data: {$finalData}\n\n";
+
+        return $chunks;
+    }
 }

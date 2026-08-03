@@ -25,6 +25,9 @@ class PurgeExpiredRunTracesCommand extends Command
 
     protected $description = 'Purge expired agent run traces (runs, steps, and message associations)';
 
+    /** Runs deleted per pass. Keeps each `whereIn` well inside SQLite's 999-parameter cap. */
+    private const CHUNK_SIZE = 500;
+
     public function handle(): int
     {
         $days = (int) ($this->option('days') ?? config('llm-client.run_trace.retention_days', 90));
@@ -37,18 +40,7 @@ class PurgeExpiredRunTracesCommand extends Command
             $this->warn('Dry-run mode — no changes will be made');
         }
 
-        // Find expired runs (by ended_at, falling back to started_at for in_progress runs).
-        // These are runs where the work is definitively old.
-        $expiredRunIds = DB::table('agent_runs')
-            ->where(function ($query) use ($cutoffDate) {
-                $query->whereNull('ended_at')
-                    ->where('started_at', '<', $cutoffDate);
-            })
-            ->orWhere('ended_at', '<', $cutoffDate)
-            ->pluck('id')
-            ->toArray();
-
-        $totalExpiredRuns = count($expiredRunIds);
+        $totalExpiredRuns = $this->expiredRunsQuery($cutoffDate)->count();
 
         if ($totalExpiredRuns === 0) {
             $this->info('No expired run traces to purge');
@@ -60,40 +52,71 @@ class PurgeExpiredRunTracesCommand extends Command
 
         $this->info("Found {$totalExpiredRuns} expired run(s) to purge");
 
-        if (!$dryRun) {
-            // Delete child rows first (associations, then steps), then parent runs.
-            // This ordering avoids foreign key violations.
-
-            // 1. Delete message associations for expired runs.
-            $deletedAssociations = DB::table('agent_run_messages')
-                ->whereIn('run_id', $expiredRunIds)
-                ->delete();
-            $this->info("Message associations purged: {$deletedAssociations}");
-
-            // 2. Delete steps for expired runs.
-            $deletedSteps = DB::table('agent_run_steps')
-                ->whereIn('run_id', $expiredRunIds)
-                ->delete();
-            $this->info("Steps purged: {$deletedSteps}");
-
-            // 3. Delete the expired runs themselves.
-            $deletedRuns = DB::table('agent_runs')
-                ->whereIn('id', $expiredRunIds)
-                ->delete();
-            $this->info("Runs purged: {$deletedRuns}");
-
-            Log::info('Agent run traces purged', [
-                'runs' => $deletedRuns,
-                'steps' => $deletedSteps,
-                'associations' => $deletedAssociations,
-                'cutoff' => $cutoffDate->toDateTimeString(),
-            ]);
-        }
-
         if ($dryRun) {
             $this->comment('Dry-run complete — no changes were made');
+            return self::SUCCESS;
         }
 
+        // Deleted in chunks (contract §5): after a full retention period this table
+        // can hold far more ids than belong in one `whereIn` — SQLite caps bound
+        // parameters at 999 by default, and MySQL is bounded by max_allowed_packet.
+        // Materialising the whole id list would also hold it all in memory at once.
+        $deletedRuns = 0;
+        $deletedSteps = 0;
+        $deletedAssociations = 0;
+
+        do {
+            $chunk = $this->expiredRunsQuery($cutoffDate)
+                ->limit(self::CHUNK_SIZE)
+                ->pluck('id')
+                ->all();
+
+            if (empty($chunk)) {
+                break;
+            }
+
+            // Children before parents, so a purge interrupted midway never leaves
+            // a step or association pointing at a run that is already gone.
+            $deletedAssociations += DB::table('agent_run_messages')
+                ->whereIn('run_id', $chunk)
+                ->delete();
+
+            $deletedSteps += DB::table('agent_run_steps')
+                ->whereIn('run_id', $chunk)
+                ->delete();
+
+            $deletedRuns += DB::table('agent_runs')
+                ->whereIn('id', $chunk)
+                ->delete();
+        } while (count($chunk) === self::CHUNK_SIZE);
+
+        $this->info("Message associations purged: {$deletedAssociations}");
+        $this->info("Steps purged: {$deletedSteps}");
+        $this->info("Runs purged: {$deletedRuns}");
+
+        Log::info('Agent run traces purged', [
+            'runs' => $deletedRuns,
+            'steps' => $deletedSteps,
+            'associations' => $deletedAssociations,
+            'cutoff' => $cutoffDate->toDateTimeString(),
+        ]);
+
         return self::SUCCESS;
+    }
+
+    /**
+     * Runs past the cutoff: closed runs by `ended_at`, still-open ones by their
+     * own `started_at` so an abandoned run the sweep never reached still ages out.
+     */
+    private function expiredRunsQuery($cutoffDate)
+    {
+        return DB::table('agent_runs')
+            ->select('id')
+            ->where(function ($query) use ($cutoffDate) {
+                $query->where(function ($q) use ($cutoffDate) {
+                    $q->whereNull('ended_at')
+                        ->where('started_at', '<', $cutoffDate);
+                })->orWhere('ended_at', '<', $cutoffDate);
+            });
     }
 }

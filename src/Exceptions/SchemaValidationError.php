@@ -67,12 +67,20 @@ class SchemaValidationError extends \RuntimeException
 
     /**
      * Return a new instance with updated retry info.
+     *
+     * Constructed rather than cloned: PHP declares `Exception::__clone` private
+     * and final, so `clone $this` on any exception is a fatal error.
      */
     public function withRetryInfo(int $retryAttempt, int $maxRetries): self
     {
-        $clone = clone $this;
-        $clone->retryAttempt = $retryAttempt;
-        $clone->maxRetries = $maxRetries;
-        return $clone;
+        return new self(
+            $this->getMessage(),
+            $this->violations,
+            $this->rawContent,
+            $this->strippedContent,
+            $this->schema,
+            $retryAttempt,
+            $maxRetries,
+        );
     }
 }

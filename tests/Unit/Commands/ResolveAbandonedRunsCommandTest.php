@@ -213,47 +213,167 @@ class ResolveAbandonedRunsCommandTest extends TestCase
         $this->insertStep($stepId, $runId, 1, RunEndState::InProgress->value,
             $staleTime->format('Y-m-d H:i:s.u'));
 
-        // Insert a pending confirmation message with expires_at in the future.
-        // The messages table may not exist in this test context, so we check first.
-        if (DB::getSchemaBuilder()->hasTable('messages')) {
-            $msgId = (string) Str::uuid();
-            $expiresAt = CarbonImmutable::now()->addMinutes(3)->toIso8601String();
-            DB::table('messages')->insert([
-                'id' => $msgId,
-                'role' => 'assistant',
-                'content' => json_encode([
-                    'content' => [[
-                        'type' => 'tool_use',
-                        'id' => 'tool_1',
-                        'name' => 'request_confirmation',
-                        'input' => ['message' => 'Please confirm.'],
-                    ]],
-                ]),
-                'tool_data' => json_encode([
-                    'run_id' => $runId,
-                    'step_id' => $stepId,
-                    'pending' => true,
-                    'expires_at' => $expiresAt,
-                ]),
-                'conversation_id' => 'test-conv',
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
+        // The pause payload is written verbatim in the shape the agent loop
+        // produces (contracts §3.2) — `pending_confirmation` nested, carrying
+        // `expires_at`, with `run_id` beside it. Inventing a flatter shape here
+        // would let the sweep's reader and this test agree with each other while
+        // both disagreeing with production.
+        $this->assertTrue(DB::getSchemaBuilder()->hasTable('messages'));
 
-            $exitCode = Artisan::call('llm-client:resolve-abandoned-runs');
+        DB::table('messages')->insert([
+            'id' => (string) Str::uuid(),
+            'role' => 'assistant',
+            'content' => '',
+            'tool_data' => json_encode([
+                'tool_calls' => [['id' => 'call_1']],
+                'tool_results' => null,
+                'iteration' => 1,
+                'pending_confirmation' => [
+                    'tool_name' => 'contacts.destroy',
+                    'operationId' => 'destroyContact',
+                    'method' => 'DELETE',
+                    'path' => '/api/contacts/{id}',
+                    'arguments' => [],
+                    // Inside the 300s confirmation timeout.
+                    'expires_at' => CarbonImmutable::now()->addSeconds(280)->toIso8601String(),
+                ],
+                'run_id' => $runId,
+                'step_id' => $stepId,
+                'paused_at' => CarbonImmutable::now()->subSeconds(20)->toIso8601String(),
+            ]),
+            'conversation_id' => (string) Str::uuid(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
 
-            $this->assertSame(0, $exitCode);
+        // --minutes=1 puts the run well past the abandonment threshold, so the
+        // exemption is the only thing that can save it. Under the 60-minute
+        // default the run would survive regardless and this would prove nothing.
+        $exitCode = Artisan::call('llm-client:resolve-abandoned-runs', ['--minutes' => 1]);
 
-            // Run should still be in_progress because a pending confirmation exists.
-            $run = DB::table('agent_runs')->where('id', $runId)->first();
-            $this->assertNotNull($run);
-            $this->assertEquals(RunEndState::InProgress->value, $run->end_state);
-        } else {
-            // Without messages table, skip the confirmation check.
-            // The test still validates that the sweep runs without error.
-            $exitCode = Artisan::call('llm-client:resolve-abandoned-runs');
-            $this->assertSame(0, $exitCode);
-        }
+        $this->assertSame(0, $exitCode);
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNotNull($run);
+        $this->assertEquals(
+            RunEndState::InProgress->value,
+            $run->end_state,
+            'A run waiting on a human inside the confirmation timeout must not be swept (SC-008)',
+        );
+
+        $step = DB::table('agent_run_steps')->where('id', $stepId)->first();
+        $this->assertEquals(RunEndState::InProgress->value, $step->end_state);
+    }
+
+    #[Test]
+    public function run_whose_confirmation_has_expired_is_swept()
+    {
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $stepId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        $this->insertStep($stepId, $runId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        // Same shape, but the human never answered and the window has closed.
+        DB::table('messages')->insert([
+            'id' => (string) Str::uuid(),
+            'role' => 'assistant',
+            'content' => '',
+            'tool_data' => json_encode([
+                'tool_calls' => [['id' => 'call_1']],
+                'tool_results' => null,
+                'iteration' => 1,
+                'pending_confirmation' => [
+                    'tool_name' => 'contacts.destroy',
+                    'expires_at' => $staleTime->addSeconds(300)->toIso8601String(),
+                ],
+                'run_id' => $runId,
+                'step_id' => $stepId,
+                'paused_at' => $staleTime->toIso8601String(),
+            ]),
+            'conversation_id' => (string) Str::uuid(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $exitCode = Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $this->assertSame(0, $exitCode);
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertEquals(
+            RunEndState::Abandoned->value,
+            $run->end_state,
+            'An expired confirmation is not a reason to stay open forever (FR-017)',
+        );
+    }
+
+    /**
+     * data-model.md §4: an open step ends at its last observed activity, not at
+     * the sweep's now(), so its duration does not absorb detection lag.
+     */
+    #[Test]
+    public function swept_step_duration_excludes_the_sweeps_detection_lag()
+    {
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $stepId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        // A step that opened and never closed: as far as anything observed, it
+        // stopped where it started.
+        $this->insertStep($stepId, $runId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $step = DB::table('agent_run_steps')->where('id', $stepId)->first();
+        $this->assertEquals(RunEndState::Abandoned->value, $step->end_state);
+        $this->assertEquals(
+            0,
+            (int) $step->duration_ms,
+            'The two hours before the sweep noticed are not step working time',
+        );
+
+        // The run, by contrast, legitimately spans the whole abandoned window —
+        // how long it was outstanding before anyone noticed.
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertGreaterThan(7_000_000, (int) $run->duration_ms);
+
+        // duration_ms is a whole number of milliseconds, not a float: the column
+        // is an unsignedBigInteger and MySQL would truncate silently.
+        $this->assertSame(
+            0.0,
+            fmod((float) $run->duration_ms, 1.0),
+            'duration_ms must be written as an integer',
+        );
+    }
+
+    #[Test]
+    public function dry_run_reports_what_it_would_resolve()
+    {
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        $this->insertStep((string) Str::uuid(), $runId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        Artisan::call('llm-client:resolve-abandoned-runs', ['--dry-run' => true]);
+        $output = Artisan::output();
+
+        // A dry run reporting zero is indistinguishable from one that found nothing.
+        $this->assertStringContainsString('Runs would be resolved: 1', $output);
+        $this->assertStringContainsString('Open steps that would be closed: 1', $output);
     }
 
     #[Test]
