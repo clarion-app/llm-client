@@ -20,7 +20,7 @@ use PHPUnit\Framework\Attributes\After;
  * Integration tests for installation-wide default assignments.
  *
  * Validates immediate effect without restart and isolation across roles
- * and users, plus all five US2 acceptance scenarios.
+ * and users.
  */
 class InstallationDefaultJourneyTest extends TestCase
 {
@@ -135,7 +135,6 @@ class InstallationDefaultJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
-    // US2 Acceptance Scenario 1:
     // Installation assignment for a role + no user assignment → any user gets installation's model
     // -----------------------------------------------------------------------
 
@@ -168,7 +167,6 @@ class InstallationDefaultJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
-    // US2 Acceptance Scenario 2:
     // Installation + user assignment for same role → that user gets their own model,
     // other users get installation's
     // -----------------------------------------------------------------------
@@ -210,7 +208,6 @@ class InstallationDefaultJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
-    // US2 Acceptance Scenario 3:
     // User with override for one role only → gets installation's models for other two roles
     // -----------------------------------------------------------------------
 
@@ -262,7 +259,6 @@ class InstallationDefaultJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
-    // US2 Acceptance Scenario 4:
     // Installation assignment changed → user without override gets new model immediately
     // -----------------------------------------------------------------------
 
@@ -294,7 +290,6 @@ class InstallationDefaultJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
-    // US2 Acceptance Scenario 5:
     // Deployment-file embedding model vs assignment → assignment wins
     // -----------------------------------------------------------------------
 
