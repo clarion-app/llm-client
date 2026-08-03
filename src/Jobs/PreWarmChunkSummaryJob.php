@@ -13,6 +13,7 @@ use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\ChunkPartitioner;
 use ClarionApp\LlmClient\Services\CondensationSummaryStore;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -147,10 +148,15 @@ class PreWarmChunkSummaryJob implements ShouldQueue
         }
 
         try {
-            $result = $llmProvider->chat([
-                ['role' => 'system', 'content' => $systemPrompt],
-                ['role' => 'user', 'content' => $transcript],
-            ], [], $options);
+            $result = app(RunTraceRecorder::class)->traceSystemRun(
+                'chunk_summary_prewarm',
+                (string) $conversation->user_id,
+                $this->conversationId,
+                fn () => $llmProvider->chat([
+                    ['role' => 'system', 'content' => $systemPrompt],
+                    ['role' => 'user', 'content' => $transcript],
+                ], [], $options),
+            );
 
             $content = $result['choices'][0]['message']['content'] ?? null;
             if (!$content) {

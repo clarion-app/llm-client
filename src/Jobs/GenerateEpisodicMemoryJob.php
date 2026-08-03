@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Models\EpisodicMemory;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\EmbeddingService;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -139,7 +140,12 @@ class GenerateEpisodicMemoryJob implements ShouldQueue
         }
 
         // Send to LLM for summarization
-        $summaryResult = $this->summarize($provider, $transcript, $maxSummaryWords, $wordCount);
+        $summaryResult = app(RunTraceRecorder::class)->traceSystemRun(
+            'episodic_memory',
+            $userId,
+            $this->conversationId,
+            fn () => $this->summarize($provider, $transcript, $maxSummaryWords, $wordCount),
+        );
 
         if (!$summaryResult) {
             // Summarization failed — broadcast failure event

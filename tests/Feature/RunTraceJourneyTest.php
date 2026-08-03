@@ -439,4 +439,145 @@ class RunTraceJourneyTest extends TestCase
         $this->assertNotNull($runReplyOnly);
         $this->assertEquals($runId, $runReplyOnly->id);
     }
+
+    // === Phase 8: US7 Background Model Work Tests ===
+
+    /** @test */
+    public function background_jobs_produce_system_initiated_runs(): void
+    {
+        // T071/T077: Background jobs with actual LLM calls produce system_initiated runs.
+        // Audit found two instrumented sources: episodic_memory and chunk_summary_prewarm.
+        // HandleOpenAIGenerateConversationTitleResponse is a response handler (no LLM call).
+        // ExtractFeedbackPreferencesJob is purely heuristic (no LLM call).
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $query = $this->app->make(RunTraceQuery::class);
+
+        $userId = (string) \Illuminate\Support\Str::uuid();
+
+        // Simulate episodic memory generation.
+        $convId = (string) \Illuminate\Support\Str::uuid();
+        $memoryResult = $recorder->traceSystemRun(
+            'episodic_memory',
+            $userId,
+            $convId,
+            fn () => ['summary' => 'Conversation summary', 'topics' => ['topic1']],
+        );
+        $this->assertEquals('Conversation summary', $memoryResult['summary']);
+
+        // Simulate chunk summary pre-warm.
+        $chunkResult = $recorder->traceSystemRun(
+            'chunk_summary_prewarm',
+            $userId,
+            $convId,
+            fn () => ['decisions' => ['keep' => ['item1']]],
+        );
+        $this->assertArrayHasKey('decisions', $chunkResult);
+
+        // Verify two system-initiated runs exist, each with exactly one step.
+        $runs = DB::table('agent_runs')
+            ->where('user_id', $userId)
+            ->where('kind', RunKind::SystemInitiated->value)
+            ->get();
+        $this->assertCount(2, $runs);
+
+        foreach ($runs as $run) {
+            $runId = $run->id;
+
+            // Each run is system-initiated with a source.
+            $this->assertEquals(RunKind::SystemInitiated->value, $run->kind);
+            $this->assertNotNull($run->source);
+            $this->assertContains($run->source, ['episodic_memory', 'chunk_summary_prewarm']);
+
+            // Each run is completed with exactly one step.
+            $this->assertEquals(RunEndState::Completed->value, $run->end_state);
+            $this->assertEquals(1, $run->step_count);
+
+            $steps = $query->stepsForRun($userId, $runId);
+            $this->assertCount(1, $steps);
+            $this->assertEquals(1, $steps[0]->position);
+            $this->assertEquals(RunEndState::Completed, $steps[0]->end_state);
+        }
+
+        // Verify system-initiated runs are distinguishable from interactive runs.
+        $interactiveRuns = DB::table('agent_runs')
+            ->where('user_id', $userId)
+            ->where('kind', RunKind::Interactive->value)
+            ->count();
+        $this->assertEquals(0, $interactiveRuns);
+    }
+
+    /** @test */
+    public function background_run_with_no_conversation_records_null_conversation_id(): void
+    {
+        // T072: A background run with no conversation records conversation_id = null
+        // and is attributed to the owning user (FR-007).
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $query = $this->app->make(RunTraceQuery::class);
+
+        $userId = (string) \Illuminate\Support\Str::uuid();
+
+        $recorder->traceSystemRun(
+            'title_generation',
+            $userId,
+            null, // No conversation.
+            fn () => 'Title',
+        );
+
+        $runs = DB::table('agent_runs')
+            ->where('user_id', $userId)
+            ->get();
+        $this->assertCount(1, $runs);
+        $run = $runs[0];
+
+        // conversation_id is null for system-initiated runs without a conversation.
+        $this->assertNull($run->conversation_id);
+        $this->assertEquals($userId, $run->user_id);
+        $this->assertEquals(RunKind::SystemInitiated->value, $run->kind);
+
+        // The run is still queryable through runsForUser.
+        $allRuns = $query->runsForUser($userId);
+        $this->assertCount(1, $allRuns);
+        $this->assertNull($allRuns[0]->conversation_id);
+    }
+
+    /** @test */
+    public function failed_background_job_yields_failed_run_with_reason(): void
+    {
+        // T072: A failed background job yields run `failed` with a reason (US7 scenario 3).
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $query = $this->app->make(RunTraceQuery::class);
+
+        $userId = (string) \Illuminate\Support\Str::uuid();
+
+        $testException = new \RuntimeException('Model API timeout');
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Model API timeout');
+
+        try {
+            $recorder->traceSystemRun(
+                'episodic_memory',
+                $userId,
+                (string) \Illuminate\Support\Str::uuid(),
+                fn () => throw $testException,
+            );
+        } finally {
+            // Verify the run was recorded as failed with the exception message as reason.
+            $runs = DB::table('agent_runs')
+                ->where('user_id', $userId)
+                ->get();
+            $this->assertCount(1, $runs);
+            $run = $runs[0];
+            $this->assertEquals(RunEndState::Failed->value, $run->end_state);
+            $this->assertEquals('Model API timeout', $run->end_reason);
+            $this->assertNotNull($run->ended_at);
+            $this->assertGreaterThanOrEqual(0, $run->duration_ms);
+
+            // The step is also failed.
+            $runId = $run->id;
+            $steps = $query->stepsForRun($userId, $runId);
+            $this->assertCount(1, $steps);
+            $this->assertEquals(RunEndState::Failed, $steps[0]->end_state);
+            $this->assertEquals('Model API timeout', $steps[0]->end_reason);
+        }
+    }
 }
