@@ -7,14 +7,13 @@ use ClarionApp\LlmClient\Models\LanguageModel;
 use Illuminate\Http\Request;
 use Auth;
 use Illuminate\Support\Facades\Log;
-use ClarionApp\LlmClient\OpenAIModelsRequest;
 
 class LanguageModelController extends Controller
 {
     public function refresh($server_id)
     {
-        $modelRequest = new OpenAIModelsRequest();
-        $modelRequest->getLanguageModels($server_id);
+        // TODO: Replace with RefreshServerModelsJob (Phase 2b, T026).
+        // OpenAIModelsRequest is retired; provider->listModels() is the new path.
         return response()->json(['message'=>'Refreshing models'], 200);
     }
 

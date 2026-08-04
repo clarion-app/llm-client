@@ -3,7 +3,10 @@
 namespace ClarionApp\LlmClient\Providers;
 
 use ClarionApp\LlmClient\Contracts\LlmProvider;
+use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Services\EndpointResolver;
+use ClarionApp\LlmClient\ValueObjects\Operation;
 use Generator;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ConnectException;
@@ -22,19 +25,15 @@ class OpenAiProvider implements LlmProvider
 {
     private Server $server;
     private Client $client;
+    private EndpointResolver $resolver;
 
-    public function __construct(Server $server, ?Client $client = null)
+    public function __construct(Server $server, ?Client $client = null, ?EndpointResolver $resolver = null)
     {
         $this->server = $server;
         $this->client = $client ?? new Client(['timeout' => 240]);
+        $this->resolver = $resolver ?? app(EndpointResolver::class);
     }
 
-    /**
-     * Extract the base URL from the server_url.
-     *
-     * The server_url may be a full endpoint URL (e.g., /v1/chat/completions)
-     * or a base URL. This method extracts the base for constructing other endpoints.
-     */
     /**
      * Translate an optional `timeout_ms` option into Guzzle request options.
      *
@@ -61,55 +60,11 @@ class OpenAiProvider implements LlmProvider
         ];
     }
 
-    private function getBaseUrl(): string
-    {
-        $url = $this->server->server_url;
-        // If the URL ends with a known endpoint path, strip it to get the base
-        $endpointPatterns = ['/v1/chat/completions', '/chat/completions', '/v1/chat', '/chat'];
-        foreach ($endpointPatterns as $pattern) {
-            if (str_ends_with($url, $pattern)) {
-                $base = substr($url, 0, strlen($url) - strlen($pattern));
-                // Ensure base ends with /
-                if (!str_ends_with($base, '/')) {
-                    $base .= '/';
-                }
-                return rtrim($base, '/');
-            }
-        }
-        // If no pattern matches, assume it's already a base URL
-        return rtrim($url, '/');
-    }
-
-    /**
-     * Build headers array — includes Authorization only if token is set.
-     *
-     * OpenAI-compatible servers running locally (llama.cpp server, Ollama, vLLM)
-     * accept unauthenticated requests, so a null token is a valid configuration
-     * rather than an error.
-     */
-    private function buildHeaders(string $accept): array
-    {
-        $headers = [
-            'Content-Type' => 'application/json',
-            'Accept' => $accept,
-        ];
-
-        if ($this->server->token !== null) {
-            $headers['Authorization'] = 'Bearer ' . $this->server->token;
-        }
-
-        return $headers;
-    }
-
     /**
      * Synchronous non-streaming chat completion.
      */
     public function chat(array $messages, array $tools = [], array $options = []): array
     {
-        if ($this->server->server_url === null) {
-            throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
-        }
-
         $body = [
             'model' => $options['model'] ?? null,
             'messages' => $messages,
@@ -141,8 +96,10 @@ class OpenAiProvider implements LlmProvider
         }
 
         try {
-            $response = $this->client->post($this->server->server_url, [
-                'headers' => $this->buildHeaders('application/json'),
+            $url = $this->resolver->urlFor($this->server, Operation::Chat);
+            $headers = $this->resolver->headersFor($this->server, Operation::Chat);
+            $response = $this->client->post($url, [
+                'headers' => $headers,
                 'json' => $body,
             ]);
 
@@ -164,10 +121,6 @@ class OpenAiProvider implements LlmProvider
      */
     public function stream(array $messages, array $tools = [], array $options = []): Generator
     {
-        if ($this->server->server_url === null) {
-            throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
-        }
-
         $body = [
             'model' => $options['model'] ?? null,
             'messages' => $messages,
@@ -196,8 +149,10 @@ class OpenAiProvider implements LlmProvider
         }
 
         try {
-            $response = $this->client->post($this->server->server_url, [
-                'headers' => $this->buildHeaders('text/event-stream'),
+            $url = $this->resolver->urlFor($this->server, Operation::ChatStream);
+            $headers = $this->resolver->headersFor($this->server, Operation::ChatStream);
+            $response = $this->client->post($url, [
+                'headers' => $headers,
                 'json' => $body,
                 'stream' => true,
             ]);
@@ -279,12 +234,7 @@ class OpenAiProvider implements LlmProvider
      */
     public function embed(array $inputs, array $options = []): array
     {
-        if ($this->server->server_url === null) {
-            throw new RuntimeException('Server URL is not configured. Cannot make embedding request.');
-        }
-
-        $baseUrl = $this->getBaseUrl();
-        $embeddingsUrl = $baseUrl . '/v1/embeddings';
+        $embeddingsUrl = $this->resolver->urlFor($this->server, Operation::Embeddings);
 
         $body = [
             'input' => $inputs,
@@ -294,8 +244,10 @@ class OpenAiProvider implements LlmProvider
             $body['model'] = $options['model'];
         }
 
+        $headers = $this->resolver->headersFor($this->server, Operation::Embeddings);
+
         $requestOptions = [
-            'headers' => $this->buildHeaders('application/json'),
+            'headers' => $headers,
             'json' => $body,
         ];
 
@@ -343,16 +295,13 @@ class OpenAiProvider implements LlmProvider
      */
     public function listModels(): array
     {
-        if ($this->server->server_url === null) {
-            throw new RuntimeException('Server URL is not configured. Cannot list models.');
-        }
+        $modelsUrl = $this->resolver->urlFor($this->server, Operation::Models);
 
-        $baseUrl = $this->getBaseUrl();
-        $modelsUrl = $baseUrl . '/v1/models';
+        $headers = $this->resolver->headersFor($this->server, Operation::Models);
 
         try {
             $response = $this->client->get($modelsUrl, [
-                'headers' => $this->buildHeaders('application/json'),
+                'headers' => $headers,
             ]);
 
             $result = json_decode($response->getBody()->getContents(), true);

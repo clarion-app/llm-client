@@ -5,7 +5,6 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Server;
 use Illuminate\Http\Request;
-use ClarionApp\LlmClient\OpenAIModelsRequest;
 use Illuminate\Support\Facades\Log;
 
 class ServerController extends Controller
@@ -26,8 +25,8 @@ class ServerController extends Controller
 
         $server = Server::create($validatedData);
 
-	    $modelRequest = new OpenAIModelsRequest();
-        $modelRequest->getLanguageModels($server->id);
+        // TODO: Dispatch RefreshServerModelsJob (Phase 2b, T026).
+        // OpenAIModelsRequest is retired; provider->listModels() is the new path.
 
         return response()->json($server, 201);
     }
@@ -47,8 +46,10 @@ class ServerController extends Controller
         ]);
 
         $server->update($validatedData);
-        $modelRequest = new OpenAIModelsRequest();
-        $modelRequest->getLanguageModels($server->id);
+
+        // TODO: Dispatch RefreshServerModelsJob (Phase 2b, T026).
+        // OpenAIModelsRequest is retired; provider->listModels() is the new path.
+
         return response()->json($server, 200);
     }
 

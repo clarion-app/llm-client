@@ -3,7 +3,10 @@
 namespace ClarionApp\LlmClient\Providers;
 
 use ClarionApp\LlmClient\Contracts\LlmProvider;
+use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Services\EndpointResolver;
+use ClarionApp\LlmClient\ValueObjects\Operation;
 use Generator;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ConnectException;
@@ -23,11 +26,13 @@ class AnthropicProvider implements LlmProvider
 {
     private Server $server;
     private Client $client;
+    private EndpointResolver $resolver;
 
-    public function __construct(Server $server, ?Client $client = null)
+    public function __construct(Server $server, ?Client $client = null, ?EndpointResolver $resolver = null)
     {
         $this->server = $server;
         $this->client = $client ?? new Client(['timeout' => 240]);
+        $this->resolver = $resolver ?? app(EndpointResolver::class);
     }
 
     /**
@@ -50,10 +55,6 @@ class AnthropicProvider implements LlmProvider
      */
     public function chat(array $messages, array $tools = [], array $options = []): array
     {
-        if ($this->server->server_url === null) {
-            throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
-        }
-
         if ($this->server->token === null) {
             throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
@@ -82,13 +83,12 @@ class AnthropicProvider implements LlmProvider
         }
 
         try {
-            $response = $this->client->post($this->server->server_url, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'x-api-key' => $this->server->token,
-                    'anthropic-version' => $this->apiVersion(),
-                ],
+            $url = $this->resolver->urlFor($this->server, Operation::Chat);
+            $headers = $this->resolver->headersFor($this->server, Operation::Chat);
+            // Anthropic requires anthropic-version header on top of standard headers
+            $headers['anthropic-version'] = $this->apiVersion();
+            $response = $this->client->post($url, [
+                'headers' => $headers,
                 'json' => $body,
             ]);
 
@@ -110,10 +110,6 @@ class AnthropicProvider implements LlmProvider
      */
     public function stream(array $messages, array $tools = [], array $options = []): Generator
     {
-        if ($this->server->server_url === null) {
-            throw new RuntimeException('Server URL is not configured. Cannot make LLM request.');
-        }
-
         if ($this->server->token === null) {
             throw new RuntimeException('API token is not configured. Cannot authenticate with LLM server.');
         }
@@ -147,12 +143,12 @@ class AnthropicProvider implements LlmProvider
         }
 
         try {
-            $response = $this->client->post($this->server->server_url, [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'x-api-key' => $this->server->token,
-                    'anthropic-version' => $this->apiVersion(),
-                ],
+            $url = $this->resolver->urlFor($this->server, Operation::ChatStream);
+            $headers = $this->resolver->headersFor($this->server, Operation::ChatStream);
+            // Anthropic requires anthropic-version header on top of standard headers
+            $headers['anthropic-version'] = $this->apiVersion();
+            $response = $this->client->post($url, [
+                'headers' => $headers,
                 'json' => $body,
                 'stream' => true,
             ]);

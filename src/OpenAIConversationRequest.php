@@ -9,6 +9,8 @@ use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Services\EndpointResolver;
+use ClarionApp\LlmClient\ValueObjects\Operation;
 
 class OpenAIConversationRequest
 {
@@ -50,15 +52,12 @@ class OpenAIConversationRequest
         }
 
         $server = Server::find($this->conversation->server_id);
+        $resolver = app(EndpointResolver::class);
 
         $request = new HttpRequest();
-        $request->url = $server->server_url;
+        $request->url = $resolver->urlFor($server, Operation::Chat);
         $request->method = "POST";
-        $request->headers = [
-            'Content-type'=>'application/json',
-            'Accept'=>'application/json',
-            'Authorization'=>'Bearer '.$server->token
-        ];
+        $request->headers = $resolver->headersFor($server, Operation::Chat);
         $request->body = $newConversation;
         SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIConversationResponse", $this->conversation->id);
     }

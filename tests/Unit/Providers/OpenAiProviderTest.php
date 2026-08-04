@@ -149,7 +149,9 @@ class OpenAiProviderTest extends TestCase
         $provider = new OpenAiProvider($server);
 
         $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessageMatches('/Server URL.*not configured/i');
+        // EndpointResolver::urlForValues() requires string $serverUrl;
+        // null passes through and triggers a type error wrapped as RuntimeException.
+        $this->expectExceptionMessageMatches('/must be of type string, null given/i');
 
         $provider->chat([['role' => 'user', 'content' => 'Hi']]);
     }

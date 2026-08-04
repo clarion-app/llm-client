@@ -28,6 +28,7 @@ use ClarionApp\LlmClient\ValueObjects\MemoryInjectionSection;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
+use ClarionApp\LlmClient\ValueObjects\Operation;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
@@ -1917,6 +1918,7 @@ class AgentLoopService
         ?string $runId = null,
     ): void {
         $server = Server::find($conversation->server_id);
+        $resolver = app(EndpointResolver::class);
 
         $body = new \stdClass();
         $body->temperature = 1.0;
@@ -1939,13 +1941,9 @@ class AgentLoopService
         }
 
         $request = new HttpRequest();
-        $request->url = $server->server_url;
+        $request->url = $resolver->urlFor($server, Operation::ChatStream);
         $request->method = "POST";
-        $request->headers = [
-            'Content-type' => 'application/json',
-            'Accept' => 'application/json',
-            'Authorization' => 'Bearer ' . $server->token,
-        ];
+        $request->headers = $resolver->headersFor($server, Operation::ChatStream);
         $request->body = $body;
 
         Log::info('AgentLoopService: sending request to LLM', [
