@@ -11,11 +11,8 @@ use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\EmbeddingService;
 use ClarionApp\LlmClient\Services\RoleResolver;
-use ClarionApp\LlmClient\ValueObjects\ModelRole;
-use ClarionApp\LlmClient\ValueObjects\RoleResolution;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Str;
-use Mockery;
 use RuntimeException;
 
 class EmbedMemoryCommandTest extends TestCase
@@ -39,17 +36,11 @@ class EmbedMemoryCommandTest extends TestCase
 
         // Register embedding service
         $registry = app(ProviderRegistry::class);
-        $roleResolver = Mockery::mock(RoleResolver::class);
-        $roleResolver->shouldReceive('resolve')
-            ->andReturn(RoleResolution::unassigned(ModelRole::Embedding));
-        $embeddingService = new EmbeddingService($registry, $roleResolver);
+        // Real resolver, not a mock: RoleResolver is final (contracts §1), and with
+        // no rows in llm_role_assignments every resolve() returns Unassigned — the
+        // config-file fallback path these tests exercise.
+        $embeddingService = new EmbeddingService($registry, new RoleResolver());
         app()->instance(EmbeddingService::class, $embeddingService);
-    }
-
-    protected function tearDown(): void
-    {
-        Mockery::close();
-        parent::tearDown();
     }
 
     public function test_dry_run_shows_count(): void

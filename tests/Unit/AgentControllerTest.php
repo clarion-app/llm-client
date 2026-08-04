@@ -7,8 +7,9 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Models\LanguageModel;
-use ClarionApp\LlmClient\Models\UserSetting;
 use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\RoleAssignmentService;
+use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Mockery;
@@ -36,11 +37,17 @@ class AgentControllerTest extends TestCase
             'name' => 'test-model',
             'server_id' => $this->server->id,
         ]);
-        UserSetting::create([
-            'user_id' => $this->user->id,
-            'server_id' => $this->server->id,
-            'model' => 'test-model',
-        ]);
+        // The conversational default is a user-scoped inference role assignment
+        // (063-model-roles). AgentController no longer reads UserSetting, and the
+        // arbitrary "first LanguageModel" fallback it used to have is gone
+        // (contracts/role-assignment.md §3.2), so an assignment is what makes a
+        // new conversation resolvable at all.
+        app(RoleAssignmentService::class)->set(
+            ModelRole::Inference,
+            $this->user->id,
+            $this->server->id,
+            'test-model',
+        );
     }
 
     protected function tearDown(): void
@@ -160,8 +167,8 @@ class AgentControllerTest extends TestCase
     #[Test]
     public function agent_endpoint_returns_422_when_no_server_configured()
     {
-        // Remove the fallback server/model created in setUp so the controller
-        // has nothing to fall back on when the user has no UserSetting.
+        // Remove the server created in setUp so a user with no inference
+        // assignment of their own has nothing left to resolve to.
         $this->server->delete();
 
         $userNoServer = User::factory()->create();

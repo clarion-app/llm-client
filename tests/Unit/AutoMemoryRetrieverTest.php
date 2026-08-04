@@ -123,7 +123,7 @@ class AutoMemoryRetrieverTest extends TestCase
         // it is the pipeline's only real interrupt.
         $this->embeddingService->shouldReceive('generate')
             ->once()
-            ->with('test query', 500)
+            ->with('test query', 500, 'user-1')
             ->andReturn($embedding);
 
         // Episodic: return empty results

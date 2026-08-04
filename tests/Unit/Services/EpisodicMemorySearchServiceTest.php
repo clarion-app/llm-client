@@ -277,7 +277,7 @@ class EpisodicMemorySearchServiceTest extends TestCase
         $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
         $embeddingMock->shouldReceive('generate')
             ->once()
-            ->with('test query')
+            ->with('test query', null, \Mockery::type('string'))
             ->andThrow(new \RuntimeException('No provider'));
 
         $service = new EpisodicMemorySearchService($embeddingMock);
@@ -295,7 +295,7 @@ class EpisodicMemorySearchServiceTest extends TestCase
         $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
         $embeddingMock->shouldReceive('generate')
             ->once()
-            ->with('test query')
+            ->with('test query', null, \Mockery::type('string'))
             ->andThrow(new \RuntimeException('No provider'));
 
         $service = new EpisodicMemorySearchService($embeddingMock);

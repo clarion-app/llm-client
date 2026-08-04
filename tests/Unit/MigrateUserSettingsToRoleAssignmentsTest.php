@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Tests\Unit;
 use Tests\TestCase;
 use ClarionApp\LlmClient\Models\RoleAssignment;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Services\RoleAssignmentService;
 use ClarionApp\LlmClient\Services\RoleResolver;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Support\Facades\DB;
@@ -52,27 +53,19 @@ class MigrateUserSettingsToRoleAssignmentsTest extends TestCase
     }
 
     /**
-     * Simulate the migration logic from llm_user_settings to llm_role_assignments.
-     * This mirrors the data-only migration in research.md D9.
+     * Run the *shipped* data-only migration, not a copy of its logic.
+     *
+     * The migration file is what actually runs at deploy time (FR-019's "with
+     * no action from the user or the node operator"), so it is what these tests
+     * must drive: a re-implementation here would keep passing with the real
+     * migration deleted. Only this file's `up()` is invoked — no schema
+     * migration is run and no data outside the hand-declared test tables is
+     * touched (Constitution §V).
      */
     private function runMigration(): void
     {
-        DB::table('llm_user_settings')->whereNull('deleted_at')->orderBy('id')->chunkById(200, function ($rows) {
-            foreach ($rows as $row) {
-                if ($row->server_id === null || $row->model === null) {
-                    continue; // FR-020: no placeholder for an empty setting
-                }
-                DB::table('llm_role_assignments')->insert([
-                    'id' => (string) Str::uuid(),
-                    'role' => 'inference',
-                    'user_id' => $row->user_id,
-                    'server_id' => $row->server_id,
-                    'model' => $row->model,
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ]);
-            }
-        });
+        $migration = require __DIR__.'/../../src/Migrations/2026_08_03_000001_migrate_llm_user_settings_to_role_assignments.php';
+        $migration->up();
     }
 
     /* -----------------------------------------------------------------
@@ -306,5 +299,42 @@ class MigrateUserSettingsToRoleAssignmentsTest extends TestCase
             ->where('user_id', $userId)
             ->count();
         $this->assertEquals(0, $count);
+    }
+
+    /**
+     * The migration runs automatically at deploy and the artisan command lets an
+     * operator re-run it: neither may duplicate a row or overwrite a choice the
+     * user has made since (the unique index on (role, user_id) would reject the
+     * first, and FR-021 forbids the second).
+     */
+    #[Test]
+    public function rerunning_the_backfill_is_idempotent_and_preserves_later_choices(): void
+    {
+        $oldServer = Server::forceCreate(['id' => (string) Str::uuid(), 'name' => 'Old Server']);
+        $newServer = Server::forceCreate(['id' => (string) Str::uuid(), 'name' => 'New Server']);
+        $userId = (string) Str::uuid();
+
+        DB::table('llm_user_settings')->insert([
+            'id' => $userId,
+            'user_id' => $userId,
+            'server_id' => $oldServer->id,
+            'model' => 'gpt-4',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $this->runMigration();
+
+        // The user then picks something else in the new settings screen.
+        app(RoleAssignmentService::class)->set(ModelRole::Inference, $userId, $newServer->id, 'llama-3-70b');
+
+        // A second run — the artisan command this time, exercising the other caller.
+        $this->artisan('llm-client:migrate-user-settings')->assertExitCode(0);
+        $this->runMigration();
+
+        $rows = DB::table('llm_role_assignments')->where('user_id', $userId)->get();
+        $this->assertCount(1, $rows);
+        $this->assertEquals($newServer->id, $rows[0]->server_id);
+        $this->assertEquals('llama-3-70b', $rows[0]->model);
     }
 }

@@ -145,10 +145,36 @@ class EmbeddingService
             $options['timeout_ms'] = $timeoutMs;
         }
 
-        $result = $provider->embed([$input], $options);
+        try {
+            $result = $provider->embed([$input], $options);
+        } catch (\Throwable $e) {
+            // FR-014: a model assigned to a role it cannot perform (a chat model
+            // assigned to embedding, say) fails here, at first use. Name the role
+            // and the model rather than letting the provider's raw error surface
+            // unexplained — but only when the model came from a role assignment;
+            // a config-file model failing is not a role's fault (research.md D8).
+            if ($roleModel !== null) {
+                throw new RoleAssignmentFailedException(
+                    ModelRole::Embedding,
+                    $roleModel,
+                    $e->getMessage(),
+                    $e,
+                );
+            }
+            throw $e;
+        }
+
         $embeddings = $result['embeddings'] ?? [];
 
         if (empty($embeddings) || !is_array($embeddings[0] ?? null)) {
+            if ($roleModel !== null) {
+                throw new RoleAssignmentFailedException(
+                    ModelRole::Embedding,
+                    $roleModel,
+                    'the provider returned an empty or malformed embedding',
+                );
+            }
+
             throw new RuntimeException('Embedding provider returned invalid result (empty or non-array embeddings).');
         }
 

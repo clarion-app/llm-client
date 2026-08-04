@@ -13,10 +13,7 @@ use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\EmbeddingService;
 use ClarionApp\LlmClient\Services\MemoryService;
 use ClarionApp\LlmClient\Services\RoleResolver;
-use ClarionApp\LlmClient\ValueObjects\ModelRole;
-use ClarionApp\LlmClient\ValueObjects\RoleResolution;
 use Illuminate\Support\Str;
-use Mockery;
 use RuntimeException;
 
 class MemoryServiceSemanticSearchTest extends TestCase
@@ -44,9 +41,10 @@ class MemoryServiceSemanticSearchTest extends TestCase
         }
 
         $this->registry = app(ProviderRegistry::class);
-        $this->roleResolver = Mockery::mock(RoleResolver::class);
-        $this->roleResolver->shouldReceive('resolve')
-            ->andReturn(RoleResolution::unassigned(ModelRole::Embedding));
+        // Real resolver, not a mock: RoleResolver is final (contracts §1), and with
+        // no rows in llm_role_assignments every resolve() returns Unassigned — the
+        // config-file fallback path these tests exercise.
+        $this->roleResolver = new RoleResolver();
         $this->embeddingService = new EmbeddingService($this->registry, $this->roleResolver);
         $this->memoryService = new MemoryService(
             null, // no eviction service
@@ -54,11 +52,6 @@ class MemoryServiceSemanticSearchTest extends TestCase
         );
     }
 
-    protected function tearDown(): void
-    {
-        Mockery::close();
-        parent::tearDown();
-    }
 
     // ─── T007: Semantic search with mocked provider returns relevant entries ───
 

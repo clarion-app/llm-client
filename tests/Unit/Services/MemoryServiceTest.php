@@ -340,7 +340,7 @@ class MemoryServiceTest extends TestCase
         });
         $embeddingMock->shouldReceive('generate')
             ->once()
-            ->with('test query')
+            ->with('test query', null, null)
             ->andThrow(new \RuntimeException('No provider available'));
 
         $service = new \ClarionApp\LlmClient\Services\MemoryService(
