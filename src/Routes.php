@@ -10,7 +10,6 @@ use ClarionApp\LlmClient\Controllers\AgentController;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Controllers\DeclarativeMemoryController;
 use ClarionApp\LlmClient\Controllers\FetchPageController;
-use ClarionApp\LlmClient\Controllers\UserSettingController;
 use ClarionApp\LlmClient\Controllers\McpServerController;
 use ClarionApp\LlmClient\Controllers\EpisodicMemoryController;
 use ClarionApp\LlmClient\Controllers\FeedbackController;
@@ -32,9 +31,6 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('model', [LanguageModelController::class, "index"]);
 
     Route::post('page/text', [FetchPageController::class, "getTextFromUrl"]);
-
-    Route::get('user-setting', [UserSettingController::class, "show"]);
-    Route::put('user-setting', [UserSettingController::class, "update"]);
 
     Route::post('mcp', [McpServerController::class, "handle"]);
 

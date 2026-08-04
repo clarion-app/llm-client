@@ -6,7 +6,7 @@ use Tests\TestCase;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Models\LanguageModel;
-use ClarionApp\LlmClient\Models\UserSetting;
+use ClarionApp\LlmClient\Models\RoleAssignment;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
@@ -67,7 +67,8 @@ class ConversationCreationTest extends TestCase
             'server_id' => $server->id,
         ]);
 
-        UserSetting::create([
+        RoleAssignment::create([
+            'role' => 'inference',
             'user_id' => $user->id,
             'server_id' => $server->id,
             'model' => 'preferred-model',
