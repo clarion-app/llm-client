@@ -393,6 +393,166 @@ class ServerControllerTest extends TestCase
         $this->assertEquals('new-token-value', $this->server->token);
     }
 
+    // ==========================================
+    // T074: PUT /server/{id} conditional refresh dispatch tests (contracts/rest-api.md §4, D12)
+    // ==========================================
+
+    #[Test]
+    public function update_dispatches_refresh_job_when_server_url_changes(): void
+    {
+        Bus::fake();
+
+        $response = $this->actingAs($this->user)->putJson(
+            "/api/clarion-app/llm-client/server/{$this->server->id}",
+            [
+                'name' => 'Test Server',
+                'server_url' => 'http://localhost:9090',
+            ]
+        );
+
+        $response->assertStatus(200);
+
+        Bus::assertDispatched(function (RefreshServerModelsJob $job) {
+            return $job->serverId === $this->server->id
+                && $job->triggeredBy === $this->user->id;
+        });
+    }
+
+    #[Test]
+    public function update_dispatches_refresh_job_when_token_is_replaced(): void
+    {
+        Bus::fake();
+
+        $response = $this->actingAs($this->user)->putJson(
+            "/api/clarion-app/llm-client/server/{$this->server->id}",
+            [
+                'name' => 'Test Server',
+                'server_url' => 'http://localhost:8081',
+                'token' => 'brand-new-token',
+            ]
+        );
+
+        $response->assertStatus(200);
+
+        Bus::assertDispatched(function (RefreshServerModelsJob $job) {
+            return $job->serverId === $this->server->id;
+        });
+    }
+
+    #[Test]
+    public function update_dispatches_refresh_job_when_token_is_cleared(): void
+    {
+        Bus::fake();
+
+        $response = $this->actingAs($this->user)->putJson(
+            "/api/clarion-app/llm-client/server/{$this->server->id}",
+            [
+                'name' => 'Test Server',
+                'server_url' => 'http://localhost:8081',
+                'token' => null,
+            ]
+        );
+
+        $response->assertStatus(200);
+
+        Bus::assertDispatched(function (RefreshServerModelsJob $job) {
+            return $job->serverId === $this->server->id;
+        });
+    }
+
+    #[Test]
+    public function update_dispatches_refresh_job_when_provider_type_changes_even_if_url_and_token_unchanged(): void
+    {
+        Bus::fake();
+
+        // Stored server is provider_type=openai (see setUp); switch to anthropic
+        // while leaving server_url and token untouched.
+        $response = $this->actingAs($this->user)->putJson(
+            "/api/clarion-app/llm-client/server/{$this->server->id}",
+            [
+                'name' => 'Test Server',
+                'server_url' => 'http://localhost:8081',
+                'provider_type' => 'anthropic',
+            ]
+        );
+
+        $response->assertStatus(200);
+
+        Bus::assertDispatched(function (RefreshServerModelsJob $job) {
+            return $job->serverId === $this->server->id;
+        });
+    }
+
+    #[Test]
+    public function update_does_not_dispatch_refresh_job_on_rename_alone(): void
+    {
+        Bus::fake();
+
+        // Only the name changes; server_url, token, and provider_type are all
+        // resubmitted with their current stored values.
+        $response = $this->actingAs($this->user)->putJson(
+            "/api/clarion-app/llm-client/server/{$this->server->id}",
+            [
+                'name' => 'Renamed Only',
+                'server_url' => 'http://localhost:8081',
+                'provider_type' => 'openai',
+            ]
+        );
+
+        $response->assertStatus(200);
+
+        Bus::assertNotDispatched(RefreshServerModelsJob::class);
+    }
+
+    #[Test]
+    public function update_does_not_dispatch_refresh_job_on_rename_alone_when_provider_type_key_is_omitted(): void
+    {
+        Bus::fake();
+
+        // A real edit form only sends fields the user actually touched. The
+        // stored server here is on a non-default provider (anthropic); a
+        // rename-only PUT omits the provider_type key entirely, the same way
+        // it omits token. Omission must never be read as "reset to openai".
+        $anthropicServer = Server::create([
+            'id' => (string) Str::uuid(),
+            'name' => 'Anthropic Server',
+            'server_url' => 'http://localhost:7000',
+            'token' => 'anthropic-token',
+            'provider_type' => 'anthropic',
+        ]);
+
+        $response = $this->actingAs($this->user)->putJson(
+            "/api/clarion-app/llm-client/server/{$anthropicServer->id}",
+            [
+                'name' => 'Anthropic Server Renamed',
+                'server_url' => 'http://localhost:7000',
+            ]
+        );
+
+        $response->assertStatus(200);
+
+        Bus::assertNotDispatched(RefreshServerModelsJob::class);
+    }
+
+    #[Test]
+    public function update_does_not_dispatch_refresh_job_when_nothing_changed(): void
+    {
+        Bus::fake();
+
+        $response = $this->actingAs($this->user)->putJson(
+            "/api/clarion-app/llm-client/server/{$this->server->id}",
+            [
+                'name' => 'Test Server',
+                'server_url' => 'http://localhost:8081',
+                'provider_type' => 'openai',
+            ]
+        );
+
+        $response->assertStatus(200);
+
+        Bus::assertNotDispatched(RefreshServerModelsJob::class);
+    }
+
     #[Test]
     public function show_response_has_has_token_never_token(): void
     {

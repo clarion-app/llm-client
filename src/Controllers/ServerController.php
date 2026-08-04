@@ -134,11 +134,16 @@ class ServerController extends Controller
         // won't touch the column at all (preserving whatever is in the DB).
 
         // Determine if server_url, token, or provider_type actually changed.
+        // An omitted provider_type key means "keep the stored value" (same
+        // semantics as an omitted token) — it must never be read as "changed
+        // to the default", or a rename-only PUT on a non-default-provider
+        // server would incorrectly trigger a refresh job.
         $originalUrl = $server->getAttributes()['server_url'];
         $originalProviderType = $server->getAttributes()['provider_type'] ?? 'openai';
+        $providerTypeKeyPresent = array_key_exists('provider_type', $validated);
         $urlChanged = $validated['server_url'] !== $originalUrl;
         $tokenChanged = $tokenKeyPresent && ($validated['token'] !== $originalTokenCasted);
-        $providerTypeChanged = ($validated['provider_type'] ?? 'openai') !== $originalProviderType;
+        $providerTypeChanged = $providerTypeKeyPresent && ($validated['provider_type'] !== $originalProviderType);
 
         $server->update($validated);
 
