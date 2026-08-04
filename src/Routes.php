@@ -15,6 +15,7 @@ use ClarionApp\LlmClient\Controllers\McpServerController;
 use ClarionApp\LlmClient\Controllers\EpisodicMemoryController;
 use ClarionApp\LlmClient\Controllers\FeedbackController;
 use ClarionApp\LlmClient\Controllers\RoleAssignmentController;
+use ClarionApp\LlmClient\Controllers\ServerStatusController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -63,6 +64,9 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('role-assignment', [RoleAssignmentController::class, "show"]);
     Route::put('role-assignment', [RoleAssignmentController::class, "update"]);
     Route::delete('role-assignment', [RoleAssignmentController::class, "destroy"]);
+
+    // Server Status endpoint (server status projection for all servers)
+    Route::get('server-status', [ServerStatusController::class, "index"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

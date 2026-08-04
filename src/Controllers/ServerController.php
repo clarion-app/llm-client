@@ -3,9 +3,11 @@
 namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
+use ClarionApp\LlmClient\Jobs\RefreshServerModelsJob;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Models\ServerStatus;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
 
 class ServerController extends Controller
 {
@@ -25,8 +27,9 @@ class ServerController extends Controller
 
         $server = Server::create($validatedData);
 
-        // TODO: Dispatch RefreshServerModelsJob (Phase 2b, T026).
-        // OpenAIModelsRequest is retired; provider->listModels() is the new path.
+        // Dispatch model refresh job.
+        $triggeredBy = Auth::id();
+        RefreshServerModelsJob::dispatch($server->id, $triggeredBy);
 
         return response()->json($server, 201);
     }
@@ -47,8 +50,9 @@ class ServerController extends Controller
 
         $server->update($validatedData);
 
-        // TODO: Dispatch RefreshServerModelsJob (Phase 2b, T026).
-        // OpenAIModelsRequest is retired; provider->listModels() is the new path.
+        // Dispatch model refresh job.
+        $triggeredBy = Auth::id();
+        RefreshServerModelsJob::dispatch($server->id, $triggeredBy);
 
         return response()->json($server, 200);
     }

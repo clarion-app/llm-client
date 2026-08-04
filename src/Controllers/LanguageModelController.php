@@ -3,18 +3,38 @@
 namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
+use ClarionApp\LlmClient\Jobs\RefreshServerModelsJob;
 use ClarionApp\LlmClient\Models\LanguageModel;
+use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Models\ServerStatus;
+use ClarionApp\LlmClient\Services\ServerStatusProjector;
 use Illuminate\Http\Request;
-use Auth;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
 
 class LanguageModelController extends Controller
 {
     public function refresh($server_id)
     {
-        // TODO: Replace with RefreshServerModelsJob (Phase 2b, T026).
-        // OpenAIModelsRequest is retired; provider->listModels() is the new path.
-        return response()->json(['message'=>'Refreshing models'], 200);
+        $server = Server::findOrFail($server_id);
+
+        // Check if a refresh is already in flight (idempotent).
+        $status = ServerStatus::where('server_id', $server_id)->first();
+        if ($status
+            && $status->refresh_started_at !== null
+            && $status->refresh_finished_at === null
+        ) {
+            // Already in flight — return current projection.
+            $projector = app(ServerStatusProjector::class);
+            return response()->json($projector->project($server), 200);
+        }
+
+        // Dispatch model refresh job.
+        $triggeredBy = Auth::id();
+        RefreshServerModelsJob::dispatch($server_id, $triggeredBy);
+
+        // Return projection.
+        $projector = app(ServerStatusProjector::class);
+        return response()->json($projector->project($server), 200);
     }
 
     /**
