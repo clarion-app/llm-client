@@ -3,58 +3,152 @@
 namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
+use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Jobs\RefreshServerModelsJob;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Models\ServerStatus;
+use ClarionApp\LlmClient\ValueObjects\ServerAddress;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Validation\Rule;
 
 class ServerController extends Controller
 {
+    /**
+     * Transform a Server model into the API response array.
+     * Adds has_token (boolean) and ensures token is never exposed.
+     */
+    private function serverToArray(Server $server): array
+    {
+        $arr = $server->toArray();
+        // Use the casted (decrypted) value to determine has_token.
+        // getAttributes() returns the raw encrypted string which is always non-empty.
+        $arr['has_token'] = !empty($server->token);
+        // Ensure token is never in the response (belt-and-suspenders).
+        unset($arr['token']);
+        return $arr;
+    }
+
     public function index()
     {
-        $servers = Server::all();
+        $servers = Server::all()->map(fn ($s) => $this->serverToArray($s));
         return response()->json($servers, 200);
     }
 
     public function store(Request $request)
     {
-        $validatedData = $request->validate([
+        $validated = $request->validate([
             'name' => 'required|string|max:255',
             'server_url' => 'required|string|max:255',
             'token' => 'nullable|string|max:255',
+            'provider_type' => [
+                'sometimes',
+                'string',
+                Rule::in(array_map(fn ($pt) => $pt->value, ProviderType::cases())),
+            ],
         ]);
 
-        $server = Server::create($validatedData);
+        // Normalize server_url through ServerAddress before storage (FR-032).
+        try {
+            $address = ServerAddress::fromInput($validated['server_url']);
+            $validated['server_url'] = (string) $address;
+        } catch (\InvalidArgumentException $e) {
+            return response()->json([
+                'errors' => [
+                    'server_url' => [
+                        sprintf('Invalid server address "%s": %s',
+                            $validated['server_url'],
+                            $e->getMessage(),
+                        ),
+                    ],
+                ],
+            ], 422);
+        }
 
-        // Dispatch model refresh job.
+        // Default provider_type to 'openai' if not provided.
+        if (!isset($validated['provider_type'])) {
+            $validated['provider_type'] = ProviderType::OpenAI->value;
+        }
+
+        $server = Server::create($validated);
+
+        // Dispatch model refresh job with triggered_by = Auth::id().
         $triggeredBy = Auth::id();
         RefreshServerModelsJob::dispatch($server->id, $triggeredBy);
 
-        return response()->json($server, 201);
+        return response()->json($this->serverToArray($server), 201);
     }
 
-    public function show(Server $server)
+    public function show($id)
     {
-        return response()->json($server, 200);
+        $server = Server::find($id);
+        if (!$server) {
+            return response()->json(['error' => 'Server not found'], 404);
+        }
+        $arr = $this->serverToArray($server);
+        return response()->json($arr, 200);
     }
 
     public function update(Request $request, $id)
     {
         $server = Server::findOrFail($id);
-        $validatedData = $request->validate([
+
+        $validated = $request->validate([
             'name' => 'required|string|max:255',
             'server_url' => 'required|string|max:255',
             'token' => 'nullable|string|max:255',
+            'provider_type' => [
+                'sometimes',
+                'string',
+                Rule::in(array_map(fn ($pt) => $pt->value, ProviderType::cases())),
+            ],
         ]);
 
-        $server->update($validatedData);
+        // Normalize server_url through ServerAddress before storage.
+        try {
+            $address = ServerAddress::fromInput($validated['server_url']);
+            $validated['server_url'] = (string) $address;
+        } catch (\InvalidArgumentException $e) {
+            return response()->json([
+                'errors' => [
+                    'server_url' => [
+                        sprintf('Invalid server address "%s": %s',
+                            $validated['server_url'],
+                            $e->getMessage(),
+                        ),
+                    ],
+                ],
+            ], 422);
+        }
 
-        // Dispatch model refresh job.
-        $triggeredBy = Auth::id();
-        RefreshServerModelsJob::dispatch($server->id, $triggeredBy);
+        // Handle token semantics: absent = preserve, null/empty = clear, non-empty = replace.
+        // Use the casted (decrypted) value for comparison, not the raw encrypted string.
+        $originalTokenCasted = $server->token; // Decrypted value via 'encrypted' cast.
+        $tokenKeyPresent = array_key_exists('token', $validated);
+        if ($tokenKeyPresent) {
+            if ($validated['token'] === null || $validated['token'] === '') {
+                $validated['token'] = null;
+            }
+        }
+        // If token key is absent, simply remove it from $validated so update()
+        // won't touch the column at all (preserving whatever is in the DB).
 
-        return response()->json($server, 200);
+        // Determine if server_url, token, or provider_type actually changed.
+        $originalUrl = $server->getAttributes()['server_url'];
+        $originalProviderType = $server->getAttributes()['provider_type'] ?? 'openai';
+        $urlChanged = $validated['server_url'] !== $originalUrl;
+        $tokenChanged = $tokenKeyPresent && ($validated['token'] !== $originalTokenCasted);
+        $providerTypeChanged = ($validated['provider_type'] ?? 'openai') !== $originalProviderType;
+
+        $server->update($validated);
+
+        // Dispatch refresh job only if server_url, token, or provider_type changed (D12).
+        if ($urlChanged || $tokenChanged || $providerTypeChanged) {
+            $triggeredBy = Auth::id();
+            RefreshServerModelsJob::dispatch($server->id, $triggeredBy);
+        }
+
+        return response()->json($this->serverToArray($server), 200);
     }
 
     public function destroy($id)
