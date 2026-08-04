@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\RoleAssignment;
 use ClarionApp\LlmClient\Services\RoleAssignmentService;
+use ClarionApp\LlmClient\Services\RoleTestRunner;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -14,6 +15,7 @@ class RoleAssignmentController extends Controller
 {
     public function __construct(
         private readonly RoleAssignmentService $service,
+        private readonly RoleTestRunner $roleTestRunner,
     ) {}
 
     public function show()
@@ -65,5 +67,19 @@ class RoleAssignmentController extends Controller
         $allRoles = $this->service->describeAllRoles(Auth::id());
 
         return response()->json($allRoles[$validated['role']], 200);
+    }
+
+    public function test(Request $request)
+    {
+        $validated = $request->validate([
+            'role' => ['required', Rule::in(['inference', 'embedding', 'image'])],
+        ]);
+
+        $result = $this->roleTestRunner->run(
+            ModelRole::from($validated['role']),
+            Auth::id(),
+        );
+
+        return response()->json($result->toArray(), 200);
     }
 }

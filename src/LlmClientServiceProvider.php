@@ -337,6 +337,13 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RoleTestRunner::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\RoleTestRunner(
+                $app->make(\ClarionApp\LlmClient\Services\RoleResolver::class),
+                $app->make(ProviderRegistry::class)
+            );
+        });
+
         // Register endpoint resolver
         $this->app->singleton(EndpointResolver::class, function () {
             return new EndpointResolver();

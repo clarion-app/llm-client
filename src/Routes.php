@@ -61,6 +61,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('feedback/audit/{preference_id}', [FeedbackController::class, "audit"]);
 
     // Role Assignment endpoints (model roles: inference, embedding, image)
+    Route::post('role-assignment/test', [RoleAssignmentController::class, "test"]);
     Route::get('role-assignment', [RoleAssignmentController::class, "show"]);
     Route::put('role-assignment', [RoleAssignmentController::class, "update"]);
     Route::delete('role-assignment', [RoleAssignmentController::class, "destroy"]);
