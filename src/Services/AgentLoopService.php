@@ -29,6 +29,8 @@ use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\ValueObjects\Operation;
+use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
+use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
@@ -359,7 +361,22 @@ class AgentLoopService
                 }
 
                 $rawMessages = $this->buildMessagesPayload($conversation);
+
+                // Site 3: ContextReshape around applyContextWindowTrim in run().
+                $reshapeActionId = null;
+                if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                    $reshapeActionId = $this->runTraceRecorder->openAction(
+                        $currentStepId,
+                        ActionType::ContextReshape,
+                        'window_trim',
+                        $attemptGroupId,
+                    );
+                }
                 $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId);
+                if ($this->runTraceRecorder !== null && $reshapeActionId !== null) {
+                    $this->runTraceRecorder->closeAction($reshapeActionId, ActionOutcome::Success);
+                }
+
                 $formatted = $this->formatMessages($conversation, $trimmed);
                 // Inject preset system prompt into the base system prompt if present
                 // NOTE: the preset system prompt appended below is covered by the
@@ -368,7 +385,25 @@ class AgentLoopService
                 if ($presetSystemPrompt !== '') {
                     $systemPrompt = $systemPrompt . "\n\n" . $presetSystemPrompt;
                 }
+
+                // Site 1: LlmRequest around callLlmSync in run().
+                $llmActionId = null;
+                $modelName = $conversation->model;
+                if ($modelName === null) {
+                    $modelName = config('llm-client.providers.' . $conversation->effectiveProviderType->value . '.default_model');
+                }
+                if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                    $llmActionId = $this->runTraceRecorder->openAction(
+                        $currentStepId,
+                        ActionType::LlmRequest,
+                        $modelName,
+                        $attemptGroupId,
+                    );
+                }
                 $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $systemPrompt);
+                if ($this->runTraceRecorder !== null && $llmActionId !== null) {
+                    $this->runTraceRecorder->closeAction($llmActionId, ActionOutcome::Success);
+                }
 
                 // Record LLM usage metrics (fire-and-forget, never throws)
                 $this->recordUsageMetric($conversation, $attemptGroupId, $response, $formatted['messages']);
@@ -482,6 +517,17 @@ class AgentLoopService
                     $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
                     $toolCallId = $toolCall['id'] ?? '';
 
+                    // Site 2: ToolInvocation around executeMetaTool in run().
+                    $toolActionId = null;
+                    if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                        $toolActionId = $this->runTraceRecorder->openAction(
+                            $currentStepId,
+                            ActionType::ToolInvocation,
+                            $toolName,
+                            $attemptGroupId,
+                        );
+                    }
+
                     $result = $this->executeMetaTool($toolName, $arguments, $conversation);
                     $decoded = json_decode($result, true);
 
@@ -527,6 +573,15 @@ class AgentLoopService
                             ];
                         }
 
+                        // Close the tool action as awaiting confirmation and store
+                        // action_id in tool_data for the resuming process (T029b).
+                        if ($this->runTraceRecorder !== null && $toolActionId !== null) {
+                            $this->runTraceRecorder->closeAction(
+                                $toolActionId,
+                                ActionOutcome::AwaitingConfirmation,
+                            );
+                        }
+
                         // Store message with pending confirmation. The step stays
                         // open across the pause; step_id and paused_at let the
                         // resuming process close it with its human-wait portion
@@ -545,6 +600,7 @@ class AgentLoopService
                                 'run_id' => $runId,
                                 'step_id' => $currentStepId,
                                 'paused_at' => now()->toIso8601String(),
+                                'action_id' => $toolActionId,
                             ],
                         ]);
 
@@ -556,11 +612,30 @@ class AgentLoopService
                         ];
                     }
 
+                    // Close tool action on normal completion.
+                    if ($this->runTraceRecorder !== null && $toolActionId !== null) {
+                        $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success);
+                    }
+
                     // Tool executed (not a confirmation pause) — record its outcome.
                     $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
 
-                    // Condense tool result if oversized
+                    // Site 4: ContextReshape around condenseToolResult in run().
+                    $condenseActionId = null;
                     $toolResultEntry = $this->condenseToolResult($result, $conversation->id, $toolName);
+                    $condenseMethod = $toolResultEntry['method'] ?? null;
+                    if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                        $condenseActionId = $this->runTraceRecorder->openAction(
+                            $currentStepId,
+                            ActionType::ContextReshape,
+                            $condenseMethod ?? 'passthrough',
+                            null,
+                        );
+                    }
+                    if ($this->runTraceRecorder !== null && $condenseActionId !== null) {
+                        $this->runTraceRecorder->closeAction($condenseActionId, ActionOutcome::Success);
+                    }
+
                     $toolResults[] = [
                         'tool_call_id' => $toolCallId,
                         'content' => $toolResultEntry['content'],
@@ -699,6 +774,10 @@ class AgentLoopService
         $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
         $pendingStepId = $toolData['step_id'] ?? null;
 
+        // Read inbound paused action id (T029c). Null if the message was paused
+        // before this feature shipped — safe no-op per C13.
+        $inboundActionId = $toolData['action_id'] ?? null;
+
         // Shared attempt group ID for this resumed turn (confirmed call + any
         // follow-on LLM calls and tool invocations in the continuation loop).
         $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
@@ -766,6 +845,25 @@ class AgentLoopService
             ];
         }
 
+        // Resolve inbound paused action (T029c). Already-instrumented tool
+        // invocation was paused at AwaitingConfirmation; now close it with the
+        // outcome. If $inboundActionId is null (pre-feature message), this is
+        // a safe no-op per contract C13.
+        if ($this->runTraceRecorder !== null && $inboundActionId !== null) {
+            if ($approved) {
+                $this->runTraceRecorder->closeAction(
+                    $inboundActionId,
+                    ActionOutcome::Success,
+                );
+            } else {
+                $this->runTraceRecorder->closeAction(
+                    $inboundActionId,
+                    ActionOutcome::Failure,
+                    'User declined',
+                );
+            }
+        }
+
         $toolData['pending_confirmation'] = null;
         $message->update(['tool_data' => $toolData]);
 
@@ -777,9 +875,42 @@ class AgentLoopService
 
         for (; $iteration <= $maxIterations; $iteration++) {
             $rawMessages = $this->buildMessagesPayload($conversation);
+
+            // Site 7: ContextReshape around applyContextWindowTrim in resumeSync().
+            $reshapeActionId = null;
+            if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                $reshapeActionId = $this->runTraceRecorder->openAction(
+                    $currentStepId,
+                    ActionType::ContextReshape,
+                    'window_trim',
+                    $attemptGroupId,
+                );
+            }
             $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId);
+            if ($this->runTraceRecorder !== null && $reshapeActionId !== null) {
+                $this->runTraceRecorder->closeAction($reshapeActionId, ActionOutcome::Success);
+            }
+
             $formatted = $this->formatMessages($conversation, $trimmed);
+
+            // Site 5: LlmRequest around callLlmSync in resumeSync().
+            $llmActionId = null;
+            $modelName = $conversation->model;
+            if ($modelName === null) {
+                $modelName = config('llm-client.providers.' . $conversation->effectiveProviderType->value . '.default_model');
+            }
+            if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                $llmActionId = $this->runTraceRecorder->openAction(
+                    $currentStepId,
+                    ActionType::LlmRequest,
+                    $modelName,
+                    $attemptGroupId,
+                );
+            }
             $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $formatted['system']);
+            if ($this->runTraceRecorder !== null && $llmActionId !== null) {
+                $this->runTraceRecorder->closeAction($llmActionId, ActionOutcome::Success);
+            }
 
             // Record LLM usage metrics (fire-and-forget, never throws)
             $this->recordUsageMetric($conversation, $attemptGroupId, $response, $formatted['messages']);
@@ -836,6 +967,18 @@ class AgentLoopService
             foreach ($toolCalls as $toolCall) {
                 $toolName = $toolCall['function']['name'] ?? '';
                 $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+
+                // Site 6: ToolInvocation around executeMetaTool in resumeSync().
+                $toolActionId = null;
+                if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                    $toolActionId = $this->runTraceRecorder->openAction(
+                        $currentStepId,
+                        ActionType::ToolInvocation,
+                        $toolName,
+                        $attemptGroupId,
+                    );
+                }
+
                 $result = $this->executeMetaTool($toolName, $arguments, $conversation);
                 $decoded = json_decode($result, true);
 
@@ -881,6 +1024,15 @@ class AgentLoopService
                         ];
                     }
 
+                    // Close the tool action as awaiting confirmation and store
+                    // action_id in tool_data for the next resume (T029b).
+                    if ($this->runTraceRecorder !== null && $toolActionId !== null) {
+                        $this->runTraceRecorder->closeAction(
+                            $toolActionId,
+                            ActionOutcome::AwaitingConfirmation,
+                        );
+                    }
+
                     // The step stays open across the pause — its duration includes
                     // the human wait (FR-004), and the resuming process closes it
                     // with the wait portion recorded. Closing it here instead would
@@ -900,6 +1052,7 @@ class AgentLoopService
                             'run_id' => $runId,
                             'step_id' => $currentStepId,
                             'paused_at' => now()->toIso8601String(),
+                            'action_id' => $toolActionId,
                         ],
                     ]);
 
@@ -911,10 +1064,30 @@ class AgentLoopService
                     ];
                 }
 
+                // Close tool action on normal completion.
+                if ($this->runTraceRecorder !== null && $toolActionId !== null) {
+                    $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success);
+                }
+
                 // Tool executed (not a confirmation pause) — record its outcome.
                 $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
 
+                // Site 8: ContextReshape around condenseToolResult in resumeSync().
+                $condenseActionId = null;
                 $toolResultEntry = $this->condenseToolResult($result, $conversation->id, $toolName);
+                $condenseMethod = $toolResultEntry['method'] ?? null;
+                if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                    $condenseActionId = $this->runTraceRecorder->openAction(
+                        $currentStepId,
+                        ActionType::ContextReshape,
+                        $condenseMethod ?? 'passthrough',
+                        null,
+                    );
+                }
+                if ($this->runTraceRecorder !== null && $condenseActionId !== null) {
+                    $this->runTraceRecorder->closeAction($condenseActionId, ActionOutcome::Success);
+                }
+
                 $toolResults[] = [
                     'tool_call_id' => $toolCall['id'] ?? '',
                     'content' => $toolResultEntry['content'],
