@@ -105,4 +105,181 @@ class RunTraceQuery
 
         return $this->findRun($callerUserId, (string) $row->run_id);
     }
+
+    // ========================================================================
+    // Actions
+    // ========================================================================
+
+    /**
+     * Get all actions for a step (user ownership filter).
+     *
+     * @return array<int, array{
+     *     id: string,
+     *     run_id: string,
+     *     step_id: string,
+     *     parent_action_id: string|null,
+     *     type: string,
+     *     outcome: string,
+     *     target: string|null,
+     *     content: string|null,
+     *     reason: string|null,
+     *     started_at: string,
+     *     ended_at: string|null,
+     *     duration_ms: int|null,
+     *     token_cost: float|null,
+     *     wait_ms: int|null,
+     *     cost_cents: int|null,
+     *     currency: string|null,
+     *     pending_confirmation: bool
+     * }>
+     */
+    public function actionsForStep(string $callerUserId, string $stepId): array
+    {
+        // Verify step belongs to a run owned by the calling user.
+        $runId = DB::table('agent_run_steps')
+            ->where('id', $stepId)
+            ->value('run_id');
+
+        if ($runId === null) {
+            return [];
+        }
+
+        $ownerUserId = DB::table('agent_runs')
+            ->where('id', $runId)
+            ->value('user_id');
+
+        if ($ownerUserId !== $callerUserId) {
+            return [];
+        }
+
+        return DB::table('agent_run_actions')
+            ->where('step_id', $stepId)
+            ->orderBy('started_at')
+            ->get()
+            ->map(function ($row) {
+                return $this->actionRowToArray($row);
+            })
+            ->all();
+    }
+
+    /**
+     * Get all actions for a run (user ownership filter).
+     *
+     * @return array<int, array{
+     *     id: string,
+     *     run_id: string,
+     *     step_id: string,
+     *     parent_action_id: string|null,
+     *     type: string,
+     *     outcome: string,
+     *     target: string|null,
+     *     content: string|null,
+     *     reason: string|null,
+     *     started_at: string,
+     *     ended_at: string|null,
+     *     duration_ms: int|null,
+     *     token_cost: float|null,
+     *     wait_ms: int|null,
+     *     cost_cents: int|null,
+     *     currency: string|null,
+     *     pending_confirmation: bool
+     * }>
+     */
+    public function actionsForRun(string $callerUserId, string $runId): array
+    {
+        $ownerUserId = DB::table('agent_runs')
+            ->where('id', $runId)
+            ->value('user_id');
+
+        if ($ownerUserId !== $callerUserId) {
+            return [];
+        }
+
+        return DB::table('agent_run_actions')
+            ->where('run_id', $runId)
+            ->orderBy('started_at')
+            ->get()
+            ->map(function ($row) {
+                return $this->actionRowToArray($row);
+            })
+            ->all();
+    }
+
+    /**
+     * Get child actions of a given action (user ownership filter via run JOIN).
+     *
+     * @return array<int, array{
+     *     id: string,
+     *     run_id: string,
+     *     step_id: string,
+     *     parent_action_id: string|null,
+     *     type: string,
+     *     outcome: string,
+     *     target: string|null,
+     *     content: string|null,
+     *     reason: string|null,
+     *     started_at: string,
+     *     ended_at: string|null,
+     *     duration_ms: int|null,
+     *     token_cost: float|null,
+     *     wait_ms: int|null,
+     *     cost_cents: int|null,
+     *     currency: string|null,
+     *     pending_confirmation: bool
+     * }>
+     */
+    public function childActions(string $callerUserId, string $actionId): array
+    {
+        // Verify the parent action belongs to a run owned by the calling user.
+        $runId = DB::table('agent_run_actions')
+            ->where('id', $actionId)
+            ->value('run_id');
+
+        if ($runId === null) {
+            return [];
+        }
+
+        $ownerUserId = DB::table('agent_runs')
+            ->where('id', $runId)
+            ->value('user_id');
+
+        if ($ownerUserId !== $callerUserId) {
+            return [];
+        }
+
+        return DB::table('agent_run_actions')
+            ->where('parent_action_id', $actionId)
+            ->orderBy('started_at')
+            ->get()
+            ->map(function ($row) {
+                return $this->actionRowToArray($row);
+            })
+            ->all();
+    }
+
+    /**
+     * Convert a raw DB row to the standardized action array shape.
+     */
+    private function actionRowToArray($row): array
+    {
+        return [
+            'id' => $row->id ?? null,
+            'run_id' => $row->run_id ?? null,
+            'step_id' => $row->step_id ?? null,
+            'parent_action_id' => $row->parent_action_id,
+            'type' => $row->type ?? '',
+            'outcome' => $row->outcome ?? '',
+            'target' => $row->target,
+            'content' => $row->content,
+            'reason' => $row->reason,
+            'started_at' => $row->started_at ?? '',
+            'ended_at' => $row->ended_at,
+            'duration_ms' => $row->duration_ms,
+            'token_cost' => $row->token_cost,
+            'wait_ms' => $row->wait_ms,
+            'cost_cents' => $row->cost_cents,
+            'currency' => $row->currency,
+            'pending_confirmation' => $row->pending_confirmation ?? false,
+        ];
+    }
 }

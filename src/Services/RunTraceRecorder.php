@@ -3,6 +3,8 @@
 namespace ClarionApp\LlmClient\Services;
 
 use Carbon\CarbonInterface;
+use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
+use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
@@ -23,6 +25,13 @@ class RunTraceRecorder
      * tripping the C6 clamp on rounding noise rather than on real disagreement.
      */
     private const TIMESTAMP_FORMAT = 'Y-m-d H:i:s.u';
+
+    private ContentSanitizer $sanitizer;
+
+    public function __construct(?ContentSanitizer $sanitizer = null)
+    {
+        $this->sanitizer = $sanitizer ?? app(ContentSanitizer::class);
+    }
 
     /**
      * Open a new run record.
@@ -285,6 +294,9 @@ class RunTraceRecorder
                 $durationMs = $stepDurationSum;
             }
 
+            // Flush in-progress actions to 'unfinished' before the run's terminal UPDATE (contract C17).
+            $this->flushUnfinishedActions($runId);
+
             // Single UPDATE for end_state, step_count, duration_ms (contract C4)
             DB::table('agent_runs')
                 ->where('id', $runId)
@@ -350,14 +362,19 @@ class RunTraceRecorder
 
     /**
      * Convenience for one-call system-initiated work (FR-012).
-     * Opens run + single step, closes both from the callable's outcome,
+     * Opens run + single step, brackets $work as an action (FR-014), closes both from the callable's outcome,
      * and rethrows the callable's exception unchanged after recording `failed`.
+     *
+     * The action opens after openStep() and resolves before closeStep()/closeRun() (C26),
+     * so flushUnfinishedActions() never observes it open.
      */
     public function traceSystemRun(
         string $source,
         string $userId,
         ?string $conversationId,
         callable $work,
+        ActionType $actionType = ActionType::LlmRequest,
+        ?string $target = null,
     ): mixed {
         $runId = $this->openRun(
             RunKind::SystemInitiated,
@@ -370,10 +387,20 @@ class RunTraceRecorder
             $stepId = $this->openStep($runId);
         }
 
+        // Open action for the callable (FR-014, D12).
+        $actionId = null;
+        if ($stepId !== null) {
+            $actionId = $this->openAction($stepId, $actionType, $target);
+        }
+
         try {
             $result = $work();
 
             if ($runId !== null) {
+                // Close action Success before closeStep/closeRun (C26).
+                if ($actionId !== null) {
+                    $this->closeAction($actionId, ActionOutcome::Success);
+                }
                 if ($stepId !== null) {
                     $this->closeStep($stepId, RunEndState::Completed);
                 }
@@ -383,6 +410,10 @@ class RunTraceRecorder
             return $result;
         } catch (\Throwable $e) {
             if ($runId !== null) {
+                // Close action Failure before closeStep/closeRun (C26).
+                if ($actionId !== null) {
+                    $this->closeAction($actionId, ActionOutcome::Failure, $e->getMessage());
+                }
                 if ($stepId !== null) {
                     $this->closeStep($stepId, RunEndState::Failed, $e->getMessage());
                 }
@@ -425,5 +456,365 @@ class RunTraceRecorder
     protected function enabled(): bool
     {
         return (bool) config('llm-client.run_trace.enabled', true);
+    }
+
+    /**
+     * Open a new action within a step.
+     *
+     * @return string|null The new action id, or null if tracing is off, the step is null,
+     *                     the run's action cap is exceeded, or the write failed.
+     */
+    public function openAction(
+        ?string $stepId,
+        ActionType $actionType,
+        ?string $target = null,
+        ?string $attemptGroupId = null,
+        ?string $parentActionId = null,
+    ): ?string {
+        if ($stepId === null || !$this->enabled()) {
+            return null;
+        }
+
+        try {
+            // Look up run_id from the step row (denormalized for query efficiency).
+            $runId = (string) DB::table('agent_run_steps')
+                ->where('id', $stepId)
+                ->value('run_id');
+
+            if ($runId === null) {
+                return null;
+            }
+
+            // Per-run action count cap check (contract C14).
+            $cap = (int) config('llm-client.run_trace.action_row_cap', 500);
+            if ($cap > 0) {
+                $count = (int) DB::table('agent_run_actions')
+                    ->where('run_id', $runId)
+                    ->count();
+
+                if ($count >= $cap) {
+                    Log::warning('RunTraceRecorder: action row cap exceeded', [
+                        'run_id' => $runId,
+                        'cap' => $cap,
+                        'current' => $count,
+                    ]);
+                    return null;
+                }
+            }
+
+            $actionId = (string) Str::uuid();
+            $now = now()->format(self::TIMESTAMP_FORMAT);
+
+            DB::table('agent_run_actions')->insert([
+                'id' => $actionId,
+                'run_id' => $runId,
+                'step_id' => $stepId,
+                'action_type' => $actionType->value,
+                'target' => $target,
+                'attempt_group_id' => $attemptGroupId,
+                'parent_action_id' => $parentActionId,
+                'outcome' => ActionOutcome::InProgress->value,
+                'failure_reason' => null,
+                'paused_at' => null,
+                'started_at' => $now,
+                'ended_at' => null,
+                'duration_ms' => null,
+                'content' => null,
+                'created_at' => $now,
+            ]);
+
+            return $actionId;
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to open action', [
+                'step_id' => $stepId,
+                'action_type' => $actionType->value,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Close an action with an outcome.
+     *
+     * $content is passed through ContentSanitizer before persistence (FR-006, FR-007).
+     * $target is NOT sanitized or truncated (FR-016) — it is set at open and never rewritten.
+     * Null $actionId is accepted and returns void (contract C1).
+     */
+    public function closeAction(
+        ?string $actionId,
+        ActionOutcome $outcome,
+        ?string $failureReason = null,
+        ?string $content = null,
+    ): void {
+        if ($actionId === null || !$this->enabled()) {
+            return;
+        }
+
+        try {
+            $current = DB::table('agent_run_actions')
+                ->where('id', $actionId)
+                ->value('outcome');
+
+            if ($current === null) {
+                return;
+            }
+
+            // Suspend path: AwaitingConfirmation stamps paused_at and leaves ended_at/duration_ms null.
+            if ($outcome === ActionOutcome::AwaitingConfirmation) {
+                // Only transition from in_progress to awaiting_confirmation.
+                if ($current !== ActionOutcome::InProgress->value) {
+                    Log::warning('RunTraceRecorder: closeAction AwaitingConfirmation from non-in_progress state', [
+                        'action_id' => $actionId,
+                        'current_state' => $current,
+                    ]);
+                    return;
+                }
+
+                DB::table('agent_run_actions')
+                    ->where('id', $actionId)
+                    ->update([
+                        'outcome' => ActionOutcome::AwaitingConfirmation->value,
+                        'paused_at' => now()->format(self::TIMESTAMP_FORMAT),
+                    ]);
+                return;
+            }
+
+            // Resolve path: transitioning from awaiting_confirmation to Success/Failure (C23).
+            $resolvingPaused = $current === ActionOutcome::AwaitingConfirmation->value;
+
+            // Terminal-state guard (C16): refuse to transition an already-terminal action.
+            // AwaitingConfirmation is the sole exception (C23).
+            if (!$resolvingPaused) {
+                $currentOutcome = ActionOutcome::from($current);
+                if ($currentOutcome->isTerminal()) {
+                    Log::warning('RunTraceRecorder: closeAction on already-terminal action', [
+                        'action_id' => $actionId,
+                        'current_state' => $current,
+                        'requested_state' => $outcome->value,
+                    ]);
+                    return;
+                }
+            }
+
+            // When resolving from awaiting_confirmation, only Success or Failure are permitted (C23).
+            if ($resolvingPaused && $outcome !== ActionOutcome::Success && $outcome !== ActionOutcome::Failure) {
+                Log::warning('RunTraceRecorder: closeAction from awaiting_confirmation to non-terminal', [
+                    'action_id' => $actionId,
+                    'requested_state' => $outcome->value,
+                ]);
+                return;
+            }
+
+            // Enforce reason requirement.
+            if ($outcome->requiresReason() && $failureReason === null) {
+                $failureReason = 'no reason provided';
+                Log::warning('RunTraceRecorder: closeAction missing required failure_reason', [
+                    'action_id' => $actionId,
+                ]);
+            }
+
+            // Compute duration.
+            $endedAt = now();
+            $startedAt = DB::table('agent_run_actions')
+                ->where('id', $actionId)
+                ->value('started_at');
+
+            if ($resolvingPaused) {
+                // Exclude the [paused_at, resume] window from duration (C24).
+                $pausedAt = DB::table('agent_run_actions')
+                    ->where('id', $actionId)
+                    ->value('paused_at');
+
+                // Duration = (paused_at - started_at) + (endedAt - now_as_resume)
+                // The "resume" point is the current now() — the pause was broken when we entered this close.
+                $durationMs = 0;
+                if ($startedAt && $pausedAt) {
+                    $prePauseMs = $this->elapsedMs($startedAt, \Carbon\Carbon::parse($pausedAt), [
+                        'action_id' => $actionId,
+                        'phase' => 'pre_pause',
+                    ]);
+                    // Post-resume portion: from now() (resume) to now() (close) — effectively 0 in practice,
+                    // but we measure it correctly.
+                    $resumeTime = $endedAt;
+                    $postResumeMs = $this->elapsedMs($resumeTime->format(self::TIMESTAMP_FORMAT), $endedAt, [
+                        'action_id' => $actionId,
+                        'phase' => 'post_resume',
+                    ]);
+                    $durationMs = $prePauseMs + $postResumeMs;
+                }
+            } else {
+                $durationMs = $this->elapsedMs($startedAt, $endedAt, ['action_id' => $actionId]);
+            }
+
+            // Sanitize content (contract C15).
+            if ($content !== null) {
+                $content = $this->sanitizer->prepare($content);
+            }
+
+            DB::table('agent_run_actions')
+                ->where('id', $actionId)
+                ->update([
+                    'outcome' => $outcome->value,
+                    'failure_reason' => $failureReason,
+                    'ended_at' => $endedAt->format(self::TIMESTAMP_FORMAT),
+                    'duration_ms' => $durationMs,
+                    'content' => $content,
+                ]);
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to close action', [
+                'action_id' => $actionId,
+                'outcome' => $outcome->value,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Write an already-finished action in a single INSERT, with explicit timestamps.
+     *
+     * @return string|null The action id, or null on no-op/failure.
+     */
+    public function recordCompletedAction(
+        ?string $stepId,
+        ActionType $actionType,
+        ActionOutcome $outcome,
+        \DateTimeInterface $startedAt,
+        \DateTimeInterface $endedAt,
+        ?string $target = null,
+        ?string $attemptGroupId = null,
+        ?string $parentActionId = null,
+        ?string $failureReason = null,
+        ?string $content = null,
+    ): ?string {
+        if ($stepId === null || !$this->enabled()) {
+            return null;
+        }
+
+        try {
+            $runId = (string) DB::table('agent_run_steps')
+                ->where('id', $stepId)
+                ->value('run_id');
+
+            if ($runId === null) {
+                return null;
+            }
+
+            // Per-run cap check (C14).
+            $cap = (int) config('llm-client.run_trace.action_row_cap', 500);
+            if ($cap > 0) {
+                $count = (int) DB::table('agent_run_actions')
+                    ->where('run_id', $runId)
+                    ->count();
+
+                if ($count >= $cap) {
+                    Log::warning('RunTraceRecorder: action row cap exceeded (recordCompletedAction)', [
+                        'run_id' => $runId,
+                        'cap' => $cap,
+                    ]);
+                    return null;
+                }
+            }
+
+            // Compute duration from caller's measured times, never the write time (C25).
+            $durationMs = $this->elapsedMs($startedAt->format(self::TIMESTAMP_FORMAT), $endedAt, [
+                'method' => 'recordCompletedAction',
+            ]);
+
+            // Enforce reason requirement.
+            if ($outcome->requiresReason() && $failureReason === null) {
+                $failureReason = 'no reason provided';
+            }
+
+            // Sanitize content (C15).
+            if ($content !== null) {
+                $content = $this->sanitizer->prepare($content);
+            }
+
+            $actionId = (string) Str::uuid();
+            $now = now()->format(self::TIMESTAMP_FORMAT);
+
+            DB::table('agent_run_actions')->insert([
+                'id' => $actionId,
+                'run_id' => $runId,
+                'step_id' => $stepId,
+                'action_type' => $actionType->value,
+                'target' => $target,
+                'attempt_group_id' => $attemptGroupId,
+                'parent_action_id' => $parentActionId,
+                'outcome' => $outcome->value,
+                'failure_reason' => $failureReason,
+                'paused_at' => null,
+                'started_at' => $startedAt->format(self::TIMESTAMP_FORMAT),
+                'ended_at' => $endedAt->format(self::TIMESTAMP_FORMAT),
+                'duration_ms' => $durationMs,
+                'content' => $content,
+                'created_at' => $now,
+            ]);
+
+            return $actionId;
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to record completed action', [
+                'step_id' => $stepId,
+                'action_type' => $actionType->value,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Flush all in-progress actions under a run to 'unfinished'.
+     * Called from closeRun() — not called independently.
+     * Never touches rows in 'awaiting_confirmation' (FR-015, C22).
+     */
+    public function flushUnfinishedActions(?string $runId): void
+    {
+        if ($runId === null || !$this->enabled()) {
+            return;
+        }
+
+        try {
+            $timeoutMinutes = (int) config('llm-client.run_trace.action_timeout_minutes', 5);
+            $now = now();
+
+            // Fetch all in_progress actions for this run (C22: only 'in_progress', never 'awaiting_confirmation').
+            $actions = DB::table('agent_run_actions')
+                ->where('run_id', $runId)
+                ->where('outcome', ActionOutcome::InProgress->value)
+                ->get();
+
+            if ($actions->isEmpty()) {
+                return;
+            }
+
+            foreach ($actions as $action) {
+                $startedAt = \Carbon\Carbon::parse($action->started_at);
+                $durationMs = $this->elapsedMs($action->started_at, $now, [
+                    'action_id' => $action->id,
+                ]);
+
+                $failureReason = null;
+
+                // Check 5-minute timeout (FR-009).
+                if ($startedAt->diffInMinutes($now) >= $timeoutMinutes) {
+                    $failureReason = sprintf('action exceeded %d-minute timeout', $timeoutMinutes);
+                }
+
+                DB::table('agent_run_actions')
+                    ->where('id', $action->id)
+                    ->update([
+                        'outcome' => ActionOutcome::Unfinished->value,
+                        'failure_reason' => $failureReason,
+                        'ended_at' => $now->format(self::TIMESTAMP_FORMAT),
+                        'duration_ms' => $durationMs,
+                    ]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to flush unfinished actions', [
+                'run_id' => $runId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 }

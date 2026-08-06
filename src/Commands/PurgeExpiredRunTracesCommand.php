@@ -64,6 +64,7 @@ class PurgeExpiredRunTracesCommand extends Command
         $deletedRuns = 0;
         $deletedSteps = 0;
         $deletedAssociations = 0;
+        $deletedActions = 0;
 
         do {
             $chunk = $this->expiredRunsQuery($cutoffDate)
@@ -77,6 +78,11 @@ class PurgeExpiredRunTracesCommand extends Command
 
             // Children before parents, so a purge interrupted midway never leaves
             // a step or association pointing at a run that is already gone.
+            // Actions (child of steps) must be deleted first (FR-013, D11).
+            $deletedActions += DB::table('agent_run_actions')
+                ->whereIn('run_id', $chunk)
+                ->delete();
+
             $deletedAssociations += DB::table('agent_run_messages')
                 ->whereIn('run_id', $chunk)
                 ->delete();
@@ -90,6 +96,7 @@ class PurgeExpiredRunTracesCommand extends Command
                 ->delete();
         } while (count($chunk) === self::CHUNK_SIZE);
 
+        $this->info("Actions purged: {$deletedActions}");
         $this->info("Message associations purged: {$deletedAssociations}");
         $this->info("Steps purged: {$deletedSteps}");
         $this->info("Runs purged: {$deletedRuns}");
@@ -98,6 +105,7 @@ class PurgeExpiredRunTracesCommand extends Command
             'runs' => $deletedRuns,
             'steps' => $deletedSteps,
             'associations' => $deletedAssociations,
+            'actions' => $deletedActions,
             'cutoff' => $cutoffDate->toDateTimeString(),
         ]);
 
