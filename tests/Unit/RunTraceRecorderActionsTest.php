@@ -472,6 +472,8 @@ class RunTraceRecorderActionsTest extends TestCase
         $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
         $this->assertEquals('unfinished', $action->outcome);
         $this->assertNotNull($action->ended_at);
+        $this->assertNotNull($action->duration_ms);
+        $this->assertGreaterThanOrEqual(0, $action->duration_ms);
     }
 
     /** @test */
@@ -706,5 +708,116 @@ class RunTraceRecorderActionsTest extends TestCase
         // Child started after parent, ended before parent
         $this->assertGreaterThanOrEqual($parentRow->started_at, $childRow->started_at);
         $this->assertLessThanOrEqual($parentRow->ended_at, $childRow->ended_at);
+    }
+
+    // ========== T059: flushUnfinishedActions skips terminal actions (C18) ==========
+
+    /** @test */
+    public function flush_unfinished_actions_skips_terminal_actions(): void
+    {
+        [$recorder, $runId, $stepId] = $this->setupRunAndStep();
+
+        // Action 1: success (terminal)
+        $successActionId = $recorder->openAction($stepId, ActionType::LlmRequest, 'gpt-4');
+        $recorder->closeAction($successActionId, ActionOutcome::Success);
+
+        // Action 2: failure (terminal)
+        $failureActionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'broken_tool');
+        $recorder->closeAction($failureActionId, ActionOutcome::Failure, 'network error');
+
+        // Action 3: already unfinished (terminal)
+        $unfinishedActionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'old_tool');
+        DB::table('agent_run_actions')
+            ->where('id', $unfinishedActionId)
+            ->update([
+                'outcome' => 'unfinished',
+                'ended_at' => now()->format('Y-m-d H:i:s.u'),
+                'duration_ms' => 100,
+            ]);
+
+        // Action 4: in_progress (will be flushed)
+        $inProgressActionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'hanging_tool');
+
+        $recorder->flushUnfinishedActions($runId);
+
+        // Terminal actions unchanged
+        $successRow = DB::table('agent_run_actions')->where('id', $successActionId)->first();
+        $this->assertEquals('success', $successRow->outcome);
+
+        $failureRow = DB::table('agent_run_actions')->where('id', $failureActionId)->first();
+        $this->assertEquals('failure', $failureRow->outcome);
+        $this->assertEquals('network error', $failureRow->failure_reason);
+
+        $unfinishedRow = DB::table('agent_run_actions')->where('id', $unfinishedActionId)->first();
+        $this->assertEquals('unfinished', $unfinishedRow->outcome);
+        $this->assertEquals(100, $unfinishedRow->duration_ms);
+
+        // In_progress action flushed
+        $flushedRow = DB::table('agent_run_actions')->where('id', $inProgressActionId)->first();
+        $this->assertEquals('unfinished', $flushedRow->outcome);
+        $this->assertNotNull($flushedRow->ended_at);
+    }
+
+    // ========== T060: closeRun() calls flushUnfinishedActions before terminal UPDATE (C17) ==========
+
+    /** @test */
+    public function close_run_flushes_unfinished_actions_before_terminal_update(): void
+    {
+        [$recorder, $runId, $stepId] = $this->setupRunAndStep();
+
+        // Open an action but don't close it
+        $actionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'hanging_tool');
+        $this->assertNotNull($actionId);
+
+        // Close the step first (required before closeRun)
+        $recorder->closeStep($stepId, \ClarionApp\LlmClient\ValueObjects\RunEndState::Completed);
+
+        // Close the run — should flush the action before marking the run terminal
+        $recorder->closeRun($runId, \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly, 'user cancelled');
+
+        // Run is now terminal
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertEquals('stopped_early', $run->end_state);
+
+        // Action was flushed to unfinished (not left in_progress)
+        $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
+        $this->assertEquals('unfinished', $action->outcome);
+        $this->assertNotNull($action->ended_at);
+        $this->assertNotNull($action->duration_ms);
+    }
+
+    // ========== T060a: awaiting_confirmation untouched even when paused_at > timeout (FR-015, C22) ==========
+
+    /** @test */
+    public function flush_unfinished_actions_leaves_awaiting_confirmation_untouched_even_when_paused_long(): void
+    {
+        // Set a very short timeout so the test is fast but the logic is exercised
+        $this->app['config']->set('llm-client.run_trace.action_timeout_minutes', 1);
+        [$recorder, $runId, $stepId] = $this->setupRunAndStep();
+
+        // Open action, suspend it, then backdate paused_at to be older than timeout
+        $actionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'execute_operation');
+        $recorder->closeAction($actionId, ActionOutcome::AwaitingConfirmation);
+
+        // Backdate paused_at to 10 minutes ago (well past the 1-minute timeout)
+        DB::table('agent_run_actions')
+            ->where('id', $actionId)
+            ->update([
+                'paused_at' => now()->subMinutes(10)->format('Y-m-d H:i:s.u'),
+            ]);
+
+        $recorder->flushUnfinishedActions($runId);
+
+        $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
+
+        // Outcome must remain awaiting_confirmation — never swept to unfinished
+        $this->assertEquals('awaiting_confirmation', $action->outcome);
+
+        // No ended_at or duration_ms set
+        $this->assertNull($action->ended_at);
+        $this->assertNull($action->duration_ms);
+
+        // No timeout failure_reason applied
+        $this->assertNull($action->failure_reason);
     }
 }
