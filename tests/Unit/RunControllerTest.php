@@ -749,4 +749,77 @@ class RunControllerTest extends TestCase
         $detailResponse->assertStatus(200)
             ->assertJson(['content' => 'sensitive parent content']);
     }
+
+    // ========================================================================
+    // T071 — server-side per_page cap is enforced regardless of what the
+    // client requests (US4, FR-011/SC-004). Phase 3's paginationParams()
+    // helper already clamps `per_page` server-side; the existing
+    // steps_endpoint_caps_per_page_at_200 / step_actions_caps_per_page_at_100
+    // / action_children_caps_per_page_at_100 tests (T013-T015) only assert
+    // the reported `meta.per_page` value against a single-row fixture. These
+    // tests are a stronger, non-duplicate regression check: they seed more
+    // rows than the cap and assert the actual number of rows *returned* is
+    // truncated to the cap, proving the cap is enforced on the data itself
+    // and not just echoed back in `meta`.
+    // ========================================================================
+
+    #[Test]
+    public function steps_endpoint_honors_per_page_cap(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        for ($i = 1; $i <= 201; $i++) {
+            $step = $this->recorder->openStep($runId, $i);
+            $this->recorder->closeStep($step, RunEndState::Completed);
+        }
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/steps?per_page=9999");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('meta.per_page', 200)
+            ->assertJsonPath('meta.total', 201);
+        $this->assertCount(200, $response->json('data'));
+    }
+
+    #[Test]
+    public function step_actions_endpoint_honors_per_page_cap(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        for ($i = 0; $i < 101; $i++) {
+            $action = $this->recorder->openAction($stepId, ActionType::ToolInvocation, "search_$i");
+            $this->recorder->closeAction($action, ActionOutcome::Success, null, "result-$i");
+        }
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/steps/{$stepId}/actions?per_page=9999");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('meta.per_page', 100)
+            ->assertJsonPath('meta.total', 101);
+        $this->assertCount(100, $response->json('data'));
+    }
+
+    #[Test]
+    public function action_children_endpoint_honors_per_page_cap(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        $parentAction = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'parent_op');
+        for ($i = 0; $i < 101; $i++) {
+            $child = $this->recorder->openAction($stepId, ActionType::LlmRequest, "child_$i", null, $parentAction);
+            $this->recorder->closeAction($child, ActionOutcome::Success, null, "child-result-$i");
+        }
+        $this->recorder->closeAction($parentAction, ActionOutcome::Success, null, 'parent-result');
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$parentAction}/children?per_page=9999");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('meta.per_page', 100)
+            ->assertJsonPath('meta.total', 101);
+        $this->assertCount(100, $response->json('data'));
+    }
 }
