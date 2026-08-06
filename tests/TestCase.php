@@ -179,12 +179,14 @@ abstract class TestCase extends BaseTestCase
                 $table->unsignedInteger('responseTime')->nullable();
                 $table->json('tool_calls')->nullable();
                 $table->json('tool_data')->nullable();
+                $table->uuid('run_id')->nullable();
                 $table->uuid('parent_id')->nullable();
                 $table->unsignedInteger('sequence_number')->default(0);
                 $table->timestamps();
                 $table->softDeletes();
                 $table->index('conversation_id');
                 $table->index(['conversation_id', 'sequence_number']);
+                $table->index('run_id');
             });
         }
 
@@ -195,6 +197,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('conversation_id');
                 $table->uuid('user_id');
                 $table->uuid('attempt_group_id');
+                $table->uuid('run_id')->nullable();
                 $table->integer('input_tokens')->nullable()->default(0);
                 $table->integer('output_tokens')->nullable()->default(0);
                 $table->integer('total_tokens')->nullable()->default(0);
@@ -209,6 +212,7 @@ abstract class TestCase extends BaseTestCase
                 $table->index('user_id');
                 $table->index('attempt_group_id');
                 $table->index(['user_id', 'created_at']);
+                $table->index('run_id');
             });
         }
 
@@ -219,6 +223,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('conversation_id');
                 $table->uuid('user_id');
                 $table->uuid('attempt_group_id');
+                $table->uuid('run_id')->nullable();
                 $table->string('tool_name', 256);
                 $table->enum('outcome', ['success', 'failure']);
                 $table->string('failure_category')->nullable();
@@ -230,6 +235,7 @@ abstract class TestCase extends BaseTestCase
                 $table->index('attempt_group_id');
                 $table->index(['tool_name', 'outcome']);
                 $table->index('created_at');
+                $table->index('run_id');
             });
         }
 
