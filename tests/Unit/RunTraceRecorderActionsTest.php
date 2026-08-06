@@ -597,4 +597,44 @@ class RunTraceRecorderActionsTest extends TestCase
         $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
         $this->assertEquals('unfinished', $action->outcome);
     }
+
+    // ========== T041: closeAction passes content through ContentSanitizer::prepare() ==========
+
+    /** @test */
+    public function close_action_passes_content_through_sanitizer(): void
+    {
+        [$recorder, , $stepId] = $this->setupRunAndStep();
+
+        $actionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'execute_operation');
+
+        // Content contains a Bearer token that should be redacted.
+        $content = '{"headers": {"authorization": "Bearer secret-token-xyz123"}}';
+        $recorder->closeAction($actionId, ActionOutcome::Success, null, $content);
+
+        $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
+
+        // Bearer token should be redacted.
+        $this->assertStringNotContainsString('secret-token-xyz123', $action->content);
+        $this->assertStringContainsString('[REDACTED]', $action->content);
+    }
+
+    /** @test */
+    public function close_action_truncates_content_over_cap(): void
+    {
+        // Set a small cap so truncation is obvious.
+        $this->app['config']->set('llm-client.run_trace.action_content_cap_bytes', 64);
+        [$recorder, , $stepId] = $this->setupRunAndStep();
+
+        $actionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'big_tool');
+
+        // Content exceeds the 64-byte cap.
+        $content = str_repeat('x', 200);
+        $recorder->closeAction($actionId, ActionOutcome::Success, null, $content);
+
+        $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
+
+        // Content should be truncated to within the cap.
+        $this->assertLessThanOrEqual(64, strlen($action->content));
+        $this->assertStringContainsString('[TRUNCATED', $action->content);
+    }
 }

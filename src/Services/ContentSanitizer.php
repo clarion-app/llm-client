@@ -9,7 +9,7 @@ class ContentSanitizer
     /** Truncation marker appended when content exceeds the byte cap. */
     private const TRUNCATION_MARKER = "\n\n[TRUNCATED: original content exceeded cap]";
 
-    /** Precompiled regex patterns (built once from config). */
+    /** Individual pattern pairs: each entry is ['pattern' => string, 'replacement' => string]. */
     private array $patterns = [];
 
     /** Byte cap for truncation. */
@@ -23,23 +23,35 @@ class ContentSanitizer
 
     /**
      * Apply redaction patterns to content string.
+     * Each pattern is applied individually so a bad regex skips only that pattern.
      * Returns the sanitized string (may be identical if no patterns match).
-     * Never throws — returns input unchanged on regex error.
+     * Never throws — bad patterns are skipped with a warning log.
      */
     public function sanitize(string $content): string
     {
-        if (empty($this->patterns)) {
+        if (count($this->patterns) === 0) {
             return $content;
         }
 
-        try {
-            return preg_replace($this->patterns['searches'], $this->patterns['replacements'], $content);
-        } catch (\Throwable $e) {
-            Log::warning('ContentSanitizer: regex error during sanitize', [
-                'error' => $e->getMessage(),
-            ]);
-            return $content;
+        $result = $content;
+        foreach ($this->patterns as $i => $entry) {
+            try {
+                $result = preg_replace($entry['pattern'], $entry['replacement'], $result);
+                if ($result === null) {
+                    // preg_replace returns null on error; skip this pattern.
+                    Log::warning('ContentSanitizer: regex error on pattern #' . $i, [
+                        'pattern' => $entry['pattern'],
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ContentSanitizer: regex error on pattern #' . $i, [
+                    'pattern' => $entry['pattern'],
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
+
+        return $result;
     }
 
     /**
@@ -66,7 +78,7 @@ class ContentSanitizer
 
     /**
      * Combined: sanitize then truncate. Used by closeAction().
-     * Order matters: redact before truncate (contract S4).
+     * Order matters: redact before truncate.
      */
     public function prepare(string $content): string
     {
@@ -79,44 +91,47 @@ class ContentSanitizer
     private function buildPatterns(): void
     {
         $config = config('llm-client.run_trace.redaction_patterns', []);
-        $searches = [];
-        $replacements = [];
 
         // Header redaction: "header_name": "value" → "header_name": "[REDACTED]"
         foreach (($config['headers'] ?? []) as $header) {
-            $pattern = '"(' . preg_quote($header, '/') . ')":\s*"([^"]*)"';
-            $searches[] = '/' . $pattern . '/i';
-            $replacements[] = '"$1": "[REDACTED]"';
+            $pattern = '/"(' . preg_quote($header, '/') . ')"\s*:\s*"([^"]*)"/i';
+            $this->patterns[] = [
+                'pattern' => $pattern,
+                'replacement' => '"$1": "[REDACTED]"',
+            ];
         }
 
         // Bearer tokens: Bearer <token> → Bearer [REDACTED]
-        $searches[] = '/Bearer\s+[a-zA-Z0-9\-._~+\/]+=*/';
-        $replacements[] = 'Bearer [REDACTED]';
+        $this->patterns[] = [
+            'pattern' => '/Bearer\s+[a-zA-Z0-9\-._~+\/]+=*/',
+            'replacement' => 'Bearer [REDACTED]',
+        ];
 
         // API key prefixes: sk-<long>, ghp_<long>, etc.
         foreach (($config['token_prefixes'] ?? []) as $prefix) {
             $escapedPrefix = preg_quote($prefix, '/');
-            $searches[] = '/' . $escapedPrefix . '[a-zA-Z0-9]{20,}/';
-            $replacements[] = $prefix . '[REDACTED]';
+            $this->patterns[] = [
+                'pattern' => '/' . $escapedPrefix . '[a-zA-Z0-9]{20,}/',
+                'replacement' => $prefix . '[REDACTED]',
+            ];
         }
 
         // JSON field redaction: "field_name": "value" → "field_name": "[REDACTED]"
         foreach (($config['json_fields'] ?? []) as $field) {
-            $pattern = '"(' . preg_quote($field, '/') . '"):\s*"([^"]*)"';
-            $searches[] = '/' . $pattern . '/i';
-            $replacements[] = '"$1": "[REDACTED]"';
+            $pattern = '/"(' . preg_quote($field, '/') . ')"\s*:\s*"([^"]*)"/i';
+            $this->patterns[] = [
+                'pattern' => $pattern,
+                'replacement' => '"$1": "[REDACTED]"',
+            ];
         }
 
         // URL query parameter redaction: ?param=value or &param=value
         foreach (($config['url_params'] ?? []) as $param) {
-            $pattern = '[?&](' . preg_quote($param, '/') . ')=[^&]*';
-            $searches[] = '/' . $pattern . '/i';
-            $replacements[] = '$1=[REDACTED]';
+            $pattern = '/([?&])(' . preg_quote($param, '/') . ')=([^&]*)/i';
+            $this->patterns[] = [
+                'pattern' => $pattern,
+                'replacement' => '$1$2=[REDACTED]',
+            ];
         }
-
-        $this->patterns = [
-            'searches' => $searches,
-            'replacements' => $replacements,
-        ];
     }
 }
