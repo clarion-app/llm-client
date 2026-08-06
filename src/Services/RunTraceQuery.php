@@ -4,6 +4,9 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Models\AgentRunStep;
+use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\ToolInvocationRecord;
+use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use Illuminate\Support\Facades\DB;
 
@@ -104,6 +107,60 @@ class RunTraceQuery
         }
 
         return $this->findRun($callerUserId, (string) $row->run_id);
+    }
+
+    /**
+     * Every message written during a run the caller owns, oldest first.
+     *
+     * @return Message[]|null Null when the run is absent, purged, or not owned by the caller (FR-018, FR-020).
+     */
+    public function messagesForRun(string $callerUserId, string $runId): ?array
+    {
+        $run = $this->findRun($callerUserId, $runId);
+        if ($run === null) {
+            return null;
+        }
+
+        return Message::where('run_id', $runId)
+            ->orderBy('created_at')
+            ->get()
+            ->all();
+    }
+
+    /**
+     * Every tool-execution record produced during a run the caller owns, oldest first.
+     *
+     * @return ToolInvocationRecord[]|null Same ownership contract as messagesForRun().
+     */
+    public function toolInvocationsForRun(string $callerUserId, string $runId): ?array
+    {
+        $run = $this->findRun($callerUserId, $runId);
+        if ($run === null) {
+            return null;
+        }
+
+        return ToolInvocationRecord::where('run_id', $runId)
+            ->orderBy('created_at')
+            ->get()
+            ->all();
+    }
+
+    /**
+     * Every usage record produced during a run the caller owns, oldest first.
+     *
+     * @return UsageRecord[]|null Same ownership contract as messagesForRun().
+     */
+    public function usageRecordsForRun(string $callerUserId, string $runId): ?array
+    {
+        $run = $this->findRun($callerUserId, $runId);
+        if ($run === null) {
+            return null;
+        }
+
+        return UsageRecord::where('run_id', $runId)
+            ->orderBy('created_at')
+            ->get()
+            ->all();
     }
 
     // ========================================================================

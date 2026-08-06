@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Models;
 
 use ClarionApp\LlmClient\ValueObjects\ToolFailureCategory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 
 class ToolInvocationRecord extends Model
@@ -35,6 +36,12 @@ class ToolInvocationRecord extends Model
         static::creating(function ($model) {
             if (!$model->id) {
                 $model->id = (string) \Illuminate\Support\Str::uuid();
+            }
+        });
+
+        static::creating(function ($model) {
+            if ($model->run_id === null) {
+                $model->run_id = Context::get('run_id');
             }
         });
     }

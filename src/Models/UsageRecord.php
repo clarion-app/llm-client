@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Context;
 
 class UsageRecord extends Model
 {
@@ -38,6 +39,12 @@ class UsageRecord extends Model
         static::creating(function ($model) {
             if (!$model->id) {
                 $model->id = (string) \Illuminate\Support\Str::uuid();
+            }
+        });
+
+        static::creating(function ($model) {
+            if ($model->run_id === null) {
+                $model->run_id = Context::get('run_id');
             }
         });
     }

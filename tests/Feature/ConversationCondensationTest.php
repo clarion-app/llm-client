@@ -88,6 +88,7 @@ class ConversationCondensationTest extends TestCase
             $table->text('content');
             $table->unsignedInteger('token_count')->nullable();
             $table->json('tool_data')->nullable();
+            $table->uuid('run_id')->nullable()->index();
             $table->timestamps();
             $table->softDeletes();
         });

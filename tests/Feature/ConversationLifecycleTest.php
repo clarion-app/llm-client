@@ -73,6 +73,7 @@ class ConversationLifecycleTest extends TestCase
             $table->string('user')->nullable();
             $table->integer('responseTime')->nullable();
             $table->json('tool_data')->nullable();
+            $table->uuid('run_id')->nullable()->index();
             $table->timestamps();
             $table->softDeletes();
         });

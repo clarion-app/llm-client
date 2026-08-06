@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Context;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 
 class Message extends Model
@@ -22,6 +23,15 @@ class Message extends Model
     protected $casts = [
         'tool_data' => 'array',
     ];
+
+    protected static function booted(): void
+    {
+        static::creating(function ($model) {
+            if ($model->run_id === null) {
+                $model->run_id = Context::get('run_id');
+            }
+        });
+    }
 
     public function conversation()
     {

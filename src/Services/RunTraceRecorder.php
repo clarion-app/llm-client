@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -66,6 +67,8 @@ class RunTraceRecorder
                 'step_count' => 0,
                 'created_at' => $now,
             ]);
+
+            Context::add('run_id', $runId);
 
             return $runId;
         } catch (\Throwable $e) {
@@ -318,6 +321,8 @@ class RunTraceRecorder
                 'end_state' => $endState->value,
                 'error' => $e->getMessage(),
             ]);
+        } finally {
+            Context::forget('run_id');
         }
     }
 
