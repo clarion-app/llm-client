@@ -130,20 +130,82 @@ class RunControllerTest extends TestCase
     #[Test]
     public function returns_identical_shape_for_absent_and_foreign_run(): void
     {
-        // US5/FR-014 — the nonexistent-id and foreign-owned-id failure bodies
-        // must be byte-identical, or the status/body split itself is a leak
-        // (research.md D2).
+        // Phase 5 (T046), US5 Scenario 2 / FR-014 — a nonexistent id and a
+        // real id owned by another user must produce byte-identical status
+        // and body across *every* endpoint added in Phases 3-4, not merely
+        // the run-summary endpoint: a status/body split on any one route is
+        // itself the leak (research.md D2). Built once here, on User A's
+        // fully-populated run (step, top-level action, nested child action),
+        // so the same comparison is exercised against every route shape.
         $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId, 1);
+        $parentAction = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'search_operations');
+        $childAction = $this->recorder->openAction(
+            $stepId,
+            ActionType::LlmRequest,
+            'nested-model',
+            null,
+            $parentAction,
+        );
+        $this->recorder->closeAction($childAction, ActionOutcome::Success, null, 'nested content');
+        $this->recorder->closeAction($parentAction, ActionOutcome::Success, null, 'parent content');
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
         $this->recorder->closeRun($runId, RunEndState::Completed);
 
-        $absentResponse = $this->actingAsUser($this->otherUser)
-            ->getJson('/api/clarion-app/llm-client/agent-runs/' . (string) Str::uuid());
+        $requester = $this->actingAsUser($this->otherUser);
+        $randomUuid = (string) Str::uuid();
 
-        $foreignResponse = $this->actingAsUser($this->otherUser)
-            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}");
+        $assertIdenticalPair = function (string $absentUrl, string $foreignUrl) use ($requester): void {
+            $absentResponse = $requester->getJson($absentUrl);
+            $foreignResponse = $requester->getJson($foreignUrl);
 
-        $this->assertSame($absentResponse->getStatusCode(), $foreignResponse->getStatusCode());
-        $this->assertSame($absentResponse->json(), $foreignResponse->json());
+            $this->assertSame(
+                $absentResponse->getStatusCode(),
+                $foreignResponse->getStatusCode(),
+                "Status code differs between absent ({$absentUrl}) and foreign-owned ({$foreignUrl}) requests.",
+            );
+            $this->assertSame(
+                $absentResponse->json(),
+                $foreignResponse->json(),
+                "Body differs between absent ({$absentUrl}) and foreign-owned ({$foreignUrl}) requests.",
+            );
+        };
+
+        // 1. GET /agent-runs/{runId}
+        $assertIdenticalPair(
+            "/api/clarion-app/llm-client/agent-runs/{$randomUuid}",
+            "/api/clarion-app/llm-client/agent-runs/{$runId}",
+        );
+
+        // 2. GET /agent-runs/{runId}/steps
+        $assertIdenticalPair(
+            "/api/clarion-app/llm-client/agent-runs/{$randomUuid}/steps",
+            "/api/clarion-app/llm-client/agent-runs/{$runId}/steps",
+        );
+
+        // 3. GET /agent-runs/{runId}/steps/{stepId}/actions
+        $assertIdenticalPair(
+            "/api/clarion-app/llm-client/agent-runs/{$randomUuid}/steps/{$randomUuid}/actions",
+            "/api/clarion-app/llm-client/agent-runs/{$runId}/steps/{$stepId}/actions",
+        );
+
+        // 4. GET /agent-runs/{runId}/actions/{actionId}/children
+        $assertIdenticalPair(
+            "/api/clarion-app/llm-client/agent-runs/{$randomUuid}/actions/{$randomUuid}/children",
+            "/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$parentAction}/children",
+        );
+
+        // 5. GET /agent-runs/{runId}/actions/{actionId} — top-level action detail
+        $assertIdenticalPair(
+            "/api/clarion-app/llm-client/agent-runs/{$randomUuid}/actions/{$randomUuid}",
+            "/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$parentAction}",
+        );
+
+        // 6. GET /agent-runs/{runId}/actions/{actionId} — nested child action detail
+        $assertIdenticalPair(
+            "/api/clarion-app/llm-client/agent-runs/{$randomUuid}/actions/{$randomUuid}",
+            "/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$childAction}",
+        );
     }
 
     // ========================================================================
