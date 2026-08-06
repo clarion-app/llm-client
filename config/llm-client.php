@@ -408,6 +408,42 @@ return [
             'url_params' => ['access_token', 'api_key', 'password', 'secret'],
             'token_prefixes' => ['sk-', 'ghp_', 'gho_', 'ghu_', 'ghs_'],
         ],
+
+        // Where records go. Any non-empty subset of ['internal', 'external'].
+        // Invalid, empty, or absent -> falls back to ['internal'], logged once
+        // per process (FR-004, FR-013-equivalent for this field).
+        'export' => [
+            'destinations' => explode(',', env('LLM_CLIENT_TRACE_EXPORT_DESTINATIONS', 'internal')),
+
+            // OTLP/HTTP endpoint, e.g. 'https://tempo.example.com:4318/v1/traces'.
+            // Required (and validated as an http(s) URL) only when 'external' is selected.
+            'otlp_endpoint' => env('LLM_CLIENT_TRACE_EXPORT_ENDPOINT'),
+
+            // Header name + value carrying the destination credential. Never logged,
+            // never persisted to any table. Excluded from every debug/array
+            // representation this feature produces.
+            'otlp_auth_header' => env('LLM_CLIENT_TRACE_EXPORT_AUTH_HEADER', 'Authorization'),
+            'otlp_auth_value' => env('LLM_CLIENT_TRACE_EXPORT_AUTH_VALUE'),
+
+            // Forwarding buffer bound, record count.
+            'buffer_max_records' => (int) env('LLM_CLIENT_TRACE_EXPORT_BUFFER_MAX', 10000),
+
+            // Delivery retry bound and backoff shape.
+            'max_attempts' => (int) env('LLM_CLIENT_TRACE_EXPORT_MAX_ATTEMPTS', 3),
+            'retry_base_seconds' => (int) env('LLM_CLIENT_TRACE_EXPORT_RETRY_BASE_SECONDS', 30),
+            'retry_max_seconds' => (int) env('LLM_CLIENT_TRACE_EXPORT_RETRY_MAX_SECONDS', 900),
+
+            // Per-request HTTP client timeout. Only ever consulted by the scheduled
+            // delivery command -- never on the request/response path.
+            'http_timeout_seconds' => (int) env('LLM_CLIENT_TRACE_EXPORT_HTTP_TIMEOUT_SECONDS', 10),
+
+            // Per-scheduler-tick delivery batch cap.
+            'max_records_per_run' => (int) env('LLM_CLIENT_TRACE_EXPORT_MAX_RECORDS_PER_RUN', 100),
+
+            // A record whose built payload exceeds this many bytes is discarded
+            // without an HTTP attempt.
+            'max_payload_bytes' => (int) env('LLM_CLIENT_TRACE_EXPORT_MAX_PAYLOAD_BYTES', 65536),
+        ],
     ],
 ];
 
