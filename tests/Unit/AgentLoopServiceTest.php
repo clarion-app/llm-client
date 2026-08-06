@@ -1452,4 +1452,149 @@ class AgentLoopServiceTest extends TestCase
         $this->assertStringContainsString('"include"', $system);
         $this->assertStringContainsString('profile', $system);
     }
+
+    #[Test]
+    public function failed_llm_call_records_action_with_failure_outcome_and_reason(): void
+    {
+        config(['llm-client.run_trace.enabled' => true]);
+        config(['llm-client.run_trace.action_row_cap' => 500]);
+        config(['llm-client.run_trace.action_content_cap_bytes' => 16384]);
+
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => false,
+            'server_id' => $server->id,
+            'model' => 'gpt-4',
+        ]);
+
+        // Mock provider that throws on chat().
+        $providerMock = Mockery::mock(\ClarionApp\LlmClient\Contracts\LlmProvider::class);
+        $providerMock->shouldReceive('chat')->andThrow(new \RuntimeException('connection timeout'));
+        $providerMock->shouldReceive('countTokens')->andReturn(10);
+
+        $registryMock = Mockery::mock(ProviderRegistry::class);
+        $registryMock->shouldReceive('resolveByType')->andReturn($providerMock);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        $service = new AgentLoopService(
+            Mockery::mock(McpToolRegistry::class),
+            $executorMock,
+            new OperationCache(),
+            $registryMock,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class),
+        );
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('connection timeout');
+
+        try {
+            $service->run($conversation, 'Hello');
+        } catch (\RuntimeException $e) {
+            // Check that the action was recorded with Failure outcome.
+            $actions = DB::table('agent_run_actions')->get();
+            $this->assertGreaterThanOrEqual(1, $actions->count(), 'Expected at least one action record');
+
+            $failureActions = $actions->where('outcome', 'failure');
+            $this->assertGreaterThanOrEqual(1, $failureActions->count(), 'Expected at least one action with failure outcome');
+
+            $firstFailure = $failureActions->first();
+            $this->assertNotNull($firstFailure->failure_reason, 'Failure action should have a failure_reason');
+            $this->assertStringContainsString('connection timeout', $firstFailure->failure_reason);
+
+            throw $e;
+        }
+    }
+
+    #[Test]
+    public function resume_sync_api_call_failure_closes_inbound_action_with_failure(): void
+    {
+        config(['llm-client.run_trace.enabled' => true]);
+        config(['llm-client.run_trace.action_row_cap' => 500]);
+        config(['llm-client.run_trace.action_content_cap_bytes' => 16384]);
+
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create(['is_processing' => true, 'server_id' => $server->id]);
+
+        // Create a message with pending confirmation and an action_id.
+        $inboundActionId = (string) \Illuminate\Support\Str::uuid();
+        $runId = (string) \Illuminate\Support\Str::uuid();
+        $stepId = (string) \Illuminate\Support\Str::uuid();
+
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+            'tool_data' => [
+                'tool_calls' => [
+                    [
+                        'id' => 'call_test123',
+                        'type' => 'function',
+                        'function' => [
+                            'name' => 'contacts.destroy',
+                            'arguments' => '{"path":{"id": "42"}}',
+                        ],
+                    ],
+                ],
+                'tool_results' => null,
+                'iteration' => 1,
+                'pending_confirmation' => [
+                    'operationId' => 'destroyContact',
+                    'tool_name' => 'contacts.destroy',
+                    'method' => 'DELETE',
+                    'path' => '/api/contacts/42',
+                    'arguments' => ['path' => ['id' => 42]],
+                    'expires_at' => now()->addMinutes(5)->toIso8601String(),
+                ],
+                'run_id' => $runId,
+                'step_id' => $stepId,
+                'action_id' => $inboundActionId,
+            ],
+        ]);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.destroy')
+            ->andReturn([
+                'name' => 'contacts.destroy',
+                '_meta' => ['operationId' => 'destroyContact', 'method' => 'DELETE', 'path' => '/api/contacts/{id}'],
+            ]);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $executorMock->shouldReceive('extractArguments')
+            ->andReturn(['path' => '/api/contacts/42', 'query' => [], 'body' => []]);
+        $executorMock->shouldReceive('executeHttpCall')
+            ->andThrow(new \RuntimeException('tool execution failed'));
+
+        $service = new AgentLoopService(
+            $registryMock,
+            $executorMock,
+            new OperationCache(),
+        );
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('tool execution failed');
+
+        try {
+            $service->resumeSync($conversation, $message, true);
+        } catch (\RuntimeException $e) {
+            // The inbound action should be closed with Failure outcome.
+            throw $e;
+        }
+    }
 }

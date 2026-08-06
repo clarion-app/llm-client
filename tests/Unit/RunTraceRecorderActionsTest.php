@@ -555,4 +555,46 @@ class RunTraceRecorderActionsTest extends TestCase
         $recorder->openAction($stepId, ActionType::LlmRequest, 'model-2');
         $this->assertTrue($warned, 'Expected a warning when cap is exceeded');
     }
+
+    // ========== T033: closeAction() on terminal action is no-op (C16) ==========
+
+    /** @test */
+    public function close_action_on_already_terminal_action_is_no_op(): void
+    {
+        [$recorder, , $stepId] = $this->setupRunAndStep();
+
+        $actionId = $recorder->openAction($stepId, ActionType::LlmRequest, 'gpt-4');
+        $recorder->closeAction($actionId, ActionOutcome::Success);
+
+        // Attempt to close again with a different outcome — should be a no-op.
+        $recorder->closeAction($actionId, ActionOutcome::Failure, 'should not overwrite');
+
+        $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
+        // Outcome should remain 'success', not overwritten to 'failure'.
+        $this->assertEquals('success', $action->outcome);
+        $this->assertNull($action->failure_reason);
+    }
+
+    /** @test */
+    public function close_action_on_unfinished_action_is_no_op(): void
+    {
+        [$recorder, , $stepId] = $this->setupRunAndStep();
+
+        $actionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'slow_tool');
+
+        // Manually set to unfinished (simulating flushUnfinishedActions).
+        DB::table('agent_run_actions')
+            ->where('id', $actionId)
+            ->update([
+                'outcome' => 'unfinished',
+                'ended_at' => now()->format('Y-m-d H:i:s.u'),
+                'duration_ms' => 0,
+            ]);
+
+        // Attempt to close again — should be a no-op.
+        $recorder->closeAction($actionId, ActionOutcome::Success);
+
+        $action = DB::table('agent_run_actions')->where('id', $actionId)->first();
+        $this->assertEquals('unfinished', $action->outcome);
+    }
 }
