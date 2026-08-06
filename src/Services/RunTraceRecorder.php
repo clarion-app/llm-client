@@ -3,6 +3,9 @@
 namespace ClarionApp\LlmClient\Services;
 
 use Carbon\CarbonInterface;
+use ClarionApp\LlmClient\Events\RunActionUpdated;
+use ClarionApp\LlmClient\Events\RunStepUpdated;
+use ClarionApp\LlmClient\Events\RunUpdated;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
@@ -32,6 +35,30 @@ class RunTraceRecorder
     public function __construct(?ContentSanitizer $sanitizer = null)
     {
         $this->sanitizer = $sanitizer ?? app(ContentSanitizer::class);
+    }
+
+    /**
+     * Fire a Phase 6 (US3) live-update event, isolated in its own try/catch
+     * so a broadcast failure (e.g. Pusher unreachable, or — as
+     * RunTraceRecorderBroadcastTest proves — a listener that throws) can
+     * never undo or mask the recording write it's reporting on, nor change
+     * the calling method's return value (standing rule 7). A narrower inner
+     * try/catch immediately around the event() call, rather than relying on
+     * the surrounding method's own try/catch, per research.md D3's
+     * documented alternative — the surrounding catch exists to log a failed
+     * *write*, and reusing it here would misreport a broadcast failure as a
+     * write failure and, for openStep()/openAction(), would turn an
+     * already-successful insert's id into a null return value.
+     */
+    private function broadcast(\Closure $emit): void
+    {
+        try {
+            $emit();
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: broadcast failed', [
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -120,6 +147,8 @@ class RunTraceRecorder
                 'wait_ms' => null,
                 'attempt_count' => 1,
             ]);
+
+            $this->broadcast(fn () => event(new RunStepUpdated($stepId)));
 
             return $stepId;
         } catch (\Throwable $e) {
@@ -224,6 +253,8 @@ class RunTraceRecorder
                     'duration_ms' => $durationMs,
                     'wait_ms' => $waitMs,
                 ]);
+
+            $this->broadcast(fn () => event(new RunStepUpdated($stepId)));
         } catch (\Throwable $e) {
             Log::warning('RunTraceRecorder: failed to close step', [
                 'step_id' => $stepId,
@@ -310,6 +341,8 @@ class RunTraceRecorder
                     'duration_ms' => $durationMs,
                     'step_count' => $stepCount,
                 ]);
+
+            $this->broadcast(fn () => event(new RunUpdated($runId)));
 
             // Link reply message if provided (done after the run close so the run is terminal first)
             if ($replyMessageId !== null) {
@@ -528,6 +561,8 @@ class RunTraceRecorder
                 'created_at' => $now,
             ]);
 
+            $this->broadcast(fn () => event(new RunActionUpdated($actionId)));
+
             return $actionId;
         } catch (\Throwable $e) {
             Log::warning('RunTraceRecorder: failed to open action', [
@@ -582,6 +617,9 @@ class RunTraceRecorder
                         'outcome' => ActionOutcome::AwaitingConfirmation->value,
                         'paused_at' => now()->format(self::TIMESTAMP_FORMAT),
                     ]);
+
+                $this->broadcast(fn () => event(new RunActionUpdated($actionId)));
+
                 return;
             }
 
@@ -666,6 +704,8 @@ class RunTraceRecorder
                     'duration_ms' => $durationMs,
                     'content' => $content,
                 ]);
+
+            $this->broadcast(fn () => event(new RunActionUpdated($actionId)));
         } catch (\Throwable $e) {
             Log::warning('RunTraceRecorder: failed to close action', [
                 'action_id' => $actionId,

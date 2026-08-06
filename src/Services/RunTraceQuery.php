@@ -503,6 +503,102 @@ class RunTraceQuery
         ];
     }
 
+    // ========================================================================
+    // Phase 6 (US3) — broadcast-payload projections, by id only. No
+    // ownership check here: each of RunUpdated/RunStepUpdated/
+    // RunActionUpdated's broadcastWith() is only ever invoked for a channel
+    // its own broadcastOn() has already resolved to the row's real owner
+    // (research.md D1/D3) — these three methods exist purely to guarantee a
+    // pushed payload can never disagree in shape or value with what the
+    // matching REST endpoint would return for the same id, by sharing the
+    // exact same field mapping / row projection those endpoints use.
+    // ========================================================================
+
+    /**
+     * RunSummary shape (data-model.md §1.1) for a single run by id — the
+     * same field mapping RunController::show() uses, so RunUpdated's
+     * broadcast payload never disagrees with a fresh GET /agent-runs/{id}.
+     *
+     * @return array<string, mixed>|null Null when the run has since been purged.
+     */
+    public function runSummaryById(string $runId): ?array
+    {
+        $run = AgentRun::find($runId);
+        if ($run === null) {
+            return null;
+        }
+
+        $actionCount = DB::table('agent_run_actions')
+            ->where('run_id', $runId)
+            ->count();
+
+        return [
+            'id' => $run->id,
+            'kind' => $run->kind->value,
+            'end_state' => $run->end_state->value,
+            'end_reason' => $run->end_reason,
+            'started_at' => $run->started_at?->toJSON(),
+            'ended_at' => $run->ended_at?->toJSON(),
+            'duration_ms' => $run->duration_ms,
+            'step_count' => $run->step_count,
+            'action_count' => (int) $actionCount,
+            'conversation_id' => $run->conversation_id,
+        ];
+    }
+
+    /**
+     * StepSummary shape (data-model.md §1.2) for a single step by id — the
+     * same field mapping RunController::steps() projects per row, so
+     * RunStepUpdated's broadcast payload never disagrees with a fresh
+     * GET /agent-runs/{runId}/steps entry for the same step.
+     *
+     * @return array<string, mixed>|null Null when the step has since been purged.
+     */
+    public function stepSummaryById(string $stepId): ?array
+    {
+        $step = AgentRunStep::find($stepId);
+        if ($step === null) {
+            return null;
+        }
+
+        $actionCount = DB::table('agent_run_actions')
+            ->where('step_id', $stepId)
+            ->count();
+
+        return [
+            'id' => $step->id,
+            'run_id' => $step->run_id,
+            'position' => $step->position,
+            'end_state' => $step->end_state->value,
+            'end_reason' => $step->end_reason,
+            'started_at' => $step->started_at?->toJSON(),
+            'ended_at' => $step->ended_at?->toJSON(),
+            'duration_ms' => $step->duration_ms,
+            'wait_ms' => $step->wait_ms,
+            'attempt_count' => $step->attempt_count,
+            'action_count' => (int) $actionCount,
+        ];
+    }
+
+    /**
+     * ActionSummary shape (data-model.md §1.3) for a single action by id —
+     * never `content`. Reuses actionSummaryRows()'s exact projection (the
+     * same one actionSummariesForStep()/actionSummaryChildren() use), so
+     * RunActionUpdated's broadcast payload is byte-identical to the matching
+     * row in a fresh GET .../actions or .../children response.
+     *
+     * @return array<string, mixed>|null Null when the action has since been purged.
+     */
+    public function actionSummaryById(string $actionId): ?array
+    {
+        $row = DB::table('agent_run_actions')->where('id', $actionId)->first();
+        if ($row === null) {
+            return null;
+        }
+
+        return $this->actionSummaryRows(collect([$row]))[0] ?? null;
+    }
+
     /**
      * Convert a raw DB row to the standardized action array shape.
      */
