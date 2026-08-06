@@ -31,6 +31,37 @@ class RunController extends Controller
     ) {}
 
     /**
+     * GET /agent-runs — the caller's own runs, most recent first, paginated
+     * (US6, FR-024). `runsForUserPaginated()` (T083) only ever queries
+     * `WHERE user_id = ?`, so this never returns another user's rows by
+     * construction — there is no ownership gate to fail, and therefore no
+     * 404 case on this endpoint (FR-014/consistency note, tasks.md Phase 8).
+     * `200` with empty `data` for a caller with zero runs (FR-025).
+     */
+    public function index(Request $request): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        [$page, $perPage] = $this->paginationParams($request, 20, 100);
+
+        $result = $this->runTraceQuery->runsForUserPaginated($callerUserId, $page, $perPage);
+
+        $runIds = array_map(fn (AgentRun $run) => $run->id, $result['data']);
+        $actionCounts = empty($runIds) ? collect() : DB::table('agent_run_actions')
+            ->select('run_id', DB::raw('COUNT(*) as cnt'))
+            ->whereIn('run_id', $runIds)
+            ->groupBy('run_id')
+            ->pluck('cnt', 'run_id');
+
+        $data = array_map(
+            fn (AgentRun $run) => $this->runSummary($run, (int) ($actionCounts[$run->id] ?? 0)),
+            $result['data'],
+        );
+
+        return response()->json($this->envelope($data, $result['total'], $page, $perPage));
+    }
+
+    /**
      * GET /agent-runs/{runId} — a single run's O(1) metadata, including the
      * cheap COUNT(*) action_count aggregate (contracts/run-read-api.md,
      * data-model.md §1.1).

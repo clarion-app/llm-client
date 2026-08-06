@@ -66,6 +66,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Server Status endpoint (server status projection for all servers)
     Route::get('server-status', [ServerStatusController::class, "index"]);
 
+    // Agent run execution graph list endpoint (070 US6)
+    Route::get('agent-runs', [RunController::class, "index"]);
     // Agent run execution graph read endpoints (070 US1)
     Route::get('agent-runs/{runId}', [RunController::class, "show"]);
     Route::get('agent-runs/{runId}/steps', [RunController::class, "steps"]);

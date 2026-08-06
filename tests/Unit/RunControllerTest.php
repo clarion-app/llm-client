@@ -822,4 +822,111 @@ class RunControllerTest extends TestCase
             ->assertJsonPath('meta.total', 101);
         $this->assertCount(100, $response->json('data'));
     }
+
+    // ========================================================================
+    // T081 — GET /agent-runs (Phase 8, US6). No `agent-runs` (bare) route
+    // exists in Routes.php yet (only `agent-runs/{runId}` and its children),
+    // and `RunController` has no `index()` method — every request below is
+    // expected to fail on Laravel's own "route not found" 404 at this phase.
+    // Phase 8's implementation tasks (T083-T085) are what turn these green.
+    // ========================================================================
+
+    #[Test]
+    public function runs_list_returns_only_callers_own_runs(): void
+    {
+        $ownRunId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $this->recorder->closeRun($ownRunId, RunEndState::Completed);
+
+        $otherRunId = $this->recorder->openRun(RunKind::Interactive, $this->otherUser->id);
+        $this->recorder->closeRun($otherRunId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson('/api/clarion-app/llm-client/agent-runs');
+
+        $response->assertStatus(200);
+        $ids = array_column($response->json('data'), 'id');
+        $this->assertContains($ownRunId, $ids);
+        $this->assertNotContains($otherRunId, $ids);
+    }
+
+    #[Test]
+    public function runs_list_is_ordered_by_started_at_descending(): void
+    {
+        $oldestRunId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $this->recorder->closeRun($oldestRunId, RunEndState::Completed);
+        DB::table('agent_runs')->where('id', $oldestRunId)
+            ->update(['started_at' => '2026-08-01 09:00:00.000000']);
+
+        $middleRunId = $this->recorder->openRun(RunKind::SystemInitiated, $this->user->id);
+        $this->recorder->closeRun($middleRunId, RunEndState::Completed);
+        DB::table('agent_runs')->where('id', $middleRunId)
+            ->update(['started_at' => '2026-08-03 09:00:00.000000']);
+
+        $newestRunId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $this->recorder->closeRun($newestRunId, RunEndState::Completed);
+        DB::table('agent_runs')->where('id', $newestRunId)
+            ->update(['started_at' => '2026-08-05 09:00:00.000000']);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson('/api/clarion-app/llm-client/agent-runs');
+
+        $response->assertStatus(200);
+        $ids = array_column($response->json('data'), 'id');
+        $this->assertSame([$newestRunId, $middleRunId, $oldestRunId], $ids);
+    }
+
+    #[Test]
+    public function runs_list_default_pagination_is_page_1_per_page_20(): void
+    {
+        for ($i = 0; $i < 3; $i++) {
+            $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+            $this->recorder->closeRun($runId, RunEndState::Completed);
+        }
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson('/api/clarion-app/llm-client/agent-runs');
+
+        $response->assertStatus(200)
+            ->assertJsonPath('meta.current_page', 1)
+            ->assertJsonPath('meta.per_page', 20)
+            ->assertJsonPath('meta.total', 3)
+            ->assertJsonPath('meta.last_page', 1);
+    }
+
+    #[Test]
+    public function runs_list_caps_per_page_at_100(): void
+    {
+        for ($i = 0; $i < 101; $i++) {
+            $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+            $this->recorder->closeRun($runId, RunEndState::Completed);
+        }
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson('/api/clarion-app/llm-client/agent-runs?per_page=9999');
+
+        $response->assertStatus(200)
+            ->assertJsonPath('meta.per_page', 100)
+            ->assertJsonPath('meta.total', 101);
+        $this->assertCount(100, $response->json('data'));
+    }
+
+    #[Test]
+    public function runs_list_returns_200_with_empty_data_for_zero_runs(): void
+    {
+        // $this->user has created no runs at all (FR-025's explicit empty
+        // state — never a 404, the caller themself is perfectly valid).
+        $response = $this->actingAsUser($this->user)
+            ->getJson('/api/clarion-app/llm-client/agent-runs');
+
+        $response->assertStatus(200)
+            ->assertExactJson([
+                'data' => [],
+                'meta' => [
+                    'current_page' => 1,
+                    'per_page' => 20,
+                    'total' => 0,
+                    'last_page' => 1,
+                ],
+            ]);
+    }
 }

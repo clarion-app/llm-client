@@ -80,6 +80,33 @@ class RunTraceQuery
     }
 
     /**
+     * Runs for a user, paginated, ordered started_at descending (US6,
+     * FR-024). `WHERE user_id = ?` only — by construction, this can never
+     * return another user's rows (data-model.md §5); there is no separate
+     * ownership gate to short-circuit, unlike the single-resource read
+     * paths this class also exposes.
+     *
+     * @return array{data: AgentRun[], total: int}
+     */
+    public function runsForUserPaginated(string $callerUserId, int $page, int $perPage): array
+    {
+        $baseQuery = AgentRun::where('user_id', $callerUserId);
+
+        $total = (clone $baseQuery)->count();
+
+        $runs = $baseQuery
+            ->orderBy('started_at', 'desc')
+            ->forPage($page, $perPage)
+            ->get()
+            ->all();
+
+        return [
+            'data' => $runs,
+            'total' => $total,
+        ];
+    }
+
+    /**
      * Resolve a message to its run — the reply the run produced, or the user message
      * that triggered it. Null when the message predates the feature, was never
      * associated, its run was purged, or the caller does not own it.
