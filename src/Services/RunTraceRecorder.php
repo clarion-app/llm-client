@@ -407,16 +407,31 @@ class RunTraceRecorder
             // Flush in-progress actions to 'unfinished' before the run's terminal UPDATE (contract C17).
             $this->flushUnfinishedActions($runId);
 
-            // Single UPDATE for end_state, step_count, duration_ms (contract C4)
-            DB::table('agent_runs')
-                ->where('id', $runId)
-                ->update([
+            // Single UPDATE for end_state, step_count, duration_ms (contract C4), isolated in its
+            // own inner try/catch so a throw here can never prevent enqueueForwarding() (below)
+            // from running -- FR-007's *reverse* direction. This repo has hit exactly this failure
+            // shape before: per the 070-run-execution-graph feature, a call left inside the
+            // method's single outer catch was silently swallowed by an unrelated failure; the fix
+            // there -- and here -- is to give the call its own inner try/catch, positioned so it
+            // always runs regardless of what happens elsewhere in the method, mirroring
+            // enqueueForwarding()'s and broadcast()'s own isolation immediately below.
+            try {
+                DB::table('agent_runs')
+                    ->where('id', $runId)
+                    ->update([
+                        'end_state' => $endState->value,
+                        'end_reason' => $reason,
+                        'ended_at' => $endedAt->format(self::TIMESTAMP_FORMAT),
+                        'duration_ms' => $durationMs,
+                        'step_count' => $stepCount,
+                    ]);
+            } catch (\Throwable $e) {
+                Log::warning('RunTraceRecorder: failed to update run terminal state', [
+                    'run_id' => $runId,
                     'end_state' => $endState->value,
-                    'end_reason' => $reason,
-                    'ended_at' => $endedAt->format(self::TIMESTAMP_FORMAT),
-                    'duration_ms' => $durationMs,
-                    'step_count' => $stepCount,
+                    'error' => $e->getMessage(),
                 ]);
+            }
 
             $this->enqueueForwarding($runId);
 
