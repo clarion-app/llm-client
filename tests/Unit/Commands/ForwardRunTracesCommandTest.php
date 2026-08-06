@@ -497,4 +497,333 @@ class ForwardRunTracesCommandTest extends TestCase
         Http::assertNothingSent();
         $this->assertSame(1, DB::table('agent_run_export_queue')->where('id', $queueId)->count());
     }
+
+    // ========================================================================
+    // Phase 5 (US3): retry/backoff, discard-on-payload-size, resume-after-
+    // recovery, and aggregate delivered/retried/discarded/buffer_evicted
+    // logging. None of these exist yet as of Phase 4 -- ForwardRunTracesCommand
+    // never increments `attempts`, never sets `next_attempt_at`, never
+    // pre-checks payload size, and its aggregate log line has no `retried` or
+    // `buffer_evicted` key at all. Every case below is expected to fail/red
+    // until T025/T026 land.
+    // ========================================================================
+
+    /**
+     * Inserts a run whose single action carries an oversized `content`
+     * field, so its built OTLP payload trivially exceeds any reasonable
+     * max_payload_bytes cap -- used to exercise the payload-size precheck
+     * without needing hundreds of real actions.
+     */
+    private function insertOversizedRunWithQueueRow(): string
+    {
+        $runId = (string) Str::uuid();
+        $userId = (string) Str::uuid();
+        $stepId = (string) Str::uuid();
+        $actionId = (string) Str::uuid();
+        $t0 = CarbonImmutable::now()->subMinutes(2);
+        $t1 = $t0->addSeconds(5);
+
+        $this->insertRun($runId, $userId, RunEndState::Completed, null, $t0, $t1);
+        $this->insertStep($stepId, $runId, RunEndState::Completed, null, $t0, $t1);
+
+        DB::table('agent_run_actions')->insert([
+            'id' => $actionId,
+            'run_id' => $runId,
+            'step_id' => $stepId,
+            'action_type' => ActionType::ToolInvocation->value,
+            'target' => 'some.tool',
+            'attempt_group_id' => null,
+            'parent_action_id' => null,
+            'outcome' => ActionOutcome::Success->value,
+            'failure_reason' => null,
+            'paused_at' => null,
+            'started_at' => $t0->format('Y-m-d H:i:s.u'),
+            'ended_at' => $t1->format('Y-m-d H:i:s.u'),
+            'duration_ms' => 5000,
+            // Comfortably past even the default 65536-byte cap once wrapped
+            // in the OTLP envelope.
+            'content' => str_repeat('x', 100_000),
+            'created_at' => $t0->format('Y-m-d H:i:s.u'),
+        ]);
+
+        $queueId = (string) Str::uuid();
+        DB::table('agent_run_export_queue')->insert([
+            'id' => $queueId,
+            'run_id' => $runId,
+            'attempts' => 0,
+            'next_attempt_at' => null,
+            'last_error' => null,
+            'created_at' => CarbonImmutable::now()->format('Y-m-d H:i:s'),
+        ]);
+
+        return $queueId;
+    }
+
+    private function assertNextAttemptNear(CarbonImmutable $expected, ?string $actualTimestamp, string $message = ''): void
+    {
+        $this->assertNotNull($actualTimestamp, $message !== '' ? $message : 'next_attempt_at must be set after a failed delivery below max_attempts');
+        $actual = CarbonImmutable::parse($actualTimestamp);
+        $diff = abs($actual->diffInSeconds($expected, false));
+        $this->assertLessThanOrEqual(
+            5,
+            $diff,
+            "expected next_attempt_at near {$expected->toDateTimeString()}, got {$actual->toDateTimeString()}",
+        );
+    }
+
+    // ========== FR-019/SC-007: exponential-with-cap backoff, discard after max_attempts ==========
+
+    #[Test]
+    public function repeated_delivery_failures_follow_the_exponential_backoff_formula_and_the_row_is_deleted_after_max_attempts(): void
+    {
+        // retry_base_seconds=30, retry_max_seconds=900, max_attempts=3 (setUp defaults).
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        Http::fake([
+            self::ENDPOINT => Http::response('', 503),
+        ]);
+
+        // Attempt 1: fails -> attempts=1, next_attempt_at ~= now + 30s (base * 2^0).
+        $exitCode = Artisan::call('llm-client:forward-run-traces');
+        $this->assertSame(0, $exitCode);
+
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row, 'row must survive a failure below max_attempts');
+        $this->assertSame(1, (int) $row->attempts);
+        $this->assertNextAttemptNear(CarbonImmutable::now()->addSeconds(30), $row->next_attempt_at);
+
+        // Simulate the backoff window having elapsed.
+        DB::table('agent_run_export_queue')->where('id', $queueId)->update([
+            'next_attempt_at' => CarbonImmutable::now()->subSecond()->format('Y-m-d H:i:s'),
+        ]);
+
+        // Attempt 2: fails again -> attempts=2, next_attempt_at ~= now + 60s (base * 2^1).
+        $exitCode = Artisan::call('llm-client:forward-run-traces');
+        $this->assertSame(0, $exitCode);
+
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row, 'row must survive a second failure below max_attempts');
+        $this->assertSame(2, (int) $row->attempts);
+        $this->assertNextAttemptNear(CarbonImmutable::now()->addSeconds(60), $row->next_attempt_at);
+
+        DB::table('agent_run_export_queue')->where('id', $queueId)->update([
+            'next_attempt_at' => CarbonImmutable::now()->subSecond()->format('Y-m-d H:i:s'),
+        ]);
+
+        // Attempt 3: this reaches max_attempts (3) -- the row must be
+        // deleted outright, not retried a fourth time.
+        $exitCode = Artisan::call('llm-client:forward-run-traces');
+        $this->assertSame(0, $exitCode);
+
+        $this->assertSame(
+            0,
+            DB::table('agent_run_export_queue')->where('id', $queueId)->count(),
+            'the row must be deleted once attempts reaches max_attempts, with zero further attempts',
+        );
+
+        Http::assertSentCount(3);
+    }
+
+    #[Test]
+    public function backoff_delay_is_capped_at_retry_max_seconds(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.export.max_attempts', 10);
+        $this->app['config']->set('llm-client.run_trace.export.retry_base_seconds', 100);
+        $this->app['config']->set('llm-client.run_trace.export.retry_max_seconds', 150);
+
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        Http::fake([
+            self::ENDPOINT => Http::response('', 503),
+        ]);
+
+        // Attempt 1: base * 2^0 = 100s (below the 150s cap).
+        Artisan::call('llm-client:forward-run-traces');
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row);
+        $this->assertSame(1, (int) $row->attempts);
+        $this->assertNextAttemptNear(CarbonImmutable::now()->addSeconds(100), $row->next_attempt_at);
+
+        DB::table('agent_run_export_queue')->where('id', $queueId)->update([
+            'next_attempt_at' => CarbonImmutable::now()->subSecond()->format('Y-m-d H:i:s'),
+        ]);
+
+        // Attempt 2: base * 2^1 = 200s, but must be capped at retry_max_seconds = 150s.
+        Artisan::call('llm-client:forward-run-traces');
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row);
+        $this->assertSame(2, (int) $row->attempts);
+        $this->assertNextAttemptNear(CarbonImmutable::now()->addSeconds(150), $row->next_attempt_at, 'the backoff delay must be capped at retry_max_seconds, not allowed to keep doubling');
+    }
+
+    // ========== research.md §5: oversized payload discarded with no HTTP attempt ==========
+
+    #[Test]
+    public function a_payload_exceeding_max_payload_bytes_is_discarded_immediately_with_no_http_attempt(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.export.max_payload_bytes', 1024);
+
+        $queueId = $this->insertOversizedRunWithQueueRow();
+
+        Http::fake();
+
+        $exitCode = Artisan::call('llm-client:forward-run-traces');
+
+        $this->assertSame(0, $exitCode);
+        $this->assertSame(
+            0,
+            DB::table('agent_run_export_queue')->where('id', $queueId)->count(),
+            'an oversized payload must be discarded outright, never retried',
+        );
+        Http::assertNothingSent();
+    }
+
+    // ========== FR-023/US3 AC6: a recovered destination resumes delivery automatically ==========
+
+    #[Test]
+    public function a_destination_that_recovers_mid_outage_resumes_delivery_on_the_next_due_tick_without_operator_action(): void
+    {
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        // Outage then recovery: the first request against this endpoint
+        // fails, the second succeeds. A second, separate Http::fake([...])
+        // call for the same URL would not achieve this -- Laravel's fake
+        // stubs accumulate and are matched in registration order, so a later
+        // fake() call for an already-stubbed URL never overrides the
+        // earlier one (verified directly against this package's Laravel
+        // version). Http::sequence() is the correct tool for "this URL
+        // responds differently across successive requests" and is the same
+        // pattern already used below in
+        // the_aggregate_log_line_reports_delivered_retried_discarded_and_buffer_evicted_counts_exactly_once().
+        Http::fake([
+            self::ENDPOINT => Http::sequence()
+                ->push('', 503)
+                ->push('', 200),
+        ]);
+
+        Artisan::call('llm-client:forward-run-traces');
+
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row, 'row must still be pending after one failure');
+        $this->assertSame(1, (int) $row->attempts);
+
+        // Simulate the backoff window elapsing naturally (time passing, not
+        // an operator action) -- the destination itself already "recovers"
+        // via the second entry in the sequence above.
+        DB::table('agent_run_export_queue')->where('id', $queueId)->update([
+            'next_attempt_at' => CarbonImmutable::now()->subSecond()->format('Y-m-d H:i:s'),
+        ]);
+
+        $exitCode = Artisan::call('llm-client:forward-run-traces');
+
+        $this->assertSame(0, $exitCode);
+        $this->assertSame(
+            0,
+            DB::table('agent_run_export_queue')->where('id', $queueId)->count(),
+            'the row must be delivered once the destination recovers, with no further operator action',
+        );
+    }
+
+    // ========== FR-021/FR-022/SC-008: one aggregate log line, all four counts ==========
+
+    #[Test]
+    public function the_aggregate_log_line_reports_delivered_retried_discarded_and_buffer_evicted_counts_exactly_once(): void
+    {
+        // ---- Phase 1: produce a known buffer_evicted count in isolation,
+        // via the real overflow-trim path (RunTraceRecorder::enqueueForwarding()),
+        // before setting up the delivery scenario below. ----
+        $this->app['config']->set('llm-client.run_trace.export.buffer_max_records', 1);
+        TraceExportConfig::reset();
+
+        DB::table('agent_run_export_queue')->insert([
+            'id' => (string) Str::uuid(),
+            'run_id' => (string) Str::uuid(),
+            'attempts' => 0,
+            'next_attempt_at' => null,
+            'last_error' => null,
+            'created_at' => CarbonImmutable::now()->subMinutes(30)->format('Y-m-d H:i:s'),
+        ]);
+        DB::table('agent_run_export_queue')->insert([
+            'id' => (string) Str::uuid(),
+            'run_id' => (string) Str::uuid(),
+            'attempts' => 0,
+            'next_attempt_at' => null,
+            'last_error' => null,
+            'created_at' => CarbonImmutable::now()->subMinutes(20)->format('Y-m-d H:i:s'),
+        ]);
+        DB::table('agent_run_export_queue')->insert([
+            'id' => (string) Str::uuid(),
+            'run_id' => (string) Str::uuid(),
+            'attempts' => 0,
+            'next_attempt_at' => null,
+            'last_error' => null,
+            'created_at' => CarbonImmutable::now()->subMinutes(10)->format('Y-m-d H:i:s'),
+        ]);
+
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $evictingUserId = (string) Str::uuid();
+        $evictingRunId = $recorder->openRun(RunKind::Interactive, $evictingUserId);
+        $this->assertNotNull($evictingRunId);
+        $evictingStepId = $recorder->openStep($evictingRunId);
+        $recorder->closeStep($evictingStepId, RunEndState::Completed);
+        $recorder->closeRun($evictingRunId, RunEndState::Completed);
+
+        // 3 seeded + 1 new, trimmed to buffer_max_records=1 -> 3 evicted.
+        // (This is the *expected* correct behavior per FR-018/T025; against
+        // today's un-trimmed enqueueForwarding() the count will differ,
+        // which is exactly the red signal this case is meant to produce.)
+
+        // Clean the slate for the delivery scenario below, restoring a
+        // generous buffer bound.
+        DB::table('agent_run_export_queue')->delete();
+        $this->app['config']->set('llm-client.run_trace.export.buffer_max_records', 10000);
+        TraceExportConfig::reset();
+
+        // ---- Phase 2: one delivered, one retried, one discarded (oversized). ----
+        [, $deliveredQueueId] = $this->insertRunWithQueueRow(createdAt: CarbonImmutable::now()->subMinutes(3));
+        [, $retriedQueueId] = $this->insertRunWithQueueRow(createdAt: CarbonImmutable::now()->subMinutes(2));
+        $oversizedQueueId = $this->insertOversizedRunWithQueueRow();
+
+        Http::fake([
+            self::ENDPOINT => Http::sequence()
+                ->push('', 200) // delivered row (oldest, processed first)
+                ->push('', 503), // retried row (second-oldest)
+        ]);
+
+        $forwardedLogEntries = [];
+        Log::listen(function ($entry) use (&$forwardedLogEntries) {
+            if ($entry->message === 'Agent run traces forwarded') {
+                $forwardedLogEntries[] = $entry;
+            }
+        });
+
+        $exitCode = Artisan::call('llm-client:forward-run-traces');
+
+        $this->assertSame(0, $exitCode);
+
+        // Per-row outcomes.
+        $this->assertSame(0, DB::table('agent_run_export_queue')->where('id', $deliveredQueueId)->count(), 'the healthy-destination row must have been delivered');
+        $retriedRow = DB::table('agent_run_export_queue')->where('id', $retriedQueueId)->first();
+        $this->assertNotNull($retriedRow, 'the failing-destination row must still be pending, not discarded');
+        $this->assertSame(1, (int) $retriedRow->attempts);
+        $this->assertSame(0, DB::table('agent_run_export_queue')->where('id', $oversizedQueueId)->count(), 'the oversized row must have been discarded');
+
+        // Exactly one aggregate summary line for the whole invocation.
+        $this->assertCount(
+            1,
+            $forwardedLogEntries,
+            'the aggregate summary must be logged exactly once per invocation, regardless of how many records were processed',
+        );
+
+        $context = $forwardedLogEntries[0]->context;
+        $this->assertArrayHasKey('delivered', $context);
+        $this->assertArrayHasKey('retried', $context);
+        $this->assertArrayHasKey('discarded', $context);
+        $this->assertArrayHasKey('buffer_evicted', $context);
+
+        $this->assertSame(1, $context['delivered']);
+        $this->assertSame(1, $context['retried']);
+        $this->assertSame(1, $context['discarded']);
+        $this->assertSame(3, $context['buffer_evicted']);
+    }
 }

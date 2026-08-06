@@ -70,6 +70,10 @@ class RunTraceRecorder
      * rule as broadcast()). A single local write only -- no network I/O, no
      * payload assembly on this path; that happens later, on the scheduler
      * tick, in ForwardRunTracesCommand.
+     *
+     * Immediately after the insert, trims the buffer back down to
+     * export.buffer_max_records if it overflowed (Phase 5, US3, FR-018) --
+     * on the same request that produced the overflow, oldest rows first.
      */
     private function enqueueForwarding(string $runId): void
     {
@@ -87,12 +91,50 @@ class RunTraceRecorder
                 'next_attempt_at' => null,
                 'created_at' => now()->format('Y-m-d H:i:s'),
             ]);
+
+            $this->trimExportQueueOverflow($config->bufferMaxRecords);
         } catch (\Throwable $e) {
             Log::warning('RunTraceRecorder: enqueueForwarding failed', [
                 'run_id' => $runId,
                 'error' => $e->getMessage(),
             ]);
         }
+    }
+
+    /**
+     * Delete the oldest rows in agent_run_export_queue, by created_at, down
+     * to $bufferMaxRecords -- never the newest (FR-018). The evicted count
+     * is recorded via BufferEvictionCounter's cross-process atomic counter
+     * (the same add-then-increment primitive this codebase already uses for
+     * budget/overflow bookkeeping -- see life-log-backend's RequestBudget)
+     * so ForwardRunTracesCommand can fold it into its next aggregate log
+     * line, even though the eviction itself happens here, on a request
+     * process, not on the scheduler tick.
+     *
+     * SQLite (the test suite's driver) has no DELETE ... ORDER BY ... LIMIT,
+     * so the oldest ids are selected first and then deleted by id -- this
+     * also works unchanged on MySQL/MariaDB in deployment.
+     */
+    private function trimExportQueueOverflow(int $bufferMaxRecords): void
+    {
+        $overflow = DB::table('agent_run_export_queue')->count() - $bufferMaxRecords;
+
+        if ($overflow <= 0) {
+            return;
+        }
+
+        $oldestIds = DB::table('agent_run_export_queue')
+            ->orderBy('created_at')
+            ->limit($overflow)
+            ->pluck('id');
+
+        if ($oldestIds->isEmpty()) {
+            return;
+        }
+
+        DB::table('agent_run_export_queue')->whereIn('id', $oldestIds)->delete();
+
+        BufferEvictionCounter::increment($oldestIds->count());
     }
 
     /**

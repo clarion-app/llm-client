@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Commands;
 
+use ClarionApp\LlmClient\Services\BufferEvictionCounter;
 use ClarionApp\LlmClient\Services\OtlpPayloadBuilder;
 use ClarionApp\LlmClient\ValueObjects\TraceExportConfig;
 use Illuminate\Console\Command;
@@ -17,10 +18,14 @@ use Illuminate\Support\Facades\Log;
  * request/response hot path. RunTraceRecorder::closeRun() only ever inserts
  * a queue row (via enqueueForwarding()); it makes no HTTP call itself.
  *
- * Full retry/backoff (attempt accounting, exponential delay, payload-size
- * precheck) lands in a later phase (US3) -- this first pass never crashes
- * and never leaves a delivered/discarded row behind, but a failed attempt
- * simply leaves the row in place for the next tick to retry unconditionally.
+ * Phase 5 (US3): a payload exceeding export.max_payload_bytes is discarded
+ * with no HTTP attempt (research.md §5); a failed delivery increments
+ * attempts and, below max_attempts, sets next_attempt_at using an
+ * exponential-with-cap backoff (research.md §4) -- at or above max_attempts
+ * the row is deleted (discarded). The per-invocation aggregate log line
+ * also folds in buffer_evicted, read (and reset) once per invocation from
+ * BufferEvictionCounter -- the hot-path buffer-overflow trim happens on a
+ * request process, in RunTraceRecorder::enqueueForwarding(), not here.
  */
 class ForwardRunTracesCommand extends Command
 {
@@ -31,14 +36,26 @@ class ForwardRunTracesCommand extends Command
 
     public function handle(OtlpPayloadBuilder $builder): int
     {
-        $config = TraceExportConfig::resolve();
-        $dryRun = (bool) $this->option('dry-run');
+        try {
+            $config = TraceExportConfig::resolve();
+            $dryRun = (bool) $this->option('dry-run');
 
-        if (!in_array('external', $config->destinations, true)) {
-            return $this->handleForwardingDisabled($dryRun);
+            if (!in_array('external', $config->destinations, true)) {
+                return $this->handleForwardingDisabled($dryRun);
+            }
+
+            return $this->handleDelivery($config, $builder, $dryRun);
+        } catch (\Throwable $e) {
+            // Exit code is always 0 (a destination being down, or any other
+            // failure here, is expected operation, not a command failure --
+            // contracts/cli-commands.md). Nothing about this invocation may
+            // ever crash the scheduler.
+            Log::warning('ForwardRunTracesCommand: invocation failed', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return self::SUCCESS;
         }
-
-        return $this->handleDelivery($config, $builder, $dryRun);
     }
 
     /**
@@ -64,7 +81,7 @@ class ForwardRunTracesCommand extends Command
             DB::table('agent_run_export_queue')->delete();
         }
 
-        $this->reportSummary(delivered: 0, discarded: $count);
+        $this->reportSummary(delivered: 0, retried: 0, discarded: $count, bufferEvicted: BufferEvictionCounter::readAndReset());
 
         return self::SUCCESS;
     }
@@ -91,6 +108,7 @@ class ForwardRunTracesCommand extends Command
         $rows = $dueQuery->get();
 
         $delivered = 0;
+        $retried = 0;
         $discarded = 0;
 
         foreach ($rows as $row) {
@@ -107,17 +125,55 @@ class ForwardRunTracesCommand extends Command
                 continue;
             }
 
+            // Oversized-payload precheck (research.md §5): a payload that is
+            // too large is not going to become smaller on retry, so it is
+            // discarded outright with no HTTP attempt at all -- checked
+            // before deliver() is ever called.
+            $payloadBytes = strlen((string) json_encode($payload));
+            if ($payloadBytes > $config->maxPayloadBytes) {
+                DB::table('agent_run_export_queue')->where('id', $row->id)->delete();
+                $discarded++;
+
+                continue;
+            }
+
             if ($this->deliver($config, $payload)) {
                 DB::table('agent_run_export_queue')->where('id', $row->id)->delete();
                 $delivered++;
+
+                continue;
             }
 
-            // Any other outcome (non-2xx, connection failure, timeout):
-            // leave the row in place. Attempt accounting and backoff are not
-            // implemented yet -- the next tick simply tries again.
+            // Delivery failed (non-2xx, connection error, or timeout):
+            // exponential-with-cap backoff (research.md §4), or discard once
+            // the bound is reached (FR-019/SC-007).
+            $attempts = (int) $row->attempts + 1;
+
+            if ($attempts >= $config->maxAttempts) {
+                DB::table('agent_run_export_queue')->where('id', $row->id)->delete();
+                $discarded++;
+
+                continue;
+            }
+
+            $delaySeconds = min(
+                $config->retryBaseSeconds * (2 ** ($attempts - 1)),
+                $config->retryMaxSeconds,
+            );
+
+            DB::table('agent_run_export_queue')->where('id', $row->id)->update([
+                'attempts' => $attempts,
+                'next_attempt_at' => now()->addSeconds($delaySeconds)->format('Y-m-d H:i:s'),
+            ]);
+            $retried++;
         }
 
-        $this->reportSummary(delivered: $delivered, discarded: $discarded);
+        $this->reportSummary(
+            delivered: $delivered,
+            retried: $retried,
+            discarded: $discarded,
+            bufferEvicted: BufferEvictionCounter::readAndReset(),
+        );
 
         return self::SUCCESS;
     }
@@ -149,13 +205,15 @@ class ForwardRunTracesCommand extends Command
         }
     }
 
-    private function reportSummary(int $delivered, int $discarded): void
+    private function reportSummary(int $delivered, int $retried, int $discarded, int $bufferEvicted): void
     {
         Log::info('Agent run traces forwarded', [
             'delivered' => $delivered,
+            'retried' => $retried,
             'discarded' => $discarded,
+            'buffer_evicted' => $bufferEvicted,
         ]);
 
-        $this->info("Delivered: {$delivered}, Discarded: {$discarded}");
+        $this->info("Delivered: {$delivered}, Retried: {$retried}, Discarded: {$discarded}, Buffer evicted: {$bufferEvicted}");
     }
 }
