@@ -348,6 +348,11 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(EndpointResolver::class, function () {
             return new EndpointResolver();
         });
+
+        // Register content sanitizer for action content redaction and truncation
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ContentSanitizer::class, function () {
+            return new \ClarionApp\LlmClient\Services\ContentSanitizer();
+        });
     }
 
     /**

@@ -388,6 +388,26 @@ return [
         // 60 minutes is conservative against false abandonment of slow queued work
         // and comfortably exceeds the 300-second confirmation timeout.
         'abandonment_minutes' => 60,
+
+        // Per-action content cap in bytes. Content exceeding this is truncated
+        // at write time to prevent a single large tool result from bloating storage.
+        'action_content_cap_bytes' => env('LLM_CLIENT_RUN_TRACE_ACTION_CONTENT_CAP_BYTES', 16384),
+
+        // Maximum action execution time in minutes. Actions exceeding this threshold
+        // are marked 'unfinished' when the run closes.
+        'action_timeout_minutes' => env('LLM_CLIENT_RUN_TRACE_ACTION_TIMEOUT_MINUTES', 5),
+
+        // Maximum number of action rows per run. When exceeded, openAction() returns
+        // null (no-op) and logs a warning, but the agent loop continues normally.
+        'action_row_cap' => env('LLM_CLIENT_RUN_TRACE_ACTION_ROW_CAP', 500),
+
+        // Patterns for credential and secret redaction in action content.
+        'redaction_patterns' => [
+            'headers' => ['authorization', 'x-api-key', 'proxy-authorization'],
+            'json_fields' => ['password', 'secret', 'token', 'api_key', 'access_key', 'private_key'],
+            'url_params' => ['access_token', 'api_key', 'password', 'secret'],
+            'token_prefixes' => ['sk-', 'ghp_', 'gho_', 'ghu_', 'ghs_'],
+        ],
     ],
 ];
 
