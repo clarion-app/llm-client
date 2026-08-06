@@ -29,6 +29,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
     private string $attemptGroupId = '';
     private ?string $runId = null;
     private ?string $stepId = null;
+    private ?string $actionId = null;
 
     public function __construct(
         ?ToolResultCondenser $toolResultCondenser = null,
@@ -134,6 +135,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         // A pre-feature payload has no run_id — mint a fresh run instead.
         $this->runId = $parsedData['run_id'] ?? null;
         $this->stepId = $parsedData['step_id'] ?? null;
+        $this->actionId = $parsedData['action_id'] ?? null;
 
         $conversation = Conversation::find($conversationId);
         if (!$conversation) return;
@@ -201,6 +203,23 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 model: $conversation->model,
                 providerType: $conversation->effectiveProviderType?->value,
             );
+        }
+
+        // Close LLM request action before tool processing.
+        if ($this->actionId !== null && $this->runTraceRecorder !== null) {
+            try {
+                $this->runTraceRecorder->closeAction(
+                    $this->actionId,
+                    \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Success,
+                    null,
+                    json_encode(['reply_length' => strlen($this->reply)]),
+                );
+            } catch (\Throwable $e) {
+                Log::warning('Failed to close LLM request action in finish()', [
+                    'action_id' => $this->actionId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
 
         // If we have tool calls to execute
@@ -299,6 +318,17 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
             $toolCallId = $toolCall['id'] ?? '';
 
+            // Open ToolInvocation action for this tool call.
+            $toolActionId = null;
+            if ($this->runTraceRecorder !== null && $this->stepId !== null) {
+                $toolActionId = $this->runTraceRecorder->openAction(
+                    $this->stepId,
+                    \ClarionApp\LlmClient\ValueObjects\ActionType::ToolInvocation,
+                    $toolName,
+                    $this->attemptGroupId,
+                );
+            }
+
             Log::info('AgentLoopStreamHandler: executing tool', [
                 'tool' => $toolName,
                 'arguments' => $arguments,
@@ -349,6 +379,21 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                             $arguments,
                             $toolName
                         ));
+
+                        // Close tool action as awaiting_confirmation before suspend.
+                        if ($toolActionId !== null && $this->runTraceRecorder !== null) {
+                            try {
+                                $this->runTraceRecorder->closeAction(
+                                    $toolActionId,
+                                    \ClarionApp\LlmClient\ValueObjects\ActionOutcome::AwaitingConfirmation,
+                                );
+                            } catch (\Throwable $e) {
+                                Log::warning('Failed to mark tool action as awaiting_confirmation', [
+                                    'action_id' => $toolActionId,
+                                    'error' => $e->getMessage(),
+                                ]);
+                            }
+                        }
 
                         return; // Suspend for confirmation
                     }
@@ -407,12 +452,57 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         'execute_operation'
                     ));
 
+                    // Close tool action as awaiting_confirmation before suspend.
+                    if ($toolActionId !== null && $this->runTraceRecorder !== null) {
+                        try {
+                            $this->runTraceRecorder->closeAction(
+                                $toolActionId,
+                                \ClarionApp\LlmClient\ValueObjects\ActionOutcome::AwaitingConfirmation,
+                            );
+                        } catch (\Throwable $e) {
+                            Log::warning('Failed to mark tool action as awaiting_confirmation', [
+                                'action_id' => $toolActionId,
+                                'error' => $e->getMessage(),
+                            ]);
+                        }
+                    }
+
                     return; // Suspend for confirmation
                 }
             }
 
-            // Condense tool result if oversized
+            // Condense tool result if oversized (T054a: ContextReshape brackets)
+            $reshapeActionId = null;
+            if ($this->runTraceRecorder !== null && $toolActionId !== null) {
+                $reshapeActionId = $this->runTraceRecorder->openAction(
+                    $this->stepId,
+                    \ClarionApp\LlmClient\ValueObjects\ActionType::ContextReshape,
+                    'condense_tool_result',
+                    $this->attemptGroupId,
+                    $toolActionId,
+                );
+            }
             $toolResultEntry = $this->condenseToolResult($result, $conversationId, $toolName);
+            if ($reshapeActionId !== null && $this->runTraceRecorder !== null) {
+                try {
+                    $this->runTraceRecorder->closeAction(
+                        $reshapeActionId,
+                        \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Success,
+                        null,
+                        json_encode([
+                            'original_tokens' => $toolResultEntry['original_tokens'] ?? null,
+                            'condensed_tokens' => $toolResultEntry['condensed_tokens'] ?? null,
+                            'method' => $toolResultEntry['method'] ?? null,
+                        ]),
+                    );
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to close context_reshape action', [
+                        'action_id' => $reshapeActionId,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
             $toolResults[] = [
                 'tool_call_id' => $toolCallId,
                 'content' => $toolResultEntry['content'],
@@ -423,9 +513,10 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             // Record tool invocation metrics (fire-and-forget, never throws).
             // Success/failure derived from the tool result: meta tools signal
             // failure with a JSON payload containing an "error" key.
+            $toolError = null;
             if ($this->metricsRecorder !== null) {
                 $resultDecoded = json_decode($result, true);
-                $error = (is_array($resultDecoded) && isset($resultDecoded['error']))
+                $toolError = (is_array($resultDecoded) && isset($resultDecoded['error']))
                     ? (string) $resultDecoded['error']
                     : null;
 
@@ -434,9 +525,29 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     userId: (string) $conversation->user_id,
                     attemptGroupId: $this->attemptGroupId,
                     toolName: $toolName,
-                    success: $error === null,
-                    failureCategory: $error === null ? null : \ClarionApp\LlmClient\ValueObjects\ToolFailureCategory::fromErrorMessage($error),
+                    success: $toolError === null,
+                    failureCategory: $toolError === null ? null : \ClarionApp\LlmClient\ValueObjects\ToolFailureCategory::fromErrorMessage($toolError),
                 );
+            }
+
+            // Close ToolInvocation action.
+            if ($toolActionId !== null && $this->runTraceRecorder !== null) {
+                try {
+                    $outcome = $toolError === null
+                        ? \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Success
+                        : \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Failure;
+                    $this->runTraceRecorder->closeAction(
+                        $toolActionId,
+                        $outcome,
+                        $toolError,
+                        null,
+                    );
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to close tool_invocation action', [
+                        'action_id' => $toolActionId,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             }
         }
 

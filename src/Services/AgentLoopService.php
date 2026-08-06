@@ -158,10 +158,24 @@ class AgentLoopService
         $tools = $this->buildToolsPayload();
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
-        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+
+        // Measure context window trim timing for retroactive action recording.
+        $reshapeTuple = null;
+        if ($this->runTraceRecorder !== null) {
+            $trimStartedAt = new \DateTimeImmutable();
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+            $trimEndedAt = new \DateTimeImmutable();
+            $reshapeTuple = [
+                'started_at' => $trimStartedAt,
+                'ended_at' => $trimEndedAt,
+            ];
+        } else {
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+        }
+
         $formatted = $this->formatMessages($conversation, $trimmed);
 
-        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId, $reshapeTuple);
     }
 
     public function resume(Conversation $conversation, Message $message, bool $approved): void
@@ -258,9 +272,23 @@ class AgentLoopService
         $tools = $this->buildToolsPayload();
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
-        $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+
+        // Measure context window trim timing for retroactive action recording.
+        $reshapeTuple = null;
+        if ($this->runTraceRecorder !== null) {
+            $trimStartedAt = new \DateTimeImmutable();
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+            $trimEndedAt = new \DateTimeImmutable();
+            $reshapeTuple = [
+                'started_at' => $trimStartedAt,
+                'ended_at' => $trimEndedAt,
+            ];
+        } else {
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+        }
+
         $formatted = $this->formatMessages($conversation, $trimmed);
-        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId, $reshapeTuple);
     }
 
     /**
@@ -2116,6 +2144,7 @@ class AgentLoopService
         string $system = '',
         ?string $responseFormat = null,
         ?string $runId = null,
+        ?array $reshapeTuple = null,
     ): void {
         $server = Server::find($conversation->server_id);
         $resolver = app(EndpointResolver::class);
@@ -2160,9 +2189,36 @@ class AgentLoopService
         // wait in the step's duration.
         $stepId = null;
         $attemptGroupId = (string) Str::uuid();
+        $actionId = null;
         if ($this->runTraceRecorder !== null && $runId !== null) {
             // Derive step position from 1 + COUNT(*) for the run.
             $stepId = $this->runTraceRecorder->openStep($runId, null, $attemptGroupId);
+
+            // Write context reshape action retroactively if trim ran before step creation.
+            if ($reshapeTuple !== null && $stepId !== null) {
+                $this->runTraceRecorder->recordCompletedAction(
+                    $stepId,
+                    \ClarionApp\LlmClient\ValueObjects\ActionType::ContextReshape,
+                    \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Success,
+                    $reshapeTuple['started_at'],
+                    $reshapeTuple['ended_at'],
+                    'window_trim',
+                    $attemptGroupId,
+                    null,
+                    null,
+                    $reshapeTuple['content'] ?? null,
+                );
+            }
+
+            // Open LLM request action — spans from dispatch to finish().
+            if ($stepId !== null) {
+                $actionId = $this->runTraceRecorder->openAction(
+                    $stepId,
+                    \ClarionApp\LlmClient\ValueObjects\ActionType::LlmRequest,
+                    $conversation->model,
+                    $attemptGroupId,
+                );
+            }
         }
 
         $data = json_encode([
@@ -2170,6 +2226,7 @@ class AgentLoopService
             'iteration' => $iteration,
             'run_id' => $runId,
             'step_id' => $stepId,
+            'action_id' => $actionId,
         ]);
 
         SendHttpStreamRequest::dispatch(

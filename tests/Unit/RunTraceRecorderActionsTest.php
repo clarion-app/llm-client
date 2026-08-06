@@ -637,4 +637,74 @@ class RunTraceRecorderActionsTest extends TestCase
         $this->assertLessThanOrEqual(64, strlen($action->content));
         $this->assertStringContainsString('[TRUNCATED', $action->content);
     }
+
+    // ========== T049: concurrent actions ==========
+
+    /** @test */
+    public function two_actions_opened_before_either_is_closed_create_independent_rows(): void
+    {
+        [$recorder, , $stepId] = $this->setupRunAndStep();
+
+        // Open two actions before closing either
+        $actionId1 = $recorder->openAction($stepId, ActionType::ToolInvocation, 'tool_one');
+        $actionId2 = $recorder->openAction($stepId, ActionType::ToolInvocation, 'tool_two');
+        $this->assertNotNull($actionId1);
+        $this->assertNotNull($actionId2);
+        $this->assertNotEquals($actionId1, $actionId2);
+
+        // Close first action
+        $recorder->closeAction($actionId1, ActionOutcome::Success);
+
+        // Close second action
+        $recorder->closeAction($actionId2, ActionOutcome::Success);
+
+        // Both rows exist with correct step_id
+        $row1 = DB::table('agent_run_actions')->where('id', $actionId1)->first();
+        $row2 = DB::table('agent_run_actions')->where('id', $actionId2)->first();
+        $this->assertEquals($stepId, $row1->step_id);
+        $this->assertEquals($stepId, $row2->step_id);
+
+        // Action 1 started before action 2
+        $this->assertLessThan($row2->started_at, $row1->started_at);
+        // Action 2 ended after action 1 (overlap: action 2 opened before action 1 closed)
+        $this->assertGreaterThan($row1->ended_at, $row2->ended_at);
+        // Action 2 started before action 1 ended (overlap)
+        $this->assertLessThan($row1->ended_at, $row2->started_at);
+
+        // Both are success
+        $this->assertEquals('success', $row1->outcome);
+        $this->assertEquals('success', $row2->outcome);
+    }
+
+    // ========== T050: nested actions ==========
+
+    /** @test */
+    public function nested_action_via_parent_action_id_preserves_hierarchy(): void
+    {
+        [$recorder, , $stepId] = $this->setupRunAndStep();
+
+        // Open parent action
+        $parentId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'parent_tool');
+        $this->assertNotNull($parentId);
+
+        // Open child action with parent_action_id
+        $childId = $recorder->openAction($stepId, ActionType::ContextReshape, 'trim', null, $parentId);
+        $this->assertNotNull($childId);
+
+        // Close child first, then parent
+        $recorder->closeAction($childId, ActionOutcome::Success);
+        $recorder->closeAction($parentId, ActionOutcome::Success);
+
+        // Verify parent-child relationship
+        $childRow = DB::table('agent_run_actions')->where('id', $childId)->first();
+        $this->assertEquals($parentId, $childRow->parent_action_id);
+
+        // Parent has no parent
+        $parentRow = DB::table('agent_run_actions')->where('id', $parentId)->first();
+        $this->assertNull($parentRow->parent_action_id);
+
+        // Child started after parent, ended before parent
+        $this->assertGreaterThanOrEqual($parentRow->started_at, $childRow->started_at);
+        $this->assertLessThanOrEqual($parentRow->ended_at, $childRow->ended_at);
+    }
 }
