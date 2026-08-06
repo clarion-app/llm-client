@@ -717,7 +717,7 @@ class RunTraceRecorder
             }
 
             // Compute duration from caller's measured times, never the write time (C25).
-            $durationMs = $this->elapsedMs($startedAt->format(self::TIMESTAMP_FORMAT), $endedAt, [
+            $durationMs = $this->elapsedMs($startedAt->format(self::TIMESTAMP_FORMAT), \Carbon\Carbon::instance($endedAt), [
                 'method' => 'recordCompletedAction',
             ]);
 
