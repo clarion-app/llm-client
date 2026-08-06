@@ -3,9 +3,11 @@
 namespace Tests\Unit;
 
 use ClarionApp\LlmClient\Services\OtlpPayloadBuilder;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
+use ClarionApp\LlmClient\ValueObjects\RunKind;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -532,5 +534,75 @@ class OtlpPayloadBuilderTest extends TestCase
 
         $this->assertNotNull($actionSpan);
         $this->assertStringNotContainsString($secretValue, json_encode($actionSpan));
+    }
+
+    /**
+     * SC-009 end-to-end: unlike the two tests above (which insert already-plain
+     * content directly into agent_run_actions and only exercise
+     * OtlpPayloadBuilder's own defense-in-depth sanitize() calls on
+     * target/failure_reason), this test drives the *full* production path for
+     * the `content` field -- RunTraceRecorder::closeAction() (which passes
+     * content through ContentSanitizer::prepare() at write time) followed by
+     * OtlpPayloadBuilder::build() (which carries content verbatim, per
+     * contracts/otlp-export-payload.md's "Content handling") -- with tool
+     * arguments/results shaped like a real credential leak: a Bearer token, an
+     * sk-prefixed API key, and an access_token query-string parameter, each in
+     * a different action's content. Proves zero occurrences of any of the
+     * three secret values survive end to end into the built OTLP payload.
+     */
+    #[Test]
+    public function content_with_credential_shaped_strings_recorded_via_run_trace_recorder_is_redacted_end_to_end(): void
+    {
+        $bearerSecret = 'SC009BEARERTOKENVALUE123456';
+        $apiKeySecret = 'sk-SC009APIKEYVALUE1234567890ABCDEF';
+        $accessTokenSecret = 'SC009ACCESSTOKENVALUE987654321';
+
+        $recorder = $this->app->make(RunTraceRecorder::class);
+
+        $userId = (string) Str::uuid();
+        $runId = $recorder->openRun(RunKind::Interactive, $userId);
+        $this->assertNotNull($runId);
+
+        $stepId = $recorder->openStep($runId);
+        $this->assertNotNull($stepId);
+
+        $bearerActionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'contacts.store');
+        $recorder->closeAction(
+            $bearerActionId,
+            ActionOutcome::Success,
+            content: json_encode(['headers' => ['Authorization' => "Bearer {$bearerSecret}"]]),
+        );
+
+        $apiKeyActionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'billing.charge');
+        $recorder->closeAction(
+            $apiKeyActionId,
+            ActionOutcome::Success,
+            content: json_encode(['api_key' => $apiKeySecret]),
+        );
+
+        $accessTokenActionId = $recorder->openAction($stepId, ActionType::ToolInvocation, 'oauth.callback');
+        $recorder->closeAction(
+            $accessTokenActionId,
+            ActionOutcome::Success,
+            content: "result: https://api.example.com/callback?access_token={$accessTokenSecret}&ok=1",
+        );
+
+        $recorder->closeStep($stepId, RunEndState::Completed);
+        $recorder->closeRun($runId, RunEndState::Completed);
+
+        $builder = new OtlpPayloadBuilder();
+        $payload = $builder->build($runId);
+
+        $this->assertIsArray($payload);
+        $encoded = json_encode($payload);
+
+        $this->assertStringNotContainsString($bearerSecret, $encoded);
+        $this->assertStringNotContainsString($apiKeySecret, $encoded);
+        $this->assertStringNotContainsString($accessTokenSecret, $encoded);
+
+        // Belt-and-braces: confirm redaction markers are actually present
+        // (i.e. the assertions above pass because the secret was redacted,
+        // not because the content silently went missing from the payload).
+        $this->assertStringContainsString('[REDACTED]', $encoded);
     }
 }
