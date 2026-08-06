@@ -453,5 +453,21 @@ abstract class TestCase extends BaseTestCase
             });
         }
 
+        // agent_run_export_queue table (for trace forwarding buffer).
+        if (!Schema::hasTable('agent_run_export_queue')) {
+            Schema::create('agent_run_export_queue', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('run_id');
+                $table->unsignedTinyInteger('attempts')->default(0);
+                $table->timestamp('next_attempt_at')->nullable();
+                $table->string('last_error', 512)->nullable();
+                $table->timestamp('created_at');
+
+                $table->index('run_id');
+                $table->index('next_attempt_at');
+                $table->index('created_at');
+            });
+        }
+
     }
 }
