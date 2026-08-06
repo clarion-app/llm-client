@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
+use ClarionApp\LlmClient\ValueObjects\TraceExportConfig;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -56,6 +57,39 @@ class RunTraceRecorder
             $emit();
         } catch (\Throwable $e) {
             Log::warning('RunTraceRecorder: broadcast failed', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Enqueue this run for external forwarding (Phase 4, US2), in its own
+     * inner try/catch mirroring broadcast()'s isolation pattern immediately
+     * above: a failure here must never undo or mask closeRun()'s own write,
+     * nor change closeRun()'s return value (void here, but the same standing
+     * rule as broadcast()). A single local write only -- no network I/O, no
+     * payload assembly on this path; that happens later, on the scheduler
+     * tick, in ForwardRunTracesCommand.
+     */
+    private function enqueueForwarding(string $runId): void
+    {
+        try {
+            $config = TraceExportConfig::resolve();
+
+            if (!in_array('external', $config->destinations, true)) {
+                return;
+            }
+
+            DB::table('agent_run_export_queue')->insert([
+                'id' => (string) Str::uuid(),
+                'run_id' => $runId,
+                'attempts' => 0,
+                'next_attempt_at' => null,
+                'created_at' => now()->format('Y-m-d H:i:s'),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: enqueueForwarding failed', [
+                'run_id' => $runId,
                 'error' => $e->getMessage(),
             ]);
         }
@@ -341,6 +375,8 @@ class RunTraceRecorder
                     'duration_ms' => $durationMs,
                     'step_count' => $stepCount,
                 ]);
+
+            $this->enqueueForwarding($runId);
 
             $this->broadcast(fn () => event(new RunUpdated($runId)));
 

@@ -116,6 +116,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\PurgeExpiredContextManagementMetricsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand::class,
+                \ClarionApp\LlmClient\Commands\ForwardRunTracesCommand::class,
                 \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
             ]);
         }
@@ -143,6 +144,12 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // Purge expired agent run traces daily.
             $schedule->command('llm-client:purge-run-traces')
                 ->daily()
+                ->withoutOverlapping();
+
+            // Drain the external-forwarding buffer every minute. A tick with
+            // nothing due (forwarding disabled, or nothing queued) is a no-op.
+            $schedule->command('llm-client:forward-run-traces')
+                ->everyMinute()
                 ->withoutOverlapping();
         });
 
