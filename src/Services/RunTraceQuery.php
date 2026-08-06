@@ -446,6 +446,64 @@ class RunTraceQuery
     }
 
     /**
+     * Full detail for a single action the caller owns — the only projection
+     * that includes `content` (data-model.md §1.4, FR-006/FR-007). Mirrors
+     * actionSummaryChildren()'s action -> run -> user_id ownership check,
+     * plus a defense-in-depth check that the action's own run_id matches the
+     * `runId` segment of the request path (contracts/run-read-api.md).
+     * `content_truncated` is computed by the caller (RunController) via
+     * ContentSanitizer::isTruncated() at read time — this method surfaces
+     * the raw (already sanitized/truncated-at-write-time) `content` column.
+     *
+     * @return array{
+     *     id: string, run_id: string, step_id: string,
+     *     parent_action_id: string|null, action_type: string,
+     *     target: string|null, outcome: string, failure_reason: string|null,
+     *     started_at: string, ended_at: string|null, duration_ms: int|null,
+     *     has_children: bool, content: string|null
+     * }|null Null when absent, not owned by the caller, or under a different
+     *        run than $runId (FR-014).
+     */
+    public function actionDetailRow(string $callerUserId, string $runId, string $actionId): ?array
+    {
+        $row = DB::table('agent_run_actions')
+            ->where('id', $actionId)
+            ->first();
+
+        if ($row === null || $row->run_id !== $runId) {
+            return null;
+        }
+
+        $ownerUserId = DB::table('agent_runs')
+            ->where('id', $row->run_id)
+            ->value('user_id');
+
+        if ($ownerUserId !== $callerUserId) {
+            return null;
+        }
+
+        $hasChildren = DB::table('agent_run_actions')
+            ->where('parent_action_id', $actionId)
+            ->exists();
+
+        return [
+            'id' => $row->id,
+            'run_id' => $row->run_id,
+            'step_id' => $row->step_id,
+            'parent_action_id' => $row->parent_action_id,
+            'action_type' => $row->action_type,
+            'target' => $row->target,
+            'outcome' => $row->outcome,
+            'failure_reason' => $row->failure_reason,
+            'started_at' => $row->started_at,
+            'ended_at' => $row->ended_at,
+            'duration_ms' => $row->duration_ms,
+            'has_children' => $hasChildren,
+            'content' => $row->content,
+        ];
+    }
+
+    /**
      * Convert a raw DB row to the standardized action array shape.
      */
     private function actionRowToArray($row): array

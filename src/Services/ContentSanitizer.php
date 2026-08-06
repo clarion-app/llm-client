@@ -86,6 +86,17 @@ class ContentSanitizer
     }
 
     /**
+     * Whether content was truncated by truncate() — determined by an exact
+     * suffix match against TRUNCATION_MARKER, not mere substring containment
+     * (research.md D4). Content that merely contains the marker text
+     * mid-string (e.g. emitted verbatim by a model) is not "truncated".
+     */
+    public function isTruncated(string $content): bool
+    {
+        return str_ends_with($content, self::TRUNCATION_MARKER);
+    }
+
+    /**
      * Build regex patterns from config. Patterns are compiled once at construction.
      */
     private function buildPatterns(): void

@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\AgentRun;
+use ClarionApp\LlmClient\Services\ContentSanitizer;
 use ClarionApp\LlmClient\Services\RunTraceQuery;
 use Auth;
 use Illuminate\Http\JsonResponse;
@@ -25,7 +26,8 @@ use Illuminate\Support\Facades\DB;
 class RunController extends Controller
 {
     public function __construct(
-        private readonly RunTraceQuery $runTraceQuery
+        private readonly RunTraceQuery $runTraceQuery,
+        private readonly ContentSanitizer $contentSanitizer,
     ) {}
 
     /**
@@ -130,6 +132,44 @@ class RunController extends Controller
         }
 
         return response()->json($this->envelope($result['data'], $result['total'], $page, $perPage));
+    }
+
+    /**
+     * GET /agent-runs/{runId}/actions/{actionId} — the single selected
+     * action's full detail: every ActionSummary field plus `content` and
+     * `content_truncated` (US2, FR-005, FR-006, FR-007). The only endpoint
+     * on this controller that returns `content`. `content_truncated` is
+     * computed at read time via ContentSanitizer::isTruncated() (T036,
+     * research.md D4) against the already sanitized/truncated-at-write-time
+     * `content` column — no re-sanitization happens here.
+     */
+    public function actionDetail(Request $request, string $runId, string $actionId): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $action = $this->runTraceQuery->actionDetailRow($callerUserId, $runId, $actionId);
+        if ($action === null) {
+            return $this->notFoundResponse();
+        }
+
+        $content = $action['content'];
+
+        return response()->json([
+            'id' => $action['id'],
+            'run_id' => $action['run_id'],
+            'step_id' => $action['step_id'],
+            'parent_action_id' => $action['parent_action_id'],
+            'action_type' => $action['action_type'],
+            'target' => $action['target'],
+            'outcome' => $action['outcome'],
+            'failure_reason' => $action['failure_reason'],
+            'started_at' => $action['started_at'],
+            'ended_at' => $action['ended_at'],
+            'duration_ms' => $action['duration_ms'],
+            'has_children' => $action['has_children'],
+            'content' => $content,
+            'content_truncated' => $content !== null && $this->contentSanitizer->isTruncated($content),
+        ]);
     }
 
     /**

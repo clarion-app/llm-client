@@ -523,4 +523,168 @@ class RunControllerTest extends TestCase
         $response->assertStatus(404)
             ->assertExactJson(['error' => 'Run not found', 'code' => 'run_not_found']);
     }
+
+    // ========================================================================
+    // T034 — GET /agent-runs/{runId}/actions/{actionId} (US2 — action detail,
+    // the only endpoint that returns `content`)
+    // ========================================================================
+
+    #[Test]
+    public function action_detail_returns_content_and_content_truncated_keys(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        $actionId = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'search_operations');
+        $this->recorder->closeAction($actionId, ActionOutcome::Success, null, 'short result content');
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$actionId}");
+
+        $response->assertStatus(200)
+            ->assertJsonStructure([
+                'id', 'run_id', 'step_id', 'parent_action_id', 'action_type', 'target',
+                'outcome', 'failure_reason', 'started_at', 'ended_at', 'duration_ms',
+                'has_children', 'content', 'content_truncated',
+            ])
+            ->assertJson([
+                'id' => $actionId,
+                'run_id' => $runId,
+                'step_id' => $stepId,
+                'content' => 'short result content',
+                'content_truncated' => false,
+            ]);
+    }
+
+    #[Test]
+    public function action_detail_content_is_null_when_action_recorded_none(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        $actionId = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'search_operations');
+        // No content passed to closeAction() — an outcome was recorded, but
+        // nothing content-bearing (contracts/run-read-api.md's "still
+        // in_progress, or a type that never captures content" case).
+        $this->recorder->closeAction($actionId, ActionOutcome::Success, null, null);
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$actionId}");
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'content' => null,
+                'content_truncated' => false,
+            ]);
+    }
+
+    #[Test]
+    public function action_detail_content_truncated_true_for_truncated_content(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        $actionId = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'search_operations');
+        // Well over the default 16384-byte cap — ContentSanitizer::prepare()
+        // truncates and appends its marker at write time (068 FR-006/FR-007);
+        // this endpoint's content_truncated must reflect that (research.md D4).
+        $this->recorder->closeAction($actionId, ActionOutcome::Success, null, str_repeat('x', 20000));
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$actionId}");
+
+        $response->assertStatus(200)
+            ->assertJson(['content_truncated' => true]);
+        $this->assertStringEndsWith(
+            "\n\n[TRUNCATED: original content exceeded cap]",
+            $response->json('content'),
+        );
+    }
+
+    #[Test]
+    public function action_detail_returns_uniform_404_for_other_users_action(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        $actionId = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'search_operations');
+        $this->recorder->closeAction($actionId, ActionOutcome::Success, null, 'result');
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->otherUser)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$actionId}");
+
+        $response->assertStatus(404)
+            ->assertExactJson(['error' => 'Run not found', 'code' => 'run_not_found']);
+    }
+
+    #[Test]
+    public function action_detail_returns_uniform_404_for_action_under_a_different_run_in_path(): void
+    {
+        // Defense in depth (contracts/run-read-api.md): the action id is real
+        // and owned by the caller, but the runId segment of the path names a
+        // different run than the one the action actually belongs to.
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        $actionId = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'search_operations');
+        $this->recorder->closeAction($actionId, ActionOutcome::Success, null, 'result');
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $otherRunId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $this->recorder->closeRun($otherRunId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$otherRunId}/actions/{$actionId}");
+
+        $response->assertStatus(404)
+            ->assertExactJson(['error' => 'Run not found', 'code' => 'run_not_found']);
+    }
+
+    #[Test]
+    public function action_detail_returns_404_for_nonexistent_action(): void
+    {
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $this->recorder->closeRun($runId, RunEndState::Completed);
+
+        $response = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/" . (string) Str::uuid());
+
+        $response->assertStatus(404)
+            ->assertExactJson(['error' => 'Run not found', 'code' => 'run_not_found']);
+    }
+
+    #[Test]
+    public function action_summary_endpoints_still_never_include_content_alongside_detail_endpoint(): void
+    {
+        // Regression guard (T014/T015, US1): once the detail endpoint gains
+        // `content`, the summary endpoints it sits alongside — step-actions
+        // and action-children — must still never leak it.
+        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        $stepId = $this->recorder->openStep($runId);
+        $parentAction = $this->recorder->openAction($stepId, ActionType::ToolInvocation, 'parent_op');
+        $childAction = $this->recorder->openAction($stepId, ActionType::LlmRequest, 'child_op', null, $parentAction);
+        $this->recorder->closeAction($childAction, ActionOutcome::Success, null, 'sensitive child content');
+        $this->recorder->closeAction($parentAction, ActionOutcome::Success, null, 'sensitive parent content');
+        $this->recorder->closeStep($stepId, RunEndState::Completed);
+
+        $stepActionsResponse = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/steps/{$stepId}/actions");
+        $childrenResponse = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$parentAction}/children");
+        $detailResponse = $this->actingAsUser($this->user)
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/actions/{$parentAction}");
+
+        $stepActionsResponse->assertStatus(200);
+        foreach ($stepActionsResponse->json('data') as $action) {
+            $this->assertArrayNotHasKey('content', $action);
+        }
+
+        $childrenResponse->assertStatus(200);
+        foreach ($childrenResponse->json('data') as $action) {
+            $this->assertArrayNotHasKey('content', $action);
+        }
+
+        // Contrast: the detail endpoint, and only the detail endpoint, carries content.
+        $detailResponse->assertStatus(200)
+            ->assertJson(['content' => 'sensitive parent content']);
+    }
 }

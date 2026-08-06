@@ -332,4 +332,52 @@ class ContentSanitizerTest extends TestCase
         $this->assertStringContainsString('[REDACTED]', $result);
         $this->assertLessThanOrEqual(128, strlen($result));
     }
+
+    // ========== isTruncated() (T033, US2 — research.md D4) ==========
+
+    /** @test */
+    public function is_truncated_true_for_content_ending_in_exact_marker(): void
+    {
+        $sanitizer = $this->makeSanitizer();
+        $content = 'some captured content' . "\n\n[TRUNCATED: original content exceeded cap]";
+
+        $this->assertTrue($sanitizer->isTruncated($content));
+    }
+
+    /** @test */
+    public function is_truncated_false_for_untruncated_content(): void
+    {
+        $sanitizer = $this->makeSanitizer();
+
+        $this->assertFalse($sanitizer->isTruncated('plain, untruncated content'));
+        $this->assertFalse($sanitizer->isTruncated(''));
+    }
+
+    /** @test */
+    public function is_truncated_false_when_marker_text_appears_mid_string_not_as_suffix(): void
+    {
+        $sanitizer = $this->makeSanitizer();
+
+        // The exact marker text is present, but truncate() never appended it —
+        // it merely occurs mid-string (e.g. the model itself emitted text that
+        // happens to match). isTruncated() must key off suffix position, not
+        // mere substring containment (research.md D4, quickstart.md mutation
+        // row 4).
+        $content = 'before ' . "\n\n[TRUNCATED: original content exceeded cap]" . ' after — not actually truncated';
+
+        $this->assertFalse($sanitizer->isTruncated($content));
+    }
+
+    /** @test */
+    public function is_truncated_matches_actual_truncate_output(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.action_content_cap_bytes', 50);
+        $sanitizer = $this->makeSanitizer();
+
+        $truncated = $sanitizer->truncate(str_repeat('x', 200));
+        $this->assertTrue($sanitizer->isTruncated($truncated));
+
+        $unaffected = $sanitizer->truncate('short content');
+        $this->assertFalse($sanitizer->isTruncated($unaffected));
+    }
 }

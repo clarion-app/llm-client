@@ -71,6 +71,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agent-runs/{runId}/steps', [RunController::class, "steps"]);
     Route::get('agent-runs/{runId}/steps/{stepId}/actions', [RunController::class, "stepActions"]);
     Route::get('agent-runs/{runId}/actions/{actionId}/children', [RunController::class, "actionChildren"]);
+    // Agent run execution graph action-detail endpoint (070 US2)
+    Route::get('agent-runs/{runId}/actions/{actionId}', [RunController::class, "actionDetail"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
