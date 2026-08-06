@@ -22,6 +22,9 @@ use PHPUnit\Framework\Attributes\Test;
  */
 class PurgeExpiredRunTracesCommandTest extends TestCase
 {
+    /** @var array<int, object{level:string,message:string,context:array}> */
+    private array $warnings = [];
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -29,6 +32,13 @@ class PurgeExpiredRunTracesCommandTest extends TestCase
         // Enable run tracing and set retention for tests.
         $this->app['config']->set('llm-client.run_trace.enabled', true);
         $this->app['config']->set('llm-client.run_trace.retention_days', 90);
+
+        $this->warnings = [];
+        Log::listen(function ($entry) {
+            if ($entry->level === 'warning') {
+                $this->warnings[] = $entry;
+            }
+        });
     }
 
     protected function tearDown(): void
@@ -421,5 +431,144 @@ class PurgeExpiredRunTracesCommandTest extends TestCase
             $widestBinding,
             'No single delete may bind more ids than the chunk size',
         );
+    }
+
+    // ========== FR-013: invalid retention_days falls back to the documented default ==========
+
+    /**
+     * Inserts one run just past the documented 90-day default (must be purged
+     * when the supplied retention input is invalid and the default applies)
+     * and one run comfortably inside it (must survive) — then runs the purge
+     * command with the given options and asserts the 90-day default cutoff,
+     * not the invalid input, was what actually governed the outcome.
+     */
+    private function assertDefaultNinetyDayCutoffWasApplied(array $artisanOptions): void
+    {
+        $userId = (string) Str::uuid();
+
+        $expiredRunId = (string) Str::uuid();
+        $expiredTime = CarbonImmutable::now()->subDays(95);
+        $this->insertRun($expiredRunId, $userId, RunEndState::Completed->value,
+            $expiredTime->format('Y-m-d H:i:s.u'),
+            $expiredTime->addHour()->format('Y-m-d H:i:s.u'),
+            3600000,
+            0);
+
+        $survivingRunId = (string) Str::uuid();
+        $survivingTime = CarbonImmutable::now()->subDays(30);
+        $this->insertRun($survivingRunId, $userId, RunEndState::Completed->value,
+            $survivingTime->format('Y-m-d H:i:s.u'),
+            $survivingTime->addHour()->format('Y-m-d H:i:s.u'),
+            3600000,
+            0);
+
+        $exitCode = Artisan::call('llm-client:purge-run-traces', $artisanOptions);
+
+        $this->assertSame(0, $exitCode);
+
+        $this->assertEquals(
+            0,
+            DB::table('agent_runs')->where('id', $expiredRunId)->count(),
+            'a run older than the documented 90-day default must be purged once the invalid retention input falls back to it',
+        );
+        $this->assertEquals(
+            1,
+            DB::table('agent_runs')->where('id', $survivingRunId)->count(),
+            'a run inside the documented 90-day default must survive once the invalid retention input falls back to it',
+        );
+    }
+
+    /**
+     * Asserts exactly one Log::warning fired for this invocation, with the
+     * documented message, and that its context names the rejected value.
+     */
+    private function assertInvalidRetentionWarningWasLoggedOnce(mixed $rejectedValue): void
+    {
+        $this->assertCount(
+            1,
+            $this->warnings,
+            'expected exactly one Log::warning for an invalid retention_days input, got: '
+                . json_encode(array_map(fn ($w) => ['message' => $w->message, 'context' => $w->context], $this->warnings)),
+        );
+
+        $warning = $this->warnings[0];
+
+        $this->assertSame(
+            'PurgeExpiredRunTracesCommand: invalid retention_days, using default',
+            $warning->message,
+        );
+
+        $namesRejectedValue = false;
+        foreach ($warning->context as $contextValue) {
+            if ($contextValue === $rejectedValue || (string) $contextValue === (string) $rejectedValue) {
+                $namesRejectedValue = true;
+                break;
+            }
+        }
+
+        $this->assertTrue(
+            $namesRejectedValue,
+            'expected the warning context to name the rejected value ' . var_export($rejectedValue, true)
+                . ', got context: ' . var_export($warning->context, true),
+        );
+    }
+
+    #[Test]
+    public function non_numeric_days_option_falls_back_to_default_and_logs_once()
+    {
+        $this->assertDefaultNinetyDayCutoffWasApplied(['--days' => 'abc']);
+        $this->assertInvalidRetentionWarningWasLoggedOnce('abc');
+    }
+
+    #[Test]
+    public function zero_days_option_falls_back_to_default_and_logs_once()
+    {
+        $this->assertDefaultNinetyDayCutoffWasApplied(['--days' => 0]);
+        $this->assertInvalidRetentionWarningWasLoggedOnce(0);
+    }
+
+    #[Test]
+    public function negative_days_option_falls_back_to_default_and_logs_once()
+    {
+        $this->assertDefaultNinetyDayCutoffWasApplied(['--days' => -5]);
+        $this->assertInvalidRetentionWarningWasLoggedOnce(-5);
+    }
+
+    #[Test]
+    public function absent_days_option_with_unset_config_falls_back_to_default_and_logs_once()
+    {
+        // Simulates an installation whose config file/env is missing the key
+        // entirely, rather than one that explicitly set it to something valid.
+        $this->app['config']->offsetUnset('llm-client.run_trace.retention_days');
+
+        $this->assertDefaultNinetyDayCutoffWasApplied([]);
+        $this->assertInvalidRetentionWarningWasLoggedOnce(null);
+    }
+
+    #[Test]
+    public function absent_days_option_with_non_numeric_config_falls_back_to_default_and_logs_once()
+    {
+        $this->app['config']->set('llm-client.run_trace.retention_days', 'abc');
+
+        $this->assertDefaultNinetyDayCutoffWasApplied([]);
+        $this->assertInvalidRetentionWarningWasLoggedOnce('abc');
+    }
+
+    #[Test]
+    public function absent_days_option_with_zero_config_falls_back_to_default_and_logs_once()
+    {
+        $this->app['config']->set('llm-client.run_trace.retention_days', 0);
+
+        $this->assertDefaultNinetyDayCutoffWasApplied([]);
+        $this->assertInvalidRetentionWarningWasLoggedOnce(0);
+    }
+
+    #[Test]
+    public function absent_days_option_with_negative_config_falls_back_to_default_and_logs_once()
+    {
+        $this->app['config']->set('llm-client.run_trace.retention_days', -5);
+
+        $this->assertDefaultNinetyDayCutoffWasApplied([]);
+        $this->assertInvalidRetentionWarningWasLoggedOnce(-5);
     }
 }

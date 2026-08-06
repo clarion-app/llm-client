@@ -28,9 +28,13 @@ class PurgeExpiredRunTracesCommand extends Command
     /** Runs deleted per pass. Keeps each `whereIn` well inside SQLite's 999-parameter cap. */
     private const CHUNK_SIZE = 500;
 
+    /** Documented fallback retention window (FR-013) when the supplied value can't be trusted. */
+    private const DEFAULT_RETENTION_DAYS = 90;
+
     public function handle(): int
     {
-        $days = (int) ($this->option('days') ?? config('llm-client.run_trace.retention_days', 90));
+        $rawDays = $this->option('days') ?? config('llm-client.run_trace.retention_days');
+        $days = $this->resolveRetentionDays($rawDays);
         $dryRun = (bool) $this->option('dry-run');
 
         $cutoffDate = now()->subDays($days);
@@ -110,6 +114,27 @@ class PurgeExpiredRunTracesCommand extends Command
         ]);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Validates the resolved retention-days input (from `--days`, else config)
+     * before it drives the cutoff (FR-013). Absent, non-numeric, zero, or
+     * negative values are rejected in favor of the documented default, with
+     * exactly one warning naming the rejected value; a valid positive integer
+     * passes through unchanged.
+     */
+    private function resolveRetentionDays(mixed $rawDays): int
+    {
+        if (is_numeric($rawDays) && (int) $rawDays > 0) {
+            return (int) $rawDays;
+        }
+
+        Log::warning('PurgeExpiredRunTracesCommand: invalid retention_days, using default', [
+            'rejected_value' => $rawDays,
+            'default' => self::DEFAULT_RETENTION_DAYS,
+        ]);
+
+        return self::DEFAULT_RETENTION_DAYS;
     }
 
     /**
