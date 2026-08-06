@@ -3,9 +3,12 @@
 namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
+use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Services\RunTraceQuery;
 use Auth;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 /**
  * RunController
@@ -24,6 +27,169 @@ class RunController extends Controller
     public function __construct(
         private readonly RunTraceQuery $runTraceQuery
     ) {}
+
+    /**
+     * GET /agent-runs/{runId} — a single run's O(1) metadata, including the
+     * cheap COUNT(*) action_count aggregate (contracts/run-read-api.md,
+     * data-model.md §1.1).
+     */
+    public function show(Request $request, string $runId): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $run = $this->runTraceQuery->findRun($callerUserId, $runId);
+        if ($run === null) {
+            return $this->notFoundResponse();
+        }
+
+        $actionCount = DB::table('agent_run_actions')
+            ->where('run_id', $runId)
+            ->count();
+
+        return response()->json($this->runSummary($run, $actionCount));
+    }
+
+    /**
+     * GET /agent-runs/{runId}/steps — ordered step list (position asc), no
+     * action content, paginated at the call site (default 100, cap 200)
+     * over stepsForRun()'s existing unpaginated result (data-model.md §2).
+     * Zero-step run: 200 with empty data (FR-018), never a 404.
+     */
+    public function steps(Request $request, string $runId): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $allSteps = $this->runTraceQuery->stepsForRun($callerUserId, $runId);
+        if ($allSteps === null) {
+            return $this->notFoundResponse();
+        }
+
+        [$page, $perPage] = $this->paginationParams($request, 100, 200);
+
+        $total = count($allSteps);
+        $slice = array_slice($allSteps, ($page - 1) * $perPage, $perPage);
+
+        $stepIds = array_map(fn ($step) => $step->id, $slice);
+        $actionCounts = empty($stepIds) ? collect() : DB::table('agent_run_actions')
+            ->select('step_id', DB::raw('COUNT(*) as cnt'))
+            ->whereIn('step_id', $stepIds)
+            ->groupBy('step_id')
+            ->pluck('cnt', 'step_id');
+
+        $data = array_map(function ($step) use ($actionCounts) {
+            return [
+                'id' => $step->id,
+                'run_id' => $step->run_id,
+                'position' => $step->position,
+                'end_state' => $step->end_state,
+                'end_reason' => $step->end_reason,
+                'started_at' => $step->started_at,
+                'ended_at' => $step->ended_at,
+                'duration_ms' => $step->duration_ms,
+                'wait_ms' => $step->wait_ms,
+                'attempt_count' => $step->attempt_count,
+                'action_count' => (int) ($actionCounts[$step->id] ?? 0),
+            ];
+        }, $slice);
+
+        return response()->json($this->envelope($data, $total, $page, $perPage));
+    }
+
+    /**
+     * GET /agent-runs/{runId}/steps/{stepId}/actions — top-level actions
+     * under one step, paginated (default 50, cap 100). Never includes
+     * `content` (FR-011).
+     */
+    public function stepActions(Request $request, string $runId, string $stepId): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        [$page, $perPage] = $this->paginationParams($request, 50, 100);
+
+        $result = $this->runTraceQuery->actionSummariesForStep($callerUserId, $stepId, $page, $perPage);
+        if ($result === null) {
+            return $this->notFoundResponse();
+        }
+
+        return response()->json($this->envelope($result['data'], $result['total'], $page, $perPage));
+    }
+
+    /**
+     * GET /agent-runs/{runId}/actions/{actionId}/children — nested actions
+     * under one action, same shape/pagination as stepActions() above.
+     */
+    public function actionChildren(Request $request, string $runId, string $actionId): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        [$page, $perPage] = $this->paginationParams($request, 50, 100);
+
+        $result = $this->runTraceQuery->actionSummaryChildren($callerUserId, $actionId, $page, $perPage);
+        if ($result === null) {
+            return $this->notFoundResponse();
+        }
+
+        return response()->json($this->envelope($result['data'], $result['total'], $page, $perPage));
+    }
+
+    /**
+     * Project an AgentRun (+ its cheap action_count aggregate) to the
+     * RunSummary wire shape (data-model.md §1.1).
+     */
+    private function runSummary(AgentRun $run, int $actionCount): array
+    {
+        return [
+            'id' => $run->id,
+            'kind' => $run->kind,
+            'end_state' => $run->end_state,
+            'end_reason' => $run->end_reason,
+            'started_at' => $run->started_at,
+            'ended_at' => $run->ended_at,
+            'duration_ms' => $run->duration_ms,
+            'step_count' => $run->step_count,
+            'action_count' => $actionCount,
+            'conversation_id' => $run->conversation_id,
+        ];
+    }
+
+    /**
+     * Resolve `page`/`per_page` query params against a per-endpoint default
+     * and cap (contracts/run-read-api.md). `per_page` below 1 falls back to
+     * the default; above the cap is clamped down to it (FR-011/SC-004,
+     * enforced server-side regardless of what the client requests).
+     *
+     * @return array{0: int, 1: int} [page, perPage]
+     */
+    private function paginationParams(Request $request, int $default, int $cap): array
+    {
+        $page = max(1, (int) $request->input('page', 1));
+
+        $perPage = (int) $request->input('per_page', $default);
+        if ($perPage < 1) {
+            $perPage = $default;
+        }
+        $perPage = min($perPage, $cap);
+
+        return [$page, $perPage];
+    }
+
+    /**
+     * Build the paginated envelope every list endpoint on this controller
+     * returns (data-model.md §1.5) — `data` + a `meta` block with no other
+     * top-level keys.
+     */
+    private function envelope(array $data, int $total, int $page, int $perPage): array
+    {
+        return [
+            'data' => $data,
+            'meta' => [
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $total,
+                'last_page' => max(1, (int) ceil($total / $perPage)),
+            ],
+        ];
+    }
 
     /**
      * The single uniform "not found" body every endpoint on this

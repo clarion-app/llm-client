@@ -15,6 +15,7 @@ use ClarionApp\LlmClient\Controllers\EpisodicMemoryController;
 use ClarionApp\LlmClient\Controllers\FeedbackController;
 use ClarionApp\LlmClient\Controllers\RoleAssignmentController;
 use ClarionApp\LlmClient\Controllers\ServerStatusController;
+use ClarionApp\LlmClient\Controllers\RunController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -64,6 +65,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     // Server Status endpoint (server status projection for all servers)
     Route::get('server-status', [ServerStatusController::class, "index"]);
+
+    // Agent run execution graph read endpoints (070 US1)
+    Route::get('agent-runs/{runId}', [RunController::class, "show"]);
+    Route::get('agent-runs/{runId}/steps', [RunController::class, "steps"]);
+    Route::get('agent-runs/{runId}/steps/{stepId}/actions', [RunController::class, "stepActions"]);
+    Route::get('agent-runs/{runId}/actions/{actionId}/children', [RunController::class, "actionChildren"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

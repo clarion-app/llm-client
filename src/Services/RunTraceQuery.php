@@ -315,6 +315,137 @@ class RunTraceQuery
     }
 
     /**
+     * Lightweight (no-content) action projection for a step, paginated,
+     * top-level actions only (`parent_action_id IS NULL`) — the lazy-expand
+     * call for a step node (data-model.md §1.3, §2).
+     *
+     * Mirrors actionsForStep()'s existing step -> run -> user_id ownership
+     * check, but — unlike actionsForStep(), which returns an empty array for
+     * both "step inaccessible" and "step accessible, zero actions" — returns
+     * null specifically for the inaccessible case, so
+     * RunController::stepActions() can tell the two apart (FR-018's
+     * zero-step/zero-action 200-empty vs FR-014's uniform 404).
+     *
+     * @return array{data: array<int, array<string, mixed>>, total: int}|null
+     */
+    public function actionSummariesForStep(string $callerUserId, string $stepId, int $page, int $perPage): ?array
+    {
+        $runId = DB::table('agent_run_steps')
+            ->where('id', $stepId)
+            ->value('run_id');
+
+        if ($runId === null) {
+            return null;
+        }
+
+        $ownerUserId = DB::table('agent_runs')
+            ->where('id', $runId)
+            ->value('user_id');
+
+        if ($ownerUserId !== $callerUserId) {
+            return null;
+        }
+
+        $baseQuery = DB::table('agent_run_actions')
+            ->where('step_id', $stepId)
+            ->whereNull('parent_action_id');
+
+        $total = (clone $baseQuery)->count();
+
+        $rows = $baseQuery
+            ->orderBy('started_at')
+            ->forPage($page, $perPage)
+            ->get();
+
+        return [
+            'data' => $this->actionSummaryRows($rows),
+            'total' => $total,
+        ];
+    }
+
+    /**
+     * Lightweight (no-content) action projection for an action's direct
+     * children, paginated — the lazy-expand call for an action node nested
+     * under another action (data-model.md §1.3, §2).
+     *
+     * Mirrors childActions()'s existing ownership check; same null-for-
+     * inaccessible / array-for-accessible contract as
+     * actionSummariesForStep() above.
+     *
+     * @return array{data: array<int, array<string, mixed>>, total: int}|null
+     */
+    public function actionSummaryChildren(string $callerUserId, string $actionId, int $page, int $perPage): ?array
+    {
+        // Verify the parent action belongs to a run owned by the calling user.
+        $runId = DB::table('agent_run_actions')
+            ->where('id', $actionId)
+            ->value('run_id');
+
+        if ($runId === null) {
+            return null;
+        }
+
+        $ownerUserId = DB::table('agent_runs')
+            ->where('id', $runId)
+            ->value('user_id');
+
+        if ($ownerUserId !== $callerUserId) {
+            return null;
+        }
+
+        $baseQuery = DB::table('agent_run_actions')
+            ->where('parent_action_id', $actionId);
+
+        $total = (clone $baseQuery)->count();
+
+        $rows = $baseQuery
+            ->orderBy('started_at')
+            ->forPage($page, $perPage)
+            ->get();
+
+        return [
+            'data' => $this->actionSummaryRows($rows),
+            'total' => $total,
+        ];
+    }
+
+    /**
+     * Project a batch of raw agent_run_actions rows to the no-content
+     * ActionSummary shape (data-model.md §1.3), computing `has_children` for
+     * the whole batch in one query rather than N+1.
+     *
+     * @param \Illuminate\Support\Collection $rows
+     * @return array<int, array<string, mixed>>
+     */
+    private function actionSummaryRows($rows): array
+    {
+        $ids = $rows->pluck('id')->all();
+
+        $idsWithChildren = empty($ids) ? [] : DB::table('agent_run_actions')
+            ->whereIn('parent_action_id', $ids)
+            ->distinct()
+            ->pluck('parent_action_id')
+            ->all();
+
+        return $rows->map(function ($row) use ($idsWithChildren) {
+            return [
+                'id' => $row->id,
+                'run_id' => $row->run_id,
+                'step_id' => $row->step_id,
+                'parent_action_id' => $row->parent_action_id,
+                'action_type' => $row->action_type,
+                'target' => $row->target,
+                'outcome' => $row->outcome,
+                'failure_reason' => $row->failure_reason,
+                'started_at' => $row->started_at,
+                'ended_at' => $row->ended_at,
+                'duration_ms' => $row->duration_ms,
+                'has_children' => in_array($row->id, $idsWithChildren, true),
+            ];
+        })->all();
+    }
+
+    /**
      * Convert a raw DB row to the standardized action array shape.
      */
     private function actionRowToArray($row): array
