@@ -28,6 +28,25 @@ class UsageRecord extends Model
         'reused_input_estimated',
         'reused_input_adjusted',
         'agent_id',
+        // Explicitly captured once at write time so it can never drift from
+        // the model_prices lookup instant / cost_summaries period_date
+        // bucket (data-model.md §2). $timestamps = false below means the
+        // base Eloquent HasTimestamps trait never sets this automatically,
+        // and the default $guarded = ['*'] silently discards any key passed
+        // to create() that isn't listed here — so 'created_at' must be
+        // fillable for MetricsRecorder::recordUsage()'s explicit capture to
+        // actually take effect (rather than relying on the DB's own
+        // useCurrent() default, which is not influenced by Carbon::setTestNow()
+        // and would let the record's own timestamp drift from the price
+        // lookup instant under a frozen clock).
+        'created_at',
+        'model_price_id',
+        'reused_input_cost',
+        'fresh_input_cost',
+        'output_cost',
+        'total_cost',
+        'cost_unpriced',
+        'cost_estimated',
     ];
 
     protected $casts = [
@@ -36,6 +55,11 @@ class UsageRecord extends Model
         'co_member_tags' => 'array',
         'reused_input_estimated' => 'boolean',
         'reused_input_adjusted' => 'boolean',
+        'cost_unpriced' => 'boolean',
+        'cost_estimated' => 'boolean',
+        // The four cost amount columns are intentionally NOT cast — they are
+        // read back as strings so no float ever re-enters the pipeline on
+        // the read side either (research.md D1).
     ];
 
     public $timestamps = false;
@@ -82,6 +106,11 @@ class UsageRecord extends Model
     public function scopeForAgent($query, string $agentId)
     {
         return $query->where('agent_id', $agentId);
+    }
+
+    public function scopeUnpriced($query)
+    {
+        return $query->where('cost_unpriced', true);
     }
 
     public function scopeWithEstimateFlags($query)

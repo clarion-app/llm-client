@@ -17,6 +17,7 @@ use ClarionApp\LlmClient\Controllers\RoleAssignmentController;
 use ClarionApp\LlmClient\Controllers\ServerStatusController;
 use ClarionApp\LlmClient\Controllers\RunController;
 use ClarionApp\LlmClient\Controllers\ModelPriceController;
+use ClarionApp\LlmClient\Controllers\CostRollupController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -80,6 +81,14 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Model price configuration endpoints (073 US1) — operator-only
     Route::get('model-prices', [ModelPriceController::class, "index"]);
     Route::put('model-prices', [ModelPriceController::class, "store"]);
+
+    // Cost rollup endpoints (073 US2) — role-scoped per contracts/cost-api.md §3/§4
+    Route::get('cost-rollups/conversations/{conversationId}', [CostRollupController::class, "conversationShow"]);
+    Route::get('cost-rollups/conversations', [CostRollupController::class, "conversationIndex"]);
+    Route::get('cost-rollups/users/{userId}', [CostRollupController::class, "userShow"]);
+    Route::get('cost-rollups/users', [CostRollupController::class, "userIndex"]);
+    Route::get('cost-rollups/agents/{agentId}', [CostRollupController::class, "agentShow"]);
+    Route::get('cost-rollups/agents', [CostRollupController::class, "agentIndex"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

@@ -7,6 +7,9 @@ use ClarionApp\LlmClient\Models\ToolInvocationRecord;
 use ClarionApp\LlmClient\Models\UsageSummary;
 use ClarionApp\LlmClient\Models\ContextManagementRecord;
 use ClarionApp\LlmClient\Models\ContextManagementSummary;
+use ClarionApp\LlmClient\Models\CostSummary;
+use ClarionApp\LlmClient\Models\ModelPrice;
+use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\ValueObjects\ToolFailureCategory;
 use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
 use ClarionApp\LlmClient\ValueObjects\ContextManagementStep;
@@ -51,6 +54,11 @@ class MetricsRecorder
     ): void {
         try {
             DB::transaction(function () use ($conversationId, $userId, $attemptGroupId, $providerUsage, $inputText, $outputText, $model, $providerType, $coMemberTags, $agentId) {
+                // Captured once so the record's own timestamp, the model_prices
+                // effective-dated lookup, and the cost_summaries period_date
+                // bucket can never drift from one another (data-model.md §2).
+                $now = now();
+
                 $hasProviderUsage = !empty($providerUsage);
 
                 if ($hasProviderUsage) {
@@ -121,6 +129,69 @@ class MetricsRecorder
                     }
                 }
 
+                // Cost computation (research.md D1/D2/D3, data-model.md §2):
+                // resolve the effective price once, at write time, and compute
+                // each component cost via bcmath only (never a float). Isolated
+                // in its own inner try/catch, matching the reused-input-tokens
+                // block above, so a costing-specific failure can never suppress
+                // the rest of the record's existing token counts.
+                $modelPriceId = null;
+                $reusedInputCost = null;
+                $freshInputCost = null;
+                $outputCost = null;
+                $totalCost = null;
+                $costUnpriced = true;
+                $costEstimated = false;
+
+                try {
+                    $price = ModelPrice::currentFor($providerType, $model, $now);
+
+                    if ($price !== null) {
+                        // research.md D3: an unknown reuse split is costed as
+                        // if the reused portion were 0 (entire input fresh) —
+                        // never understates spend, since fresh_input_rate is
+                        // always >= reused_input_rate in real pricing.
+                        $reusedForCosting = $reusedInputTokens ?? 0;
+                        $freshForCosting = $inputTokens - $reusedForCosting;
+
+                        $reusedInputCost = Decimal::round(
+                            bcdiv(bcmul((string) $reusedForCosting, (string) $price->reused_input_rate, 20), '1000000', 20),
+                            10
+                        );
+                        $freshInputCost = Decimal::round(
+                            bcdiv(bcmul((string) $freshForCosting, (string) $price->fresh_input_rate, 20), '1000000', 20),
+                            10
+                        );
+                        $outputCost = Decimal::round(
+                            bcdiv(bcmul((string) $outputTokens, (string) $price->output_rate, 20), '1000000', 20),
+                            10
+                        );
+                        $totalCost = bcadd(bcadd($reusedInputCost, $freshInputCost, 10), $outputCost, 10);
+
+                        $modelPriceId = $price->id;
+                        $costUnpriced = false;
+                        $costEstimated = $inputEstimated || $outputEstimated || $reusedInputEstimated;
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning('MetricsRecorder: failed to compute cost', [
+                        'conversation_id' => $conversationId,
+                        'user_id' => $userId,
+                        'error' => $e->getMessage(),
+                    ]);
+                    $modelPriceId = null;
+                    $reusedInputCost = null;
+                    $freshInputCost = null;
+                    $outputCost = null;
+                    $totalCost = null;
+                    $costUnpriced = true;
+                    $costEstimated = false;
+                }
+
+                // A genuinely zero-priced request (all rates configured as 0)
+                // stores a real "0.0000000000" total_cost and must stay
+                // visibly distinct from an unpriced request (FR-013/SC-005).
+                $isZeroPricedCost = !$costUnpriced && bccomp($totalCost, '0', 10) === 0;
+
                 // Create usage record
                 UsageRecord::create([
                     'id' => (string) Str::uuid(),
@@ -139,6 +210,14 @@ class MetricsRecorder
                     'reused_input_estimated' => $reusedInputEstimated,
                     'reused_input_adjusted' => $reusedInputAdjusted,
                     'agent_id' => $agentId,
+                    'created_at' => $now,
+                    'model_price_id' => $modelPriceId,
+                    'reused_input_cost' => $reusedInputCost,
+                    'fresh_input_cost' => $freshInputCost,
+                    'output_cost' => $outputCost,
+                    'total_cost' => $totalCost,
+                    'cost_unpriced' => $costUnpriced,
+                    'cost_estimated' => $costEstimated,
                 ]);
 
                 // Update conversation summary
@@ -164,6 +243,57 @@ class MetricsRecorder
                     $outputEstimated ? $outputTokens : 0,
                     ($inputEstimated ? $inputTokens : 0) + ($outputEstimated ? $outputTokens : 0),
                 );
+
+                // cost_summaries bucketing (T036, data-model.md §3) — isolated
+                // in its own try/catch so a failure specific to this step can
+                // never roll back the UsageRecord row or the usage_summaries
+                // upserts above, matching the isolation pattern already
+                // established for the reused-input-tokens/cost-computation
+                // blocks in this same method.
+                try {
+                    $periodDate = $now->toDateString();
+                    $summaryCost = $totalCost ?? '0.0000000000';
+
+                    $this->upsertCostSummary(
+                        CostSummary::ENTITY_CONVERSATION,
+                        $conversationId,
+                        $userId,
+                        $periodDate,
+                        $summaryCost,
+                        $costUnpriced,
+                        $isZeroPricedCost,
+                        $costEstimated,
+                        $totalTokens,
+                    );
+                    $this->upsertCostSummary(
+                        CostSummary::ENTITY_USER,
+                        $userId,
+                        $userId,
+                        $periodDate,
+                        $summaryCost,
+                        $costUnpriced,
+                        $isZeroPricedCost,
+                        $costEstimated,
+                        $totalTokens,
+                    );
+                    $this->upsertCostSummary(
+                        CostSummary::ENTITY_AGENT,
+                        $agentId ?? CostSummary::UNATTRIBUTED_AGENT_BUCKET,
+                        $userId,
+                        $periodDate,
+                        $summaryCost,
+                        $costUnpriced,
+                        $isZeroPricedCost,
+                        $costEstimated,
+                        $totalTokens,
+                    );
+                } catch (\Throwable $e) {
+                    Log::warning('MetricsRecorder: failed to upsert cost summaries', [
+                        'conversation_id' => $conversationId,
+                        'user_id' => $userId,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             });
         } catch (\Throwable $e) {
             Log::warning('MetricsRecorder: failed to record usage', [
@@ -290,6 +420,72 @@ class MetricsRecorder
                 'estimated_output_tokens' => DB::raw("estimated_output_tokens + {$estimatedOutputTokens}"),
                 'estimated_total_tokens' => DB::raw("estimated_total_tokens + {$estimatedTotalTokens}"),
                 'request_count' => DB::raw('request_count + 1'),
+                'updated_at' => now(),
+            ]);
+    }
+
+    /**
+     * Upsert a cost_summaries row using the same atomic insertOrIgnore +
+     * column = column + n idiom as upsertSummary() (data-model.md §3).
+     *
+     * $periodDate is a pre-formatted Y-m-d string, not a DateTimeInterface,
+     * matching every call site and the raw DB::table() idiom this class
+     * already uses elsewhere. $totalCost is validated against a strict
+     * decimal-string shape before being interpolated into the atomic
+     * priced_cost_total increment, mirroring upsertSummary()'s own stated
+     * injection-safety argument for typed-value interpolation.
+     */
+    private function upsertCostSummary(
+        string $entityType,
+        string $entityId,
+        string $userId,
+        string $periodDate,
+        string $totalCost,
+        bool $unpriced,
+        bool $isZeroPriced,
+        bool $estimated,
+        int $totalTokens,
+    ): void {
+        if (!preg_match('/^-?\d+\.\d{10}$/', $totalCost)) {
+            throw new \InvalidArgumentException("Invalid cost string for cost_summaries upsert: '{$totalCost}'");
+        }
+
+        // Ensure the summary row exists. insertOrIgnore is a no-op when a row
+        // for this bucket already exists (unique constraint), so a concurrent
+        // create by another request cannot produce a duplicate.
+        DB::table('cost_summaries')->insertOrIgnore([
+            'id' => (string) Str::uuid(),
+            'entity_type' => $entityType,
+            'entity_id' => $entityId,
+            'user_id' => $userId,
+            'period_date' => $periodDate,
+            'request_count' => 0,
+            'priced_cost_total' => '0.0000000000',
+            'zero_priced_request_count' => 0,
+            'unpriced_request_count' => 0,
+            'unpriced_total_tokens' => 0,
+            'estimated_request_count' => 0,
+            'updated_at' => now(),
+        ]);
+
+        // Atomic increment. priced_cost_total is 0 for an unpriced request
+        // (never adding a null), and unpriced_total_tokens is 0 for a priced
+        // request — no lost update across concurrent writers for the same
+        // bucket.
+        $unpricedTokensIncrement = $unpriced ? $totalTokens : 0;
+
+        DB::table('cost_summaries')
+            ->where('entity_type', $entityType)
+            ->where('entity_id', $entityId)
+            ->where('user_id', $userId)
+            ->where('period_date', $periodDate)
+            ->update([
+                'request_count' => DB::raw('request_count + 1'),
+                'priced_cost_total' => DB::raw("priced_cost_total + {$totalCost}"),
+                'zero_priced_request_count' => DB::raw('zero_priced_request_count + '.($isZeroPriced ? 1 : 0)),
+                'unpriced_request_count' => DB::raw('unpriced_request_count + '.($unpriced ? 1 : 0)),
+                'unpriced_total_tokens' => DB::raw("unpriced_total_tokens + {$unpricedTokensIncrement}"),
+                'estimated_request_count' => DB::raw('estimated_request_count + '.($estimated ? 1 : 0)),
                 'updated_at' => now(),
             ]);
     }
