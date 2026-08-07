@@ -85,6 +85,40 @@ class MetricsRecorder
                     }
                 }
 
+                // research.md D9/D9a/D9b: reused-input extraction and clamping.
+                // Gated on having real provider usage and an unestimated input
+                // figure — reuse is never reported against a fabricated total
+                // (D9a). Isolated in its own inner try/catch (D9b) so a
+                // failure specific to these new fields can never suppress the
+                // rest of the record's existing token counts.
+                $reusedInputTokens = null;
+                $reusedInputEstimated = false;
+                $reusedInputAdjusted = false;
+
+                if ($hasProviderUsage && !$inputEstimated) {
+                    try {
+                        $reusedRaw = $this->extractReusedInputTokens($providerUsage);
+
+                        if ($reusedRaw !== null) {
+                            if ($reusedRaw > $inputTokens || $reusedRaw < 0) {
+                                $reusedInputTokens = max(0, min($reusedRaw, $inputTokens));
+                                $reusedInputAdjusted = true;
+                            } else {
+                                $reusedInputTokens = $reusedRaw;
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        Log::warning('MetricsRecorder: failed to extract reused input tokens', [
+                            'conversation_id' => $conversationId,
+                            'user_id' => $userId,
+                            'error' => $e->getMessage(),
+                        ]);
+                        $reusedInputTokens = null;
+                        $reusedInputEstimated = false;
+                        $reusedInputAdjusted = false;
+                    }
+                }
+
                 // Create usage record
                 UsageRecord::create([
                     'id' => (string) Str::uuid(),
@@ -99,6 +133,9 @@ class MetricsRecorder
                     'model' => $model,
                     'provider_type' => $providerType,
                     'co_member_tags' => $coMemberTags,
+                    'reused_input_tokens' => $reusedInputTokens,
+                    'reused_input_estimated' => $reusedInputEstimated,
+                    'reused_input_adjusted' => $reusedInputAdjusted,
                 ]);
 
                 // Update conversation summary
@@ -132,6 +169,41 @@ class MetricsRecorder
                 'error' => $e->getMessage(),
             ]);
         }
+    }
+
+    /**
+     * Detect a provider-reported reused (cache-read) input token figure from
+     * the raw provider usage array, checking two known shapes in order:
+     * Anthropic's `cache_read_input_tokens` key, then OpenAI's nested
+     * `prompt_tokens_details.cached_tokens` key. Returns null when neither
+     * shape is present — unknown, never zero (research.md D3, contracts §2).
+     *
+     * Protected (not private) so a test subclass can override this to force
+     * the inner try/catch failure-isolation path deterministically
+     * (research.md D9b).
+     */
+    protected function extractReusedInputTokens(array $providerUsage): ?int
+    {
+        if (array_key_exists('cache_read_input_tokens', $providerUsage)) {
+            return (int) $providerUsage['cache_read_input_tokens'];
+        }
+
+        if (array_key_exists('prompt_tokens_details', $providerUsage)) {
+            $details = $providerUsage['prompt_tokens_details'];
+
+            // A shallow (array) cast of a json_decode()'d object (used by the
+            // legacy OpenAI stream handler) leaves nested values as stdClass —
+            // normalize before checking the nested key.
+            if (is_object($details)) {
+                $details = (array) $details;
+            }
+
+            if (is_array($details) && array_key_exists('cached_tokens', $details)) {
+                return (int) $details['cached_tokens'];
+            }
+        }
+
+        return null;
     }
 
     /**

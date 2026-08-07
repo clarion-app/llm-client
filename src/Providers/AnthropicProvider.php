@@ -324,6 +324,31 @@ class AnthropicProvider implements LlmProvider
             $message['tool_calls'] = $toolCalls;
         }
 
+        // D2: Anthropic reports cache-creation and cache-read tokens as
+        // additional keys alongside input_tokens, not included in it. Fold
+        // both into the total input figure so FR-002's reused+fresh===total
+        // invariant holds against a cache hit, rather than a pre-existing
+        // undercount that would otherwise make every ordinary cache hit look
+        // like an FR-014 anomaly.
+        $inputTokens = $usage['input_tokens'] ?? 0;
+        $cacheCreationTokens = $usage['cache_creation_input_tokens'] ?? 0;
+        $cacheReadTokens = $usage['cache_read_input_tokens'] ?? 0;
+        $outputTokens = $usage['output_tokens'] ?? 0;
+        $promptTokens = $inputTokens + $cacheCreationTokens + $cacheReadTokens;
+
+        $mappedUsage = [
+            'prompt_tokens' => $promptTokens,
+            'completion_tokens' => $outputTokens,
+            'total_tokens' => $promptTokens + $outputTokens,
+        ];
+
+        // Forward cache_read_input_tokens only when Anthropic's own response
+        // actually included the key — array_key_exists (not isset) so a
+        // genuinely-reported 0 survives and unknown stays unknown (C1).
+        if (array_key_exists('cache_read_input_tokens', $usage)) {
+            $mappedUsage['cache_read_input_tokens'] = $usage['cache_read_input_tokens'];
+        }
+
         return [
             'id' => $response['id'] ?? '',
             'model' => $response['model'] ?? '',
@@ -334,11 +359,7 @@ class AnthropicProvider implements LlmProvider
                     'finish_reason' => $finishReason,
                 ],
             ],
-            'usage' => [
-                'prompt_tokens' => $usage['input_tokens'] ?? 0,
-                'completion_tokens' => $usage['output_tokens'] ?? 0,
-                'total_tokens' => ($usage['input_tokens'] ?? 0) + ($usage['output_tokens'] ?? 0),
-            ],
+            'usage' => $mappedUsage,
         ];
     }
 

@@ -30,6 +30,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
     private ?string $runId = null;
     private ?string $stepId = null;
     private ?string $actionId = null;
+    private array $usage = [];
 
     public function __construct(
         ?ToolResultCondenser $toolResultCondenser = null,
@@ -70,6 +71,12 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
             $json = json_decode($chunk, true);
             if ($json === null) continue;
+
+            // Capture usage from whichever SSE chunk reports it (typically
+            // the final chunk, alongside an empty choices array) — D4.
+            if (isset($json['usage']) && $json['usage'] !== null) {
+                $this->usage = (array) $json['usage'];
+            }
 
             foreach ($json['choices'] ?? [] as $choice) {
                 $delta = $choice['delta'] ?? [];
@@ -176,7 +183,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         // Record LLM usage metrics for the final chunk (fire-and-forget, never throws)
         // Streaming responses may have usage in the final SSE chunk
         if ($this->metricsRecorder !== null) {
-            $providerUsage = $parsedData['usage'] ?? [];
+            $providerUsage = $this->usage;
 
             // Only rebuild the input payload when the provider omitted usage and
             // input tokens must be estimated — avoids the cost on the common path.

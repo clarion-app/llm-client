@@ -24,12 +24,17 @@ class UsageRecord extends Model
         'model',
         'provider_type',
         'co_member_tags',
+        'reused_input_tokens',
+        'reused_input_estimated',
+        'reused_input_adjusted',
     ];
 
     protected $casts = [
         'input_estimated' => 'boolean',
         'output_estimated' => 'boolean',
         'co_member_tags' => 'array',
+        'reused_input_estimated' => 'boolean',
+        'reused_input_adjusted' => 'boolean',
     ];
 
     public $timestamps = false;
@@ -52,6 +57,15 @@ class UsageRecord extends Model
     public function conversation()
     {
         return $this->belongsTo(Conversation::class, 'conversation_id');
+    }
+
+    public function getFreshInputTokensAttribute(): ?int
+    {
+        if ($this->reused_input_tokens === null) {
+            return null;
+        }
+
+        return $this->input_tokens - $this->reused_input_tokens;
     }
 
     public function scopeForConversation($query, string $conversationId)
