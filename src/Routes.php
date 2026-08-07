@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\Controllers\ServerStatusController;
 use ClarionApp\LlmClient\Controllers\RunController;
 use ClarionApp\LlmClient\Controllers\ModelPriceController;
 use ClarionApp\LlmClient\Controllers\CostRollupController;
+use ClarionApp\LlmClient\Controllers\UsageRecordController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -81,6 +82,9 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Model price configuration endpoints (073 US1) — operator-only
     Route::get('model-prices', [ModelPriceController::class, "index"]);
     Route::put('model-prices', [ModelPriceController::class, "store"]);
+
+    // Per-record cost detail endpoint (073 US4)
+    Route::get('usage-records/{id}', [UsageRecordController::class, "show"]);
 
     // Cost rollup endpoints (073 US2) — role-scoped per contracts/cost-api.md §3/§4
     Route::get('cost-rollups/conversations/{conversationId}', [CostRollupController::class, "conversationShow"]);
