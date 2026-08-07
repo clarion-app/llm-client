@@ -4,10 +4,10 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\UsageRecord;
-use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\Support\OperatorAccess;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Auth;
 
 /**
@@ -45,32 +45,29 @@ class UsageRecordController extends Controller
             'cost' => [
                 'unpriced' => $record->cost_unpriced,
                 'estimated' => $record->cost_estimated,
-                'reused_input_cost' => $this->formatCost($record->reused_input_cost),
-                'fresh_input_cost' => $this->formatCost($record->fresh_input_cost),
-                'output_cost' => $this->formatCost($record->output_cost),
-                'total_cost' => $this->formatCost($record->total_cost),
+                // The decimal(20,10) cost columns are read straight from the
+                // model: UsageRecord's PlainDecimalCast already guarantees
+                // each one comes back as the exact plain-decimal-notation
+                // string it was written as (or null, for unpriced — FR-006,
+                // never a fabricated zero), rounded to its own scale via
+                // Decimal::round() inside the cast itself. Re-rounding here
+                // would be redundant — see that cast's docblock.
+                'reused_input_cost' => $record->reused_input_cost,
+                'fresh_input_cost' => $record->fresh_input_cost,
+                'output_cost' => $record->output_cost,
+                'total_cost' => $record->total_cost,
             ],
-            'created_at' => $record->created_at,
+            // UsageRecord has $timestamps = false (data-model.md §2's
+            // "explicit capture" reasoning), so created_at is never an
+            // Eloquent-managed date attribute and never passes through the
+            // framework's automatic Carbon::toJSON() serialization the way
+            // ModelPriceController's effective_from/effective_until do —
+            // read back from the DB it is a plain "Y-m-d H:i:s" string.
+            // Parsed and re-rendered here so this endpoint matches
+            // contracts/cost-api.md §2's documented ISO-8601 shape
+            // ("2026-08-07T14:03:11Z") instead of leaking the raw storage
+            // format.
+            'created_at' => Carbon::parse($record->created_at)->toJSON(),
         ]);
-    }
-
-    /**
-     * The decimal(20,10) cost columns are read back untyped (UsageRecord's
-     * $casts deliberately excludes them, research.md D1) so that SQLite's
-     * NUMERIC storage affinity — which stores a whole-number value like
-     * exactly 0 as an integer rather than as text — never gets a chance to
-     * silently promote a stored cost into a PHP float. Re-rounding through
-     * Decimal::round() here restores the full decimal-string shape
-     * (e.g. "0.0000000000") that contracts/cost-api.md §2 documents, without
-     * ever forming a float in between. null (unpriced) passes through
-     * unchanged (FR-006 — never a fabricated zero).
-     */
-    private function formatCost(mixed $value): ?string
-    {
-        if ($value === null) {
-            return null;
-        }
-
-        return Decimal::round((string) $value, 10);
     }
 }
