@@ -197,10 +197,14 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('conversation_id');
                 $table->uuid('user_id');
                 $table->uuid('attempt_group_id');
+                $table->string('agent_id', 255)->nullable();
                 $table->uuid('run_id')->nullable();
                 $table->integer('input_tokens')->nullable()->default(0);
                 $table->integer('output_tokens')->nullable()->default(0);
                 $table->integer('total_tokens')->nullable()->default(0);
+                $table->integer('reused_input_tokens')->nullable();
+                $table->boolean('reused_input_estimated')->default(false);
+                $table->boolean('reused_input_adjusted')->default(false);
                 $table->boolean('input_estimated')->default(false);
                 $table->boolean('output_estimated')->default(false);
                 $table->string('model', 128)->nullable();
@@ -213,6 +217,7 @@ abstract class TestCase extends BaseTestCase
                 $table->index('attempt_group_id');
                 $table->index(['user_id', 'created_at']);
                 $table->index('run_id');
+                $table->index('agent_id');
             });
         }
 
