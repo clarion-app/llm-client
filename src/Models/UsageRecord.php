@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Models;
 
+use ClarionApp\LlmClient\Casts\PlainDecimalCast;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Context;
 
@@ -57,9 +58,18 @@ class UsageRecord extends Model
         'reused_input_adjusted' => 'boolean',
         'cost_unpriced' => 'boolean',
         'cost_estimated' => 'boolean',
-        // The four cost amount columns are intentionally NOT cast — they are
-        // read back as strings so no float ever re-enters the pipeline on
-        // the read side either (research.md D1).
+        // The four cost amount columns (decimal(20,10)) are intentionally
+        // not given a native numeric cast — a native cast would form a
+        // float. PlainDecimalCast instead guarantees the exact
+        // plain-decimal-notation string these columns were written as, at
+        // their own scale of 10, on every read — never a float — so no
+        // float re-enters the pipeline on the read side either
+        // (research.md D1), including under the SQLite NUMERIC storage
+        // affinity quirk documented on the cast itself.
+        'reused_input_cost' => PlainDecimalCast::class.':10',
+        'fresh_input_cost' => PlainDecimalCast::class.':10',
+        'output_cost' => PlainDecimalCast::class.':10',
+        'total_cost' => PlainDecimalCast::class.':10',
     ];
 
     public $timestamps = false;

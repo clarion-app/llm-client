@@ -55,4 +55,61 @@ class DecimalTest extends TestCase
 
         Decimal::round('not-a-number', 10);
     }
+
+    /**
+     * Reproduces the exact production bug found in the Phase 7 reconciliation
+     * test: SQLite's NUMERIC storage affinity for a decimal(20,10) column
+     * returns a genuine PHP float rather than a string, and PHP's own
+     * `(string)` cast of a small-magnitude float renders scientific
+     * notation. Passing that string straight through used to fail the plain
+     * decimal regex; it must now normalize and round correctly instead.
+     */
+    #[Test]
+    public function a_scientific_notation_string_from_a_stringified_small_float_normalizes_and_rounds_correctly()
+    {
+        // (string) 1 reused token x $0.30/million rate = 0.0000003, exactly
+        // the shape reported in the bug: PHP renders this as "3.0E-7".
+        $scientific = (string) 3.0E-7;
+        $this->assertSame('3.0E-7', $scientific, 'Precondition: PHP must actually render this in scientific notation');
+
+        $this->assertSame('0.0000003000', Decimal::round($scientific, 10));
+    }
+
+    #[Test]
+    public function a_scientific_notation_string_at_a_magnitude_that_does_not_round_cleanly_still_rounds_correctly()
+    {
+        // (string) cast of a float known to stringify to scientific
+        // notation, per the task's exact reproduction case.
+        $scientific = (string) 1.83E-5;
+        $this->assertSame('1.83E-5', $scientific, 'Precondition: PHP must actually render this in scientific notation');
+
+        $this->assertSame('0.0000183000', Decimal::round($scientific, 10));
+    }
+
+    #[Test]
+    public function a_negative_scientific_notation_string_rounds_away_from_zero_in_its_own_direction()
+    {
+        $result = Decimal::round((string) -1.83E-5, 10);
+
+        $this->assertSame('-0.0000183000', $result);
+    }
+
+    #[Test]
+    public function a_plain_decimal_string_is_never_routed_through_a_float_round_trip()
+    {
+        // A value with more significant digits than a double can represent
+        // exactly — if this were routed through (float) casting it would
+        // corrupt, since it already matches the plain-notation fast path and
+        // must be returned untouched.
+        $this->assertSame(
+            '123456789012345678.9000000001',
+            Decimal::round('123456789012345678.90000000005', 10)
+        );
+    }
+
+    #[Test]
+    public function to_plain_notation_leaves_a_non_numeric_string_unchanged_for_the_caller_to_reject()
+    {
+        $this->assertSame('not-a-number', Decimal::toPlainNotation('not-a-number'));
+    }
 }

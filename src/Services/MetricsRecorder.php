@@ -154,6 +154,14 @@ class MetricsRecorder
                         $reusedForCosting = $reusedInputTokens ?? 0;
                         $freshForCosting = $inputTokens - $reusedForCosting;
 
+                        // $price->reused_input_rate/fresh_input_rate/output_rate are
+                        // decimal(14,8) columns guaranteed to come back in plain
+                        // decimal notation at their own scale by ModelPrice's
+                        // PlainDecimalCast (see that cast's docblock for why an
+                        // uncast read of a small configured rate could otherwise
+                        // reach bcmul() — which, unlike Decimal::round(), has no
+                        // tolerance of its own for scientific notation — as a
+                        // malformed string under SQLite's NUMERIC storage affinity).
                         $reusedInputCost = Decimal::round(
                             bcdiv(bcmul((string) $reusedForCosting, (string) $price->reused_input_rate, 20), '1000000', 20),
                             10

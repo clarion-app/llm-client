@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Models;
 
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
+use ClarionApp\LlmClient\Casts\PlainDecimalCast;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
@@ -34,6 +35,17 @@ class ModelPrice extends Model
     protected $casts = [
         'effective_from' => 'datetime',
         'effective_until' => 'datetime',
+        // PlainDecimalCast (not a native numeric cast, which would form a
+        // float): guarantees the exact plain-decimal-notation string these
+        // decimal(14,8) columns were written as, at their own scale of 8,
+        // even under SQLite's NUMERIC storage affinity for a small
+        // configured rate — see the cast's own docblock.
+        // MetricsRecorder::recordUsage() reads these three rates straight
+        // into bcmul(), which — unlike Decimal::round() — has no tolerance
+        // of its own for scientific notation.
+        'reused_input_rate' => PlainDecimalCast::class.':8',
+        'fresh_input_rate' => PlainDecimalCast::class.':8',
+        'output_rate' => PlainDecimalCast::class.':8',
     ];
 
     /**
