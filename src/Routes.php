@@ -16,6 +16,7 @@ use ClarionApp\LlmClient\Controllers\FeedbackController;
 use ClarionApp\LlmClient\Controllers\RoleAssignmentController;
 use ClarionApp\LlmClient\Controllers\ServerStatusController;
 use ClarionApp\LlmClient\Controllers\RunController;
+use ClarionApp\LlmClient\Controllers\ModelPriceController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -75,6 +76,10 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agent-runs/{runId}/actions/{actionId}/children', [RunController::class, "actionChildren"]);
     // Agent run execution graph action-detail endpoint (070 US2)
     Route::get('agent-runs/{runId}/actions/{actionId}', [RunController::class, "actionDetail"]);
+
+    // Model price configuration endpoints (073 US1) — operator-only
+    Route::get('model-prices', [ModelPriceController::class, "index"]);
+    Route::put('model-prices', [ModelPriceController::class, "store"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
