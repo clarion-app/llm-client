@@ -83,7 +83,7 @@ class AgentLoopMetricsIntegrationTest extends TestCase
         );
     }
 
-    private function makeConversation(): Conversation
+    private function makeConversation(array $overrides = []): Conversation
     {
         $server = Server::create([
             'name' => 'test',
@@ -92,11 +92,11 @@ class AgentLoopMetricsIntegrationTest extends TestCase
         ]);
 
         // title set so the loop skips the (HTTP) title-generation call.
-        return Conversation::factory()->create([
+        return Conversation::factory()->create(array_merge([
             'is_processing' => false,
             'server_id' => $server->id,
             'title' => 'Test conversation',
-        ]);
+        ], $overrides));
     }
 
     private function textResponse(string $content, array $usage = ['prompt_tokens' => 10, 'completion_tokens' => 20, 'total_tokens' => 30]): array
@@ -147,6 +147,53 @@ class AgentLoopMetricsIntegrationTest extends TestCase
         $this->assertNotNull($summary);
         $this->assertEquals(30, $summary->total_tokens);
         $this->assertEquals(1, $summary->request_count);
+    }
+
+    /**
+     * FR-005/US2 Acceptance Scenario 1, driven through the real call site
+     * (AgentLoopService::recordUsageMetric()) rather than MetricsRecorder
+     * directly: a conversation with an identifiable agent configuration
+     * (character) must produce a usage record carrying that identifier.
+     */
+    #[Test]
+    public function run_attributes_usage_to_the_conversations_character(): void
+    {
+        $conversation = $this->makeConversation(['character' => 'Researcher']);
+        $service = $this->makeService($this->fakeProvider([
+            $this->textResponse('Hello there.'),
+        ]));
+
+        $result = $service->run($conversation, 'Hi');
+
+        $this->assertEquals('completed', $result['status']);
+
+        $usage = UsageRecord::forConversation($conversation->id)->first();
+        $this->assertNotNull($usage);
+        $this->assertSame('Researcher', $usage->agent_id);
+    }
+
+    /**
+     * FR-006/US2 Acceptance Scenario 3, driven through the real call site:
+     * a request made outside the context of any agent configuration
+     * (no character set) must still record usage, with agent_id NULL —
+     * never the conversation's own id and never an empty string.
+     */
+    #[Test]
+    public function run_records_no_agent_attribution_when_conversation_has_no_character(): void
+    {
+        $conversation = $this->makeConversation(['character' => null]);
+        $service = $this->makeService($this->fakeProvider([
+            $this->textResponse('Hello there.'),
+        ]));
+
+        $result = $service->run($conversation, 'Hi');
+
+        $this->assertEquals('completed', $result['status']);
+
+        $usage = UsageRecord::forConversation($conversation->id)->first();
+        $this->assertNotNull($usage);
+        $this->assertNull($usage->agent_id);
+        $this->assertNotSame($conversation->id, $usage->agent_id);
     }
 
     #[Test]
