@@ -445,5 +445,21 @@ return [
             'max_payload_bytes' => (int) env('LLM_CLIENT_TRACE_EXPORT_MAX_PAYLOAD_BYTES', 65536),
         ],
     ],
+
+    // Usage cost rollups — per-model pricing and cost attribution across
+    // conversations, users, and agents.
+    'cost' => [
+        // Currency label attached to cost-related API responses as metadata
+        // only. No conversion, no multi-currency storage (FR-018).
+        'currency' => env('LLM_CLIENT_COST_CURRENCY', 'USD'),
+
+        // Config-driven operator allow-list (research.md D4). User UUID
+        // strings permitted to configure prices (FR-017) and see unrestricted
+        // cross-user rollups (FR-021). Comma-separated in the env var.
+        'operator_user_ids' => array_values(array_filter(
+            explode(',', env('LLM_CLIENT_COST_OPERATOR_USER_IDS', '')),
+            fn ($id) => $id !== ''
+        )),
+    ],
 ];
 

@@ -210,6 +210,13 @@ abstract class TestCase extends BaseTestCase
                 $table->string('model', 128)->nullable();
                 $table->string('provider_type', 32)->nullable();
                 $table->json('co_member_tags')->nullable();
+                $table->uuid('model_price_id')->nullable();
+                $table->decimal('reused_input_cost', 20, 10)->nullable();
+                $table->decimal('fresh_input_cost', 20, 10)->nullable();
+                $table->decimal('output_cost', 20, 10)->nullable();
+                $table->decimal('total_cost', 20, 10)->nullable();
+                $table->boolean('cost_unpriced')->default(false);
+                $table->boolean('cost_estimated')->default(false);
                 $table->timestamp('created_at')->useCurrent();
 
                 $table->index('conversation_id');
@@ -218,6 +225,45 @@ abstract class TestCase extends BaseTestCase
                 $table->index(['user_id', 'created_at']);
                 $table->index('run_id');
                 $table->index('agent_id');
+            });
+        }
+
+        // model_prices table (for cost rollup tests — 073-usage-cost-rollups).
+        if (!Schema::hasTable('model_prices')) {
+            Schema::create('model_prices', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('provider_type', 32);
+                $table->string('model', 128);
+                $table->decimal('reused_input_rate', 14, 8);
+                $table->decimal('fresh_input_rate', 14, 8);
+                $table->decimal('output_rate', 14, 8);
+                $table->timestamp('effective_from');
+                $table->timestamp('effective_until')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index(['provider_type', 'model', 'effective_from']);
+            });
+        }
+
+        // cost_summaries table (for cost rollup tests — 073-usage-cost-rollups).
+        if (!Schema::hasTable('cost_summaries')) {
+            Schema::create('cost_summaries', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->enum('entity_type', ['conversation', 'user', 'agent']);
+                $table->string('entity_id', 255);
+                $table->uuid('user_id');
+                $table->date('period_date');
+                $table->integer('request_count')->default(0);
+                $table->decimal('priced_cost_total', 20, 10)->default(0);
+                $table->integer('zero_priced_request_count')->default(0);
+                $table->integer('unpriced_request_count')->default(0);
+                $table->bigInteger('unpriced_total_tokens')->default(0);
+                $table->integer('estimated_request_count')->default(0);
+                $table->timestamp('updated_at')->useCurrent();
+
+                $table->unique(['entity_type', 'entity_id', 'user_id', 'period_date']);
+                $table->index(['entity_type', 'period_date']);
             });
         }
 
