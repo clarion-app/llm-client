@@ -1567,6 +1567,7 @@ class AgentLoopService
             outputText: $response['choices'][0]['message']['content'] ?? '',
             model: $conversation->model,
             providerType: $conversation->effectiveProviderType?->value,
+            agentId: $conversation->character ?: null,
         );
     }
 

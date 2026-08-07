@@ -27,6 +27,7 @@ class UsageRecord extends Model
         'reused_input_tokens',
         'reused_input_estimated',
         'reused_input_adjusted',
+        'agent_id',
     ];
 
     protected $casts = [
@@ -76,6 +77,11 @@ class UsageRecord extends Model
     public function scopeForUser($query, string $userId)
     {
         return $query->where('user_id', $userId);
+    }
+
+    public function scopeForAgent($query, string $agentId)
+    {
+        return $query->where('agent_id', $agentId);
     }
 
     public function scopeWithEstimateFlags($query)

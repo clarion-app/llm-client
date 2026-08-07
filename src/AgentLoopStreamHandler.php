@@ -209,6 +209,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 outputText: $this->reply,
                 model: $conversation->model,
                 providerType: $conversation->effectiveProviderType?->value,
+                agentId: $conversation->character ?: null,
             );
         }
 

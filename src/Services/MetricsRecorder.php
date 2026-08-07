@@ -35,6 +35,7 @@ class MetricsRecorder
      * @param string|null  $model            Model name (nullable)
      * @param string|null  $providerType     Provider family string (nullable)
      * @param array|null   $coMemberTags     Co-member user ID tags (nullable)
+     * @param string|null  $agentId          Agent configuration identifier (nullable; written exactly as passed, no fallback/derivation)
      */
     public function recordUsage(
         string $conversationId,
@@ -45,10 +46,11 @@ class MetricsRecorder
         string $outputText,
         ?string $model = null,
         ?string $providerType = null,
-        ?array $coMemberTags = null
+        ?array $coMemberTags = null,
+        ?string $agentId = null
     ): void {
         try {
-            DB::transaction(function () use ($conversationId, $userId, $attemptGroupId, $providerUsage, $inputText, $outputText, $model, $providerType, $coMemberTags) {
+            DB::transaction(function () use ($conversationId, $userId, $attemptGroupId, $providerUsage, $inputText, $outputText, $model, $providerType, $coMemberTags, $agentId) {
                 $hasProviderUsage = !empty($providerUsage);
 
                 if ($hasProviderUsage) {
@@ -136,6 +138,7 @@ class MetricsRecorder
                     'reused_input_tokens' => $reusedInputTokens,
                     'reused_input_estimated' => $reusedInputEstimated,
                     'reused_input_adjusted' => $reusedInputAdjusted,
+                    'agent_id' => $agentId,
                 ]);
 
                 // Update conversation summary
