@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -248,5 +249,58 @@ class CostSummaryUpsertTest extends TestCase
         $row = $this->summaryRow('conversation', $conversationId);
         $this->assertNotNull($row, 'Once cost_summaries exists again, the next call must resume writing to it');
         $this->assertSame(1, (int) $row->request_count, 'Only the second call succeeded in writing; the first was isolated away');
+    }
+
+    /**
+     * data-model.md §2/§3 (FR-015): recordUsage() captures `$now = now()`
+     * exactly once at the top of its transaction closure, and every
+     * cost_summaries `period_date` is bucketed from that captured instant's
+     * `toDateString()` — never from a fresh `now()` call taken later in the
+     * same transaction. `Carbon::setTestNow()` can't distinguish these two
+     * implementations: it freezes every `now()` call in the process to the
+     * same value, so a stray fresh read would coincidentally match the
+     * captured one 100% of the time in a test. Instead this test replaces
+     * the `Date` facade `now()` resolves through (see the global `now()`
+     * helper) with a Mockery double that returns a different Carbon instant
+     * on each successive call — simulating real wall-clock time crossing a
+     * day boundary mid-transaction. recordUsage()'s own `$now = now()`
+     * capture is the first call and gets the pre-midnight instant; every
+     * other `now()` call already present in the method (upsertSummary()'s
+     * and upsertCostSummary()'s own `updated_at => now()` writes) happens
+     * after it and gets the post-midnight instant instead. Only a
+     * `period_date` derived from something other than the captured `$now`
+     * (i.e. a fresh `now()` call) could observe the post-midnight date.
+     */
+    #[Test]
+    public function period_date_is_bucketed_from_the_captured_now_not_a_fresh_clock_read_later_in_the_transaction(): void
+    {
+        $this->seedPrice();
+
+        $beforeMidnight = Carbon::parse('2026-08-07 23:59:59.900000');
+        $afterMidnight = Carbon::parse('2026-08-08 00:00:00.100000');
+
+        // First call (recordUsage()'s `$now = now()`) gets $beforeMidnight;
+        // every subsequent now() call in the same recordUsage() invocation
+        // gets (and keeps getting, per Mockery's andReturn() repeating its
+        // last argument) $afterMidnight.
+        Date::shouldReceive('now')->andReturn($beforeMidnight, $afterMidnight);
+
+        $conversationId = (string) Str::uuid();
+        $userId = (string) Str::uuid();
+
+        $this->recordUsageFor($conversationId, $userId, $this->pricedProviderUsage(), 'claude-sonnet-5', 'anthropic', 'research-agent');
+
+        $conversationRow = $this->summaryRow('conversation', $conversationId);
+        $userRow = $this->summaryRow('user', $userId);
+        $agentRow = $this->summaryRow('agent', 'research-agent');
+
+        foreach (['conversationRow' => $conversationRow, 'userRow' => $userRow, 'agentRow' => $agentRow] as $label => $row) {
+            $this->assertNotNull($row, "$label must exist");
+            $this->assertSame(
+                '2026-08-07',
+                Carbon::parse($row->period_date)->toDateString(),
+                "$label's period_date must reflect the instant captured once at the top of recordUsage(), not a later, post-midnight now() call in the same transaction"
+            );
+        }
     }
 }
