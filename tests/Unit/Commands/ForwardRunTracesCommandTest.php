@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\TraceExportConfig;
 use Carbon\CarbonImmutable;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -825,5 +826,120 @@ class ForwardRunTracesCommandTest extends TestCase
         $this->assertSame(1, $context['retried']);
         $this->assertSame(1, $context['discarded']);
         $this->assertSame(3, $context['buffer_evicted']);
+    }
+
+    // ========================================================================
+    // Reconciliation fix (Issue 3): agent_run_export_queue.last_error was
+    // never populated on a failed delivery attempt -- the row's attempts and
+    // next_attempt_at were updated on every failure path, but last_error
+    // stayed NULL forever, leaving an operator reading the table with no way
+    // to tell *why* a record kept retrying. Per data-model.md §2 and
+    // contracts/otlp-export-payload.md's "Failure handling", last_error must
+    // hold only an HTTP status code and a truncated response body/reason
+    // phrase, and per contracts/config-reference.md's secret-handling
+    // contract it must come from the HTTP *response* only, never from the
+    // outgoing request -- so a rejected credential can never end up in it.
+    // ========================================================================
+
+    #[Test]
+    public function a_failed_delivery_populates_last_error_with_the_status_code_and_a_truncated_response_body(): void
+    {
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        Http::fake([
+            self::ENDPOINT => Http::response('destination rejected the payload: malformed span', 500),
+        ]);
+
+        $exitCode = Artisan::call('llm-client:forward-run-traces');
+
+        $this->assertSame(0, $exitCode);
+
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row, 'row must survive a failure below max_attempts');
+        $this->assertNotNull($row->last_error, 'last_error must be populated on a failed delivery attempt');
+        $this->assertStringContainsString('500', $row->last_error);
+        $this->assertStringContainsString('destination rejected the payload', $row->last_error);
+    }
+
+    #[Test]
+    public function last_error_is_truncated_to_fit_the_string_512_column(): void
+    {
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        Http::fake([
+            self::ENDPOINT => Http::response(str_repeat('x', 5000), 500),
+        ]);
+
+        Artisan::call('llm-client:forward-run-traces');
+
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row);
+        $this->assertNotNull($row->last_error);
+        $this->assertLessThanOrEqual(512, strlen($row->last_error));
+    }
+
+    #[Test]
+    public function last_error_never_contains_the_configured_auth_value_even_when_the_response_echoes_something_credential_shaped_back(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.export.otlp_auth_value', 'Bearer super-secret-token');
+        TraceExportConfig::reset();
+
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        // The mocked failure response echoes back something that reads like
+        // a credential-shaped diagnostic -- exactly the kind of thing a real
+        // destination could plausibly send. last_error must be built from
+        // the HTTP response only, never from the outgoing request/config, so
+        // the real configured secret can never appear in it regardless of
+        // what the destination sends back.
+        Http::fake([
+            self::ENDPOINT => Http::response('unauthorized: token abc123 rejected', 401),
+        ]);
+
+        Artisan::call('llm-client:forward-run-traces');
+
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row);
+        $this->assertStringNotContainsString('super-secret-token', $row->last_error ?? '');
+    }
+
+    #[Test]
+    public function a_connection_failure_populates_last_error_with_a_synthetic_message_since_there_is_no_response_body(): void
+    {
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        Http::fake(function () {
+            throw new ConnectionException('Connection refused');
+        });
+
+        Artisan::call('llm-client:forward-run-traces');
+
+        $row = DB::table('agent_run_export_queue')->where('id', $queueId)->first();
+        $this->assertNotNull($row);
+        $this->assertNotNull($row->last_error, 'a connection failure must still populate last_error, even with no HTTP response to read');
+        $this->assertNotSame('', trim($row->last_error));
+    }
+
+    #[Test]
+    public function last_error_is_moot_once_a_row_is_discarded_at_max_attempts(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.export.max_attempts', 1);
+        TraceExportConfig::reset();
+
+        [, $queueId] = $this->insertRunWithQueueRow();
+
+        Http::fake([
+            self::ENDPOINT => Http::response('server error', 500),
+        ]);
+
+        Artisan::call('llm-client:forward-run-traces');
+
+        // max_attempts=1 is reached on the very first failure, so the row is
+        // deleted outright -- there is no row left for last_error to matter on.
+        $this->assertSame(
+            0,
+            DB::table('agent_run_export_queue')->where('id', $queueId)->count(),
+            'a row discarded at max_attempts must not linger just to carry a last_error nobody will read',
+        );
     }
 }

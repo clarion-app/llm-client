@@ -65,8 +65,8 @@ class RunTraceRecorder
     /**
      * Enqueue this run for external forwarding (Phase 4, US2), in its own
      * inner try/catch mirroring broadcast()'s isolation pattern immediately
-     * above: a failure here must never undo or mask closeRun()'s own write,
-     * nor change closeRun()'s return value (void here, but the same standing
+     * above: a failure here must never undo or mask the caller's own write,
+     * nor change the caller's return value (void here, but the same standing
      * rule as broadcast()). A single local write only -- no network I/O, no
      * payload assembly on this path; that happens later, on the scheduler
      * tick, in ForwardRunTracesCommand.
@@ -74,8 +74,20 @@ class RunTraceRecorder
      * Immediately after the insert, trims the buffer back down to
      * export.buffer_max_records if it overflowed (Phase 5, US3, FR-018) --
      * on the same request that produced the overflow, oldest rows first.
+     *
+     * Public (not just closeRun()'s private helper): ResolveAbandonedRunsCommand
+     * calls this directly, once per swept run id, after its own bulk
+     * DB::table('agent_runs')->update(...) closes the run without going
+     * through closeRun() -- the sweep's bulk-update shape (one grouped
+     * eligibility query, then per-run terminal UPDATEs without closeRun()'s
+     * extra re-transition/reason/step-duration bookkeeping) predates
+     * forwarding and is deliberately preserved here rather than rerouted
+     * through closeRun(), so this method is the seam that gives an abandoned
+     * run the same "forwarded, not omitted" guarantee closeRun() gives every
+     * other terminal state (spec.md US2 Acceptance Scenario 2) without
+     * disturbing that shape.
      */
-    private function enqueueForwarding(string $runId): void
+    public function enqueueForwarding(string $runId): void
     {
         try {
             $config = TraceExportConfig::resolve();

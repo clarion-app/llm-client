@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Commands;
 
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -29,7 +30,7 @@ class ResolveAbandonedRunsCommand extends Command
 
     protected $description = 'Resolve abandoned (stale in_progress) agent runs and their open steps';
 
-    public function handle(): int
+    public function handle(RunTraceRecorder $recorder): int
     {
         $minutes = (int) ($this->option('minutes')
             ?? config('llm-client.run_trace.abandonment_minutes', 60));
@@ -129,6 +130,20 @@ class ResolveAbandonedRunsCommand extends Command
                 }
 
                 $resolvedRuns++;
+
+                // The run was closed above via a raw UPDATE, not
+                // RunTraceRecorder::closeRun() -- deliberately, to keep the
+                // sweep's bulk-update shape (one grouped eligibility query,
+                // then a per-run terminal UPDATE without closeRun()'s extra
+                // re-transition/reason/step-duration bookkeeping). That means
+                // closeRun()'s own enqueueForwarding() call never runs for a
+                // swept run, so it is called explicitly here -- the same
+                // "forwarded, not omitted" guarantee every other terminal
+                // state gets (spec.md US2 Acceptance Scenario 2), without
+                // rerouting the sweep through closeRun(). Isolated by
+                // enqueueForwarding()'s own inner try/catch, so a forwarding
+                // failure can never undo the abandonment resolution above.
+                $recorder->enqueueForwarding($runId);
 
                 Log::info('Abandoned run resolved', [
                     'run_id' => $runId,

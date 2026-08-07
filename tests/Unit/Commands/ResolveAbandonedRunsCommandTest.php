@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Unit\Commands;
 
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
+use ClarionApp\LlmClient\ValueObjects\TraceExportConfig;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -33,8 +34,10 @@ class ResolveAbandonedRunsCommandTest extends TestCase
 
     protected function tearDown(): void
     {
+        TraceExportConfig::reset();
+
         // Clean up tables after each test.
-        foreach (['agent_run_messages', 'agent_run_steps', 'agent_runs'] as $table) {
+        foreach (['agent_run_export_queue', 'agent_run_messages', 'agent_run_steps', 'agent_runs'] as $table) {
             if (DB::getSchemaBuilder()->hasTable($table)) {
                 DB::table($table)->delete();
             }
@@ -528,5 +531,74 @@ class ResolveAbandonedRunsCommandTest extends TestCase
         $this->assertNotNull($run->end_reason);
         $this->assertNotNull($run->ended_at);
         $this->assertNotNull($run->duration_ms);
+    }
+
+    // ========================================================================
+    // Reconciliation fix (Issue 2, spec.md US2 Acceptance Scenario 2): the
+    // sweep closed abandoned runs via raw DB::table('agent_runs')->update(...)
+    // calls, entirely bypassing RunTraceRecorder::closeRun() -- so
+    // enqueueForwarding() never ran and an abandoned run's forwarding row
+    // was never written to agent_run_export_queue, even with 'external'
+    // selected. "a run fails or is abandoned... the forwarded record
+    // reflects that outcome rather than being omitted" therefore did not
+    // hold for the abandoned case.
+    // ========================================================================
+
+    #[Test]
+    public function an_abandoned_run_is_enqueued_for_external_forwarding(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.export.destinations', ['internal', 'external']);
+        $this->app['config']->set('llm-client.run_trace.export.otlp_endpoint', 'https://tempo.example.com:4318/v1/traces');
+        TraceExportConfig::reset();
+
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $stepId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        $this->insertStep($stepId, $runId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        $exitCode = Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $this->assertSame(0, $exitCode);
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNotNull($run);
+        $this->assertEquals(RunEndState::Abandoned->value, $run->end_state);
+
+        $this->assertSame(
+            1,
+            DB::table('agent_run_export_queue')->where('run_id', $runId)->count(),
+            'an abandoned run must be enqueued for forwarding exactly like any other terminal state, when external is selected (spec.md US2 Acceptance Scenario 2)',
+        );
+    }
+
+    #[Test]
+    public function an_abandoned_run_is_not_enqueued_when_external_is_not_selected(): void
+    {
+        // Default TraceExportConfig (internal only) -- no otlp_endpoint
+        // configured. The sweep must not enqueue anything in this case,
+        // mirroring closeRun()'s own enqueueForwarding() gate.
+        TraceExportConfig::reset();
+
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        $exitCode = Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $this->assertSame(0, $exitCode);
+
+        $this->assertSame(
+            0,
+            DB::table('agent_run_export_queue')->where('run_id', $runId)->count(),
+            'internal-only (the default) must not enqueue anything for forwarding',
+        );
     }
 }

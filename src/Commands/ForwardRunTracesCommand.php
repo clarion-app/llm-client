@@ -137,7 +137,9 @@ class ForwardRunTracesCommand extends Command
                 continue;
             }
 
-            if ($this->deliver($config, $payload)) {
+            $result = $this->deliver($config, $payload);
+
+            if ($result['delivered']) {
                 DB::table('agent_run_export_queue')->where('id', $row->id)->delete();
                 $delivered++;
 
@@ -150,6 +152,8 @@ class ForwardRunTracesCommand extends Command
             $attempts = (int) $row->attempts + 1;
 
             if ($attempts >= $config->maxAttempts) {
+                // The row is being deleted -- nothing left to read last_error
+                // off of, so there is no point writing it first.
                 DB::table('agent_run_export_queue')->where('id', $row->id)->delete();
                 $discarded++;
 
@@ -164,6 +168,7 @@ class ForwardRunTracesCommand extends Command
             DB::table('agent_run_export_queue')->where('id', $row->id)->update([
                 'attempts' => $attempts,
                 'next_attempt_at' => now()->addSeconds($delaySeconds)->format('Y-m-d H:i:s'),
+                'last_error' => $result['error'],
             ]);
             $retried++;
         }
@@ -179,9 +184,27 @@ class ForwardRunTracesCommand extends Command
     }
 
     /**
-     * @param array<string, mixed> $payload
+     * The column agent_run_export_queue.last_error is truncated to, per
+     * data-model.md §2. A short fixed prefix ("HTTP 500: ") is included in
+     * this budget rather than added on top of it, so the stored value never
+     * exceeds the column regardless of how long the prefix or body get.
      */
-    private function deliver(TraceExportConfig $config, array $payload): bool
+    private const LAST_ERROR_MAX_LENGTH = 512;
+
+    /**
+     * Attempt delivery of one payload. Returns `['delivered' => bool, 'error' => ?string]`.
+     *
+     * `error` is built exclusively from the HTTP *response* (status code +
+     * truncated body/reason phrase) on a non-2xx reply, or from a short
+     * synthetic message on a connection failure/timeout where no response
+     * body exists at all -- never from the outgoing request, the endpoint,
+     * or the configured credential (contracts/config-reference.md's
+     * secret-handling contract). `error` is null whenever delivery succeeds.
+     *
+     * @param array<string, mixed> $payload
+     * @return array{delivered: bool, error: ?string}
+     */
+    private function deliver(TraceExportConfig $config, array $payload): array
     {
         // otlp_auth_value is read here, at the single point of use, and never
         // stored in a variable that outlives this call (config-reference.md
@@ -199,10 +222,26 @@ class ForwardRunTracesCommand extends Command
                 ->withHeaders($headers)
                 ->post($config->otlpEndpoint, $payload);
 
-            return $response->successful();
+            if ($response->successful()) {
+                return ['delivered' => true, 'error' => null];
+            }
+
+            $error = 'HTTP ' . $response->status() . ': ' . $response->body();
+
+            return ['delivered' => false, 'error' => $this->truncateError($error)];
         } catch (\Throwable $e) {
-            return false;
+            // No HTTP response exists on a connection failure or timeout --
+            // a synthetic message stands in, built only from the exception's
+            // own message, never from anything sent in the request.
+            $error = 'Connection error: ' . $e->getMessage();
+
+            return ['delivered' => false, 'error' => $this->truncateError($error)];
         }
+    }
+
+    private function truncateError(string $error): string
+    {
+        return mb_substr($error, 0, self::LAST_ERROR_MAX_LENGTH);
     }
 
     private function reportSummary(int $delivered, int $retried, int $discarded, int $bufferEvicted): void
