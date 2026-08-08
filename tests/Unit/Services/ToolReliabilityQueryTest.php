@@ -94,7 +94,7 @@ class ToolReliabilityQueryTest extends TestCase
         ]);
 
         $query = new ToolReliabilityQuery();
-        $result = $query->toolSummary('search_documents', 'day', $this->today(), (string) Str::uuid(), true);
+        $result = $query->toolSummary('search_documents', 'day', $this->today(), null, (string) Str::uuid(), true);
 
         $this->assertSame('search_documents', $result['tool_name']);
         $this->assertSame(8, $result['invocation_count']);
@@ -119,7 +119,7 @@ class ToolReliabilityQueryTest extends TestCase
         ]);
 
         $query = new ToolReliabilityQuery();
-        $result = $query->toolSummary('search_documents', 'day', $this->today(), (string) Str::uuid(), true);
+        $result = $query->toolSummary('search_documents', 'day', $this->today(), null, (string) Str::uuid(), true);
 
         $this->assertSame(0, $result['failure_count']);
         $this->assertArrayHasKey('failure_breakdown', $result);
@@ -139,10 +139,10 @@ class ToolReliabilityQueryTest extends TestCase
 
         $query = new ToolReliabilityQuery();
 
-        $todayResult = $query->toolSummary('search_documents', 'day', $this->today(), (string) Str::uuid(), true);
+        $todayResult = $query->toolSummary('search_documents', 'day', $this->today(), null, (string) Str::uuid(), true);
         $this->assertSame(5, $todayResult['invocation_count'], "today's read must not bleed in yesterday's figures");
 
-        $yesterdayResult = $query->toolSummary('search_documents', 'day', $yesterday, (string) Str::uuid(), true);
+        $yesterdayResult = $query->toolSummary('search_documents', 'day', $yesterday, null, (string) Str::uuid(), true);
         $this->assertSame(40, $yesterdayResult['invocation_count']);
         $this->assertSame(30, $yesterdayResult['failure_count']);
     }
@@ -152,7 +152,7 @@ class ToolReliabilityQueryTest extends TestCase
     {
         $query = new ToolReliabilityQuery();
 
-        $result = $query->toolSummary('a_tool_name_that_has_never_existed', 'day', $this->today(), (string) Str::uuid(), true);
+        $result = $query->toolSummary('a_tool_name_that_has_never_existed', 'day', $this->today(), null, (string) Str::uuid(), true);
 
         $this->assertIsArray($result);
         $this->assertSame(0, $result['invocation_count']);
@@ -170,7 +170,7 @@ class ToolReliabilityQueryTest extends TestCase
         $this->seedSummary(['tool_name' => 'boundary_tool', 'invocation_count' => 9, 'success_count' => 9]);
 
         $query = new ToolReliabilityQuery();
-        $nine = $query->toolSummary('boundary_tool', 'day', $this->today(), (string) Str::uuid(), true);
+        $nine = $query->toolSummary('boundary_tool', 'day', $this->today(), null, (string) Str::uuid(), true);
         $this->assertTrue($nine['low_sample'], '9 invocations is below the fixed threshold of 10');
         $this->assertFalse($nine['no_activity']);
 
@@ -178,7 +178,7 @@ class ToolReliabilityQueryTest extends TestCase
             ->where('tool_name', 'boundary_tool')
             ->update(['invocation_count' => 10, 'success_count' => 10]);
 
-        $ten = $query->toolSummary('boundary_tool', 'day', $this->today(), (string) Str::uuid(), true);
+        $ten = $query->toolSummary('boundary_tool', 'day', $this->today(), null, (string) Str::uuid(), true);
         $this->assertFalse($ten['low_sample'], '10 invocations must clear the threshold');
     }
 
@@ -227,7 +227,7 @@ class ToolReliabilityQueryTest extends TestCase
         $this->seedSummary(['tool_name' => 'shared_tool', 'user_id' => $userB, 'invocation_count' => 4, 'success_count' => 4]);
 
         $query = new ToolReliabilityQuery();
-        $result = $query->toolSummary('shared_tool', 'day', $this->today(), $caller, true);
+        $result = $query->toolSummary('shared_tool', 'day', $this->today(), null, $caller, true);
 
         $this->assertSame(7, $result['invocation_count'], "an operator sees every user's contribution, including a caller who contributed none");
     }
@@ -242,10 +242,149 @@ class ToolReliabilityQueryTest extends TestCase
         $this->seedSummary(['tool_name' => 'shared_tool', 'user_id' => $stranger, 'invocation_count' => 9, 'success_count' => 0, 'failure_count' => 9, 'failure_other_count' => 9]);
 
         $query = new ToolReliabilityQuery();
-        $result = $query->toolSummary('shared_tool', 'day', $this->today(), $owner, false);
+        $result = $query->toolSummary('shared_tool', 'day', $this->today(), null, $owner, false);
 
         $this->assertIsArray($result, 'a non-operator scoping mismatch must never throw');
         $this->assertSame(3, $result['invocation_count'], "only the caller's own rows, never the stranger's");
         $this->assertSame(0, $result['failure_count']);
+    }
+
+    // === User Story 2 (Phase 4, T026): agent-scoping ===
+    //
+    // toolSummary() does not yet accept an $agentId parameter -- these tests
+    // call it with the final signature data-model.md §4.4 declares
+    // (toolName, periodType, date, agentId, callerId, isOperator), via named
+    // arguments, so they fail against today's 5-parameter method with an
+    // "Unknown named parameter $agentId" error until Phase 4's
+    // implementation inserts it. toolAgentBreakdown() does not exist at all
+    // yet and fails with an undefined-method error.
+
+    #[Test]
+    public function a_real_agent_id_filters_the_summary_to_that_agent_only(): void
+    {
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-a', 'invocation_count' => 10, 'success_count' => 9, 'failure_count' => 1, 'failure_timeout_count' => 1]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-b', 'invocation_count' => 20, 'success_count' => 15, 'failure_count' => 5, 'failure_server_error_count' => 5]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->toolSummary(
+            toolName: 'shared_tool',
+            periodType: 'day',
+            date: $this->today(),
+            agentId: 'agent-a',
+            callerId: (string) Str::uuid(),
+            isOperator: true,
+        );
+
+        $this->assertSame(10, $result['invocation_count'], 'agent-scoped read must reflect only agent-a, never agent-b');
+        $this->assertSame(1, $result['failure_count']);
+        $this->assertSame(1, $result['failure_breakdown']['timeout']);
+        $this->assertSame(0, $result['failure_breakdown']['server_error'], "agent-b's failures must not leak into agent-a's scope");
+    }
+
+    #[Test]
+    public function the_unattributed_sentinel_passed_explicitly_filters_to_unattributed_only(): void
+    {
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET, 'invocation_count' => 4, 'success_count' => 4]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-a', 'invocation_count' => 10, 'success_count' => 10]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->toolSummary(
+            toolName: 'shared_tool',
+            periodType: 'day',
+            date: $this->today(),
+            agentId: ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET,
+            callerId: (string) Str::uuid(),
+            isOperator: true,
+        );
+
+        $this->assertSame(4, $result['invocation_count'], 'the Unattributed sentinel scope must reflect only Unattributed rows, never a named agent');
+    }
+
+    #[Test]
+    public function omitting_the_agent_scope_still_aggregates_across_every_agent(): void
+    {
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-a', 'invocation_count' => 10, 'success_count' => 10]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-b', 'invocation_count' => 5, 'success_count' => 5]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET, 'invocation_count' => 3, 'success_count' => 3]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->toolSummary(
+            toolName: 'shared_tool',
+            periodType: 'day',
+            date: $this->today(),
+            agentId: null,
+            callerId: (string) Str::uuid(),
+            isOperator: true,
+        );
+
+        $this->assertSame(18, $result['invocation_count'], 'US1 behavior is unchanged: omitting the agent scope sums across every agent bucket');
+    }
+
+    #[Test]
+    public function tool_agent_breakdown_returns_one_entry_per_agent_including_an_explicit_unattributed_entry(): void
+    {
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-a', 'invocation_count' => 100, 'success_count' => 99, 'failure_count' => 1, 'failure_timeout_count' => 1]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-b', 'invocation_count' => 20, 'success_count' => 5, 'failure_count' => 15, 'failure_server_error_count' => 15]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET, 'invocation_count' => 10, 'success_count' => 7, 'failure_count' => 3, 'failure_other_count' => 3]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->toolAgentBreakdown(
+            toolName: 'shared_tool',
+            periodType: 'day',
+            date: $this->today(),
+            callerId: (string) Str::uuid(),
+            isOperator: true,
+        );
+
+        $agentIds = array_column($result, 'agent_id');
+        $this->assertContains('agent-a', $agentIds);
+        $this->assertContains('agent-b', $agentIds);
+        $this->assertContains(ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET, $agentIds, 'FR-013: invocations with no agent must appear as an explicit Unattributed entry, never silently dropped');
+        $this->assertCount(3, $result);
+
+        $this->assertSame('agent-b', $agentIds[0], 'ordering must be failure_count DESC (agent-b has the most failures)');
+    }
+
+    #[Test]
+    public function access_scoping_applies_identically_to_the_agent_scoped_read_and_the_breakdown_list(): void
+    {
+        $owner = (string) Str::uuid();
+        $stranger = (string) Str::uuid();
+
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-a', 'user_id' => $owner, 'invocation_count' => 3, 'success_count' => 3]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-a', 'user_id' => $stranger, 'invocation_count' => 50, 'success_count' => 0, 'failure_count' => 50, 'failure_other_count' => 50]);
+        $this->seedSummary(['tool_name' => 'shared_tool', 'agent_id' => 'agent-b', 'user_id' => $stranger, 'invocation_count' => 9, 'success_count' => 9]);
+
+        $query = new ToolReliabilityQuery();
+
+        // Single-agent read: a non-operator's own contribution only, never 403.
+        $singleAgent = $query->toolSummary(
+            toolName: 'shared_tool',
+            periodType: 'day',
+            date: $this->today(),
+            agentId: 'agent-a',
+            callerId: $owner,
+            isOperator: false,
+        );
+        $this->assertIsArray($singleAgent, 'a non-operator scoping mismatch must never throw');
+        $this->assertSame(3, $singleAgent['invocation_count'], "only the caller's own agent-a rows, never the stranger's");
+        $this->assertSame(0, $singleAgent['failure_count']);
+
+        // Breakdown list: a non-operator sees only their own contribution to
+        // each agent's total, and never an agent they never personally used.
+        $breakdown = $query->toolAgentBreakdown(
+            toolName: 'shared_tool',
+            periodType: 'day',
+            date: $this->today(),
+            callerId: $owner,
+            isOperator: false,
+        );
+
+        $agentIds = array_column($breakdown, 'agent_id');
+        $this->assertContains('agent-a', $agentIds);
+        $this->assertNotContains('agent-b', $agentIds, 'the caller never personally used agent-b for this tool, so it must not appear as a row');
+
+        $agentARow = collect($breakdown)->firstWhere('agent_id', 'agent-a');
+        $this->assertSame(3, $agentARow['invocation_count'], "the caller's own contribution only, never the stranger's 50 folded in");
     }
 }

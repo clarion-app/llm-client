@@ -556,6 +556,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     toolName: $toolName,
                     success: $toolError === null,
                     failureCategory: $toolError === null ? null : \ClarionApp\LlmClient\ValueObjects\ToolFailureCategory::fromErrorMessage($toolError),
+                    agentId: $conversation->character ?: null,
                 );
             }
 

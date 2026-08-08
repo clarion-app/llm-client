@@ -1603,6 +1603,7 @@ class AgentLoopService
             toolName: $toolName,
             success: $error === null,
             failureCategory: $error === null ? null : ToolFailureCategory::fromErrorMessage($error),
+            agentId: $conversation->character ?: null,
         );
     }
 

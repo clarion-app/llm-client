@@ -106,6 +106,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // contracts/tool-reliability-api.md §1-2
     Route::get('tool-reliability/tools/{toolName}', [ToolReliabilityController::class, "show"]);
     Route::get('tool-reliability/tools', [ToolReliabilityController::class, "index"]);
+    // Per-agent breakdown for one tool (075 US2) — contracts/tool-reliability-api.md §3
+    Route::get('tool-reliability/tools/{toolName}/agents', [ToolReliabilityController::class, "agentBreakdown"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

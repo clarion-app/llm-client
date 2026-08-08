@@ -1818,4 +1818,145 @@ class AgentLoopServiceTest extends TestCase
         $this->assertEquals('gpt-4', $run->model);
         $this->assertEquals('research-assistant', $run->agent_id);
     }
+
+    // === 075-tool-reliability-rates Phase 4 (US2, T027): recordToolMetric() agent attribution ===
+
+    /**
+     * Builds a scripted confirmed-tool-call round trip through resumeSync(),
+     * with a real MetricsRecorder injected but no RunTraceRecorder at all --
+     * so no agent_runs row can ever be created for this fixture. That is
+     * deliberate: a wrong implementation of recordToolMetric() that derives
+     * agentId via AgentRun::find($runId)?->agent_id instead of
+     * $conversation->character could otherwise coincidentally produce the
+     * same value (both this suite's own run-trace tests and production code
+     * put $conversation->character into agent_runs.agent_id), which would
+     * make such a mutation pass this test for the wrong reason.
+     */
+    private function runConfirmedToolCallThroughResumeSync(\ClarionApp\LlmClient\Models\Conversation $conversation, string $resultJson = '{"success": true}'): void
+    {
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+            'tool_data' => [
+                'tool_calls' => [
+                    [
+                        'id' => 'call_agent_attr',
+                        'type' => 'function',
+                        'function' => [
+                            'name' => 'contacts.destroy',
+                            'arguments' => '{"path":{"id": "42"}}',
+                        ],
+                    ],
+                ],
+                'tool_results' => null,
+                'iteration' => 1,
+                'pending_confirmation' => [
+                    'operationId' => 'destroyContact',
+                    'tool_name' => 'contacts.destroy',
+                    'method' => 'DELETE',
+                    'path' => '/api/contacts/42',
+                    'arguments' => ['path' => ['id' => '42']],
+                    'expires_at' => now()->addMinutes(5)->toIso8601String(),
+                ],
+                // No run_id -- and no RunTraceRecorder is injected below --
+                // so no agent_runs row can exist for this fixture at all.
+            ],
+        ]);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.destroy')
+            ->andReturn([
+                'name' => 'contacts.destroy',
+                '_meta' => ['operationId' => 'destroyContact', 'method' => 'DELETE', 'path' => '/api/contacts/{id}'],
+            ]);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $executorMock->shouldReceive('extractArguments')
+            ->andReturn(['path' => '/api/contacts/42', 'query' => [], 'body' => []]);
+        $executorMock->shouldReceive('executeHttpCall')
+            ->andReturn([
+                'content' => [['type' => 'text', 'text' => $resultJson]],
+                'isError' => false,
+            ]);
+
+        $providerMock = Mockery::mock(\ClarionApp\LlmClient\Contracts\LlmProvider::class);
+        $providerMock->shouldReceive('chat')->andReturn([
+            'choices' => [
+                ['message' => ['content' => 'Done', 'tool_calls' => []]],
+            ],
+        ]);
+        $providerMock->shouldReceive('countTokens')->andReturn(10);
+
+        $providerRegistryMock = Mockery::mock(ProviderRegistry::class);
+        $providerRegistryMock->shouldReceive('resolveByType')->andReturn($providerMock);
+
+        $service = new AgentLoopService(
+            $registryMock,
+            $executorMock,
+            new OperationCache(),
+            $providerRegistryMock,
+            metricsRecorder: new \ClarionApp\LlmClient\Services\MetricsRecorder(),
+        );
+
+        $service->resumeSync($conversation, $message, true);
+    }
+
+    #[Test]
+    public function resume_sync_confirmed_tool_call_attributes_the_invocation_to_the_conversations_character(): void
+    {
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => true,
+            'server_id' => $server->id,
+            'model' => 'gpt-4',
+            'character' => 'research-assistant',
+        ]);
+
+        $this->runConfirmedToolCallThroughResumeSync($conversation);
+
+        $this->assertSame(
+            0,
+            DB::table('agent_runs')->where('conversation_id', $conversation->id)->count(),
+            'no run trace may exist for this fixture -- otherwise a run_id-derived agentId could coincidentally match'
+        );
+
+        $record = DB::table('tool_invocation_records')->where('tool_name', 'contacts.destroy')->first();
+        $this->assertNotNull($record, 'recordToolMetric() must have written a tool_invocation_records row');
+        $this->assertSame('research-assistant', $record->agent_id, "agentId must be \$conversation->character exactly, never a run_id-derived value");
+
+        $summary = DB::table('tool_reliability_summaries')
+            ->where('tool_name', 'contacts.destroy')
+            ->where('agent_id', 'research-assistant')
+            ->first();
+        $this->assertNotNull($summary, 'the tool_reliability_summaries row must be bucketed under the real agent id, not Unattributed');
+        $this->assertSame(1, (int) $summary->invocation_count);
+    }
+
+    #[Test]
+    public function resume_sync_confirmed_tool_call_with_no_character_attributes_the_unattributed_bucket(): void
+    {
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => true,
+            'server_id' => $server->id,
+            'model' => 'gpt-4',
+            'character' => null,
+        ]);
+
+        $this->runConfirmedToolCallThroughResumeSync($conversation);
+
+        $record = DB::table('tool_invocation_records')->where('tool_name', 'contacts.destroy')->first();
+        $this->assertNotNull($record);
+        $this->assertNull($record->agent_id, 'a characterless conversation must record a null agent_id on the detail row');
+
+        $summary = DB::table('tool_reliability_summaries')
+            ->where('tool_name', 'contacts.destroy')
+            ->where('agent_id', \ClarionApp\LlmClient\Models\ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET)
+            ->first();
+        $this->assertNotNull($summary, 'a characterless conversation must bucket into the explicit Unattributed sentinel');
+    }
 }

@@ -1106,4 +1106,136 @@ class AgentLoopStreamHandlerTest extends TestCase
         $this->assertEquals('gpt-4', $run->model);
         $this->assertEquals('research-assistant', $run->agent_id);
     }
+
+    // === 075-tool-reliability-rates Phase 4 (US2, T028): inline recordToolInvocation() agent attribution ===
+
+    #[Test]
+    public function finish_attributes_the_scripted_tool_call_to_the_conversations_character(): void
+    {
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
+
+        // run_trace disabled so no agent_runs row can ever exist for this
+        // conversation -- otherwise a wrong implementation deriving agentId
+        // via AgentRun::find($runId)?->agent_id could coincidentally match
+        // $conversation->character (the streaming finish() path also mints
+        // agent_runs.agent_id from the same conversation->character value)
+        // and pass this test for the wrong reason.
+        $this->app['config']->set('llm-client.run_trace.enabled', false);
+
+        $server = \ClarionApp\LlmClient\Models\Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => true,
+            'server_id' => $server->id,
+            'character' => 'stream-agent',
+        ]);
+
+        $handler = new AgentLoopStreamHandler(metricsRecorder: new \ClarionApp\LlmClient\Services\MetricsRecorder());
+        $handler->toolCalls = [
+            [
+                'id' => 'call_stream_attr_1',
+                'type' => 'function',
+                'function' => [
+                    'name' => 'contacts.store',
+                    'arguments' => '{"body":{"name": "Jane"}}',
+                ],
+            ],
+        ];
+        $handler->message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+        ]);
+
+        $this->mockToolExecution('contacts.store', '{"id": "uuid-123"}');
+
+        $data = json_encode([
+            'conversation_id' => $conversation->id,
+            'iteration' => 1,
+        ]);
+
+        $handler->finish($data, 2);
+
+        $this->assertSame(
+            0,
+            \Illuminate\Support\Facades\DB::table('agent_runs')->where('conversation_id', $conversation->id)->count(),
+            'no run trace may exist for this fixture -- otherwise a run_id-derived agentId could coincidentally match'
+        );
+
+        $record = \Illuminate\Support\Facades\DB::table('tool_invocation_records')->where('tool_name', 'contacts.store')->first();
+        $this->assertNotNull($record, "the handler's inline recordToolInvocation() call must have written a detail row");
+        $this->assertSame('stream-agent', $record->agent_id, "agentId must be \$conversation->character exactly, never a run_id-derived value");
+
+        $summary = \Illuminate\Support\Facades\DB::table('tool_reliability_summaries')
+            ->where('tool_name', 'contacts.store')
+            ->where('agent_id', 'stream-agent')
+            ->first();
+        $this->assertNotNull($summary, 'the tool_reliability_summaries row must be bucketed under the real agent id, not Unattributed');
+    }
+
+    #[Test]
+    public function finish_attributes_a_characterless_conversations_tool_call_to_the_unattributed_bucket(): void
+    {
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
+
+        $this->app['config']->set('llm-client.run_trace.enabled', false);
+
+        $server = \ClarionApp\LlmClient\Models\Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => true,
+            'server_id' => $server->id,
+            'character' => null,
+        ]);
+
+        $handler = new AgentLoopStreamHandler(metricsRecorder: new \ClarionApp\LlmClient\Services\MetricsRecorder());
+        $handler->toolCalls = [
+            [
+                'id' => 'call_stream_attr_2',
+                'type' => 'function',
+                'function' => [
+                    'name' => 'contacts.store',
+                    'arguments' => '{"body":{"name": "Jane"}}',
+                ],
+            ],
+        ];
+        $handler->message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+        ]);
+
+        $this->mockToolExecution('contacts.store', '{"id": "uuid-456"}');
+
+        $data = json_encode([
+            'conversation_id' => $conversation->id,
+            'iteration' => 1,
+        ]);
+
+        $handler->finish($data, 2);
+
+        $record = \Illuminate\Support\Facades\DB::table('tool_invocation_records')->where('tool_name', 'contacts.store')->first();
+        $this->assertNotNull($record);
+        $this->assertNull($record->agent_id, 'a characterless conversation must record a null agent_id on the detail row');
+
+        $summary = \Illuminate\Support\Facades\DB::table('tool_reliability_summaries')
+            ->where('tool_name', 'contacts.store')
+            ->where('agent_id', \ClarionApp\LlmClient\Models\ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET)
+            ->first();
+        $this->assertNotNull($summary, 'a characterless conversation must bucket into the explicit Unattributed sentinel');
+    }
 }
