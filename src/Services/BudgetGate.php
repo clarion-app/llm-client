@@ -51,6 +51,18 @@ class BudgetGate
     private const DEGRADED_THROTTLE_KEY = 'llm-client:budget:degraded-notice';
 
     /**
+     * Where a standing report's applicable ceiling came from, so a user can
+     * see *why* their ceiling is what it is.
+     */
+    public const SOURCE_OVERRIDE = 'override';
+    public const SOURCE_DEFAULT = 'default';
+    public const SOURCE_INSTALLATION = 'installation';
+
+    /** Why a standing report has no ceiling to show for a scope. */
+    public const REASON_NO_CEILING = 'no_ceiling_configured';
+    public const REASON_WAIVED = 'waived';
+
+    /**
      * Scopes already admitted during this request or job, keyed by the same
      * scope key the ledger uses. Per-instance and never static.
      *
@@ -167,6 +179,168 @@ class BudgetGate
         }
 
         $this->admitted[$scopeKey] = true;
+    }
+
+    /**
+     * Where a scope stands right now — asked and answered without anything
+     * being warned about, refused, or otherwise disturbed.
+     *
+     * Built from evaluate()'s own parts: the same ceiling resolution, the
+     * same ledger read, the same per-ceiling assessment, and the same
+     * EnforcementDecision renderers the 402 body and the warning payload use.
+     * A standing report and a refusal for the same instant therefore cannot
+     * disagree about the same ceiling.
+     *
+     * Deliberately built on evaluate()'s parts rather than on admit(): admit()
+     * fires a threshold notification on an allow_with_warning outcome, and
+     * asking where you stand must never be the thing that warns you. Nothing
+     * here writes a row, fires an event, or records a run.
+     *
+     * The envelope is the same on every route that serves it. The
+     * installation block is an installation-wide aggregate rather than any
+     * individual's figures, so it is reported to whoever asks — it is the
+     * ceiling that will stop them, and the entire point of this surface is
+     * that nobody is stopped by a limit they had no way to see. It is also
+     * exactly what the refusal body already hands a non-operator when the
+     * installation ceiling stops them, and a report that contradicted the
+     * refusal would defeat the purpose of building the two from one
+     * computation. No *other individual user's* id,
+     * ceiling, or consumption appears in any block, whoever is asking.
+     *
+     * @return array{
+     *   user_ceiling: array<string, mixed>,
+     *   installation_ceiling: array<string, mixed>,
+     *   degraded: bool,
+     * }
+     */
+    public function standingFor(?string $userId): array
+    {
+        // The pre-waiver row, so a waived user can be told they are waived
+        // rather than that nothing is configured. resolveForUser() walks the
+        // chain by calling the same method, so the row reported here is
+        // always the row enforcement measures against.
+        $userRow = $userId === null ? null : $this->ceilings->applicableUserRow($userId);
+        $installationCeiling = $this->ceilings->resolveInstallation();
+
+        if ($userRow === null) {
+            $userBlock = self::inapplicable(self::REASON_NO_CEILING);
+        } elseif ($userRow->waived) {
+            $userBlock = self::inapplicable(self::REASON_WAIVED);
+        } else {
+            $userBlock = $this->standingBlock(
+                $userRow,
+                'user',
+                $userRow->scope_type === BudgetScope::User->value
+                    ? self::SOURCE_OVERRIDE
+                    : self::SOURCE_DEFAULT,
+                $this->ledger->forUser((string) $userId, $userRow->period_type),
+            );
+        }
+
+        $installationBlock = $installationCeiling === null
+            ? self::inapplicable(self::REASON_NO_CEILING)
+            : $this->standingBlock(
+                $installationCeiling,
+                BudgetScope::Installation->value,
+                self::SOURCE_INSTALLATION,
+                $this->ledger->forInstallation($installationCeiling->period_type),
+            );
+
+        return [
+            'user_ceiling' => $userBlock,
+            'installation_ceiling' => $installationBlock,
+            'degraded' => self::blockIsDegraded($userBlock) || self::blockIsDegraded($installationBlock),
+        ];
+    }
+
+    /**
+     * A scope that has no ceiling to report.
+     *
+     * Exactly two keys, and never a ceiling of "0": an unconstrained scope
+     * rendered as a zero ceiling reads as "you may spend nothing", which is
+     * the precise opposite of the truth (FR-037).
+     *
+     * @return array{applies: false, reason: string}
+     */
+    private static function inapplicable(string $reason): array
+    {
+        return ['applies' => false, 'reason' => $reason];
+    }
+
+    /**
+     * @param  array<string, mixed>  $block
+     */
+    private static function blockIsDegraded(array $block): bool
+    {
+        return ($block['consumption']['available'] ?? true) === false;
+    }
+
+    /**
+     * One applicable ceiling, its figure, and the headroom between them.
+     *
+     * @return array<string, mixed>
+     */
+    private function standingBlock(
+        SpendingCeiling $ceiling,
+        string $axis,
+        string $source,
+        ConsumptionSnapshot $snapshot,
+    ): array {
+        $assessment = $this->assess($ceiling, $axis, $snapshot);
+
+        // The same value object a refusal and a warning are rendered from —
+        // which is what makes remaining()'s flooring, the ceiling shape, and
+        // the period shape identical across all three surfaces rather than
+        // three implementations that agree today. No `reason` sentence: every
+        // one this class composes opens by announcing that something was
+        // stopped or crossed, and a standing report has done neither.
+        $decision = new EnforcementDecision(
+            outcome: $this->outcomeFor($assessment),
+            governingCeiling: $ceiling,
+            snapshot: $snapshot,
+            degraded: !$snapshot->available,
+        );
+
+        return [
+            'applies' => true,
+            'source' => $source,
+            'ceiling' => $decision->ceilingArray(),
+            'period' => $decision->periodArray(),
+            'consumption' => $snapshot->toArray(),
+            // Null when the figure could not be read: no headroom can be
+            // computed from a number nobody has.
+            'remaining' => $decision->remaining(),
+            'threshold_crossed' => $assessment['thresholdCrossed'],
+            'reached' => $assessment['reached'],
+        ];
+    }
+
+    /**
+     * The outcome this one ceiling would produce on its own, by the same
+     * rule combine() applies across all of them.
+     *
+     * Standing does not publish it — a block reports `reached` and
+     * `threshold_crossed` instead — but an EnforcementDecision is never
+     * constructed without the outcome that produced it, and hard-coding an
+     * allow here would leave the object claiming a ceiling was fine while
+     * reporting consumption past it. An unreadable figure decides nothing:
+     * the fail-closed policy belongs to admit(), not to a report.
+     *
+     * @param  array<string, mixed>  $assessment
+     */
+    private function outcomeFor(array $assessment): string
+    {
+        if (!$assessment['snapshot']->available) {
+            return EnforcementDecision::ALLOW;
+        }
+
+        if ($assessment['reached'] && $assessment['ceiling']->enforcement_mode === EnforcementMode::Stop->value) {
+            return EnforcementDecision::STOP;
+        }
+
+        return $assessment['reached'] || $assessment['thresholdCrossed']
+            ? EnforcementDecision::ALLOW_WITH_WARNING
+            : EnforcementDecision::ALLOW;
     }
 
     /**

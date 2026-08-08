@@ -22,6 +22,7 @@ use ClarionApp\LlmClient\Controllers\UsageRecordController;
 use ClarionApp\LlmClient\Controllers\LatencyController;
 use ClarionApp\LlmClient\Controllers\ToolReliabilityController;
 use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
+use ClarionApp\LlmClient\Controllers\BudgetStandingController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -120,6 +121,14 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::delete('budget/ceilings/installation', [BudgetCeilingController::class, "destroyInstallation"]);
     Route::delete('budget/ceilings/user-default', [BudgetCeilingController::class, "destroyUserDefault"]);
     Route::delete('budget/ceilings/users/{userId}', [BudgetCeilingController::class, "destroyUser"]);
+
+    // "Where do I stand" — read-only, and deliberately taking no from/to:
+    // standing is always the current period of each applicable ceiling,
+    // resolved server-side, because a caller-chosen range would not be the
+    // range enforcement measures over.
+    Route::get('budget/standing', [BudgetStandingController::class, "self"]);
+    Route::get('budget/standing/users/{userId}', [BudgetStandingController::class, "user"]);
+    Route::get('budget/standing/installation', [BudgetStandingController::class, "installation"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

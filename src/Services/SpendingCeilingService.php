@@ -113,23 +113,44 @@ class SpendingCeilingService
      */
     public function resolveForUser(string $userId): ?SpendingCeiling
     {
-        $row = SpendingCeiling::query()
-            ->where('scope_type', BudgetScope::User->value)
-            ->where('scope_id', $userId)
-            ->first();
-
-        if ($row === null) {
-            $row = SpendingCeiling::query()
-                ->where('scope_type', BudgetScope::UserDefault->value)
-                ->where('scope_id', SpendingCeiling::INSTALLATION_SCOPE_ID)
-                ->first();
-        }
+        $row = $this->applicableUserRow($userId);
 
         if ($row === null || $row->waived) {
             return null;
         }
 
         return $row;
+    }
+
+    /**
+     * The row the user chain selects for a user — their own override if they
+     * have one, otherwise the installation-wide per-user default — *before*
+     * a waiver is applied, so a caller can tell "waived" apart from "nothing
+     * configured".
+     *
+     * Enforcement never uses this: resolveForUser() above is the only entry
+     * point that decides whether a ceiling applies, and it walks the chain by
+     * calling this method, so the two can never disagree about which row a
+     * user is measured against. This exists because reporting has one
+     * question enforcement does not — *why* is a user's ceiling what it is —
+     * and answering it from a second walk of the same tables would be a
+     * parallel resolution waiting to drift.
+     */
+    public function applicableUserRow(string $userId): ?SpendingCeiling
+    {
+        $row = SpendingCeiling::query()
+            ->where('scope_type', BudgetScope::User->value)
+            ->where('scope_id', $userId)
+            ->first();
+
+        if ($row !== null) {
+            return $row;
+        }
+
+        return SpendingCeiling::query()
+            ->where('scope_type', BudgetScope::UserDefault->value)
+            ->where('scope_id', SpendingCeiling::INSTALLATION_SCOPE_ID)
+            ->first();
     }
 
     /**
