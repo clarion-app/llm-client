@@ -31,6 +31,10 @@ final readonly class EnforcementDecision
     /** ...and when it was not: never dressed up as a real crossing. */
     public const CODE_CONSUMPTION_UNAVAILABLE = 'budget_consumption_unavailable';
 
+    /** The two flavours of notice composeNoticeReason() can produce. */
+    public const NOTICE_APPROACH = 'approach';
+    public const NOTICE_REACHED = 'reached';
+
     /** Decimal places every stored monetary figure carries. */
     private const SCALE = 10;
 
@@ -192,6 +196,48 @@ final readonly class EnforcementDecision
         string $governingScope,
         bool $degraded,
     ): string {
+        return self::compose('Work stopped: ', $ceiling, $snapshot, $governingScope, $degraded);
+    }
+
+    /**
+     * The same sentence, said about something that did *not* stop the work.
+     *
+     * A warning and a warn-mode ceiling both let work through, so the
+     * refusal sentence's opening clause — "Work stopped" — would be a plain
+     * falsehood on either. Only the opening clause differs: the three facts
+     * and the caveat that follow are composed by the same code as the
+     * refusal's, which is the whole point of the sentence living in this
+     * class. A notice that composed its own message would drift from the
+     * refusal the first time either was reworded, and the reader would have
+     * no way to tell which of the two was current.
+     *
+     * @param  string  $kind  NOTICE_APPROACH | NOTICE_REACHED
+     */
+    public static function composeNoticeReason(
+        SpendingCeiling $ceiling,
+        ConsumptionSnapshot $snapshot,
+        string $governingScope,
+        string $kind,
+    ): string {
+        $opening = $kind === self::NOTICE_REACHED
+            ? 'Spending ceiling reached: '
+            : 'Approaching a spending ceiling: ';
+
+        return self::compose($opening, $ceiling, $snapshot, $governingScope, degraded: false);
+    }
+
+    /**
+     * The shared body of every sentence this class produces: an opening
+     * clause chosen by the caller, then the amount, the consumption to
+     * date, the reset time, and the caveat — in that order, always.
+     */
+    private static function compose(
+        string $opening,
+        SpendingCeiling $ceiling,
+        ConsumptionSnapshot $snapshot,
+        string $governingScope,
+        bool $degraded,
+    ): string {
         $currency = (string) config('llm-client.cost.currency', 'USD');
         $whose = $governingScope === BudgetScope::Installation->value
             ? 'this installation'
@@ -200,8 +246,8 @@ final readonly class EnforcementDecision
         $resetsAt = $snapshot->resetsAt->format('Y-m-d H:i').' UTC';
 
         if ($degraded || !$snapshot->available) {
-            return sprintf(
-                'Work stopped: the %s spending ceiling for %s is %s %s, but the amount recorded '
+            return $opening.sprintf(
+                'the %s spending ceiling for %s is %s %s, but the amount recorded '
                 .'against it could not be read, so new work is being refused until it can be. '
                 .'The period resets on %s. Any figure here would be approximate — the cost of a '
                 .'unit of work is only known once that work completes.',
@@ -213,8 +259,8 @@ final readonly class EnforcementDecision
             );
         }
 
-        return sprintf(
-            'Work stopped: the %s spending ceiling for %s is %s %s and %s %s has been recorded '
+        return $opening.sprintf(
+            'the %s spending ceiling for %s is %s %s and %s %s has been recorded '
             .'against it so far. The period resets on %s. This figure is approximate — the cost '
             .'of a unit of work is only known once that work completes.',
             $period,

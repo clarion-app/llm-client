@@ -304,6 +304,33 @@ class MetricsRecorder
                     ]);
                 }
             });
+
+            // Spending thresholds are evaluated here because this is the
+            // only place in the package where consumption can increase.
+            //
+            // Placement is two decisions, both with a wrong answer that
+            // looks right. It sits *after* the transaction closure returns,
+            // not inside it: inside, the notifier would read a total that has
+            // not been committed and could latch a period's single warning
+            // for consumption a subsequent rollback erases — and a
+            // once-per-period latch cannot be undone by any later unit of
+            // work. And it has its *own* try/catch, matching the three
+            // isolation blocks above, because this method is fire-and-forget
+            // and must never throw into a conversation: a broadcast failure
+            // in front of the usage record would suppress the record itself.
+            //
+            // Resolved from the container at call time rather than injected,
+            // because MetricsRecorder is constructed with `new` at most of
+            // its call sites and would otherwise have no notifier at all.
+            try {
+                app(BudgetThresholdNotifier::class)->notify($userId);
+            } catch (\Throwable $e) {
+                Log::warning('MetricsRecorder: failed to evaluate spending thresholds', [
+                    'conversation_id' => $conversationId,
+                    'user_id' => $userId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         } catch (\Throwable $e) {
             Log::warning('MetricsRecorder: failed to record usage', [
                 'conversation_id' => $conversationId,

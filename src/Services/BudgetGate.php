@@ -146,6 +146,26 @@ class BudgetGate
             throw new BudgetExceededException($decision, $kind);
         }
 
+        // The second of the two moments a threshold can be crossed. The
+        // first is the write that increases consumption; this one is what
+        // makes a ceiling *lowered* below existing consumption warn on the
+        // next request, rather than staying silent until somebody happens to
+        // complete another unit of work. It returns normally either way — a
+        // warning never blocks — and the notifier's own latch is what keeps
+        // the two moments from producing two notifications in one request.
+        if ($decision->outcome === EnforcementDecision::ALLOW_WITH_WARNING) {
+            try {
+                app(BudgetThresholdNotifier::class)->notify($userId);
+            } catch (\Throwable $e) {
+                // notify() swallows its own failures; this catch covers the
+                // resolution itself, because nothing about announcing a
+                // warning may stop work that the gate has already allowed.
+                Log::warning('Failed to evaluate spending thresholds at the gate', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         $this->admitted[$scopeKey] = true;
     }
 

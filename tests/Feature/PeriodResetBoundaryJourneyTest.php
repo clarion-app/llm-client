@@ -3,11 +3,13 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Events\SpendingThresholdWarned;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\CostSummary;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Models\SpendingCeiling;
 use ClarionApp\LlmClient\Services\BudgetLedger;
+use ClarionApp\LlmClient\Services\BudgetThresholdNotifier;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
 use ClarionApp\LlmClient\Services\SpendingCeilingService;
 use ClarionApp\LlmClient\Support\CalendarPeriod;
@@ -15,6 +17,7 @@ use ClarionApp\LlmClient\ValueObjects\BudgetScope;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -105,6 +108,7 @@ class PeriodResetBoundaryJourneyTest extends TestCase
     {
         Carbon::setTestNow();
 
+        DB::table('budget_threshold_notifications')->delete();
         DB::table('cost_summaries')->delete();
         DB::table('spending_ceilings')->delete();
         DB::table('agent_runs')->delete();
@@ -180,10 +184,30 @@ class PeriodResetBoundaryJourneyTest extends TestCase
 
     private function resetEverything(): void
     {
+        DB::table('budget_threshold_notifications')->delete();
         DB::table('cost_summaries')->delete();
         DB::table('spending_ceilings')->delete();
         DB::table('agent_runs')->delete();
         $this->newRequestBoundary();
+    }
+
+    private function evaluateThresholds(): void
+    {
+        app(BudgetThresholdNotifier::class)->notify((string) $this->user->id);
+    }
+
+    /** @return string[] the period_start of every approach warning on record */
+    private function warnedPeriodStarts(): array
+    {
+        $starts = DB::table('budget_threshold_notifications')
+            ->where('kind', 'approach')
+            ->pluck('period_start')
+            ->map(fn ($value) => substr((string) $value, 0, 10))
+            ->all();
+
+        sort($starts);
+
+        return $starts;
     }
 
     // ---------------------------------------------------------------
@@ -372,6 +396,65 @@ class PeriodResetBoundaryJourneyTest extends TestCase
             '0.0000000000',
             app(BudgetLedger::class)->forUser($this->user->id, 'day')->amount,
             'Consumption for the new period begins at zero; the previous unit belongs to the day it finished in'
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // A warning is fresh in a new period, for the same reason
+    // ---------------------------------------------------------------
+
+    /**
+     * The once-per-period latch is keyed on the period itself, so a new
+     * period is a new key. That is the whole mechanism: there is nothing to
+     * clear, no reset job to run, and no operator action of any kind — the
+     * warning that fired yesterday is simply a different row from the one
+     * that fires today.
+     *
+     * Take period_start out of the key and this is the test that notices:
+     * the warning would fire once in the life of the installation and never
+     * again, and every later period would pass its threshold in silence.
+     */
+    #[Test]
+    public function a_warning_that_fired_in_the_previous_period_fires_again_in_the_new_one(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-08-14 23:30:00', 'UTC'));
+
+        // 25.00 daily ceiling, default 0.80 threshold => due at 20.00.
+        $this->declareCeiling('day');
+        $this->recordSpend('21.0000000000', '2026-08-14');
+
+        Event::fake([SpendingThresholdWarned::class]);
+
+        $this->evaluateThresholds();
+        Event::assertDispatchedTimes(SpendingThresholdWarned::class, 1);
+
+        // Still the same period: no duplicate, however often it is asked.
+        $this->evaluateThresholds();
+        $this->evaluateThresholds();
+        Event::assertDispatchedTimes(SpendingThresholdWarned::class, 1);
+
+        $ceilingsBefore = DB::table('spending_ceilings')->get()->toArray();
+
+        // Midnight passes. Nothing is run, nothing is cleared, nobody is
+        // asked to do anything.
+        Carbon::setTestNow(Carbon::parse('2026-08-15 00:30:00', 'UTC'));
+        $this->newRequestBoundary();
+
+        $this->recordSpend('21.0000000000', '2026-08-15');
+        $this->evaluateThresholds();
+
+        Event::assertDispatchedTimes(SpendingThresholdWarned::class, 2);
+
+        $this->assertSame(
+            ['2026-08-14', '2026-08-15'],
+            $this->warnedPeriodStarts(),
+            'Two warnings on record, one per period — and the previous period\'s row was never deleted'
+        );
+
+        $this->assertEquals(
+            $ceilingsBefore,
+            DB::table('spending_ceilings')->get()->toArray(),
+            'No reset job and no operator action: the ceiling is byte-identical across the boundary'
         );
     }
 }

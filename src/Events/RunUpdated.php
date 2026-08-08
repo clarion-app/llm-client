@@ -13,7 +13,7 @@ use Illuminate\Queue\SerializesModels;
  * its terminal UPDATE to agent_runs succeeds (research.md D3,
  * data-model.md §4.1). Delivered on the run owner's already-hardened
  * PrivateChannel('User.{id}') (research.md D1) — this feature adds zero new
- * Broadcast::channel() predicates and zero new identifier-comparison code
+ * channel-authorization predicates and zero new identifier-comparison code
  * (standing rule 5): broadcastOn() below performs no comparison at all, it
  * only looks up the owner's id and hands it to the already-authorized
  * channel name.

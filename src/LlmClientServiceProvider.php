@@ -401,6 +401,20 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\BudgetLedger::class),
             );
         });
+
+        // bind(), not singleton() and not scoped(). The notifier holds no
+        // state of its own, but it reads through BudgetLedger, whose memo is
+        // deliberately per-request/per-job: a longer-lived notifier would
+        // pin one job's ledger instance and compare every later job's
+        // consumption against a figure that stopped being current when that
+        // first job ended. Resolving a fresh one each time costs nothing and
+        // always picks up the current scoped ledger.
+        $this->app->bind(\ClarionApp\LlmClient\Services\BudgetThresholdNotifier::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\BudgetThresholdNotifier(
+                $app->make(\ClarionApp\LlmClient\Services\SpendingCeilingService::class),
+                $app->make(\ClarionApp\LlmClient\Services\BudgetLedger::class),
+            );
+        });
     }
 
     /**
