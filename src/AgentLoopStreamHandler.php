@@ -92,6 +92,24 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                             'content' => '',
                         ]);
                         event(new NewConversationMessageEvent($conversationId, $this->message->id));
+
+                        // Record time-to-first-visible-output (074-latency-metrics
+                        // FR-002/US1): this is the first assistant message row and
+                        // the first broadcast the frontend receives for this
+                        // response -- literally "first visible output." The
+                        // handler is instantiated with `new` by the http-queue
+                        // job (not container-resolved), so runTraceRecorder is
+                        // lazily resolved here the same way finish() already does.
+                        if ($this->runTraceRecorder === null) {
+                            try {
+                                $this->runTraceRecorder = app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class);
+                            } catch (\Throwable $e) {
+                                $this->runTraceRecorder = null;
+                            }
+                        }
+                        if ($this->runTraceRecorder !== null) {
+                            $this->runTraceRecorder->recordFirstOutput($parsedData['run_id'] ?? $this->runId);
+                        }
                     }
 
                     $this->reply .= $delta['content'];
@@ -169,6 +187,9 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
                 (string) $conversation->user_id,
                 $conversation->id,
+                streamed: true,
+                model: $conversation->model,
+                agentId: $conversation->character ?? $conversation->id,
             );
             // If we minted a run but have no step_id, open one now.
             if ($this->runId !== null && $this->stepId === null) {

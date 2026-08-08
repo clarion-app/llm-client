@@ -86,6 +86,12 @@ class ResolveAbandonedRunsCommand extends Command
             }
 
             if (!$dryRun) {
+                // FR-009: the sweep bypasses closeRun() by design (its own bulk
+                // UPDATE, see the comment on enqueueForwarding() below), so it
+                // must compute the four latency-breakdown columns itself rather
+                // than leaving them null forever.
+                $breakdown = $recorder->computeLatencyBreakdown($runId, $durationMs);
+
                 DB::table('agent_runs')
                     ->where('id', $runId)
                     ->where('end_state', 'in_progress')
@@ -95,6 +101,10 @@ class ResolveAbandonedRunsCommand extends Command
                         'ended_at' => $now->format('Y-m-d H:i:s.u'),
                         'duration_ms' => $durationMs,
                         'step_count' => $stepCount,
+                        'model_wait_ms' => $breakdown['model_wait_ms'],
+                        'tool_exec_ms' => $breakdown['tool_exec_ms'],
+                        'confirm_wait_ms' => $breakdown['confirm_wait_ms'],
+                        'product_ms' => $breakdown['product_ms'],
                     ]);
 
                 // Close any still-open steps in the same pass.

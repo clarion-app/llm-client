@@ -24,13 +24,77 @@ class RunTraceRecorderTest extends TestCase
     protected function tearDown(): void
     {
         // Clean up tables after each test (check existence first — never-throw tests may drop them).
-        foreach (['agent_run_messages', 'agent_run_steps', 'agent_runs'] as $table) {
+        foreach (['agent_run_messages', 'agent_run_actions', 'agent_run_steps', 'agent_runs'] as $table) {
             if (Schema::hasTable($table)) {
                 DB::table($table)->delete();
             }
         }
 
         parent::tearDown();
+    }
+
+    /**
+     * Insert an agent_run_actions row directly, with explicit timestamps, so the
+     * latency-breakdown tests can control interval shapes precisely rather than
+     * relying on usleep()-based timing.
+     */
+    private function insertAction(
+        string $runId,
+        string $stepId,
+        string $actionType,
+        string $startedAt,
+        ?string $endedAt = null,
+        ?int $durationMs = null,
+        ?string $pausedAt = null,
+        string $outcome = 'success',
+    ): string {
+        $id = (string) \Illuminate\Support\Str::uuid();
+
+        DB::table('agent_run_actions')->insert([
+            'id' => $id,
+            'run_id' => $runId,
+            'step_id' => $stepId,
+            'action_type' => $actionType,
+            'target' => null,
+            'attempt_group_id' => null,
+            'parent_action_id' => null,
+            'outcome' => $outcome,
+            'failure_reason' => null,
+            'paused_at' => $pausedAt,
+            'started_at' => $startedAt,
+            'ended_at' => $endedAt,
+            'duration_ms' => $durationMs,
+            'content' => null,
+            'created_at' => $startedAt,
+        ]);
+
+        return $id;
+    }
+
+    /**
+     * Insert an agent_run_steps row directly, with an explicit wait_ms, for the
+     * confirm_wait_ms aggregation tests.
+     */
+    private function insertStepWithWait(string $runId, int $position, ?int $waitMs): string
+    {
+        $id = (string) \Illuminate\Support\Str::uuid();
+        $now = now()->format('Y-m-d H:i:s.u');
+
+        DB::table('agent_run_steps')->insert([
+            'id' => $id,
+            'run_id' => $runId,
+            'position' => $position,
+            'attempt_group_id' => null,
+            'end_state' => 'completed',
+            'end_reason' => null,
+            'started_at' => $now,
+            'ended_at' => $now,
+            'duration_ms' => 1000,
+            'wait_ms' => $waitMs,
+            'attempt_count' => 1,
+        ]);
+
+        return $id;
     }
 
     // ========== openRun ==========
@@ -491,5 +555,227 @@ class RunTraceRecorderTest extends TestCase
         $recorder->closeRun('non-existent-run', RunEndState::Completed);
         // No exception thrown.
         $this->assertTrue($warned, 'Expected a warning log entry');
+    }
+
+    // ========== openRun: streamed/model/agentId (074-latency-metrics) ==========
+
+    /** @test */
+    public function open_run_writes_streamed_model_and_agent_id(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $userId = (string) \Illuminate\Support\Str::uuid();
+
+        $runId = $recorder->openRun(
+            RunKind::Interactive,
+            $userId,
+            null,
+            null,
+            streamed: true,
+            model: 'claude-sonnet-5',
+            agentId: 'research-assistant',
+        );
+
+        $this->assertNotNull($runId);
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertEquals(1, (int) $run->is_streamed);
+        $this->assertEquals('claude-sonnet-5', $run->model);
+        $this->assertEquals('research-assistant', $run->agent_id);
+    }
+
+    /** @test */
+    public function open_run_defaults_streamed_model_and_agent_id(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+
+        $this->assertNotNull($runId);
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertEquals(0, (int) $run->is_streamed, 'streamed defaults to false');
+        $this->assertNull($run->model);
+        $this->assertNull($run->agent_id);
+    }
+
+    // ========== recordFirstOutput (074-latency-metrics) ==========
+
+    /** @test */
+    public function record_first_output_is_noop_for_null_run_id(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+
+        // Must not throw.
+        $recorder->recordFirstOutput(null);
+        $this->assertTrue(true);
+    }
+
+    /** @test */
+    public function record_first_output_is_noop_when_tracing_disabled(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+
+        $this->app['config']->set('llm-client.run_trace.enabled', false);
+        $recorder->recordFirstOutput($runId);
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNull($run->first_output_ms);
+    }
+
+    /** @test */
+    public function record_first_output_sets_elapsed_time_on_first_call(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+
+        usleep(50_000);
+        $recorder->recordFirstOutput($runId);
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNotNull($run->first_output_ms);
+        $this->assertGreaterThanOrEqual(50, $run->first_output_ms);
+        $this->assertLessThan(5_000, $run->first_output_ms);
+    }
+
+    /** @test */
+    public function record_first_output_second_call_is_noop(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+
+        $recorder->recordFirstOutput($runId);
+        $first = DB::table('agent_runs')->where('id', $runId)->value('first_output_ms');
+
+        usleep(50_000);
+        $recorder->recordFirstOutput($runId);
+        $second = DB::table('agent_runs')->where('id', $runId)->value('first_output_ms');
+
+        $this->assertSame(
+            $first,
+            $second,
+            'A later call must not overwrite the first-recorded value (the WHERE first_output_ms IS NULL guard)',
+        );
+    }
+
+    /** @test */
+    public function record_first_output_catches_db_errors(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+
+        DB::statement('DROP TABLE IF EXISTS agent_runs');
+
+        $warned = false;
+        Log::listen(function ($entry) use (&$warned) {
+            if ($entry->level === 'warning') {
+                $warned = true;
+            }
+        });
+
+        // Must not throw — mirrors open_run_catches_db_errors/close_run_catches_db_errors above.
+        $recorder->recordFirstOutput($runId);
+        $this->assertTrue($warned, 'Expected a warning log entry');
+    }
+
+    // ========== computeLatencyBreakdown (074-latency-metrics) ==========
+
+    /** @test */
+    public function compute_latency_breakdown_sums_model_wait_ms_from_llm_request_actions(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+        $stepId = $recorder->openStep($runId);
+
+        $now = now()->format('Y-m-d H:i:s.u');
+        $this->insertAction($runId, $stepId, 'llm_request', $now, $now, 1000);
+        $this->insertAction($runId, $stepId, 'llm_request', $now, $now, 1500);
+        // Noise: a tool_invocation action must not be counted into model_wait_ms.
+        $this->insertAction($runId, $stepId, 'tool_invocation', $now, $now, 999999);
+
+        $breakdown = $recorder->computeLatencyBreakdown($runId, 100000);
+
+        $this->assertSame(2500, $breakdown['model_wait_ms']);
+    }
+
+    /** @test */
+    public function compute_latency_breakdown_merges_overlapping_tool_invocation_intervals(): void
+    {
+        // data-model.md §3 worked example: [10:00:00,10:00:05] (5000ms) +
+        // [10:00:02,10:00:07] (5000ms) merge to 7000ms, not the naive 10000ms sum.
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+        $stepId = $recorder->openStep($runId);
+
+        $this->insertAction($runId, $stepId, 'tool_invocation', '2026-08-07 10:00:00.000000', '2026-08-07 10:00:05.000000');
+        $this->insertAction($runId, $stepId, 'tool_invocation', '2026-08-07 10:00:02.000000', '2026-08-07 10:00:07.000000');
+
+        $breakdown = $recorder->computeLatencyBreakdown($runId, 100000);
+
+        $this->assertSame(7000, $breakdown['tool_exec_ms']);
+    }
+
+    /** @test */
+    public function compute_latency_breakdown_uses_pre_pause_interval_for_paused_then_resumed_action(): void
+    {
+        // A tool_invocation that passed through awaiting_confirmation contributes
+        // only its pre-pause portion — the long confirmation wait afterward must
+        // not inflate tool_exec_ms (data-model.md §3).
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+        $stepId = $recorder->openStep($runId);
+
+        $this->insertAction(
+            $runId,
+            $stepId,
+            'tool_invocation',
+            startedAt: '2026-08-07 10:00:00.000000',
+            endedAt: '2026-08-07 10:00:52.000000', // resolved 52s later
+            durationMs: null,
+            pausedAt: '2026-08-07 10:00:02.000000', // paused after 2s
+            outcome: 'success',
+        );
+
+        $breakdown = $recorder->computeLatencyBreakdown($runId, 100000);
+
+        $this->assertSame(2000, $breakdown['tool_exec_ms']);
+    }
+
+    /** @test */
+    public function compute_latency_breakdown_sums_confirm_wait_ms_from_step_wait_ms(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+
+        $this->insertStepWithWait($runId, 1, 300);
+        $this->insertStepWithWait($runId, 2, 700);
+        $this->insertStepWithWait($runId, 3, null); // no confirmation pause
+
+        $breakdown = $recorder->computeLatencyBreakdown($runId, 100000);
+
+        $this->assertSame(1000, $breakdown['confirm_wait_ms']);
+    }
+
+    /** @test */
+    public function compute_latency_breakdown_clamps_product_ms_to_zero_with_warning(): void
+    {
+        $recorder = $this->app->make(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, 'user-1');
+        $stepId = $recorder->openStep($runId);
+
+        $now = now()->format('Y-m-d H:i:s.u');
+        // model_wait_ms alone (5000ms) already exceeds the total duration (1000ms).
+        $this->insertAction($runId, $stepId, 'llm_request', $now, $now, 5000);
+
+        $warned = false;
+        Log::listen(function ($entry) use (&$warned) {
+            if ($entry->level === 'warning') {
+                $warned = true;
+            }
+        });
+
+        $breakdown = $recorder->computeLatencyBreakdown($runId, 1000);
+
+        $this->assertSame(0, $breakdown['product_ms'], 'product_ms must clamp to 0, never go negative');
+        $this->assertTrue($warned, 'Expected a warning log entry when the clamp fires');
     }
 }

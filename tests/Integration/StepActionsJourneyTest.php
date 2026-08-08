@@ -222,7 +222,14 @@ class StepActionsJourneyTest extends AssembledSystemTestCase
         // Resolve the action to success (user approved after long wait).
         $recorder->closeAction($actionId, ActionOutcome::Success, null, '{"result": "executed"}');
 
-        // Close step and run.
+        // Close step and run. The action's started_at/paused_at were backdated
+        // above (to simulate the long human wait) but the run's own started_at
+        // was not, so the run's real elapsed duration_ms is tiny next to the
+        // ~10-minute pre-pause tool_exec_ms this fixture produces. closeRun()'s
+        // computeLatencyBreakdown() (074-latency-metrics) correctly clamps
+        // product_ms to 0 and logs a warning in that case — declare it expected
+        // here rather than let it read as an undeclared degradation.
+        $this->ledger->expect('RunTraceRecorder:*');
         $recorder->closeStep($stepId, RunEndState::Completed);
         $recorder->closeRun($runId, RunEndState::Completed);
 

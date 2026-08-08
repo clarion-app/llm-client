@@ -944,4 +944,166 @@ class AgentLoopStreamHandlerTest extends TestCase
         $this->assertEquals($stepId, $handler->message->tool_data['step_id']);
         $this->assertArrayHasKey('paused_at', $handler->message->tool_data);
     }
+
+    // === 074-latency-metrics T012: recordFirstOutput() ===
+
+    #[Test]
+    public function handle_calls_record_first_output_on_first_content_delta(): void
+    {
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
+
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+
+        $conversation = Conversation::factory()->create();
+        $recorder = $this->app->make(\ClarionApp\LlmClient\Services\RunTraceRecorder::class);
+        $runId = $recorder->openRun(
+            \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+            (string) $conversation->user_id,
+            $conversation->id,
+            null,
+            streamed: true,
+        );
+
+        $handler = new AgentLoopStreamHandler(null, null, $recorder);
+
+        // The same job payload finish() reads run_id from (contracts §3.1) is
+        // available to handle() on every chunk — both are called with $data.
+        $data = json_encode([
+            'conversation_id' => $conversation->id,
+            'iteration' => 1,
+            'run_id' => $runId,
+            'step_id' => null,
+            'action_id' => null,
+        ]);
+
+        $chunk = "data: " . json_encode([
+            'choices' => [['delta' => ['content' => 'Hello'], 'finish_reason' => null]],
+        ]) . "\n\n";
+
+        usleep(20_000);
+        $handler->handle($chunk, $data, 0);
+
+        $run = \Illuminate\Support\Facades\DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNotNull($run);
+        $this->assertNotNull($run->first_output_ms, 'The first content delta must record first_output_ms');
+        $this->assertGreaterThanOrEqual(0, $run->first_output_ms);
+    }
+
+    #[Test]
+    public function first_output_ms_is_not_overwritten_by_a_later_rounds_first_delta(): void
+    {
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
+
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+
+        $conversation = Conversation::factory()->create();
+        $recorder = $this->app->make(\ClarionApp\LlmClient\Services\RunTraceRecorder::class);
+        $runId = $recorder->openRun(
+            \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+            (string) $conversation->user_id,
+            $conversation->id,
+            null,
+            streamed: true,
+        );
+
+        $dataRound1 = json_encode([
+            'conversation_id' => $conversation->id,
+            'iteration' => 1,
+            'run_id' => $runId,
+        ]);
+        $chunkRound1 = "data: " . json_encode([
+            'choices' => [['delta' => ['content' => 'First'], 'finish_reason' => null]],
+        ]) . "\n\n";
+
+        // Round one: its own handler instance, matching production — a fresh
+        // AgentLoopStreamHandler is minted per streaming dispatch.
+        $handlerRound1 = new AgentLoopStreamHandler(null, null, $recorder);
+        $handlerRound1->handle($chunkRound1, $dataRound1, 0);
+
+        $firstValue = \Illuminate\Support\Facades\DB::table('agent_runs')->where('id', $runId)->value('first_output_ms');
+        $this->assertNotNull($firstValue);
+
+        usleep(50_000);
+
+        // Round two: a later streaming round for the same run (e.g. the model's
+        // summary reply after a tool call) also produces its own "first" content
+        // delta — it must not overwrite the already-recorded value.
+        $dataRound2 = json_encode([
+            'conversation_id' => $conversation->id,
+            'iteration' => 2,
+            'run_id' => $runId,
+        ]);
+        $chunkRound2 = "data: " . json_encode([
+            'choices' => [['delta' => ['content' => 'Second'], 'finish_reason' => null]],
+        ]) . "\n\n";
+
+        $handlerRound2 = new AgentLoopStreamHandler(null, null, $recorder);
+        $handlerRound2->handle($chunkRound2, $dataRound2, 0);
+
+        $secondValue = \Illuminate\Support\Facades\DB::table('agent_runs')->where('id', $runId)->value('first_output_ms');
+        $this->assertSame(
+            $firstValue,
+            $secondValue,
+            "A later round's own first content delta must not overwrite first_output_ms",
+        );
+    }
+
+    #[Test]
+    public function finish_fallback_open_run_passes_streamed_true_model_and_agent_id(): void
+    {
+        // T012: the handler's own openRun() fallback call site (~line 168, minting
+        // a fresh run for a pre-run_id-shaped payload) must pass the same new
+        // arguments every other call site does.
+        Event::fake([
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            NewConversationMessageEvent::class,
+            ToolExecutionEvent::class,
+            \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
+        ]);
+
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+
+        $conversation = Conversation::factory()->create([
+            'model' => 'gpt-4',
+            'character' => 'research-assistant',
+        ]);
+
+        $handler = new AgentLoopStreamHandler();
+        $handler->reply = 'Response without run_id.';
+        $handler->message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+        ]);
+
+        // No run_id in payload — simulates a pre-feature job, exercising the
+        // fallback openRun() call site inside finish().
+        $data = json_encode([
+            'conversation_id' => $conversation->id,
+            'iteration' => 1,
+        ]);
+
+        $handler->finish($data, 2);
+
+        $run = \Illuminate\Support\Facades\DB::table('agent_runs')->where('conversation_id', $conversation->id)->first();
+        $this->assertNotNull($run);
+        $this->assertEquals(1, (int) $run->is_streamed, 'the streaming path always mints streamed: true');
+        $this->assertEquals('gpt-4', $run->model);
+        $this->assertEquals('research-assistant', $run->agent_id);
+    }
 }

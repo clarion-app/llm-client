@@ -601,4 +601,71 @@ class ResolveAbandonedRunsCommandTest extends TestCase
             'internal-only (the default) must not enqueue anything for forwarding',
         );
     }
+
+    // ========================================================================
+    // 074-latency-metrics T013: the sweep's terminal UPDATE must also populate
+    // the four latency-breakdown columns via the same computeLatencyBreakdown()
+    // helper closeRun() uses (FR-009), rather than leaving them null forever.
+    // ========================================================================
+
+    #[Test]
+    public function swept_run_populates_latency_breakdown_columns(): void
+    {
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $stepId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        $this->insertStep($stepId, $runId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        $exitCode = Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $this->assertSame(0, $exitCode);
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNotNull($run);
+        $this->assertEquals(RunEndState::Abandoned->value, $run->end_state);
+
+        // FR-009: the sweep bypasses closeRun() by design (its own bulk UPDATE),
+        // so it must call computeLatencyBreakdown() itself rather than leaving
+        // these four columns null forever.
+        $this->assertNotNull($run->model_wait_ms, 'model_wait_ms must be populated by the sweep');
+        $this->assertNotNull($run->tool_exec_ms, 'tool_exec_ms must be populated by the sweep');
+        $this->assertNotNull($run->confirm_wait_ms, 'confirm_wait_ms must be populated by the sweep');
+        $this->assertNotNull($run->product_ms, 'product_ms must be populated by the sweep');
+
+        $this->assertSame((int) $run->model_wait_ms, (int) $run->model_wait_ms);
+        $this->assertSame((int) $run->tool_exec_ms, (int) $run->tool_exec_ms);
+        $this->assertSame((int) $run->confirm_wait_ms, (int) $run->confirm_wait_ms);
+        $this->assertSame((int) $run->product_ms, (int) $run->product_ms);
+        $this->assertGreaterThanOrEqual(0, (int) $run->product_ms);
+    }
+
+    #[Test]
+    public function swept_runs_breakdown_reconciles_with_duration(): void
+    {
+        // FR-007: the four breakdown columns reconcile with duration_ms on the
+        // swept row exactly as they do on a closeRun()-closed one.
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $stepId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        $this->insertStep($stepId, $runId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'), null, null, 1, null, null, 250);
+
+        Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNotNull($run);
+
+        $sum = (int) $run->model_wait_ms + (int) $run->tool_exec_ms
+            + (int) $run->confirm_wait_ms + (int) $run->product_ms;
+        $this->assertSame((int) $run->duration_ms, $sum);
+    }
 }

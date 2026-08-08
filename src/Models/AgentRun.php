@@ -27,6 +27,14 @@ class AgentRun extends Model
         'duration_ms',
         'step_count',
         'created_at',
+        'is_streamed',
+        'first_output_ms',
+        'model',
+        'agent_id',
+        'model_wait_ms',
+        'tool_exec_ms',
+        'confirm_wait_ms',
+        'product_ms',
     ];
 
     protected $casts = [
@@ -37,6 +45,12 @@ class AgentRun extends Model
         'duration_ms' => 'integer',
         'step_count' => 'integer',
         'created_at' => 'datetime',
+        'is_streamed' => 'boolean',
+        'first_output_ms' => 'integer',
+        'model_wait_ms' => 'integer',
+        'tool_exec_ms' => 'integer',
+        'confirm_wait_ms' => 'integer',
+        'product_ms' => 'integer',
     ];
 
     protected static function booted(): void

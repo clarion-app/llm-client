@@ -1597,4 +1597,225 @@ class AgentLoopServiceTest extends TestCase
             throw $e;
         }
     }
+
+    // === 074-latency-metrics T011: openRun() call sites pass streamed/model/agentId ===
+
+    #[Test]
+    public function start_passes_streamed_true_model_and_agent_id_to_open_run(): void
+    {
+        Queue::fake();
+        config(['llm-client.run_trace.enabled' => true]);
+
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => false,
+            'server_id' => $server->id,
+            'model' => 'gpt-4',
+            'character' => 'research-assistant',
+        ]);
+        Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'user',
+            'user' => 'Tim',
+            'content' => 'Hello',
+            'responseTime' => 0,
+        ]);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        $service = new AgentLoopService(
+            $registryMock,
+            $executorMock,
+            new OperationCache(),
+            app(ProviderRegistry::class),
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class),
+        );
+
+        $service->start($conversation);
+
+        $run = DB::table('agent_runs')->where('conversation_id', $conversation->id)->first();
+        $this->assertNotNull($run, 'start() must open a run trace');
+        $this->assertEquals(1, (int) $run->is_streamed, 'start() is the streaming entry point (streamed: true)');
+        $this->assertEquals('gpt-4', $run->model);
+        $this->assertEquals('research-assistant', $run->agent_id);
+    }
+
+    #[Test]
+    public function run_passes_streamed_false_model_and_agent_id_to_open_run(): void
+    {
+        config(['llm-client.run_trace.enabled' => true]);
+        config(['llm-client.run_trace.action_row_cap' => 500]);
+        config(['llm-client.run_trace.action_content_cap_bytes' => 16384]);
+
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => false,
+            'server_id' => $server->id,
+            'model' => 'gpt-4',
+            'character' => 'research-assistant',
+        ]);
+
+        $providerMock = Mockery::mock(\ClarionApp\LlmClient\Contracts\LlmProvider::class);
+        $providerMock->shouldReceive('chat')->andReturn([
+            'choices' => [
+                ['message' => ['content' => 'Hi there', 'tool_calls' => []]],
+            ],
+        ]);
+        $providerMock->shouldReceive('countTokens')->andReturn(10);
+
+        $registryMock = Mockery::mock(ProviderRegistry::class);
+        $registryMock->shouldReceive('resolveByType')->andReturn($providerMock);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+
+        $service = new AgentLoopService(
+            Mockery::mock(McpToolRegistry::class),
+            $executorMock,
+            new OperationCache(),
+            $registryMock,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class),
+        );
+
+        $result = $service->run($conversation, 'Hello');
+        $this->assertEquals('completed', $result['status']);
+
+        $run = DB::table('agent_runs')->where('conversation_id', $conversation->id)->first();
+        $this->assertNotNull($run, 'run() must open a run trace');
+        $this->assertEquals(0, (int) $run->is_streamed, 'run() is the synchronous, non-streaming path');
+        $this->assertEquals('gpt-4', $run->model);
+        $this->assertEquals('research-assistant', $run->agent_id);
+    }
+
+    #[Test]
+    public function resume_sync_fresh_run_passes_streamed_false_model_and_agent_id(): void
+    {
+        // resumeSync()'s "pre-feature tool_data" branch (no run_id present) mints
+        // a fresh run — it must pass the same new arguments as every other call site.
+        config(['llm-client.run_trace.enabled' => true]);
+        config(['llm-client.run_trace.action_row_cap' => 500]);
+        config(['llm-client.run_trace.action_content_cap_bytes' => 16384]);
+
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'is_processing' => true,
+            'server_id' => $server->id,
+            'model' => 'gpt-4',
+            'character' => 'research-assistant',
+        ]);
+
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+            'tool_data' => [
+                'tool_calls' => [
+                    [
+                        'id' => 'call_def456',
+                        'type' => 'function',
+                        'function' => [
+                            'name' => 'contacts.destroy',
+                            'arguments' => '{"path":{"id": "42"}}',
+                        ],
+                    ],
+                ],
+                'tool_results' => null,
+                'iteration' => 1,
+                'pending_confirmation' => [
+                    'operationId' => 'destroyContact',
+                    'tool_name' => 'contacts.destroy',
+                    'method' => 'DELETE',
+                    'path' => '/api/contacts/42',
+                    'arguments' => ['path' => ['id' => '42']],
+                    'expires_at' => now()->addMinutes(5)->toIso8601String(),
+                ],
+                // No run_id — pre-feature tool_data, triggers the fresh-run branch.
+            ],
+        ]);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.destroy')
+            ->andReturn([
+                'name' => 'contacts.destroy',
+                '_meta' => ['operationId' => 'destroyContact', 'method' => 'DELETE', 'path' => '/api/contacts/{id}'],
+            ]);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $executorMock->shouldReceive('extractArguments')
+            ->andReturn(['path' => '/api/contacts/42', 'query' => [], 'body' => []]);
+        $executorMock->shouldReceive('executeHttpCall')
+            ->andReturn([
+                'content' => [['type' => 'text', 'text' => '{"success": true}']],
+                'isError' => false,
+            ]);
+
+        $providerMock = Mockery::mock(\ClarionApp\LlmClient\Contracts\LlmProvider::class);
+        $providerMock->shouldReceive('chat')->andReturn([
+            'choices' => [
+                ['message' => ['content' => 'Done', 'tool_calls' => []]],
+            ],
+        ]);
+        $providerMock->shouldReceive('countTokens')->andReturn(10);
+
+        $providerRegistryMock = Mockery::mock(ProviderRegistry::class);
+        $providerRegistryMock->shouldReceive('resolveByType')->andReturn($providerMock);
+
+        $service = new AgentLoopService(
+            $registryMock,
+            $executorMock,
+            new OperationCache(),
+            $providerRegistryMock,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class),
+        );
+
+        $service->resumeSync($conversation, $message, true);
+
+        $run = DB::table('agent_runs')->where('conversation_id', $conversation->id)->first();
+        $this->assertNotNull($run, 'resumeSync() must mint a fresh run trace when tool_data carries no run_id');
+        $this->assertEquals(0, (int) $run->is_streamed, 'resumeSync() is a synchronous, non-streaming path');
+        $this->assertEquals('gpt-4', $run->model);
+        $this->assertEquals('research-assistant', $run->agent_id);
+    }
 }

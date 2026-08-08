@@ -143,6 +143,9 @@ class AgentLoopService
                     RunKind::Interactive,
                     (string) $conversation->user_id,
                     $conversation->id,
+                    streamed: true,
+                    model: $conversation->model,
+                    agentId: $conversation->character ?? $conversation->id,
                 );
                 // Link the trigger message when minting a new run.
                 if ($triggerMessageId !== null && $runId !== null) {
@@ -313,6 +316,9 @@ class AgentLoopService
                 \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
                 (string) $conversation->user_id,
                 $conversation->id,
+                streamed: false,
+                model: $conversation->model,
+                agentId: $conversation->character ?? $conversation->id,
             );
         }
 
@@ -853,6 +859,9 @@ class AgentLoopService
                     \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
                     (string) $conversation->user_id,
                     $conversation->id,
+                    streamed: false,
+                    model: $conversation->model,
+                    agentId: $conversation->character ?? $conversation->id,
                 );
                 $currentStepId = $this->runTraceRecorder->openStep(
                     $runId,

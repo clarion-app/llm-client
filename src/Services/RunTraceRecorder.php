@@ -159,6 +159,9 @@ class RunTraceRecorder
         string $userId,
         ?string $conversationId = null,
         ?string $source = null,
+        bool $streamed = false,
+        ?string $model = null,
+        ?string $agentId = null,
     ): ?string {
         if (!$this->enabled()) {
             return null;
@@ -181,6 +184,9 @@ class RunTraceRecorder
                 'duration_ms' => null,
                 'step_count' => 0,
                 'created_at' => $now,
+                'is_streamed' => $streamed,
+                'model' => $model,
+                'agent_id' => $agentId,
             ]);
 
             Context::add('run_id', $runId);
@@ -193,6 +199,46 @@ class RunTraceRecorder
                 'error' => $e->getMessage(),
             ]);
             return null;
+        }
+    }
+
+    /**
+     * Record the elapsed time from a run's start to the moment its first
+     * visible content reached the user (074-latency-metrics FR-002).
+     *
+     * Idempotent: the WHERE first_output_ms IS NULL guard means only the
+     * first call across a run's lifetime has any effect. Called from the
+     * streaming path only -- a whole (non-streamed) response never calls
+     * this, so its first_output_ms stays null by construction (SC-005).
+     *
+     * Null run id and disabled tracing are both no-ops.
+     */
+    public function recordFirstOutput(?string $runId): void
+    {
+        if ($runId === null || !$this->enabled()) {
+            return;
+        }
+
+        try {
+            $startedAt = DB::table('agent_runs')
+                ->where('id', $runId)
+                ->value('started_at');
+
+            if ($startedAt === null) {
+                return;
+            }
+
+            $elapsedMs = $this->elapsedMs($startedAt, now(), ['run_id' => $runId]);
+
+            DB::table('agent_runs')
+                ->where('id', $runId)
+                ->whereNull('first_output_ms')
+                ->update(['first_output_ms' => $elapsedMs]);
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to record first output', [
+                'run_id' => $runId,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
@@ -353,6 +399,138 @@ class RunTraceRecorder
     }
 
     /**
+     * Compute the model/tool/confirmation/product latency breakdown for a run
+     * (074-latency-metrics FR-005/FR-006/FR-007/FR-010/FR-011).
+     *
+     * Public, not private -- ResolveAbandonedRunsCommand::handle() (a
+     * different class, bypassing closeRun() by design) calls this directly,
+     * mirroring the existing enqueueForwarding() precedent used for the same
+     * reason.
+     *
+     * Self-contained: wraps its own body in try/catch so a DB error here can
+     * never abort a caller's terminal write (closeRun()'s own inner try/catch
+     * already isolates its call; the sweep's per-run loop has no equivalent
+     * surrounding try/catch, so this method cannot rely on one).
+     *
+     * @return array{model_wait_ms: int, tool_exec_ms: int, confirm_wait_ms: int, product_ms: int}
+     */
+    public function computeLatencyBreakdown(string $runId, int $totalDurationMs): array
+    {
+        try {
+            $modelWaitMs = (int) DB::table('agent_run_actions')
+                ->where('run_id', $runId)
+                ->where('action_type', ActionType::LlmRequest->value)
+                ->sum('duration_ms');
+
+            $toolExecMs = $this->mergedToolExecMs($runId);
+
+            $confirmWaitMs = (int) DB::table('agent_run_steps')
+                ->where('run_id', $runId)
+                ->sum('wait_ms');
+
+            $productMs = $totalDurationMs - $modelWaitMs - $toolExecMs - $confirmWaitMs;
+
+            if ($productMs < 0) {
+                Log::warning('RunTraceRecorder: product_ms clamped to 0', [
+                    'run_id' => $runId,
+                    'total_duration_ms' => $totalDurationMs,
+                    'model_wait_ms' => $modelWaitMs,
+                    'tool_exec_ms' => $toolExecMs,
+                    'confirm_wait_ms' => $confirmWaitMs,
+                    'raw_product_ms' => $productMs,
+                ]);
+                $productMs = 0;
+            }
+
+            return [
+                'model_wait_ms' => $modelWaitMs,
+                'tool_exec_ms' => $toolExecMs,
+                'confirm_wait_ms' => $confirmWaitMs,
+                'product_ms' => $productMs,
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to compute latency breakdown', [
+                'run_id' => $runId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'model_wait_ms' => 0,
+                'tool_exec_ms' => 0,
+                'confirm_wait_ms' => 0,
+                'product_ms' => $totalDurationMs,
+            ];
+        }
+    }
+
+    /**
+     * Merged-interval union over a run's tool_invocation actions
+     * (data-model.md §3): overlapping/adjacent windows are counted once, not
+     * summed individually (FR-006).
+     *
+     * Each interval is [started_at, paused_at ?? ended_at] -- the pre-pause
+     * portion only for an action that passed through awaiting_confirmation,
+     * so a long confirmation wait afterward never inflates tool_exec_ms.
+     * Actions with a null ended_at are skipped (should not occur for a run
+     * reaching a terminal state -- flushUnfinishedActions() has already run).
+     *
+     * Bounded by the existing run_trace.action_row_cap -- no new cap.
+     */
+    private function mergedToolExecMs(string $runId): int
+    {
+        $cap = (int) config('llm-client.run_trace.action_row_cap', 500);
+
+        $rows = DB::table('agent_run_actions')
+            ->where('run_id', $runId)
+            ->where('action_type', ActionType::ToolInvocation->value)
+            ->orderBy('started_at')
+            ->limit($cap > 0 ? $cap : PHP_INT_MAX)
+            ->get(['started_at', 'ended_at', 'paused_at']);
+
+        $intervals = [];
+        foreach ($rows as $row) {
+            if ($row->ended_at === null) {
+                continue;
+            }
+
+            $start = \Carbon\Carbon::parse($row->started_at)->getPreciseTimestamp(3);
+            $end = \Carbon\Carbon::parse($row->paused_at ?? $row->ended_at)->getPreciseTimestamp(3);
+
+            if ($end < $start) {
+                continue;
+            }
+
+            $intervals[] = [$start, $end];
+        }
+
+        if (empty($intervals)) {
+            return 0;
+        }
+
+        // Already sorted by started_at from the query, but sort defensively --
+        // paused_at/ended_at substitution can reorder start-adjacent rows.
+        usort($intervals, fn ($a, $b) => $a[0] <=> $b[0]);
+
+        $totalMs = 0;
+        [$mergedStart, $mergedEnd] = $intervals[0];
+
+        for ($i = 1; $i < count($intervals); $i++) {
+            [$start, $end] = $intervals[$i];
+
+            if ($start <= $mergedEnd) {
+                $mergedEnd = max($mergedEnd, $end);
+            } else {
+                $totalMs += $mergedEnd - $mergedStart;
+                [$mergedStart, $mergedEnd] = [$start, $end];
+            }
+        }
+
+        $totalMs += $mergedEnd - $mergedStart;
+
+        return $totalMs;
+    }
+
+    /**
      * Close a run with an end state, computing step_count and duration_ms in the same UPDATE (contract C4).
      */
     public function closeRun(
@@ -428,6 +606,8 @@ class RunTraceRecorder
             // always runs regardless of what happens elsewhere in the method, mirroring
             // enqueueForwarding()'s and broadcast()'s own isolation immediately below.
             try {
+                $breakdown = $this->computeLatencyBreakdown($runId, $durationMs);
+
                 DB::table('agent_runs')
                     ->where('id', $runId)
                     ->update([
@@ -436,6 +616,10 @@ class RunTraceRecorder
                         'ended_at' => $endedAt->format(self::TIMESTAMP_FORMAT),
                         'duration_ms' => $durationMs,
                         'step_count' => $stepCount,
+                        'model_wait_ms' => $breakdown['model_wait_ms'],
+                        'tool_exec_ms' => $breakdown['tool_exec_ms'],
+                        'confirm_wait_ms' => $breakdown['confirm_wait_ms'],
+                        'product_ms' => $breakdown['product_ms'],
                     ]);
             } catch (\Throwable $e) {
                 Log::warning('RunTraceRecorder: failed to update run terminal state', [
