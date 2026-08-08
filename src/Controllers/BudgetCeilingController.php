@@ -58,6 +58,22 @@ class BudgetCeilingController extends Controller
         return $this->put($request, BudgetScope::UserDefault, SpendingCeiling::INSTALLATION_SCOPE_ID);
     }
 
+    /**
+     * Create or update one user's own ceiling — a raise, a lower, or a
+     * waiver. Nothing here reaches any other user: the write names one
+     * scope id and the service touches that row alone, so no other user's
+     * row is created, rewritten, or materialized on the way past.
+     *
+     * $userId is the raw user UUID from the path. It is not resolved to a
+     * User model: a ceiling is configuration about an identifier, and an
+     * override written slightly ahead of the account it names is a
+     * legitimate thing for an operator to do.
+     */
+    public function putUser(Request $request, string $userId)
+    {
+        return $this->put($request, BudgetScope::User, $userId);
+    }
+
     public function destroyInstallation()
     {
         return $this->destroy(BudgetScope::Installation, SpendingCeiling::INSTALLATION_SCOPE_ID);
@@ -66,6 +82,16 @@ class BudgetCeilingController extends Controller
     public function destroyUserDefault()
     {
         return $this->destroy(BudgetScope::UserDefault, SpendingCeiling::INSTALLATION_SCOPE_ID);
+    }
+
+    /**
+     * Remove one user's override, reverting them to the per-user default.
+     * A soft delete, like every other removal here, so the override
+     * survives as history and a later PUT restores that same row.
+     */
+    public function destroyUser(string $userId)
+    {
+        return $this->destroy(BudgetScope::User, $userId);
     }
 
     private function put(Request $request, BudgetScope $scopeType, string $scopeId)

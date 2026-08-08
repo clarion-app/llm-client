@@ -46,12 +46,14 @@ use PHPUnit\Framework\Attributes\Test;
 class SpendingCeilingServiceTest extends TestCase
 {
     private string $userA;
+    private string $userB;
 
     protected function setUp(): void
     {
         parent::setUp();
 
         $this->userA = (string) Str::uuid();
+        $this->userB = (string) Str::uuid();
     }
 
     protected function tearDown(): void
@@ -567,6 +569,337 @@ class SpendingCeilingServiceTest extends TestCase
 
         $this->assertNull($service->resolveInstallation(), 'A soft-deleted ceiling must not resolve');
         $this->assertNull($service->resolveForUser($this->userA), 'A soft-deleted ceiling must not resolve');
+    }
+
+    // ---------------------------------------------------------------
+    // The user-scope branch: overrides, waivers, and their isolation
+    // ---------------------------------------------------------------
+
+    /**
+     * The whole point of a per-user override is that it wins. A resolution
+     * that consulted the default even when a user row existed would ignore
+     * every raise and every lower an operator ever applied, silently — the
+     * table would look correctly configured and the enforcement would be
+     * against the wrong number.
+     */
+    #[Test]
+    public function resolve_for_user_returns_the_users_own_override_and_does_not_fall_through_to_the_default(): void
+    {
+        $service = $this->service();
+
+        $service->upsert(BudgetScope::UserDefault, $this->sentinel(), $this->ceilingAttributes([
+            'amount' => '25.00',
+            'period_type' => 'day',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $override = $service->upsert(BudgetScope::User, $this->userA, $this->ceilingAttributes([
+            'amount' => '100.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'warn',
+        ]));
+
+        $resolved = $service->resolveForUser($this->userA);
+
+        $this->assertNotNull($resolved);
+        $this->assertSame($override->id, $resolved->id, "A user's own override wins over the default");
+        $this->assertSame('user', $resolved->scope_type);
+        $this->assertSame($this->userA, $resolved->scope_id);
+        $this->assertSame('100.0000000000', $resolved->amount);
+        $this->assertSame('month', $resolved->period_type);
+        $this->assertSame('warn', $resolved->enforcement_mode);
+    }
+
+    #[Test]
+    public function resolve_for_user_returns_the_default_for_a_user_whose_neighbour_has_an_override(): void
+    {
+        $service = $this->service();
+
+        $default = $service->upsert(BudgetScope::UserDefault, $this->sentinel(), $this->ceilingAttributes([
+            'amount' => '25.00',
+            'period_type' => 'day',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $service->upsert(BudgetScope::User, $this->userA, $this->ceilingAttributes([
+            'amount' => '100.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'warn',
+        ]));
+
+        $resolved = $service->resolveForUser($this->userB);
+
+        $this->assertNotNull($resolved);
+        $this->assertSame($default->id, $resolved->id, "One user's override must not reach another user");
+        $this->assertSame('25.0000000000', $resolved->amount);
+        $this->assertSame('day', $resolved->period_type);
+    }
+
+    #[Test]
+    public function resolve_for_user_returns_null_when_neither_an_override_nor_a_default_exists(): void
+    {
+        $service = $this->service();
+
+        $service->upsert(BudgetScope::User, $this->userA, $this->ceilingAttributes([
+            'amount' => '100.00',
+        ]));
+
+        $this->assertNull($service->resolveForUser($this->userB));
+    }
+
+    /**
+     * A waiver is the *absence* of a user-scoped ceiling, not a ceiling of
+     * unlimited size and not a request to fall back to the default. Falling
+     * back would make a waiver mean nothing at all wherever a default is
+     * configured, which is every installation that would want one.
+     */
+    #[Test]
+    public function a_waived_user_row_resolves_to_no_user_ceiling_and_never_falls_back_to_the_default(): void
+    {
+        $service = $this->service();
+
+        $service->upsert(BudgetScope::UserDefault, $this->sentinel(), $this->ceilingAttributes([
+            'amount' => '25.00',
+            'period_type' => 'day',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $service->upsert(BudgetScope::User, $this->userA, [
+            'waived' => true,
+            'amount' => null,
+            'period_type' => 'day',
+            'enforcement_mode' => 'stop',
+        ]);
+
+        $this->assertNull($service->resolveForUser($this->userA), 'A waived user has no user-scoped ceiling');
+        $this->assertNotNull($service->resolveForUser($this->userB), 'Every other user stays on the default');
+    }
+
+    /**
+     * FR-010, at the level where it is decided. resolveInstallation() must
+     * not consult the user chain at all, so no arrangement of user rows —
+     * waived or not, matching the caller or not — can change its answer.
+     */
+    #[Test]
+    public function resolve_installation_is_unaffected_by_any_user_row_waived_or_otherwise(): void
+    {
+        $service = $this->service();
+
+        $installation = $service->upsert(BudgetScope::Installation, $this->sentinel(), $this->ceilingAttributes([
+            'amount' => '500.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $before = $service->resolveInstallation();
+        $this->assertNotNull($before);
+        $this->assertSame($installation->id, $before->id);
+
+        $service->upsert(BudgetScope::User, $this->userA, [
+            'waived' => true,
+            'amount' => null,
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]);
+        $service->upsert(BudgetScope::User, $this->userB, $this->ceilingAttributes([
+            'amount' => '5.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $after = $service->resolveInstallation();
+
+        $this->assertNotNull($after, 'A user-scoped waiver can never remove the installation-wide ceiling');
+        $this->assertSame($installation->id, $after->id);
+        $this->assertSame('500.0000000000', $after->amount);
+        $this->assertSame('stop', $after->enforcement_mode);
+        $this->assertFalse((bool) $after->waived);
+    }
+
+    #[Test]
+    public function a_waiver_is_accepted_only_for_the_user_scope(): void
+    {
+        $waiver = [
+            'waived' => true,
+            'amount' => null,
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ];
+
+        $this->assertUpsertRejected(
+            BudgetScope::Installation,
+            $this->sentinel(),
+            $waiver,
+            'The installation-wide ceiling cannot be waived',
+        );
+
+        $this->assertUpsertRejected(
+            BudgetScope::UserDefault,
+            $this->sentinel(),
+            $waiver,
+            'The default per-user ceiling cannot be waived',
+        );
+
+        $accepted = $this->service()->upsert(BudgetScope::User, $this->userA, $waiver);
+
+        $this->assertTrue($accepted->waived);
+        $this->assertNull($accepted->amount);
+    }
+
+    #[Test]
+    public function a_waiver_carrying_an_amount_is_rejected(): void
+    {
+        $this->assertUpsertRejected(
+            BudgetScope::User,
+            $this->userA,
+            [
+                'waived' => true,
+                'amount' => '100.00',
+                'period_type' => 'month',
+                'enforcement_mode' => 'stop',
+            ],
+            'A waived ceiling carries no amount, so supplying one is a rejection rather than a value that is ignored',
+        );
+    }
+
+    #[Test]
+    public function a_user_ceiling_that_is_not_waived_still_requires_a_positive_amount(): void
+    {
+        $missing = [
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+            'waived' => false,
+        ];
+
+        $this->assertUpsertRejected(
+            BudgetScope::User,
+            $this->userA,
+            $missing,
+            'A non-waived user override with no amount must be rejected',
+        );
+
+        foreach (['0', '-1.00', 'lots'] as $amount) {
+            $this->assertUpsertRejected(
+                BudgetScope::User,
+                $this->userA,
+                array_merge($missing, ['amount' => $amount]),
+                "A non-waived user override with amount '{$amount}' must be rejected",
+            );
+        }
+    }
+
+    /**
+     * FR-011: removing an override is a soft delete of the user row, after
+     * which the user is governed by the default again — not by nothing.
+     */
+    #[Test]
+    public function removing_a_users_override_soft_deletes_it_and_resolution_falls_back_to_the_default(): void
+    {
+        $service = $this->service();
+
+        $default = $service->upsert(BudgetScope::UserDefault, $this->sentinel(), $this->ceilingAttributes([
+            'amount' => '25.00',
+            'period_type' => 'day',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $override = $service->upsert(BudgetScope::User, $this->userA, $this->ceilingAttributes([
+            'amount' => '100.00',
+            'period_type' => 'month',
+        ]));
+
+        $this->assertSame($override->id, $service->resolveForUser($this->userA)->id);
+
+        $service->remove(BudgetScope::User, $this->userA);
+
+        $reverted = $service->resolveForUser($this->userA);
+
+        $this->assertNotNull($reverted, 'Removing an override reverts the user to the default, not to no ceiling');
+        $this->assertSame($default->id, $reverted->id);
+        $this->assertSame('25.0000000000', $reverted->amount);
+
+        $trashed = SpendingCeiling::withTrashed()->find($override->id);
+        $this->assertNotNull($trashed, 'The override survives as history rather than being erased');
+        $this->assertNotNull($trashed->deleted_at);
+    }
+
+    #[Test]
+    public function re_adding_an_override_for_a_user_whose_row_was_removed_restores_that_row_rather_than_duplicating_it(): void
+    {
+        $service = $this->service();
+
+        $original = $service->upsert(BudgetScope::User, $this->userA, $this->ceilingAttributes([
+            'amount' => '100.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $service->remove(BudgetScope::User, $this->userA);
+
+        $restored = $service->upsert(BudgetScope::User, $this->userA, [
+            'waived' => true,
+            'amount' => null,
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]);
+
+        $this->assertSame($original->id, $restored->id, 'The soft-deleted override must be restored, not duplicated');
+        $this->assertNull($restored->deleted_at);
+        $this->assertTrue($restored->waived);
+        $this->assertNull($restored->amount);
+
+        $this->assertSame(1, $this->liveRowCount());
+        $this->assertSame(1, $this->totalRowCount());
+    }
+
+    /**
+     * SC-010 at the level of stored configuration: raising one user, lowering
+     * a second, and waiving a third leaves the fourth — and each other — on
+     * exactly the value they had.
+     */
+    #[Test]
+    public function raising_lowering_and_waiving_three_users_leaves_a_fourth_on_the_unchanged_default(): void
+    {
+        $service = $this->service();
+        $userC = (string) Str::uuid();
+        $userD = (string) Str::uuid();
+
+        $default = $service->upsert(BudgetScope::UserDefault, $this->sentinel(), $this->ceilingAttributes([
+            'amount' => '25.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]));
+
+        $service->upsert(BudgetScope::User, $this->userA, $this->ceilingAttributes([
+            'amount' => '100.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]));
+        $service->upsert(BudgetScope::User, $this->userB, $this->ceilingAttributes([
+            'amount' => '5.00',
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]));
+        $service->upsert(BudgetScope::User, $userC, [
+            'waived' => true,
+            'amount' => null,
+            'period_type' => 'month',
+            'enforcement_mode' => 'stop',
+        ]);
+
+        $this->assertSame('100.0000000000', $service->resolveForUser($this->userA)->amount);
+        $this->assertSame('5.0000000000', $service->resolveForUser($this->userB)->amount);
+        $this->assertNull($service->resolveForUser($userC));
+
+        $untouched = $service->resolveForUser($userD);
+        $this->assertNotNull($untouched, 'A user nobody touched is still governed by the default');
+        $this->assertSame($default->id, $untouched->id);
+        $this->assertSame('25.0000000000', $untouched->amount);
+
+        // And the default row itself was never rewritten on the way.
+        $defaultReread = SpendingCeiling::find($default->id);
+        $this->assertSame('25.0000000000', $defaultReread->amount);
+        $this->assertFalse((bool) $defaultReread->waived);
     }
 
     // ---------------------------------------------------------------

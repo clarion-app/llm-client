@@ -116,8 +116,10 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('budget/ceilings', [BudgetCeilingController::class, "index"]);
     Route::put('budget/ceilings/installation', [BudgetCeilingController::class, "putInstallation"]);
     Route::put('budget/ceilings/user-default', [BudgetCeilingController::class, "putUserDefault"]);
+    Route::put('budget/ceilings/users/{userId}', [BudgetCeilingController::class, "putUser"]);
     Route::delete('budget/ceilings/installation', [BudgetCeilingController::class, "destroyInstallation"]);
     Route::delete('budget/ceilings/user-default', [BudgetCeilingController::class, "destroyUserDefault"]);
+    Route::delete('budget/ceilings/users/{userId}', [BudgetCeilingController::class, "destroyUser"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
