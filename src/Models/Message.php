@@ -18,6 +18,15 @@ class Message extends Model
         'responseTime',
         'conversation_id',
         'tool_data',
+
+        // Mass-assignable so a caller building a transcript can place a
+        // message at a specific instant. Nothing in src/ passes either one —
+        // every production write takes the automatic timestamp — but a caller
+        // that supplies one silently getting "now" instead is the kind of
+        // difference that produces a transcript ordered other than the way it
+        // was written, with nothing to indicate it.
+        'created_at',
+        'updated_at',
     ];
 
     protected $casts = [

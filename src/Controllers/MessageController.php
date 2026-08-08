@@ -14,6 +14,8 @@ use Illuminate\Support\Facades\Log;
 use ClarionApp\LlmClient\OpenAIConversationRequest;
 use ClarionApp\LlmClient\OpenAIConversationStreamRequest;
 use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\BudgetGate;
+use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 
 class MessageController extends Controller
 {
@@ -45,6 +47,23 @@ class MessageController extends Controller
         {
             return response()->json([], 403);
         }
+
+        // Before Message::create(), not after. A refused request must leave the
+        // stored history byte-identical, and the user's own turn is the half
+        // that is easy to miss: nothing downstream can tell a stored message
+        // for work that never happened apart from one that was answered —
+        // condensation will summarise it, memory capture will remember it, and
+        // the next turn's context will include it.
+        //
+        // This is an ordering requirement layered on the funnel, not a second
+        // decision point: it calls the same BudgetGate, and the check inside
+        // start() below remains as defence in depth, free because the gate
+        // admits a scope once per request.
+        app(BudgetGate::class)->admit(
+            (string) Auth::id(),
+            BudgetWorkKind::Interactive,
+            $conversation->id,
+        );
 
         $validatedData['role'] = "user";
         $validatedData['user'] = Auth::user()->name;

@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
+use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\RoleResolver;
@@ -89,6 +90,13 @@ class AgentController extends Controller
         try {
             $agentLoopService = app(AgentLoopService::class);
             $result = $agentLoopService->run($conversation, $validated['message']);
+        } catch (BudgetExceededException $e) {
+            // Structural, rather than an instanceof test inside the blanket
+            // catch below, so the intent is visible at a glance: a ceiling
+            // refusal is a decision with its own 402 body, not an unexplained
+            // failure. Left to the catch below it would surface as exactly the
+            // generic 500 this feature exists to replace.
+            throw $e;
         } catch (\Throwable $e) {
             Log::error('AgentController: agent loop error', [
                 'conversation_id' => $conversation->id,

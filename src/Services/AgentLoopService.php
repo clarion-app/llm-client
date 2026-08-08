@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Contracts\ProviderType;
+use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
@@ -31,6 +32,7 @@ use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\ValueObjects\Operation;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
+use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
@@ -125,12 +127,79 @@ class AgentLoopService
         return max(0, (int) round($pausedAt->diffInMilliseconds(now(), false)));
     }
 
+    /**
+     * The user-initiated funnel: every way a person starts model work goes
+     * through here before anything is written or opened.
+     *
+     * Ordering is the whole contract. The gate has to run before
+     * is_processing is set and before a run is opened, because a refusal that
+     * happens after either one leaves the conversation wedged with an open
+     * run and no path that clears it.
+     *
+     * @param  string|null  $existingRunId  the run a resumed conversation
+     *   arrives already carrying. Passing it means a refusal CLOSES that run
+     *   rather than opening a second one.
+     */
+    private function admitInteractiveWork(
+        Conversation $conversation,
+        BudgetWorkKind $kind,
+        ?string $existingRunId = null,
+    ): void {
+        app(BudgetGate::class)->admit(
+            $conversation->user_id === null ? null : (string) $conversation->user_id,
+            $kind,
+            $conversation->id,
+            null,
+            $existingRunId,
+        );
+    }
+
+    /**
+     * Admit a conversation being resumed after a confirmation pause, and
+     * leave nothing behind if it is refused.
+     *
+     * Both halves of the cleanup are required and neither is optional:
+     * is_processing is cleared so the conversation is usable again — exactly
+     * as the "confirmation has expired" branch a few lines below already does
+     * — and the inherited run id is handed to the gate so the refusal closes
+     * that run stopped_early instead of opening a second one. Without them a
+     * ceiling crossed during a human's pause leaves the conversation
+     * permanently flagged as processing, with a run only the abandonment
+     * sweep will ever close.
+     */
+    private function admitResumedWork(Conversation $conversation, ?string $runId): void
+    {
+        try {
+            $this->admitInteractiveWork($conversation, BudgetWorkKind::Resumed, $runId);
+        } catch (BudgetExceededException $e) {
+            $conversation->update(['is_processing' => false]);
+
+            throw $e;
+        }
+    }
+
     public function start(
         Conversation $conversation,
         int $iteration = 1,
         ?string $runId = null,
         ?string $triggerMessageId = null,
     ): void {
+        // Gated only when this call MINTS a run. The condition is load-bearing
+        // in both directions, and both mistakes look reasonable in review:
+        //
+        //  - AgentLoopStreamHandler re-enters start($conversation,
+        //    $iteration + 1, $this->runId) on every streaming iteration with
+        //    the run id carried forward, so a non-null $runId *is* the
+        //    "already executing" signal. Gating unconditionally would abandon
+        //    a response the user is already reading, which the spec calls out
+        //    as worse than no enforcement at all.
+        //  - Dropping the gate entirely would let the streamed entry path walk
+        //    straight past the ceiling, since a new run is exactly what a new
+        //    request mints.
+        if ($runId === null) {
+            $this->admitInteractiveWork($conversation, BudgetWorkKind::Interactive);
+        }
+
         // The user is engaging again, so this session is live: clear any end
         // marker set by the idle sweep, making the session eligible to end
         // (and be captured) again once it next goes quiet.
@@ -186,6 +255,16 @@ class AgentLoopService
         $toolData = $message->tool_data;
         $pending = $toolData['pending_confirmation'] ?? null;
         $runId = $toolData['run_id'] ?? null;
+
+        // A confirmation pause is a person deciding, not work executing, and
+        // the ceiling can be crossed during it — so resuming is new model work
+        // as far as enforcement is concerned, whether the call was approved or
+        // declined (declining still continues the loop, telling the model what
+        // happened). The cleanup either side of the throw is what run()/start()
+        // do not need: this method is entered with is_processing already true
+        // and a run already open, so "gate before anything is set" is not
+        // available to it. Mirrors the expired-confirmation branch just below.
+        $this->admitResumedWork($conversation, $runId);
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
@@ -304,6 +383,11 @@ class AgentLoopService
      */
     public function run(Conversation $conversation, string $message, array $options = []): array
     {
+        // First statement, before is_processing is set and before a run is
+        // opened: a refusal here has to be a clean no-op, and there is no path
+        // that unwinds either of those for work that never started.
+        $this->admitInteractiveWork($conversation, BudgetWorkKind::Interactive);
+
         // The user is engaging again, so this session is live: clear any end
         // marker set by the idle sweep, making the session eligible to end
         // (and be captured) again once it next goes quiet.
@@ -806,6 +890,11 @@ class AgentLoopService
         $toolData = $message->tool_data;
         $pending = $toolData['pending_confirmation'] ?? null;
         $runId = $toolData['run_id'] ?? null;
+
+        // See resume() — the synchronous sibling is gated identically, and for
+        // the same reason: a human wait of up to confirmation_timeout is a
+        // window in which the ceiling can be crossed by somebody else.
+        $this->admitResumedWork($conversation, $runId);
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');

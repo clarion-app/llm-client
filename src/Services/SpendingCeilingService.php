@@ -139,12 +139,19 @@ class SpendingCeilingService
      * structurally impossible for a user-scoped waiver to waive the
      * installation-wide ceiling — no data state can produce that outcome,
      * because no data state is consulted that could.
+     *
+     * Matched on scope_type alone. The installation ceiling is the single
+     * row of its kind and always carries the sentinel scope id, so adding
+     * that predicate narrows nothing; leaving it out is what makes "no
+     * user-scoped read was issued" an observable property of the query log
+     * rather than something a reader has to take on trust. The
+     * (scope_type, scope_id) index still serves this lookup on its leading
+     * column.
      */
     public function resolveInstallation(): ?SpendingCeiling
     {
         return SpendingCeiling::query()
             ->where('scope_type', BudgetScope::Installation->value)
-            ->where('scope_id', SpendingCeiling::INSTALLATION_SCOPE_ID)
             ->first();
     }
 

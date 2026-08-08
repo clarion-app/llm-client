@@ -59,7 +59,10 @@ class PlainDecimalCast implements CastsAttributes
             return null;
         }
 
-        return Decimal::round((string) $value, $this->scale);
+        // fromNumeric(), not (string): a plain cast renders a float at PHP's
+        // 14-significant-digit `precision` default, which throws away digits
+        // the double still holds before this class ever sees them.
+        return Decimal::round(Decimal::fromNumeric($value), $this->scale);
     }
 
     public function set($model, string $key, mixed $value, array $attributes): mixed

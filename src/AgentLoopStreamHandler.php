@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient;
 
 use ClarionApp\HttpQueue\HandleHttpStreamResponse;
+use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
@@ -680,7 +681,28 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         if ($latestUserMessage && $latestAssistantMessage &&
             $latestUserMessage->created_at > $latestAssistantMessage->created_at) {
             $agentLoopService = app(AgentLoopService::class);
-            $agentLoopService->start($conversation);
+
+            try {
+                $agentLoopService->start($conversation);
+            } catch (BudgetExceededException $e) {
+                // start()'s second call site, and the only one with no request
+                // boundary above it: this runs inside the stream handler's own
+                // queue job, mints a new run, and is therefore correctly gated
+                // — but nobody is awaiting a 402 here, so an escaping exception
+                // would surface only as a failed job. The gate has already
+                // recorded the refusal; this catch is what turns "failed job"
+                // into "recorded stop", leaving is_processing false and the
+                // user's message genuinely unprocessed until the period resets
+                // or the ceiling is raised.
+                //
+                // Deliberately NOT applied to the continuation call in
+                // handleToolCalls(): that path carries the open run id and is
+                // never gated in the first place.
+                Log::info('AgentLoopStreamHandler: unprocessed message not started, spending ceiling reached', [
+                    'conversation_id' => $conversation->id,
+                    'reason' => $e->getMessage(),
+                ]);
+            }
         }
     }
 

@@ -188,7 +188,11 @@ class CostRollupQuery
     private function shapeRow(?object $row): array
     {
         return [
-            'priced_cost_total' => Decimal::round((string) ($row->priced_cost_total ?? '0'), 10),
+            // fromNumeric(), not (string): SUM() over a decimal column comes
+            // back from SQLite as a float, and a plain cast would render it at
+            // PHP's 14-significant-digit default — dropping the tenth decimal
+            // place on any total above about ten thousand.
+            'priced_cost_total' => Decimal::round(Decimal::fromNumeric($row->priced_cost_total ?? '0'), 10),
             'request_count' => (int) ($row->request_count ?? 0),
             'zero_priced_request_count' => (int) ($row->zero_priced_request_count ?? 0),
             'unpriced_request_count' => (int) ($row->unpriced_request_count ?? 0),

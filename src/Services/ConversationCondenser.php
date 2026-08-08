@@ -10,8 +10,10 @@ use ClarionApp\LlmClient\Models\ChunkSummary;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Presets\CondensationPreset;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
 use ClarionApp\LlmClient\ValueObjects\ContextManagementStep;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 
 class ConversationCondenser
@@ -403,10 +405,18 @@ class ConversationCondenser
                 $options['model'] = $condensationModel;
             }
 
-            $result = $llmProvider->chat([
+            // Condensation is model-consuming system-initiated work, so it goes
+            // through the same funnel every other such path does. The gate runs
+            // inside traceSystemRun(), before the call is made — and when this
+            // condensation happens inside an already-admitted turn or job, the
+            // gate's per-unit-of-work record makes it a no-op rather than a
+            // mid-flight refusal.
+            $chat = fn () => $llmProvider->chat([
                 ['role' => 'system', 'content' => $systemPrompt],
                 ['role' => 'user', 'content' => $transcript],
             ], [], $options);
+
+            $result = $this->traceCondensation($conversationId, $chat);
 
             $content = $result['choices'][0]['message']['content'] ?? null;
             if (!$content) {
@@ -459,6 +469,44 @@ class ConversationCondenser
         }
 
         return $summary;
+    }
+
+    /**
+     * Run a condensation model call inside the system-initiated funnel.
+     *
+     * traceSystemRun()'s $userId is non-nullable, so a conversation with no
+     * owner — or one that has since been deleted — cannot go through it. The
+     * gate still runs in that case, with a null user, which evaluates the
+     * installation ceiling alone. Widening traceSystemRun()'s signature is not
+     * an option: its $userId is load-bearing for run attribution.
+     */
+    private function traceCondensation(string $conversationId, \Closure $work): mixed
+    {
+        // A plain column read, not a model lookup: all this needs is the
+        // owner's id to attribute the run and the ceiling to, and going
+        // through the Conversation model would drag its soft-delete scope
+        // along — so a conversation deleted between the turn starting and its
+        // condensation running would silently lose its owner and be evaluated
+        // against the installation ceiling alone.
+        $userId = DB::table('conversations')->where('id', $conversationId)->value('user_id');
+
+        if ($userId === null) {
+            app(BudgetGate::class)->admit(
+                null,
+                BudgetWorkKind::SystemInitiated,
+                $conversationId,
+                'condensation',
+            );
+
+            return $work();
+        }
+
+        return app(RunTraceRecorder::class)->traceSystemRun(
+            'condensation',
+            (string) $userId,
+            $conversationId,
+            $work,
+        );
     }
 
     /**

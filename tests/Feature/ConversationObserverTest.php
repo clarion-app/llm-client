@@ -13,6 +13,11 @@ class ConversationObserverTest extends TestCase
 {
     protected function defineDatabaseMigrations(): void
     {
+        // This class declares its own schema, so it does not inherit the
+        // parent's. Every entry path now crosses the budget gate, whose
+        // first act is to ask whether any ceiling exists.
+        $this->defineBudgetSchema();
+
         // Create minimal tables needed for Conversation model.
         // Parent creates users table.
 

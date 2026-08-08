@@ -9,7 +9,10 @@ use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Services\BudgetGate;
 use ClarionApp\LlmClient\Services\EndpointResolver;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
+use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\Operation;
 
 class OpenAIGenerateConversationTitleRequest
@@ -60,6 +63,48 @@ class OpenAIGenerateConversationTitleRequest
         $request->method = "POST";
         $request->headers = $resolver->headersFor($server, Operation::TitleGeneration);
         $request->body = $newConversation;
-        SendHttpRequest::dispatch($request, "ClarionApp\LlmClient\HandleOpenAIGenerateConversationTitleResponse", $this->conversation->id);
+
+        $dispatch = fn () => SendHttpRequest::dispatch(
+            $request,
+            "ClarionApp\LlmClient\HandleOpenAIGenerateConversationTitleResponse",
+            $this->conversation->id
+        );
+
+        $userId = $this->conversation->user_id;
+
+        // Known deviation, recorded rather than papered over: dispatch() only
+        // ENQUEUES, and the model call itself is made later by a job in the
+        // separate clarion-app/http-queue package. So this one path is admitted
+        // at enqueue rather than at dequeue — the shape deferred work
+        // deliberately rejects, because a backlog accumulated just under a
+        // ceiling would otherwise drain straight through it.
+        //
+        // Accepted here because it is bounded: one short call, dispatched and
+        // executed in the same window, not a queue that can grow. Closing it
+        // properly means gating inside http-queue, which this package cannot
+        // do. Nothing in this file or its tests claims dequeue-time evaluation
+        // for this path.
+        if ($userId === null) {
+            // traceSystemRun()'s $userId is non-nullable, so an ownerless
+            // conversation cannot go through the funnel. The gate still runs:
+            // a null user means the installation ceiling alone is evaluated.
+            app(BudgetGate::class)->admit(
+                null,
+                BudgetWorkKind::SystemInitiated,
+                $this->conversation->id,
+                'title_generation',
+            );
+
+            $dispatch();
+
+            return;
+        }
+
+        app(RunTraceRecorder::class)->traceSystemRun(
+            'title_generation',
+            (string) $userId,
+            $this->conversation->id,
+            $dispatch,
+        );
     }
 }

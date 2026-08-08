@@ -4,11 +4,13 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Contracts\MemoryScope;
+use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\RoleAssignmentFailedException;
 use ClarionApp\LlmClient\Models\MemoryEntry;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\RoleResolver;
+use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\ValueObjects\RoleResolutionStatus;
 use Illuminate\Support\Facades\Log;
@@ -145,8 +147,50 @@ class EmbeddingService
             $options['timeout_ms'] = $timeoutMs;
         }
 
+        // Embedding costs real money, so it crosses the spending gate like
+        // every other model-consuming path.
+        //
+        // The gate is called DIRECTLY rather than through
+        // RunTraceRecorder::traceSystemRun(), and that is a deliberate
+        // departure from the other three system paths this feature funnelled.
+        // Almost every embedding here is a query embedded while a live turn
+        // assembles its context, so routing it through traceSystemRun() would
+        // open and close a whole nested run — six writes and a broadcast that
+        // re-reads the run — on every single turn. That regresses the run
+        // recorder's measured per-step overhead budget (its own benchmark
+        // catches it) and
+        // fills the run listing with one embedding run per turn, for no gain
+        // enforcement needs: admit() writes its own refusal record, so a
+        // refused embedding is just as visible to an operator either way.
+        //
+        // Two more things this has to get right:
+        //
+        // (a) A null $userId is legitimate here and means the installation
+        //     ceiling alone is evaluated — there is no user whose ceiling could
+        //     apply.
+        //
+        // (b) This method is frequently reached from INSIDE already-admitted
+        //     work — AutoMemoryRetriever and MemoryService embed a query while
+        //     building the context of a live turn, DeclarativeMemoryService
+        //     embeds during one, and GenerateEpisodicMemoryJob embeds inside
+        //     the traceSystemRun() that already gated that job. BudgetGate's
+        //     per-unit-of-work admission record is the only thing stopping
+        //     those calls throwing mid-turn and abandoning a half-built
+        //     response. A change to either side breaks that silently, so the
+        //     dependency is stated here as well as there.
         try {
+            app(BudgetGate::class)->admit(
+                $userId === null ? null : (string) $userId,
+                BudgetWorkKind::SystemInitiated,
+                null,
+                'embedding',
+            );
+
             $result = $provider->embed([$input], $options);
+        } catch (BudgetExceededException $e) {
+            // A ceiling refusal is not a broken role assignment; it must not be
+            // reshaped into one by the catch below.
+            throw $e;
         } catch (\Throwable $e) {
             // FR-014: a model assigned to a role it cannot perform (a chat model
             // assigned to embedding, say) fails here, at first use. Name the role

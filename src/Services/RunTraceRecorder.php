@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Events\RunStepUpdated;
 use ClarionApp\LlmClient\Events\RunUpdated;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
+use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
@@ -688,6 +689,106 @@ class RunTraceRecorder
     }
 
     /**
+     * Record a unit of work that a spending ceiling refused.
+     *
+     * One implementation for every kind of refusal — interactive, resumed,
+     * deferred, and system-initiated alike — so operator visibility does not
+     * depend on which entry path was blocked. The row is opened and closed in
+     * the same breath: the work never started, so there is no step, no action,
+     * and no message to link, and asserting that emptiness is how a reviewer
+     * can tell a refusal apart from a run that began and was abandoned.
+     *
+     * Two behaviours the signature exists for:
+     *
+     *  - $existingRunId is the resumed path. A conversation resumed after a
+     *    confirmation pause arrives with a run already open in the message's
+     *    tool_data, so a refusal there CLOSES that run rather than opening a
+     *    second one. One refused unit of work is always exactly one row.
+     *  - When run tracing is switched off, openRun() writes nothing and
+     *    returns null. The refusal then falls back to a warning log carrying
+     *    the same reason, scope, and work kind, so a spending stop never
+     *    becomes invisible as a side effect of an unrelated feature flag.
+     *
+     * The whole body is defensive, in this file's established style: a
+     * failure to record a refusal must never convert a ceiling stop into
+     * some other, unrelated error on the caller's path.
+     *
+     * @return string|null the run id that carries the refusal, or null when
+     *                     none could be written.
+     */
+    public function recordRefusedRun(
+        ?string $userId,
+        ?string $conversationId,
+        ?string $source,
+        string $reason,
+        BudgetWorkKind $kind,
+        ?string $existingRunId = null,
+    ): ?string {
+        try {
+            if ($existingRunId !== null) {
+                $this->closeRun($existingRunId, RunEndState::StoppedEarly, $reason);
+
+                return $existingRunId;
+            }
+
+            // agent_runs.user_id is not nullable, and a null user means work
+            // with no owner to attribute a run to (an embedding generated
+            // outside any user's request, say). Logged rather than dropped.
+            if ($userId === null) {
+                $this->logUnrecordedRefusal($userId, $conversationId, $source, $reason, $kind, 'no user to attribute the run to');
+
+                return null;
+            }
+
+            $runKind = match ($kind) {
+                BudgetWorkKind::Interactive, BudgetWorkKind::Resumed => RunKind::Interactive,
+                default => RunKind::SystemInitiated,
+            };
+
+            $runId = $this->openRun($runKind, $userId, $conversationId, $source);
+
+            if ($runId === null) {
+                $this->logUnrecordedRefusal($userId, $conversationId, $source, $reason, $kind, 'run tracing is disabled or the write failed');
+
+                return null;
+            }
+
+            // Closed immediately, with no step opened: nothing ran.
+            $this->closeRun($runId, RunEndState::StoppedEarly, $reason);
+
+            return $runId;
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to record refused run', [
+                'user_id' => $userId,
+                'conversation_id' => $conversationId,
+                'source' => $source,
+                'work_kind' => $kind->value,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function logUnrecordedRefusal(
+        ?string $userId,
+        ?string $conversationId,
+        ?string $source,
+        string $reason,
+        BudgetWorkKind $kind,
+        string $why,
+    ): void {
+        Log::warning('Spending ceiling refused work; no run record could be written', [
+            'why' => $why,
+            'user_id' => $userId,
+            'conversation_id' => $conversationId,
+            'source' => $source,
+            'work_kind' => $kind->value,
+            'reason' => $reason,
+        ]);
+    }
+
+    /**
      * Convenience for one-call system-initiated work (FR-012).
      * Opens run + single step, brackets $work as an action (FR-014), closes both from the callable's outcome,
      * and rethrows the callable's exception unchanged after recording `failed`.
@@ -703,6 +804,38 @@ class RunTraceRecorder
         ActionType $actionType = ActionType::LlmRequest,
         ?string $target = null,
     ): mixed {
+        // The gate runs FIRST — before openRun(), not between openRun() and
+        // $work. Two reasons, both from the shape of this method:
+        //
+        //  - the catch below closes the run as `failed` with the exception
+        //    message, so a refusal caught there would be filed as a failure
+        //    rather than the stop it is; and
+        //  - admit() writes its own refusal record, so gating after openRun()
+        //    leaves two rows behind for one refused unit of work.
+        //
+        // Gating here leaves exactly one row, closed stopped_early, written by
+        // the one implementation that writes every refusal record — and the
+        // model is never reached. BudgetGate is resolved from the container
+        // lazily rather than injected, to avoid a circular binding with this
+        // class, which BudgetGate itself depends on.
+        app(BudgetGate::class)->admit(
+            $userId,
+            BudgetWorkKind::SystemInitiated,
+            $conversationId,
+            $source,
+        );
+
+        // The ambient run id belonging to whatever is already running.
+        //
+        // This method is now reached from *inside* live work as well as from
+        // the top of a background job — an embedding built while a turn
+        // assembles its context, a condensation during one, title generation
+        // at the end of one. openRun() overwrites the ambient id and
+        // closeRun() clears it outright, so without this save-and-restore a
+        // nested system run would leave the enclosing turn with no run id at
+        // all, and every record it wrote afterwards would be unattributed.
+        $enclosingRunId = Context::get('run_id');
+
         $runId = $this->openRun(
             RunKind::SystemInitiated,
             $userId,
@@ -747,6 +880,13 @@ class RunTraceRecorder
                 $this->closeRun($runId, RunEndState::Failed, $e->getMessage());
             }
             throw $e;
+        } finally {
+            // Hand the enclosing run its id back. Nothing to restore when this
+            // was top-level work, which is the case closeRun() already handles
+            // correctly by clearing the slot outright.
+            if ($enclosingRunId !== null && $runId !== null) {
+                Context::add('run_id', $enclosingRunId);
+            }
         }
     }
 

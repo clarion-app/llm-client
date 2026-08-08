@@ -29,6 +29,11 @@ class ConversationLifecycleTest extends TestCase
 
     protected function defineDatabaseMigrations(): void
     {
+        // This class declares its own schema, so it does not inherit the
+        // parent's. Every entry path now crosses the budget gate, whose
+        // first act is to ask whether any ceiling exists.
+        $this->defineBudgetSchema();
+
         Schema::create('users', function (Blueprint $table) {
             $table->uuid('id')->primary();
             $table->string('name');

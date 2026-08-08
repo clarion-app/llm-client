@@ -386,6 +386,21 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Services\SpendingCeilingService::class, function () {
             return new \ClarionApp\LlmClient\Services\SpendingCeilingService();
         });
+
+        // scoped(), for the same reason BudgetLedger is — and for one more of
+        // its own. The gate keeps two pieces of per-unit-of-work state: the
+        // ledger memo it reads through, and its own record of which scopes it
+        // has already admitted. The second is what stops nested work inside a
+        // live turn being re-evaluated and throwing mid-flight; as a singleton
+        // it would instead become a standing pass for the life of a queue
+        // worker, admitting every later job on the strength of the first one's
+        // decision.
+        $this->app->scoped(\ClarionApp\LlmClient\Services\BudgetGate::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\BudgetGate(
+                $app->make(\ClarionApp\LlmClient\Services\SpendingCeilingService::class),
+                $app->make(\ClarionApp\LlmClient\Services\BudgetLedger::class),
+            );
+        });
     }
 
     /**
