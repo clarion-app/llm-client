@@ -461,5 +461,13 @@ return [
             fn ($id) => $id !== ''
         )),
     ],
+
+    // Response latency distributions — per-model and per-agent percentile
+    // figures computed at read time from agent_runs.
+    'latency' => [
+        // The percentile reported as "worst-case" in a distribution. "Typical"
+        // is always the median (p50) and is not separately configurable.
+        'worst_case_percentile' => env('LLM_CLIENT_LATENCY_WORST_CASE_PERCENTILE', 95),
+    ],
 ];
 

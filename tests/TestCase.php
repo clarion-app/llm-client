@@ -385,10 +385,20 @@ abstract class TestCase extends BaseTestCase
                 $table->unsignedBigInteger('duration_ms')->nullable();
                 $table->unsignedInteger('step_count')->default(0);
                 $table->timestamp('created_at')->useCurrent();
+                $table->boolean('is_streamed')->default(false);
+                $table->unsignedBigInteger('first_output_ms')->nullable();
+                $table->string('model', 128)->nullable();
+                $table->string('agent_id', 255)->nullable();
+                $table->unsignedBigInteger('model_wait_ms')->nullable();
+                $table->unsignedBigInteger('tool_exec_ms')->nullable();
+                $table->unsignedBigInteger('confirm_wait_ms')->nullable();
+                $table->unsignedBigInteger('product_ms')->nullable();
 
                 $table->index('conversation_id');
                 $table->index(['user_id', 'started_at']);
                 $table->index(['end_state', 'started_at']);
+                $table->index(['model', 'started_at']);
+                $table->index(['agent_id', 'started_at']);
             });
         }
 
