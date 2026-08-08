@@ -106,6 +106,19 @@ final class Decimal
      * scientific notation is numeric and must be accepted; garbage must
      * still be rejected.
      */
+    public static function toPlainNotation(string $value): string
+    {
+        if (preg_match('/^[+-]?\d+(\.\d+)?$/', $value)) {
+            return $value;
+        }
+
+        if (!is_numeric($value)) {
+            return $value;
+        }
+
+        return sprintf('%.'.self::NORMALIZATION_PRECISION.'F', (float) $value);
+    }
+
     /**
      * Renders a value read back from a numeric column as a string WITHOUT
      * losing precision the value still had.
@@ -115,11 +128,11 @@ final class Decimal
      * by default, so a double that genuinely distinguishes 1000000.0000000001
      * from 1000000.0 stringifies to "1.0E+6" and the distinction is gone
      * before any bcmath sees it. That is not the float's fault and it is not
-     * recoverable downstream — toPlainNotation() can only re-expand what it
-     * was given. A `decimal(20,10)` column read back through SQLite's NUMERIC
-     * storage affinity is exactly this case, and a ceiling compared against a
-     * consumption figure is exactly where losing the tenth decimal place
-     * matters.
+     * recoverable downstream — toPlainNotation() above can only re-expand what
+     * it was given. A `decimal(20,10)` column read back through SQLite's
+     * NUMERIC storage affinity is exactly this case, and a ceiling compared
+     * against a consumption figure is exactly where losing the tenth decimal
+     * place matters.
      *
      * Rendering at fixed high precision instead keeps every digit the double
      * actually carries; the caller's own round() then reduces it to the
@@ -132,18 +145,5 @@ final class Decimal
         }
 
         return (string) $value;
-    }
-
-    public static function toPlainNotation(string $value): string
-    {
-        if (preg_match('/^[+-]?\d+(\.\d+)?$/', $value)) {
-            return $value;
-        }
-
-        if (!is_numeric($value)) {
-            return $value;
-        }
-
-        return sprintf('%.'.self::NORMALIZATION_PRECISION.'F', (float) $value);
     }
 }

@@ -80,12 +80,23 @@ class BudgetEnforcementGuardTest extends TestCase
         'Jobs/GenerateEpisodicMemoryJob.php',
         'Jobs/PreWarmChunkSummaryJob.php',
 
-        // System-initiated work brought under traceSystemRun() by this
-        // feature.
+        // System-initiated work brought under the gate by this feature.
+        // Condensation, the role test, and title generation go through
+        // RunTraceRecorder::traceSystemRun(), whose first act is the gate.
         'Services/ConversationCondenser.php',
-        'Services/EmbeddingService.php',
         'Services/RoleTestRunner.php',
         'OpenAIGenerateConversationTitleRequest.php',
+
+        // Embedding calls BudgetGate::admit() DIRECTLY rather than going
+        // through traceSystemRun(). Almost every embedding here is a query
+        // embedded while a live turn assembles its context, so wrapping it
+        // would open and close a nested run on every turn — measurably over
+        // spec 062's own per-step overhead budget, and one embedding run per
+        // turn in the run listing. admit() writes its own refusal record, so
+        // a refused embedding is exactly as visible to an operator either
+        // way. The partition below classifies it as gating itself, which it
+        // does; only the funnel differs.
+        'Services/EmbeddingService.php',
 
         // Dead legacy classes. They are on the list because they genuinely
         // contain the constructs and the assertion is an equality — not
