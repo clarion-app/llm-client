@@ -23,6 +23,20 @@ class ToolInvocationRecord extends Model
         'failure_category',
         'co_member_tags',
         'agent_id',
+        // Explicitly captured once at write time so it can never drift from
+        // the tool_reliability_summaries period_date bucket it feeds
+        // (data-model.md §1, research.md D9). $timestamps = false below
+        // means the base Eloquent HasTimestamps trait never sets this
+        // automatically, and the default $guarded = ['*'] silently discards
+        // any key passed to create() that isn't listed here -- so
+        // 'created_at' must be fillable for
+        // MetricsRecorder::recordToolInvocation()'s explicit capture to
+        // actually take effect (rather than silently falling back to the
+        // DB's own useCurrent() default, which is not influenced by
+        // Carbon::setTestNow() and would let the record's own timestamp
+        // drift from the summary bucket under a frozen clock). Mirrors
+        // UsageRecord::$fillable's identical fix for the identical reason.
+        'created_at',
     ];
 
     protected $casts = [
