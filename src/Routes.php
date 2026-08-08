@@ -19,6 +19,7 @@ use ClarionApp\LlmClient\Controllers\RunController;
 use ClarionApp\LlmClient\Controllers\ModelPriceController;
 use ClarionApp\LlmClient\Controllers\CostRollupController;
 use ClarionApp\LlmClient\Controllers\UsageRecordController;
+use ClarionApp\LlmClient\Controllers\LatencyController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -93,6 +94,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('cost-rollups/users', [CostRollupController::class, "userIndex"]);
     Route::get('cost-rollups/agents/{agentId}', [CostRollupController::class, "agentShow"]);
     Route::get('cost-rollups/agents', [CostRollupController::class, "agentIndex"]);
+
+    // Latency distribution endpoints (074 US2) — role-scoped per contracts/latency-api.md §1
+    Route::get('latency/models/{model}', [LatencyController::class, "modelShow"]);
+    Route::get('latency/models', [LatencyController::class, "modelIndex"]);
+    Route::get('latency/agents/{agentId}', [LatencyController::class, "agentShow"]);
+    Route::get('latency/agents', [LatencyController::class, "agentIndex"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
