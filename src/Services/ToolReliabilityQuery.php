@@ -1,0 +1,136 @@
+<?php
+
+namespace ClarionApp\LlmClient\Services;
+
+use ClarionApp\LlmClient\Models\ToolReliabilitySummary;
+use ClarionApp\LlmClient\Support\CalendarPeriod;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * Role-scoped reads over tool_reliability_summaries (075-tool-reliability-
+ * rates, User Story 1), mirroring CostRollupQuery's per-scope show/list
+ * shape.
+ *
+ * Every toolSummary() call resolves a caller-chosen period type + reference
+ * date into a calendar-aligned [from, to] range via CalendarPeriod::resolve()
+ * and sums the in-range tool_reliability_summaries rows for a single tool —
+ * never a scan of tool_invocation_records, and never more than the bounded
+ * (<=31) day-granularity rows the resolved range spans.
+ *
+ * $callerId/$isOperator mirror CostRollupQuery's authorization pattern
+ * exactly: an operator's read is unrestricted; a non-operator's read is
+ * scoped to rows where user_id = $callerId. This class never throws or 403s
+ * for a scoping mismatch — it simply narrows, or returns the zero-value/
+ * no_activity shape when nothing matches.
+ */
+class ToolReliabilityQuery
+{
+    /**
+     * Sum a single tool's in-range tool_reliability_summaries rows, across
+     * every agent bucket (the all-agents aggregate — per-agent scoping is a
+     * later phase). Returns the zero-value/no_activity shape (never null,
+     * never an exception) when nothing matches, including when the tool name
+     * has never appeared at all.
+     */
+    public function toolSummary(string $toolName, string $periodType, string $date, ?string $callerId, bool $isOperator): array
+    {
+        $period = CalendarPeriod::resolve($periodType, $date);
+
+        $query = $this->periodQuery($period['from'], $period['to'])->where('tool_name', $toolName);
+
+        if (!$isOperator) {
+            $query->where('user_id', $callerId);
+        }
+
+        $row = $query->selectRaw($this->aggregateSelect())->first();
+
+        return $this->shape($toolName, $period, $row);
+    }
+
+    /**
+     * One entry per tool with any in-range, in-scope activity, ordered by
+     * failure_count DESC then invocation_count DESC (contracts/tool-
+     * reliability-api.md §2). A tool with zero activity in the period never
+     * appears as a row.
+     */
+    public function toolList(string $periodType, string $date, ?string $callerId, bool $isOperator): array
+    {
+        $period = CalendarPeriod::resolve($periodType, $date);
+
+        $toolNames = $this->distinctToolNames($period['from'], $period['to'], $isOperator ? null : $callerId);
+
+        $rows = array_map(
+            fn (string $toolName) => $this->toolSummary($toolName, $periodType, $date, $callerId, $isOperator),
+            $toolNames
+        );
+
+        usort($rows, function (array $a, array $b) {
+            return $b['failure_count'] <=> $a['failure_count']
+                ?: $b['invocation_count'] <=> $a['invocation_count'];
+        });
+
+        return array_values($rows);
+    }
+
+    private function distinctToolNames(string $from, string $to, ?string $userIdFilter): array
+    {
+        $query = $this->periodQuery($from, $to);
+
+        if ($userIdFilter !== null) {
+            $query->where('user_id', $userIdFilter);
+        }
+
+        return $query->distinct()->pluck('tool_name')->all();
+    }
+
+    private function periodQuery(string $from, string $to)
+    {
+        return DB::table('tool_reliability_summaries')
+            ->whereBetween('period_date', [$from, $to]);
+    }
+
+    private function aggregateSelect(): string
+    {
+        return
+            'COALESCE(SUM(invocation_count), 0) as invocation_count, '.
+            'COALESCE(SUM(success_count), 0) as success_count, '.
+            'COALESCE(SUM(failure_count), 0) as failure_count, '.
+            'COALESCE(SUM(failure_timeout_count), 0) as failure_timeout_count, '.
+            'COALESCE(SUM(failure_connection_failure_count), 0) as failure_connection_failure_count, '.
+            'COALESCE(SUM(failure_authentication_failure_count), 0) as failure_authentication_failure_count, '.
+            'COALESCE(SUM(failure_invalid_input_count), 0) as failure_invalid_input_count, '.
+            'COALESCE(SUM(failure_server_error_count), 0) as failure_server_error_count, '.
+            'COALESCE(SUM(failure_other_count), 0) as failure_other_count, '.
+            'COALESCE(SUM(failure_uncategorized_count), 0) as failure_uncategorized_count';
+    }
+
+    /**
+     * low_sample/no_activity are computed here, after summation — the only
+     * point at which a multi-day period's true total is known (research.md
+     * D6/D7).
+     */
+    private function shape(string $toolName, array $period, ?object $row): array
+    {
+        $invocationCount = (int) ($row->invocation_count ?? 0);
+
+        return [
+            'tool_name' => $toolName,
+            'agent_id' => null,
+            'period' => $period,
+            'invocation_count' => $invocationCount,
+            'success_count' => (int) ($row->success_count ?? 0),
+            'failure_count' => (int) ($row->failure_count ?? 0),
+            'failure_breakdown' => [
+                'timeout' => (int) ($row->failure_timeout_count ?? 0),
+                'connection_failure' => (int) ($row->failure_connection_failure_count ?? 0),
+                'authentication_failure' => (int) ($row->failure_authentication_failure_count ?? 0),
+                'invalid_input' => (int) ($row->failure_invalid_input_count ?? 0),
+                'server_error' => (int) ($row->failure_server_error_count ?? 0),
+                'other' => (int) ($row->failure_other_count ?? 0),
+                'uncategorized' => (int) ($row->failure_uncategorized_count ?? 0),
+            ],
+            'low_sample' => $invocationCount < ToolReliabilitySummary::LOW_SAMPLE_THRESHOLD,
+            'no_activity' => $invocationCount === 0,
+        ];
+    }
+}

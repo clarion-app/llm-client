@@ -4,8 +4,10 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use Tests\TestCase;
 use ClarionApp\LlmClient\Models\ToolInvocationRecord;
+use ClarionApp\LlmClient\Models\ToolReliabilitySummary;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
 use ClarionApp\LlmClient\ValueObjects\ToolFailureCategory;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\Test;
 
@@ -322,5 +324,288 @@ class ToolReliabilityMetricsTest extends TestCase
             ->get();
         $this->assertCount(2, $recentFailures);
         $this->assertTrue($recentFailures->every(fn($r) => $r->outcome === 'failure'));
+    }
+
+    /**
+     * The new $agentId parameter is written verbatim to
+     * tool_invocation_records.agent_id when passed, and NULL when omitted --
+     * never a fabricated/derived value. An explicit created_at is also
+     * captured on every call, non-null on the detail row.
+     */
+    #[Test]
+    public function agent_id_is_written_verbatim_when_passed_and_null_when_omitted(): void
+    {
+        $recorder = new MetricsRecorder();
+        $userId = (string) Str::uuid();
+
+        $recorder->recordToolInvocation(
+            conversationId: (string) Str::uuid(),
+            userId: $userId,
+            attemptGroupId: (string) Str::uuid(),
+            toolName: 'search_documents',
+            success: true,
+            agentId: 'research-assistant',
+        );
+
+        $withAgent = ToolInvocationRecord::where('tool_name', 'search_documents')->first();
+        $this->assertNotNull($withAgent);
+        $this->assertSame('research-assistant', $withAgent->agent_id);
+        $this->assertNotNull($withAgent->created_at, 'created_at must be explicitly captured at write time, non-null on the detail row');
+
+        $recorder->recordToolInvocation(
+            conversationId: (string) Str::uuid(),
+            userId: $userId,
+            attemptGroupId: (string) Str::uuid(),
+            toolName: 'fetch_url',
+            success: true,
+        );
+
+        $withoutAgent = ToolInvocationRecord::where('tool_name', 'fetch_url')->first();
+        $this->assertNotNull($withoutAgent);
+        $this->assertNull($withoutAgent->agent_id, 'Omitting agentId must record NULL, never a fabricated/derived identifier');
+    }
+
+    /**
+     * One recordToolInvocation() call upserts exactly one
+     * tool_reliability_summaries row, keyed (tool_name, agent_id-or-
+     * Unattributed, user_id, period_date), with invocation_count = 1 and
+     * exactly one of success_count/failure_count incremented. An invocation
+     * carrying no agentId buckets under the reserved Unattributed sentinel,
+     * never a NULL agent_id column.
+     */
+    #[Test]
+    public function recording_a_tool_invocation_upserts_exactly_one_correctly_bucketed_summary_row(): void
+    {
+        $recorder = new MetricsRecorder();
+        $userId = (string) Str::uuid();
+        $today = now()->toDateString();
+
+        $recorder->recordToolInvocation(
+            conversationId: (string) Str::uuid(),
+            userId: $userId,
+            attemptGroupId: (string) Str::uuid(),
+            toolName: 'search_documents',
+            success: true,
+            agentId: 'research-assistant',
+        );
+
+        $this->assertDatabaseCount('tool_reliability_summaries', 1);
+
+        $row = DB::table('tool_reliability_summaries')
+            ->where('tool_name', 'search_documents')
+            ->where('agent_id', 'research-assistant')
+            ->where('user_id', $userId)
+            ->where('period_date', $today)
+            ->first();
+
+        $this->assertNotNull($row, 'the summary row must be keyed (tool_name, agent_id, user_id, period_date)');
+        $this->assertSame(1, (int) $row->invocation_count);
+        $this->assertSame(1, (int) $row->success_count);
+        $this->assertSame(0, (int) $row->failure_count);
+
+        $recorder->recordToolInvocation(
+            conversationId: (string) Str::uuid(),
+            userId: $userId,
+            attemptGroupId: (string) Str::uuid(),
+            toolName: 'fetch_url',
+            success: false,
+            failureCategory: ToolFailureCategory::Timeout,
+        );
+
+        $this->assertDatabaseCount('tool_reliability_summaries', 2);
+
+        $unattributedRow = DB::table('tool_reliability_summaries')
+            ->where('tool_name', 'fetch_url')
+            ->where('agent_id', ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET)
+            ->where('user_id', $userId)
+            ->where('period_date', $today)
+            ->first();
+
+        $this->assertNotNull($unattributedRow, 'an invocation with no agentId must bucket under the reserved Unattributed sentinel, never a NULL agent_id column');
+        $this->assertSame(1, (int) $unattributedRow->invocation_count);
+        $this->assertSame(0, (int) $unattributedRow->success_count);
+        $this->assertSame(1, (int) $unattributedRow->failure_count);
+    }
+
+    /**
+     * A second recordToolInvocation() call for the identical bucket
+     * accumulates atomically -- one row, invocation_count = 2, no lost
+     * update.
+     */
+    #[Test]
+    public function a_second_call_for_the_identical_bucket_accumulates_atomically(): void
+    {
+        $recorder = new MetricsRecorder();
+        $conversationId = (string) Str::uuid();
+        $userId = (string) Str::uuid();
+
+        $recorder->recordToolInvocation(
+            conversationId: $conversationId,
+            userId: $userId,
+            attemptGroupId: (string) Str::uuid(),
+            toolName: 'search_documents',
+            success: true,
+            agentId: 'research-assistant',
+        );
+        $recorder->recordToolInvocation(
+            conversationId: $conversationId,
+            userId: $userId,
+            attemptGroupId: (string) Str::uuid(),
+            toolName: 'search_documents',
+            success: false,
+            failureCategory: ToolFailureCategory::ServerError,
+            agentId: 'research-assistant',
+        );
+
+        $this->assertDatabaseCount('tool_reliability_summaries', 1);
+
+        $row = DB::table('tool_reliability_summaries')
+            ->where('tool_name', 'search_documents')
+            ->where('agent_id', 'research-assistant')
+            ->where('user_id', $userId)
+            ->first();
+
+        $this->assertSame(2, (int) $row->invocation_count, 'no lost update across two calls for the identical bucket');
+        $this->assertSame(1, (int) $row->success_count);
+        $this->assertSame(1, (int) $row->failure_count);
+        $this->assertSame(1, (int) $row->failure_server_error_count);
+    }
+
+    /**
+     * A failure recorded with failureCategory: null increments
+     * failure_uncategorized_count -- never failure_other_count, which is
+     * itself a real, distinct classification.
+     */
+    #[Test]
+    public function an_uncategorized_failure_increments_the_uncategorized_column_not_other(): void
+    {
+        $recorder = new MetricsRecorder();
+
+        $recorder->recordToolInvocation(
+            conversationId: (string) Str::uuid(),
+            userId: (string) Str::uuid(),
+            attemptGroupId: (string) Str::uuid(),
+            toolName: 'search_documents',
+            success: false,
+            failureCategory: null,
+            agentId: 'research-assistant',
+        );
+
+        $row = DB::table('tool_reliability_summaries')->where('tool_name', 'search_documents')->first();
+        $this->assertNotNull($row);
+        $this->assertSame(1, (int) $row->failure_uncategorized_count);
+        $this->assertSame(0, (int) $row->failure_other_count, 'an uncategorized failure must never be folded into the Other classification');
+        $this->assertSame(1, (int) $row->failure_count);
+    }
+
+    /**
+     * Each of the six named ToolFailureCategory cases increments its own
+     * matching summary column, and no other.
+     */
+    #[Test]
+    public function each_named_failure_category_increments_only_its_own_column(): void
+    {
+        $recorder = new MetricsRecorder();
+        $userId = (string) Str::uuid();
+        $toolName = 'category_probe_tool';
+
+        $categories = [
+            ToolFailureCategory::Timeout,
+            ToolFailureCategory::ConnectionFailure,
+            ToolFailureCategory::AuthenticationFailure,
+            ToolFailureCategory::InvalidInput,
+            ToolFailureCategory::ServerError,
+            ToolFailureCategory::Other,
+        ];
+
+        foreach ($categories as $category) {
+            $recorder->recordToolInvocation(
+                conversationId: (string) Str::uuid(),
+                userId: $userId,
+                attemptGroupId: (string) Str::uuid(),
+                toolName: $toolName,
+                success: false,
+                failureCategory: $category,
+                agentId: 'research-assistant',
+            );
+        }
+
+        $row = DB::table('tool_reliability_summaries')->where('tool_name', $toolName)->first();
+        $this->assertNotNull($row);
+
+        foreach (ToolReliabilitySummary::FAILURE_CATEGORY_COLUMNS as $value => $column) {
+            $this->assertSame(1, (int) $row->{$column}, "column {$column} for category {$value} must be incremented exactly once");
+        }
+        $this->assertSame(0, (int) $row->failure_uncategorized_count, 'every failure in this batch carried a named category');
+        $this->assertSame(6, (int) $row->failure_count);
+    }
+
+    /**
+     * After a mixed batch of successes and every failure kind (the six named
+     * categories plus one uncategorized failure), the sum of the seven
+     * failure_*_count columns exactly equals failure_count (FR-002).
+     */
+    #[Test]
+    public function failure_breakdown_columns_sum_to_failure_count_after_a_mixed_batch(): void
+    {
+        $recorder = new MetricsRecorder();
+        $userId = (string) Str::uuid();
+        $toolName = 'mixed_batch_tool';
+
+        for ($i = 0; $i < 3; $i++) {
+            $recorder->recordToolInvocation(
+                conversationId: (string) Str::uuid(),
+                userId: $userId,
+                attemptGroupId: (string) Str::uuid(),
+                toolName: $toolName,
+                success: true,
+                agentId: 'research-assistant',
+            );
+        }
+
+        foreach ([
+            ToolFailureCategory::Timeout,
+            ToolFailureCategory::ConnectionFailure,
+            ToolFailureCategory::AuthenticationFailure,
+            ToolFailureCategory::InvalidInput,
+            ToolFailureCategory::ServerError,
+            ToolFailureCategory::Other,
+        ] as $category) {
+            $recorder->recordToolInvocation(
+                conversationId: (string) Str::uuid(),
+                userId: $userId,
+                attemptGroupId: (string) Str::uuid(),
+                toolName: $toolName,
+                success: false,
+                failureCategory: $category,
+                agentId: 'research-assistant',
+            );
+        }
+
+        $recorder->recordToolInvocation(
+            conversationId: (string) Str::uuid(),
+            userId: $userId,
+            attemptGroupId: (string) Str::uuid(),
+            toolName: $toolName,
+            success: false,
+            failureCategory: null,
+            agentId: 'research-assistant',
+        );
+
+        $row = DB::table('tool_reliability_summaries')->where('tool_name', $toolName)->first();
+        $this->assertNotNull($row);
+        $this->assertSame(10, (int) $row->invocation_count);
+        $this->assertSame(3, (int) $row->success_count);
+        $this->assertSame(7, (int) $row->failure_count);
+
+        $breakdownSum = $row->failure_timeout_count
+            + $row->failure_connection_failure_count
+            + $row->failure_authentication_failure_count
+            + $row->failure_invalid_input_count
+            + $row->failure_server_error_count
+            + $row->failure_other_count
+            + $row->failure_uncategorized_count;
+
+        $this->assertSame((int) $row->failure_count, (int) $breakdownSum, 'the seven breakdown columns must account for every failure counted in the summary (FR-002)');
     }
 }

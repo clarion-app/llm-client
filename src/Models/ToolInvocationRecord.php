@@ -22,6 +22,7 @@ class ToolInvocationRecord extends Model
         'outcome',
         'failure_category',
         'co_member_tags',
+        'agent_id',
     ];
 
     protected $casts = [

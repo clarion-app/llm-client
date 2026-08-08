@@ -20,6 +20,7 @@ use ClarionApp\LlmClient\Controllers\ModelPriceController;
 use ClarionApp\LlmClient\Controllers\CostRollupController;
 use ClarionApp\LlmClient\Controllers\UsageRecordController;
 use ClarionApp\LlmClient\Controllers\LatencyController;
+use ClarionApp\LlmClient\Controllers\ToolReliabilityController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -100,6 +101,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('latency/models', [LatencyController::class, "modelIndex"]);
     Route::get('latency/agents/{agentId}', [LatencyController::class, "agentShow"]);
     Route::get('latency/agents', [LatencyController::class, "agentIndex"]);
+
+    // Tool reliability rate summary endpoints (075 US1) — role-scoped per
+    // contracts/tool-reliability-api.md §1-2
+    Route::get('tool-reliability/tools/{toolName}', [ToolReliabilityController::class, "show"]);
+    Route::get('tool-reliability/tools', [ToolReliabilityController::class, "index"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

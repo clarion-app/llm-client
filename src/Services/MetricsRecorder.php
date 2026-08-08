@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Models\ContextManagementRecord;
 use ClarionApp\LlmClient\Models\ContextManagementSummary;
 use ClarionApp\LlmClient\Models\CostSummary;
 use ClarionApp\LlmClient\Models\ModelPrice;
+use ClarionApp\LlmClient\Models\ToolReliabilitySummary;
 use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\ValueObjects\ToolFailureCategory;
 use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
@@ -357,9 +358,15 @@ class MetricsRecorder
         string $toolName,
         bool $success,
         ?ToolFailureCategory $failureCategory = null,
-        ?array $coMemberTags = null
+        ?array $coMemberTags = null,
+        ?string $agentId = null,
     ): void {
         try {
+            // Captured once so the detail row's own timestamp and the
+            // tool_reliability_summaries.period_date bucket it feeds below
+            // can never drift apart from one another.
+            $now = now();
+
             ToolInvocationRecord::create([
                 'id' => (string) Str::uuid(),
                 'conversation_id' => $conversationId,
@@ -369,7 +376,31 @@ class MetricsRecorder
                 'outcome' => $success ? 'success' : 'failure',
                 'failure_category' => $failureCategory?->value,
                 'co_member_tags' => $coMemberTags,
+                'agent_id' => $agentId,
+                'created_at' => $now,
             ]);
+
+            // tool_reliability_summaries bucketing — isolated in its own
+            // try/catch so a failure specific to this rollup can never
+            // suppress the detail-row write above, matching the isolation
+            // pattern already established for upsertCostSummary() in
+            // recordUsage().
+            try {
+                $this->upsertToolReliabilitySummary(
+                    $toolName,
+                    $agentId ?? ToolReliabilitySummary::UNATTRIBUTED_AGENT_BUCKET,
+                    $userId,
+                    $now->toDateString(),
+                    $success,
+                    $failureCategory,
+                );
+            } catch (\Throwable $e) {
+                Log::warning('MetricsRecorder: failed to upsert tool reliability summary', [
+                    'conversation_id' => $conversationId,
+                    'tool_name' => $toolName,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         } catch (\Throwable $e) {
             Log::warning('MetricsRecorder: failed to record tool invocation', [
                 'conversation_id' => $conversationId,
@@ -377,6 +408,77 @@ class MetricsRecorder
                 'error' => $e->getMessage(),
             ]);
         }
+    }
+
+    /**
+     * Upsert a tool_reliability_summaries row using the same atomic
+     * insertOrIgnore + column = column + n idiom as upsertSummary()/
+     * upsertCostSummary() (data-model.md §3). Increments invocation_count by
+     * 1, exactly one of success_count/failure_count by 1, and — only for a
+     * failure — exactly one of the seven breakdown columns by 1: the column
+     * matching $failureCategory->value when a category was given, else the
+     * reserved "uncategorized" column (kept distinct from "other", which is
+     * itself a real classification).
+     */
+    private function upsertToolReliabilitySummary(
+        string $toolName,
+        string $agentId,
+        string $userId,
+        string $periodDate,
+        bool $success,
+        ?ToolFailureCategory $failureCategory,
+    ): void {
+        // Ensure the summary row exists. insertOrIgnore is a no-op when a row
+        // for this bucket already exists (unique constraint), so a
+        // concurrent create by another request cannot produce a duplicate.
+        DB::table('tool_reliability_summaries')->insertOrIgnore([
+            'id' => (string) Str::uuid(),
+            'tool_name' => $toolName,
+            'agent_id' => $agentId,
+            'user_id' => $userId,
+            'period_date' => $periodDate,
+            'invocation_count' => 0,
+            'success_count' => 0,
+            'failure_count' => 0,
+            'failure_timeout_count' => 0,
+            'failure_connection_failure_count' => 0,
+            'failure_authentication_failure_count' => 0,
+            'failure_invalid_input_count' => 0,
+            'failure_server_error_count' => 0,
+            'failure_other_count' => 0,
+            'failure_uncategorized_count' => 0,
+            'updated_at' => now(),
+        ]);
+
+        $failureBreakdownColumn = null;
+
+        if (!$success) {
+            $failureBreakdownColumn = $failureCategory !== null
+                ? (ToolReliabilitySummary::FAILURE_CATEGORY_COLUMNS[$failureCategory->value] ?? ToolReliabilitySummary::UNCATEGORIZED_COLUMN)
+                : ToolReliabilitySummary::UNCATEGORIZED_COLUMN;
+        }
+
+        // Atomic increment. Every incremented value here is a literal 1 or
+        // 0, never a caller-influenced string, so raw interpolation is
+        // injection-safe (matching upsertCostSummary()'s identical
+        // argument).
+        $update = [
+            'invocation_count' => DB::raw('invocation_count + 1'),
+            'success_count' => DB::raw('success_count + '.($success ? 1 : 0)),
+            'failure_count' => DB::raw('failure_count + '.($success ? 0 : 1)),
+            'updated_at' => now(),
+        ];
+
+        if ($failureBreakdownColumn !== null) {
+            $update[$failureBreakdownColumn] = DB::raw("{$failureBreakdownColumn} + 1");
+        }
+
+        DB::table('tool_reliability_summaries')
+            ->where('tool_name', $toolName)
+            ->where('agent_id', $agentId)
+            ->where('user_id', $userId)
+            ->where('period_date', $periodDate)
+            ->update($update);
     }
 
     /**
