@@ -66,6 +66,7 @@ class PurgeExpiredRunTracesCommandTest extends TestCase
         string $kind = 'interactive',
         ?string $source = null,
         ?string $endReason = null,
+        ?array $latencyColumns = null,
     ): void {
         DB::table('agent_runs')->insert([
             'id' => $id,
@@ -80,6 +81,7 @@ class PurgeExpiredRunTracesCommandTest extends TestCase
             'duration_ms' => $durationMs,
             'step_count' => $stepCount,
             'created_at' => $startedAt,
+            ...($latencyColumns ?? []),
         ]);
     }
 
@@ -158,6 +160,47 @@ class PurgeExpiredRunTracesCommandTest extends TestCase
         $this->assertEquals(0, DB::table('agent_runs')->where('id', $expiredRunId)->count());
         $this->assertEquals(0, DB::table('agent_run_steps')->where('run_id', $expiredRunId)->count());
         $this->assertEquals(0, DB::table('agent_run_messages')->where('run_id', $expiredRunId)->count());
+    }
+
+    /**
+     * FR-022 (074-latency-metrics): a run carrying non-null values in all 8
+     * new latency columns (is_streamed, first_output_ms, model, agent_id,
+     * model_wait_ms, tool_exec_ms, confirm_wait_ms, product_ms) is deleted
+     * in full once past retention -- the same row, no separate purge step,
+     * since the columns live on agent_runs itself (data-model.md §9).
+     */
+    #[Test]
+    public function expired_run_with_all_latency_columns_populated_is_deleted_in_full()
+    {
+        $userId = (string) Str::uuid();
+        $expiredRunId = (string) Str::uuid();
+        $expiredTime = CarbonImmutable::now()->subDays(100);
+
+        $this->insertRun($expiredRunId, $userId, RunEndState::Completed->value,
+            $expiredTime->format('Y-m-d H:i:s.u'),
+            $expiredTime->addHour()->format('Y-m-d H:i:s.u'),
+            3600000,
+            1,
+            latencyColumns: [
+                'is_streamed' => true,
+                'first_output_ms' => 410,
+                'model' => 'claude-sonnet-5',
+                'agent_id' => 'research-assistant',
+                'model_wait_ms' => 2000,
+                'tool_exec_ms' => 1000,
+                'confirm_wait_ms' => 500,
+                'product_ms' => 100,
+            ]);
+
+        $this->assertEquals(1, DB::table('agent_runs')->where('id', $expiredRunId)->count(), 'precondition: the run exists before purge');
+
+        $exitCode = Artisan::call('llm-client:purge-run-traces');
+
+        $this->assertSame(0, $exitCode);
+
+        // The whole row -- including its 8 latency columns -- is gone, same as
+        // every other column on the row (no partial deletion, no orphaned data).
+        $this->assertEquals(0, DB::table('agent_runs')->where('id', $expiredRunId)->count());
     }
 
     #[Test]
