@@ -2,6 +2,8 @@
 
 namespace ClarionApp\LlmClient\Support;
 
+use Carbon\CarbonImmutable;
+use Carbon\CarbonInterface;
 use Illuminate\Support\Carbon;
 
 /**
@@ -37,5 +39,45 @@ final class CalendarPeriod
         };
 
         return ['type' => $type, 'from' => $from->toDateString(), 'to' => $to->toDateString()];
+    }
+
+    /**
+     * The period *containing* an instant, defaulting to now — the form
+     * budget enforcement needs, as opposed to resolve()'s date-string
+     * anchor.
+     *
+     * This deliberately delegates to resolve() rather than repeating the
+     * boundary arithmetic, so a budget period and the cost_summaries
+     * period_date buckets summed over it are the same period by
+     * construction. The instant is normalised to UTC before its calendar
+     * date is taken, so an instant expressed in another timezone lands in
+     * the UTC period that actually contains it.
+     *
+     * @return array{0: string, 1: string} The inclusive [from, to] Y-m-d pair.
+     */
+    public static function containing(string $type, ?CarbonInterface $at = null): array
+    {
+        $anchor = ($at ? Carbon::instance($at) : Carbon::now())->utc();
+
+        $resolved = self::resolve($type, $anchor->toDateString());
+
+        return [$resolved['from'], $resolved['to']];
+    }
+
+    /**
+     * The UTC instant at which the period containing $date ends, as an
+     * *exclusive* upper bound: the day after the period's inclusive 'to',
+     * at 00:00:00Z.
+     *
+     * Exclusive rather than "23:59:59 of the last day" on purpose — the
+     * latter is the classic off-by-one that has a user watching the clock
+     * see a minute of apparent limbo between the reset time they were
+     * quoted and the reset actually taking effect.
+     */
+    public static function resetsAt(string $type, string $date): CarbonImmutable
+    {
+        $resolved = self::resolve($type, $date);
+
+        return CarbonImmutable::parse($resolved['to'], 'UTC')->addDay()->startOfDay();
     }
 }

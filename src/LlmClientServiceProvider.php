@@ -360,6 +360,24 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Services\ContentSanitizer::class, function () {
             return new \ClarionApp\LlmClient\Services\ContentSanitizer();
         });
+
+        // scoped(), deliberately — and NOT singleton() like every other
+        // binding in this method. BudgetLedger memoizes the consumption
+        // figure it reads, so that the two scope reads and any repeated
+        // checks within one request or job share one read and the memo is
+        // then discarded. In a web request scoped() and singleton() are
+        // indistinguishable, but a queue worker keeps one container alive
+        // across many jobs and flushes only *scoped* instances between
+        // them: a singleton ledger would carry the first job's consumption
+        // figure into every later job for the life of the worker, letting
+        // work through long after a ceiling had been crossed. That is a
+        // binding mistake a passing single-process test suite would never
+        // reveal, which is why it is written down here.
+        $this->app->scoped(\ClarionApp\LlmClient\Services\BudgetLedger::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\BudgetLedger(
+                $app->make(\ClarionApp\LlmClient\Services\CostRollupQuery::class)
+            );
+        });
     }
 
     /**

@@ -267,6 +267,43 @@ abstract class TestCase extends BaseTestCase
             });
         }
 
+        // spending_ceilings table (for budget ceiling tests).
+        if (!Schema::hasTable('spending_ceilings')) {
+            Schema::create('spending_ceilings', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('scope_type', 16);
+                $table->uuid('scope_id');
+                $table->decimal('amount', 20, 10)->nullable();
+                $table->string('period_type', 8);
+                $table->string('enforcement_mode', 8);
+                $table->decimal('approach_threshold', 5, 4)->default(0.8);
+                $table->boolean('waived')->default(false);
+                $table->timestamps();
+                $table->softDeletes();
+
+                // Plain index, not unique — see the migration's own comment.
+                $table->index(['scope_type', 'scope_id']);
+            });
+        }
+
+        // budget_threshold_notifications table (for budget warning tests).
+        if (!Schema::hasTable('budget_threshold_notifications')) {
+            Schema::create('budget_threshold_notifications', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('scope_type', 16);
+                $table->uuid('scope_id');
+                $table->string('period_type', 8);
+                $table->date('period_start');
+                $table->string('kind', 16);
+                $table->uuid('ceiling_id')->nullable();
+                $table->decimal('consumption_at_fire', 20, 10);
+                $table->timestamp('created_at')->useCurrent();
+
+                // The once-per-period latch, not merely a constraint.
+                $table->unique(['scope_type', 'scope_id', 'period_type', 'period_start', 'kind']);
+            });
+        }
+
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
             Schema::create('tool_invocation_records', function (Blueprint $table) {

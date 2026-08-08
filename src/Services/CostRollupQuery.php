@@ -64,6 +64,39 @@ class CostRollupQuery
         return $this->groupedList(CostSummary::ENTITY_USER, 'user_id', $from, $to, null);
     }
 
+    /**
+     * The whole installation's total over [$from, $to]: the same aggregate
+     * shape as userTotal(), without the entity_id predicate, served by the
+     * existing index(['entity_type','period_date']).
+     *
+     * Summing the 'user' dimension is what makes this figure by
+     * construction the exact sum of every userTotal() over the same range —
+     * recordUsage() writes exactly one entity_type='user' increment per
+     * unit of work, and the 'conversation'/'agent' rows are separate
+     * dimensions over the same money.
+     *
+     * It deliberately takes no $callerId/$isOperator: an installation total
+     * is exposed only through an operator-only endpoint, authorization is
+     * the controller's job, and widening this signature would create a
+     * second place to get that wrong.
+     */
+    public function installationTotal(string $from, string $to): array
+    {
+        $row = DB::table('cost_summaries')
+            ->where('entity_type', CostSummary::ENTITY_USER)
+            ->whereBetween('period_date', [$from, $to])
+            ->selectRaw(
+                'COALESCE(SUM(request_count), 0) as request_count, '.
+                'COALESCE(SUM(priced_cost_total), 0) as priced_cost_total, '.
+                'COALESCE(SUM(zero_priced_request_count), 0) as zero_priced_request_count, '.
+                'COALESCE(SUM(unpriced_request_count), 0) as unpriced_request_count, '.
+                'COALESCE(SUM(unpriced_total_tokens), 0) as unpriced_total_tokens, '.
+                'COALESCE(SUM(estimated_request_count), 0) as estimated_request_count'
+            )->first();
+
+        return $this->shapeRow($row);
+    }
+
     public function agentTotal(string $agentId, string $from, string $to, ?string $callerId, bool $isOperator): array
     {
         return $this->aggregate(CostSummary::ENTITY_AGENT, $agentId, $from, $to, $isOperator ? null : $callerId);

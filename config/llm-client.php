@@ -462,6 +462,30 @@ return [
         )),
     ],
 
+    // Spending ceilings — how enforcement behaves at the edges. Note there
+    // is deliberately NO master on/off toggle here: "off" already means "no
+    // ceiling configured", and a second way to be off would be a second
+    // competing notion of whether a limit applies. Currency and operator
+    // identity are not redeclared either — they reuse the 'cost' section
+    // above, so this feature adds no second permission tier.
+    'budget' => [
+        // What to do when the consumption figure cannot be read at all.
+        // 'stop' = fail-closed (the default), 'allow' = fail-open. This
+        // bites only where a ceiling is configured in 'stop' mode: a
+        // warn-only ceiling never blocks, and an installation with no
+        // ceiling configured never reaches the ledger in the first place.
+        'on_unreadable_consumption' => env('LLM_CLIENT_BUDGET_ON_UNREADABLE_CONSUMPTION', 'stop'),
+
+        // Proportion of a ceiling's amount at which the approach warning
+        // fires, used when a ceiling does not name its own. Exactly one
+        // threshold per ceiling.
+        'default_approach_threshold' => 0.80,
+
+        // Seconds between repeat degraded-enforcement broadcasts while the
+        // degraded condition persists. Every occurrence is still logged.
+        'degraded_notice_throttle_seconds' => env('LLM_CLIENT_BUDGET_DEGRADED_THROTTLE', 60),
+    ],
+
     // Response latency distributions — per-model and per-agent percentile
     // figures computed at read time from agent_runs.
     'latency' => [
