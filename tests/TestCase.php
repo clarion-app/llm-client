@@ -314,7 +314,10 @@ abstract class TestCase extends BaseTestCase
                 $table->integer('failure_uncategorized_count')->default(0);
                 $table->timestamp('updated_at')->useCurrent();
 
-                $table->unique(['tool_name', 'agent_id', 'user_id', 'period_date']);
+                $table->unique(
+                    ['tool_name', 'agent_id', 'user_id', 'period_date'],
+                    'tool_reliability_summaries_bucket_unique'
+                );
                 $table->index(['tool_name', 'period_date']);
                 $table->index(['tool_name', 'agent_id', 'period_date']);
             });
@@ -605,8 +608,13 @@ abstract class TestCase extends BaseTestCase
                 $table->decimal('consumption_at_fire', 20, 10);
                 $table->timestamp('created_at')->useCurrent();
 
-                // The once-per-period latch, not merely a constraint.
-                $table->unique(['scope_type', 'scope_id', 'period_type', 'period_start', 'kind']);
+                // The once-per-period latch, not merely a constraint. Named
+                // to match the migration, whose generated name would exceed
+                // the 64-character identifier limit MySQL/MariaDB enforce.
+                $table->unique(
+                    ['scope_type', 'scope_id', 'period_type', 'period_start', 'kind'],
+                    'budget_threshold_notifications_latch_unique'
+                );
             });
         }
     }

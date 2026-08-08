@@ -153,9 +153,24 @@ class InFlightWorkCompletesJourneyTest extends TestCase
     }
 
     /** Some other request completes and takes the scope over its ceiling. */
+    /**
+     * Somebody else's work pushes the scope past its ceiling while this
+     * request is still running.
+     *
+     * The ledger's memo is discarded along with the write, and that second
+     * half is load-bearing rather than tidiness. Within one request the memo
+     * would otherwise keep serving the pre-crossing figure, and every case
+     * below would pass whether or not the gate remembered its admission —
+     * the memo, not the record under test, would be doing the work. The
+     * discard is not artificial either: BudgetThresholdNotifier drops the
+     * memo after every usage write, so a live turn that records a completion
+     * of its own has exactly this state a moment later.
+     */
     private function anotherRequestCrossesTheCeiling(): void
     {
         $this->recordSpend('9999.0000000000');
+
+        app(\ClarionApp\LlmClient\Services\BudgetLedger::class)->forget();
     }
 
     private function fakeProvider(?\Closure $onChat = null): void

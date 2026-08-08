@@ -30,7 +30,15 @@ return new class extends Migration
             $table->integer('failure_uncategorized_count')->default(0);
             $table->timestamp('updated_at')->useCurrent();
 
-            $table->unique(['tool_name', 'agent_id', 'user_id', 'period_date']);
+            // Named explicitly: the generated name for these four columns on
+            // this table is 72 characters, and MySQL/MariaDB reject any
+            // identifier over 64. Left to the default, this CREATE TABLE
+            // fails on every deployment engine while passing under SQLite,
+            // which has no such limit.
+            $table->unique(
+                ['tool_name', 'agent_id', 'user_id', 'period_date'],
+                'tool_reliability_summaries_bucket_unique'
+            );
             $table->index(['tool_name', 'period_date']);
             $table->index(['tool_name', 'agent_id', 'period_date']);
         });

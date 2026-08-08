@@ -335,6 +335,48 @@ class CeilingStopsWorkJourneyTest extends TestCase
         $this->assertSame(0, bccomp($body['ceiling']['amount'], '25.00', 10));
     }
 
+    /**
+     * The two cases above each have exactly one ceiling that could stop the
+     * work, so any tie-break rule at all would name the right one. These two
+     * put **both** ceilings past their limits at once, which is the only
+     * situation in which the choice is a choice: the refusal must name the
+     * one with the least headroom left, and the same consumption figure has
+     * to produce opposite answers depending only on the amounts configured.
+     *
+     * Without a pair like this, "picks the largest headroom" and "picks
+     * whichever matched first" are both indistinguishable from the rule
+     * FR-022 actually requires.
+     */
+    #[Test]
+    public function with_both_ceilings_reached_the_refusal_names_the_one_with_the_least_headroom(): void
+    {
+        // 50 spent. Installation is 10 over; the user is 30 over, so the
+        // user's is the tighter of the two.
+        $this->declareCeiling(BudgetScope::Installation, '40.00', 'stop', 'month');
+        $this->declareCeiling(BudgetScope::UserDefault, '20.00', 'stop', 'month');
+        $this->recordSpend($this->user->id, '50.0000000000');
+
+        $body = $this->requestAgentWork($this->user)->assertStatus(402)->json();
+
+        $this->assertSame('user', $body['governing_scope'], 'The user ceiling has the least headroom of the two');
+        $this->assertSame(0, bccomp($body['ceiling']['amount'], '20.00', 10));
+    }
+
+    #[Test]
+    public function with_both_ceilings_reached_the_same_consumption_names_the_installation_when_it_is_tighter(): void
+    {
+        // The mirror image: same 50 spent, amounts swapped, so the
+        // installation is now 40 over against the user's 5.
+        $this->declareCeiling(BudgetScope::Installation, '10.00', 'stop', 'month');
+        $this->declareCeiling(BudgetScope::UserDefault, '45.00', 'stop', 'month');
+        $this->recordSpend($this->user->id, '50.0000000000');
+
+        $body = $this->requestAgentWork($this->user)->assertStatus(402)->json();
+
+        $this->assertSame('installation', $body['governing_scope']);
+        $this->assertSame(0, bccomp($body['ceiling']['amount'], '10.00', 10));
+    }
+
     // ---------------------------------------------------------------
     // Scenario 5 — the period resets, with nobody doing anything
     // ---------------------------------------------------------------

@@ -46,7 +46,17 @@ return new class extends Migration
             // index. Because period_start is part of the key, a new period
             // is a new key — the warning fires again with nothing to clear
             // and no reset job.
-            $table->unique(['scope_type', 'scope_id', 'period_type', 'period_start', 'kind']);
+            //
+            // Named explicitly. Laravel's generated name for a five-column
+            // index on a thirty-character table would be 87 characters, and
+            // MySQL/MariaDB reject any identifier over 64 — so the default
+            // name would have made this CREATE TABLE fail on every
+            // deployment engine while passing under SQLite, which has no
+            // such limit.
+            $table->unique(
+                ['scope_type', 'scope_id', 'period_type', 'period_start', 'kind'],
+                'budget_threshold_notifications_latch_unique'
+            );
         });
     }
 

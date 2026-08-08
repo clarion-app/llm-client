@@ -96,6 +96,67 @@ class BudgetEnforcementGuardTest extends TestCase
     ];
 
     /**
+     * The members of the allowlist that must carry a gate of their **own**.
+     *
+     * The equality assertion above is a guard in one direction only: it
+     * notices a *new* file that reaches a model, and it notices one that
+     * stops reaching a model. It cannot see whether an allowlisted file is
+     * still gated, because unwrapping a call site does not change which file
+     * contains `->chat(`. Left at that, quietly removing
+     * ConversationCondenser's traceSystemRun() wrapper — so condensation
+     * calls a model with no ceiling consulted at all — passes the whole
+     * suite, which is how this list came to exist.
+     *
+     * "A gate of their own" means the file itself contains one of the two
+     * funnels: a BudgetGate::admit() call, or a traceSystemRun() call whose
+     * first act is that same admit().
+     */
+    private const MUST_GATE_THEMSELVES = [
+        'Services/AgentLoopService.php',
+        'Services/ConversationCondenser.php',
+        'Services/EmbeddingService.php',
+        'Services/RoleTestRunner.php',
+        'Jobs/GenerateEpisodicMemoryJob.php',
+        'Jobs/PreWarmChunkSummaryJob.php',
+        'OpenAIGenerateConversationTitleRequest.php',
+    ];
+
+    /**
+     * The rest of the allowlist: files that reach a model from *inside* a
+     * unit of work something else already admitted, plus the two dead
+     * legacy classes nothing constructs.
+     *
+     * Enumerated rather than derived so that the two lists together are an
+     * exact partition of the allowlist — a new entry has to be classified
+     * deliberately as one or the other, and cannot arrive unclassified.
+     */
+    private const GATED_BY_THEIR_CALLER = [
+        // Reached only within an already-admitted turn; re-checking mid-turn
+        // would truncate a response already in flight.
+        'Services/ToolResultCondenser.php',
+
+        // Self-recursion inside one provider call.
+        'Providers/LlamaCppProvider.php',
+
+        // Dead legacy classes, instantiated nowhere.
+        'OpenAIConversationRequest.php',
+        'OpenAIConversationStreamRequest.php',
+    ];
+
+    /**
+     * What counts as this file gating itself.
+     *
+     * Matched against the file's code with comments stripped. Every one of
+     * these files *discusses* gating at length in its docblocks, so a raw
+     * text scan would be satisfied by the prose explaining a gate that had
+     * just been deleted.
+     */
+    private const GATING_CONSTRUCTS = [
+        '->admit(',
+        '->traceSystemRun(',
+    ];
+
+    /**
      * Classes that still contain a model-invoking construct but must never
      * be constructed anywhere in src/ again.
      */
@@ -145,6 +206,63 @@ class BudgetEnforcementGuardTest extends TestCase
         sort($expected);
         sort($found);
         $this->assertSame($expected, $found);
+    }
+
+    /**
+     * The other direction: every allowlisted file that is not reached from
+     * inside somebody else's admitted work still gates itself.
+     *
+     * This is what makes "unwrapped" visible. The equality assertion above
+     * would go on passing with condensation, title generation, embedding, or
+     * the role test calling a model directly, because unwrapping a call does
+     * not change which file contains it.
+     */
+    #[Test]
+    public function every_allowlisted_file_is_either_gated_by_itself_or_by_its_caller(): void
+    {
+        // The two lists are an exact partition of the allowlist, so a new
+        // entry cannot arrive unclassified and skip this check entirely.
+        $classified = array_merge(self::MUST_GATE_THEMSELVES, self::GATED_BY_THEIR_CALLER);
+        sort($classified);
+        $allowlist = self::ALLOWLIST;
+        sort($allowlist);
+
+        $this->assertSame(
+            $allowlist,
+            $classified,
+            'Every allowlisted file must be classified as gating itself or as being gated by its caller'
+        );
+
+        $files = $this->phpFiles();
+        $ungated = [];
+
+        foreach (self::MUST_GATE_THEMSELVES as $relativePath) {
+            $content = $files[$relativePath] ?? null;
+
+            $this->assertNotNull($content, "Allowlisted file is missing from src/: {$relativePath}");
+
+            $code = self::withoutComments($content);
+            $gated = false;
+
+            foreach (self::GATING_CONSTRUCTS as $construct) {
+                if (str_contains($code, $construct)) {
+                    $gated = true;
+                    break;
+                }
+            }
+
+            if (!$gated) {
+                $ungated[] = $relativePath;
+            }
+        }
+
+        $this->assertSame(
+            [],
+            $ungated,
+            "A model-invoking path has lost its gate:\n".implode("\n", $ungated)
+            ."\nEach of these must call BudgetGate::admit() or RunTraceRecorder::traceSystemRun() itself, "
+            .'or move to GATED_BY_THEIR_CALLER with the reason it is reached only from admitted work.'
+        );
     }
 
     /**
@@ -248,6 +366,30 @@ class BudgetEnforcementGuardTest extends TestCase
     /**
      * @return array<string, string> relative path => file contents
      */
+    /**
+     * The file's code with every comment and docblock removed.
+     */
+    private static function withoutComments(string $content): string
+    {
+        $code = '';
+
+        foreach (token_get_all($content) as $token) {
+            if (is_array($token)) {
+                if ($token[0] === T_COMMENT || $token[0] === T_DOC_COMMENT) {
+                    continue;
+                }
+
+                $code .= $token[1];
+
+                continue;
+            }
+
+            $code .= $token;
+        }
+
+        return $code;
+    }
+
     private function phpFiles(): array
     {
         static $cache = null;

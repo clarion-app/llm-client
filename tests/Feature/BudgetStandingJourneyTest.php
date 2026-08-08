@@ -444,11 +444,18 @@ class BudgetStandingJourneyTest extends TestCase
         $this->recordSpend($this->userA, '18.0000000000');
         $this->recordSpend($this->userB, '7.0000000000');
 
-        // The conversation-scoped rows the metrics path writes for the very
-        // same work. Summing these instead of, or as well as, the user rows
+        // The conversation-scoped rows the metrics path writes alongside the
+        // user rows. Summing these instead of, or as well as, the user rows
         // would double-count every unit of work in the installation.
-        $this->recordConversationSpend($this->userA, '18.0000000000');
-        $this->recordConversationSpend($this->userB, '7.0000000000');
+        //
+        // Their amounts deliberately do NOT match the user-scoped figures
+        // above. In a deployment the two agree by construction, which is
+        // exactly why matching them here would make this scenario pass
+        // whichever entity_type the query happened to select — the assertion
+        // would look like a real one and check nothing. 5 + 11 = 16, against
+        // the 25 the user rows sum to.
+        $this->recordConversationSpend($this->userA, '5.0000000000');
+        $this->recordConversationSpend($this->userB, '11.0000000000');
 
         $response = $this->standing($this->operator, $this->installationEndpoint());
         $response->assertStatus(200);
