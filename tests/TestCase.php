@@ -275,6 +275,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('user_id');
                 $table->uuid('attempt_group_id');
                 $table->uuid('run_id')->nullable();
+                $table->string('agent_id', 255)->nullable();
                 $table->string('tool_name', 256);
                 $table->enum('outcome', ['success', 'failure']);
                 $table->string('failure_category')->nullable();
@@ -287,6 +288,33 @@ abstract class TestCase extends BaseTestCase
                 $table->index(['tool_name', 'outcome']);
                 $table->index('created_at');
                 $table->index('run_id');
+                $table->index('agent_id');
+            });
+        }
+
+        // tool_reliability_summaries table (for tool reliability rate summaries).
+        if (!Schema::hasTable('tool_reliability_summaries')) {
+            Schema::create('tool_reliability_summaries', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('tool_name', 256);
+                $table->string('agent_id', 255);
+                $table->uuid('user_id');
+                $table->date('period_date');
+                $table->integer('invocation_count')->default(0);
+                $table->integer('success_count')->default(0);
+                $table->integer('failure_count')->default(0);
+                $table->integer('failure_timeout_count')->default(0);
+                $table->integer('failure_connection_failure_count')->default(0);
+                $table->integer('failure_authentication_failure_count')->default(0);
+                $table->integer('failure_invalid_input_count')->default(0);
+                $table->integer('failure_server_error_count')->default(0);
+                $table->integer('failure_other_count')->default(0);
+                $table->integer('failure_uncategorized_count')->default(0);
+                $table->timestamp('updated_at')->useCurrent();
+
+                $table->unique(['tool_name', 'agent_id', 'user_id', 'period_date']);
+                $table->index(['tool_name', 'period_date']);
+                $table->index(['tool_name', 'agent_id', 'period_date']);
             });
         }
 
