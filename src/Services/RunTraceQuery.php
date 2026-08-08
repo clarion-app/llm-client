@@ -542,9 +542,11 @@ class RunTraceQuery
     // ========================================================================
 
     /**
-     * RunSummary shape (data-model.md §1.1) for a single run by id — the
-     * same field mapping RunController::show() uses, so RunUpdated's
-     * broadcast payload never disagrees with a fresh GET /agent-runs/{id}.
+     * RunSummary shape (data-model.md §1.1, extended by 074-latency-metrics
+     * data-model.md §5 with eight latency fields) for a single run by id —
+     * the same field mapping RunController::show()/index() use via
+     * runSummaryRow() below, so RunUpdated's broadcast payload never
+     * disagrees with a fresh GET /agent-runs/{id}.
      *
      * @return array<string, mixed>|null Null when the run has since been purged.
      */
@@ -559,6 +561,21 @@ class RunTraceQuery
             ->where('run_id', $runId)
             ->count();
 
+        return $this->runSummaryRow($run, (int) $actionCount);
+    }
+
+    /**
+     * Project an already-loaded AgentRun (+ its action_count aggregate) to
+     * the RunSummary wire shape — the single source of truth both
+     * RunController (GET /agent-runs, GET /agent-runs/{id}) and
+     * runSummaryById() above (the RunUpdated broadcast payload) build their
+     * response from, so the two can never drift apart (074-latency-metrics
+     * data-model.md §5).
+     *
+     * @return array<string, mixed>
+     */
+    public function runSummaryRow(AgentRun $run, int $actionCount): array
+    {
         return [
             'id' => $run->id,
             'kind' => $run->kind->value,
@@ -568,8 +585,16 @@ class RunTraceQuery
             'ended_at' => $run->ended_at?->toJSON(),
             'duration_ms' => $run->duration_ms,
             'step_count' => $run->step_count,
-            'action_count' => (int) $actionCount,
+            'action_count' => $actionCount,
             'conversation_id' => $run->conversation_id,
+            'is_streamed' => $run->is_streamed,
+            'first_output_ms' => $run->first_output_ms,
+            'model' => $run->model,
+            'agent_id' => $run->agent_id,
+            'model_wait_ms' => $run->model_wait_ms,
+            'tool_exec_ms' => $run->tool_exec_ms,
+            'confirm_wait_ms' => $run->confirm_wait_ms,
+            'product_ms' => $run->product_ms,
         ];
     }
 

@@ -69,7 +69,17 @@ class RunControllerTest extends TestCase
     #[Test]
     public function own_run_returns_200_with_run_summary_shape(): void
     {
-        $runId = $this->recorder->openRun(RunKind::Interactive, $this->user->id);
+        // US3 (074-latency-metrics, T026): the run is opened as a streamed
+        // response carrying an explicit model/agent, per contracts/latency-api.md
+        // §2, so the eight new fields the response must surface have concrete,
+        // assertable values rather than only their (nullable) defaults.
+        $runId = $this->recorder->openRun(
+            RunKind::Interactive,
+            $this->user->id,
+            streamed: true,
+            model: 'claude-sonnet-5',
+            agentId: 'research-assistant',
+        );
 
         $step1 = $this->recorder->openStep($runId);
         $action1 = $this->recorder->openAction($step1, ActionType::ToolInvocation, 'search_operations');
@@ -92,6 +102,11 @@ class RunControllerTest extends TestCase
             ->assertJsonStructure([
                 'id', 'kind', 'end_state', 'end_reason', 'started_at', 'ended_at',
                 'duration_ms', 'step_count', 'action_count', 'conversation_id',
+                // 074-latency-metrics US3 (contracts/latency-api.md §2): the eight
+                // fields the existing run-detail read gains, sourced from the
+                // AgentRun row RunTraceQuery::runSummaryById() already loads.
+                'is_streamed', 'first_output_ms', 'model', 'agent_id',
+                'model_wait_ms', 'tool_exec_ms', 'confirm_wait_ms', 'product_ms',
             ])
             ->assertJson([
                 'id' => $runId,
@@ -101,6 +116,9 @@ class RunControllerTest extends TestCase
                 'conversation_id' => null,
                 'step_count' => 2,
                 'action_count' => 3,
+                'is_streamed' => true,
+                'model' => 'claude-sonnet-5',
+                'agent_id' => 'research-assistant',
             ]);
     }
 

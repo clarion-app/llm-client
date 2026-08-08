@@ -205,22 +205,15 @@ class RunController extends Controller
 
     /**
      * Project an AgentRun (+ its cheap action_count aggregate) to the
-     * RunSummary wire shape (data-model.md §1.1).
+     * RunSummary wire shape (data-model.md §1.1, extended by
+     * 074-latency-metrics data-model.md §5 with eight latency fields).
+     * Delegates to RunTraceQuery::runSummaryRow() — the same mapping
+     * runSummaryById() uses for the RunUpdated broadcast payload — so this
+     * endpoint and that broadcast can never disagree on shape or value.
      */
     private function runSummary(AgentRun $run, int $actionCount): array
     {
-        return [
-            'id' => $run->id,
-            'kind' => $run->kind,
-            'end_state' => $run->end_state,
-            'end_reason' => $run->end_reason,
-            'started_at' => $run->started_at,
-            'ended_at' => $run->ended_at,
-            'duration_ms' => $run->duration_ms,
-            'step_count' => $run->step_count,
-            'action_count' => $actionCount,
-            'conversation_id' => $run->conversation_id,
-        ];
+        return $this->runTraceQuery->runSummaryRow($run, $actionCount);
     }
 
     /**
