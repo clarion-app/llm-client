@@ -378,6 +378,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\CostRollupQuery::class)
             );
         });
+
+        // Stateless — it holds no memo and reads every ceiling row live, so
+        // an operator's change takes effect on the next enforcement
+        // decision with no restart. singleton() is safe here for exactly
+        // the reason it is not safe for BudgetLedger above.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\SpendingCeilingService::class, function () {
+            return new \ClarionApp\LlmClient\Services\SpendingCeilingService();
+        });
     }
 
     /**

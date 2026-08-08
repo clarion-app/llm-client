@@ -21,6 +21,7 @@ use ClarionApp\LlmClient\Controllers\CostRollupController;
 use ClarionApp\LlmClient\Controllers\UsageRecordController;
 use ClarionApp\LlmClient\Controllers\LatencyController;
 use ClarionApp\LlmClient\Controllers\ToolReliabilityController;
+use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -108,6 +109,15 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('tool-reliability/tools', [ToolReliabilityController::class, "index"]);
     // Per-agent breakdown for one tool (075 US2) — contracts/tool-reliability-api.md §3
     Route::get('tool-reliability/tools/{toolName}/agents', [ToolReliabilityController::class, "agentBreakdown"]);
+
+    // Spending ceiling configuration — operator-only, and never itself
+    // subject to budget enforcement, so raising or waiving a ceiling stays
+    // reachable to an operator whom that ceiling has stopped.
+    Route::get('budget/ceilings', [BudgetCeilingController::class, "index"]);
+    Route::put('budget/ceilings/installation', [BudgetCeilingController::class, "putInstallation"]);
+    Route::put('budget/ceilings/user-default', [BudgetCeilingController::class, "putUserDefault"]);
+    Route::delete('budget/ceilings/installation', [BudgetCeilingController::class, "destroyInstallation"]);
+    Route::delete('budget/ceilings/user-default', [BudgetCeilingController::class, "destroyUserDefault"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
