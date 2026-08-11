@@ -17,9 +17,11 @@ use PHPUnit\Framework\Attributes\Test;
  * name) uniqueness is scoped to the pair and to live suites only
  * (research.md D7).
  *
- * rename()/archive() are User Story 2's concern and are added to this file
- * in Phase 4 — this file covers only create()/list()/find(), the surface
- * User Story 1 needs.
+ * Also covers rename()/archive() (User Story 2): rename() updates only the
+ * field(s) passed and re-runs the (agent_identifier, name) collision check
+ * against the effective post-rename pair, excluding the suite's own current
+ * row; archive() soft-deletes and frees the name for reuse by a brand new
+ * suite (never a restore, research.md D7).
  */
 class EvalSuiteServiceTest extends TestCase
 {
@@ -223,5 +225,131 @@ class EvalSuiteServiceTest extends TestCase
         DB::table('eval_suites')->where('id', $suite->id)->update(['deleted_at' => now()]);
 
         $this->assertNull($service->find($suite->id), 'An archived suite is "not found" through this method (contracts §5)');
+    }
+
+    // ---------------------------------------------------------------
+    // rename() — null means unchanged (US2)
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function rename_updates_only_the_name_when_only_name_is_passed(): void
+    {
+        $service = $this->service();
+
+        $suite = $service->create('Original name', 'home-automation-agent');
+
+        $renamed = $service->rename($suite, 'New name', null);
+
+        $this->assertSame('New name', $renamed->name);
+        $this->assertSame('home-automation-agent', $renamed->agent_identifier);
+    }
+
+    #[Test]
+    public function rename_updates_only_the_agent_identifier_when_only_that_is_passed(): void
+    {
+        $service = $this->service();
+
+        $suite = $service->create('Sanity checks', 'home-automation-agent');
+
+        $renamed = $service->rename($suite, null, 'billing-agent');
+
+        $this->assertSame('Sanity checks', $renamed->name);
+        $this->assertSame('billing-agent', $renamed->agent_identifier);
+    }
+
+    #[Test]
+    public function rename_updates_both_fields_when_both_are_passed(): void
+    {
+        $service = $this->service();
+
+        $suite = $service->create('Original name', 'home-automation-agent');
+
+        $renamed = $service->rename($suite, 'New name', 'billing-agent');
+
+        $this->assertSame('New name', $renamed->name);
+        $this->assertSame('billing-agent', $renamed->agent_identifier);
+    }
+
+    #[Test]
+    public function rename_with_both_null_leaves_the_suite_entirely_unchanged(): void
+    {
+        $service = $this->service();
+
+        $suite = $service->create('Untouched', 'home-automation-agent');
+
+        $renamed = $service->rename($suite, null, null);
+
+        $this->assertSame('Untouched', $renamed->name);
+        $this->assertSame('home-automation-agent', $renamed->agent_identifier);
+    }
+
+    #[Test]
+    public function renaming_into_another_live_suites_pair_is_rejected(): void
+    {
+        $service = $this->service();
+
+        $service->create('Taken name', 'home-automation-agent');
+        $suite = $service->create('Free name', 'home-automation-agent');
+
+        try {
+            $service->rename($suite, 'Taken name', null);
+            $this->fail('Renaming into a pair already held by another live suite must be rejected');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertNotSame('', $e->getMessage(), 'A rejection must say what was wrong');
+        }
+
+        $this->assertSame('Free name', $suite->fresh()->name, 'A rejected rename must not change the suite');
+    }
+
+    #[Test]
+    public function renaming_a_suite_to_its_own_current_pair_is_not_rejected_as_a_collision(): void
+    {
+        $service = $this->service();
+
+        $suite = $service->create('Stays the same', 'home-automation-agent');
+
+        // The collision check must exclude the suite's own current row —
+        // otherwise every no-op / same-value rename would wrongly reject
+        // itself as colliding with itself.
+        $renamed = $service->rename($suite, 'Stays the same', 'home-automation-agent');
+
+        $this->assertSame('Stays the same', $renamed->name);
+        $this->assertSame('home-automation-agent', $renamed->agent_identifier);
+    }
+
+    // ---------------------------------------------------------------
+    // archive() (US2, C2/research.md D6/D7)
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function archive_soft_deletes_the_suite_and_it_drops_out_of_list_and_find(): void
+    {
+        $service = $this->service();
+
+        $suite = $service->create('Soon archived', 'home-automation-agent');
+
+        $service->archive($suite);
+
+        $this->assertNull($service->find($suite->id));
+        $this->assertNotContains($suite->id, $service->list()->pluck('id')->all());
+
+        $row = DB::table('eval_suites')->where('id', $suite->id)->first();
+        $this->assertNotNull($row, 'archive() must not hard-delete the row');
+        $this->assertNotNull($row->deleted_at);
+    }
+
+    #[Test]
+    public function creating_a_new_suite_with_an_archived_suites_exact_pair_gets_a_fresh_id_never_the_old_row_restored(): void
+    {
+        $service = $this->service();
+
+        $original = $service->create('Reused name', 'home-automation-agent');
+        $service->archive($original);
+
+        $recreated = $service->create('Reused name', 'home-automation-agent');
+
+        $this->assertNotSame($original->id, $recreated->id, 'Archiving frees the name for reuse; it does not offer a restore (research.md D7)');
+        $this->assertSame(1, $this->liveRowCount(), 'Exactly one live suite must exist for the pair after the archive+recreate');
+        $this->assertSame(2, $this->totalRowCount(), 'Both the archived original and the fresh suite must exist as rows');
     }
 }

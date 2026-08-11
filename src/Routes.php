@@ -138,6 +138,15 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);
     Route::get('agent-eval-suites/{suiteId}', [EvalSuiteController::class, "show"]);
     Route::post('agent-eval-suites/{suiteId}/cases', [EvalCaseController::class, "store"]);
+
+    // Agent eval suite maintenance (077 US2) — rename/archive a suite,
+    // edit/archive a case (versioned, insert-only), and list a case's
+    // full version history (contracts/eval-suites-api.md §2-3).
+    Route::put('agent-eval-suites/{suiteId}', [EvalSuiteController::class, "update"]);
+    Route::delete('agent-eval-suites/{suiteId}', [EvalSuiteController::class, "destroy"]);
+    Route::put('agent-eval-suites/{suiteId}/cases/{caseId}', [EvalCaseController::class, "update"]);
+    Route::delete('agent-eval-suites/{suiteId}/cases/{caseId}', [EvalCaseController::class, "destroy"]);
+    Route::get('agent-eval-suites/{suiteId}/cases/{caseId}/versions', [EvalCaseController::class, "versions"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

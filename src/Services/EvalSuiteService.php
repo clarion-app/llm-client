@@ -65,6 +65,45 @@ class EvalSuiteService
     }
 
     /**
+     * Rename and/or reassign a suite's agent_identifier. Either argument
+     * may be null, meaning "leave this field unchanged" (the
+     * SpendingCeilingController::put() "only() distinguishes absent from
+     * null" idiom). Re-runs the (agent_identifier, name) collision check
+     * against the effective post-rename pair, excluding the suite's own
+     * current row, so a no-op rename never rejects itself.
+     *
+     * @throws \InvalidArgumentException when a field fails validation, or
+     *   the effective pair collides with another live suite; no change is
+     *   saved in that case.
+     */
+    public function rename(EvalSuite $suite, ?string $name, ?string $agentIdentifier): EvalSuite
+    {
+        $effectiveName = $name !== null ? $this->validatedName($name) : $suite->name;
+        $effectiveAgentIdentifier = $agentIdentifier !== null
+            ? $this->validatedAgentIdentifier($agentIdentifier)
+            : $suite->agent_identifier;
+
+        $this->assertPairAvailable($effectiveAgentIdentifier, $effectiveName, $suite->id);
+
+        $suite->name = $effectiveName;
+        $suite->agent_identifier = $effectiveAgentIdentifier;
+        $suite->save();
+
+        return $suite->fresh();
+    }
+
+    /**
+     * Archive (soft delete) a suite. Never touches eval_cases or
+     * eval_case_versions rows belonging to it (C2, research.md D6).
+     * Archiving frees the (agent_identifier, name) pair for reuse by a
+     * brand new suite — there is no restore (research.md D7).
+     */
+    public function archive(EvalSuite $suite): void
+    {
+        $suite->delete();
+    }
+
+    /**
      * @throws \InvalidArgumentException
      */
     private function validatedName(string $name): string

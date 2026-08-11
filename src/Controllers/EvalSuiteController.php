@@ -72,6 +72,53 @@ class EvalSuiteController extends Controller
         return response()->json($this->formatSuiteDetail($suite), 200);
     }
 
+    public function update(Request $request, string $id)
+    {
+        if (!OperatorAccess::isOperator(Auth::id())) {
+            return $this->forbidden();
+        }
+
+        $suite = $this->service->find($id);
+
+        if ($suite === null) {
+            return $this->notFound();
+        }
+
+        // only() distinguishes a field that is genuinely absent from the
+        // request from one explicitly sent as null/empty — an omitted
+        // field must be left unchanged (contracts §2).
+        $fields = $request->only(['name', 'agent_identifier']);
+
+        try {
+            $suite = $this->service->rename(
+                $suite,
+                array_key_exists('name', $fields) ? (string) $fields['name'] : null,
+                array_key_exists('agent_identifier', $fields) ? (string) $fields['agent_identifier'] : null,
+            );
+        } catch (\InvalidArgumentException $e) {
+            return $this->unprocessable($e->getMessage());
+        }
+
+        return response()->json($this->formatSuiteSummary($suite), 200);
+    }
+
+    public function destroy(string $id)
+    {
+        if (!OperatorAccess::isOperator(Auth::id())) {
+            return $this->forbidden();
+        }
+
+        $suite = $this->service->find($id);
+
+        if ($suite === null) {
+            return $this->notFound();
+        }
+
+        $this->service->archive($suite);
+
+        return response()->json(null, 204);
+    }
+
     /**
      * @return array<string, mixed>
      */
