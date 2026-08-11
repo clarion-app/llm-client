@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\EvalCaseResult;
 use ClarionApp\LlmClient\Models\EvalRun;
+use ClarionApp\LlmClient\Services\EvalRunConsumptionQuery;
 use ClarionApp\LlmClient\Services\EvalRunService;
 use ClarionApp\LlmClient\Services\EvalSuiteService;
 use ClarionApp\LlmClient\Support\OperatorAccess;
@@ -26,6 +27,7 @@ class EvalRunController extends Controller
     public function __construct(
         private readonly EvalRunService $service,
         private readonly EvalSuiteService $suiteService,
+        private readonly EvalRunConsumptionQuery $consumptionQuery,
     ) {
     }
 
@@ -161,13 +163,17 @@ class EvalRunController extends Controller
     }
 
     /**
-     * The §1.4 detail shape, minus `consumption` — added in Phase 6/US4.
+     * The §1.4 detail shape, including `consumption` (§1.2 shape) — present
+     * and meaningful at any run status, computed fresh at read time
+     * (research.md D11, FR-011). Shared by store()/show()/resume(), all
+     * three of which return "the run body (§1.4 shape)" per contracts §2-3.
      *
      * @return array<string, mixed>
      */
     private function formatRunDetail(EvalRun $run): array
     {
         $summary = $this->service->summarize($run);
+        $consumption = $this->consumptionQuery->summarize($run);
 
         return array_merge($this->formatRunSummary($run), [
             'failure_reason' => $run->failure_reason,
@@ -177,6 +183,14 @@ class EvalRunController extends Controller
                 'fail' => $summary['fail'],
                 'needs_human_review' => $summary['needs_human_review'],
                 'errored' => $summary['errored'],
+            ],
+            'consumption' => [
+                'total_cost' => $consumption->totalCost,
+                'cost_currency' => config('llm-client.cost.currency'),
+                'cost_unpriced' => $consumption->costUnpriced,
+                'total_tokens' => $consumption->totalTokens,
+                'tool_invocation_count' => $consumption->toolInvocationCount,
+                'total_duration_ms' => $consumption->totalDurationMs,
             ],
         ]);
     }
