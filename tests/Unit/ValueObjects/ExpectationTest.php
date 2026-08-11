@@ -318,4 +318,74 @@ class ExpectationTest extends TestCase
 
         Expectation::fromArray(['kind' => 'action_taken', 'action' => '']);
     }
+
+    // --- rubric_judgment: the sixth kind, required non-empty bounded criteria ---
+
+    #[Test]
+    public function validate_accepts_a_well_formed_rubric_judgment(): void
+    {
+        Expectation::validate([
+            'kind' => 'rubric_judgment',
+            'criteria' => "The response must acknowledge the customer's frustration before offering a solution.",
+        ]);
+
+        $this->addToAssertionCount(1);
+    }
+
+    #[Test]
+    public function validate_rejects_rubric_judgment_with_missing_criteria(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        Expectation::validate([
+            'kind' => 'rubric_judgment',
+        ]);
+    }
+
+    #[Test]
+    public function validate_rejects_rubric_judgment_with_empty_after_trim_criteria(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        Expectation::validate([
+            'kind' => 'rubric_judgment',
+            'criteria' => '   ',
+        ]);
+    }
+
+    #[Test]
+    public function validate_rejects_rubric_judgment_criteria_exceeding_max_text_length(): void
+    {
+        $tooLong = str_repeat('a', config('llm-client.eval_suites.max_text_length') + 1);
+
+        $this->expectException(\InvalidArgumentException::class);
+
+        Expectation::validate([
+            'kind' => 'rubric_judgment',
+            'criteria' => $tooLong,
+        ]);
+    }
+
+    #[Test]
+    public function validate_accepts_rubric_judgment_criteria_exactly_at_max_text_length(): void
+    {
+        $atLimit = str_repeat('a', config('llm-client.eval_suites.max_text_length'));
+
+        Expectation::validate([
+            'kind' => 'rubric_judgment',
+            'criteria' => $atLimit,
+        ]);
+
+        $this->addToAssertionCount(1);
+    }
+
+    #[Test]
+    public function rubric_judgment_round_trips_through_from_array_and_to_array(): void
+    {
+        $data = ['kind' => 'rubric_judgment', 'criteria' => 'Must acknowledge the customer\'s frustration.'];
+
+        $expectation = Expectation::fromArray($data);
+
+        $this->assertSame($data, $expectation->toArray());
+    }
 }

@@ -270,6 +270,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineBudgetSchema();
         $this->defineEvalSuiteSchema();
         $this->defineEvalRunSchema();
+        $this->defineEvalJudgmentSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -737,6 +738,88 @@ abstract class TestCase extends BaseTestCase
                 $table->unique(['run_id', 'eval_case_id']);
                 $table->index('run_id');
                 $table->index('conversation_id');
+            });
+        }
+    }
+
+    /**
+     * The three tables the rubric-judging feature reads and writes —
+     * eval_judgments, eval_judgment_overrides, and
+     * eval_judgment_consistency_samples — plus the one additive nullable
+     * column (outcome_override) on the existing eval_case_results table.
+     * Mirrors the production migrations exactly. Guarded by
+     * Schema::hasTable()/Schema::hasColumn() like every existing block
+     * here, and called from defineDatabaseMigrations() directly,
+     * immediately after defineEvalRunSchema(), matching its own call-site
+     * pattern.
+     */
+    protected function defineEvalJudgmentSchema(): void
+    {
+        if (!Schema::hasTable('eval_judgments')) {
+            Schema::create('eval_judgments', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('eval_case_result_id')->nullable();
+                $table->uuid('eval_case_version_id');
+                $table->unsignedInteger('expectation_index');
+                $table->text('criteria');
+                $table->text('response_text')->nullable();
+                $table->string('status', 20);
+                $table->unsignedTinyInteger('score')->nullable();
+                $table->text('justification')->nullable();
+                $table->text('unjudged_reason')->nullable();
+                $table->string('model', 255)->nullable();
+                $table->uuid('server_id')->nullable();
+                $table->uuid('conversation_id')->nullable();
+                $table->uuid('consistency_sample_id')->nullable();
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index('eval_case_result_id');
+                $table->index('consistency_sample_id');
+                $table->index(['eval_case_version_id', 'expectation_index']);
+            });
+        }
+
+        if (!Schema::hasTable('eval_judgment_overrides')) {
+            Schema::create('eval_judgment_overrides', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('judgment_id');
+                $table->uuid('user_id');
+                $table->unsignedTinyInteger('score');
+                $table->text('justification');
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index(['judgment_id', 'created_at']);
+            });
+        }
+
+        if (!Schema::hasTable('eval_judgment_consistency_samples')) {
+            Schema::create('eval_judgment_consistency_samples', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('eval_case_id');
+                $table->uuid('eval_case_version_id');
+                $table->unsignedInteger('expectation_index');
+                $table->uuid('source_eval_case_result_id')->nullable();
+                $table->text('response_text');
+                $table->unsignedInteger('sample_size');
+                $table->unsignedInteger('judged_count');
+                $table->unsignedInteger('unjudged_count');
+                $table->json('scores');
+                $table->unsignedTinyInteger('score_min')->nullable();
+                $table->unsignedTinyInteger('score_max')->nullable();
+                $table->decimal('score_mean', 4, 2)->nullable();
+                $table->unsignedTinyInteger('flag_threshold_used')->nullable();
+                $table->boolean('flagged_unstable')->nullable();
+                $table->uuid('requested_by');
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index('eval_case_id');
+                $table->index('source_eval_case_result_id');
+            });
+        }
+
+        if (!Schema::hasColumn('eval_case_results', 'outcome_override')) {
+            Schema::table('eval_case_results', function (Blueprint $table) {
+                $table->string('outcome_override', 20)->nullable();
             });
         }
     }

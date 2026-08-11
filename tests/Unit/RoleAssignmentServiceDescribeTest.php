@@ -27,10 +27,10 @@ class RoleAssignmentServiceDescribeTest extends TestCase
         parent::tearDown();
     }
 
-    // ========== describeAllRoles returns entries for all three roles ==========
+    // ========== describeAllRoles returns entries for all four roles ==========
 
     #[Test]
-    public function describe_all_roles_returns_entries_for_all_three_roles(): void
+    public function describe_all_roles_returns_entries_for_all_four_roles(): void
     {
         $service = $this->app->make(RoleAssignmentService::class);
         $userId = (string) Str::uuid();
@@ -40,7 +40,8 @@ class RoleAssignmentServiceDescribeTest extends TestCase
         $this->assertArrayHasKey('inference', $result);
         $this->assertArrayHasKey('embedding', $result);
         $this->assertArrayHasKey('image', $result);
-        $this->assertCount(3, $result);
+        $this->assertArrayHasKey('judge', $result);
+        $this->assertCount(4, $result);
     }
 
     // ========== Per-role effective reflects resolver status ==========

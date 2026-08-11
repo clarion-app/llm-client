@@ -39,6 +39,14 @@ class ModelRoleTest extends TestCase
         $this->assertIsString($message);
     }
 
+    #[Test]
+    public function judge_returns_non_empty_what_breaks_message(): void
+    {
+        $message = ModelRole::Judge->whatBreaksWhenUnassigned();
+        $this->assertNotEmpty($message);
+        $this->assertIsString($message);
+    }
+
     // ========== Enum values match string storage ==========
 
     #[Test]
@@ -57,6 +65,12 @@ class ModelRoleTest extends TestCase
     public function image_enum_value_is_image_string(): void
     {
         $this->assertEquals('image', ModelRole::Image->value);
+    }
+
+    #[Test]
+    public function judge_enum_value_is_judge_string(): void
+    {
+        $this->assertEquals('judge', ModelRole::Judge->value);
     }
 
     // ========== tryFrom round-trip ==========
@@ -80,17 +94,23 @@ class ModelRoleTest extends TestCase
     }
 
     #[Test]
+    public function tryFrom_returns_correct_case_for_judge(): void
+    {
+        $this->assertEquals(ModelRole::Judge, ModelRole::tryFrom('judge'));
+    }
+
+    #[Test]
     public function tryFrom_returns_null_for_unrecognised_string(): void
     {
         $this->assertNull(ModelRole::tryFrom('translation'));
     }
 
-    // ========== Enum has exactly three cases ==========
+    // ========== Enum has exactly four cases ==========
 
     #[Test]
-    public function enum_has_exactly_three_cases(): void
+    public function enum_has_exactly_four_cases(): void
     {
         $cases = ModelRole::cases();
-        $this->assertCount(3, $cases);
+        $this->assertCount(4, $cases);
     }
 }

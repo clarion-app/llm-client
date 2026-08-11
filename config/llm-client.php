@@ -538,6 +538,39 @@ return [
         'queue' => 'eval-runs',
     ],
 
+    // Rubric-based (LLM-as-judge) evaluation of a case's response against
+    // operator-authored plain-language criteria.
+    'eval_judging' => [
+        // The upper bound of a judge's integer score, and the "N" named
+        // in the strict JSON-only output contract RubricJudgmentPromptBuilder
+        // puts in front of the judge model. RubricJudge rejects any score
+        // outside [1, score_scale_max] as a malformed response.
+        'score_scale_max' => 10,
+
+        // The score at or above which a judged rubric_judgment expectation
+        // counts as "met" when contributing to a case's expectation_results
+        // entry — mirrors human_judgment's own met: null convention when
+        // unjudged.
+        'passing_score' => 7,
+
+        // The bounded wait for one judge chat() call before RubricJudge
+        // gives up and records the expectation unjudged.
+        'timeout_ms' => 20000,
+
+        // The default repeat count for an operator-requested consistency
+        // check when none is specified.
+        'consistency_sample_size' => 5,
+
+        // The upper bound a requested consistency sample_size is clamped
+        // to.
+        'max_consistency_sample_size' => 10,
+
+        // How wide the spread between a consistency sample's score_min and
+        // score_max may be before EvalJudgmentConsistencyService flags the
+        // sample flagged_unstable.
+        'consistency_flag_threshold' => 3,
+    ],
+
     // Response latency distributions — per-model and per-agent percentile
     // figures computed at read time from agent_runs.
     'latency' => [

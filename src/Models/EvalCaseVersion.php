@@ -51,4 +51,15 @@ class EvalCaseVersion extends Model
         return collect($this->expectations)
             ->contains(fn ($expectation) => ($expectation['kind'] ?? null) === ExpectationKind::HumanJudgment->value);
     }
+
+    /**
+     * True iff any expectation on this version has kind = rubric_judgment.
+     * Computed, never a stored column — the same reasoning as
+     * requiresHumanJudgment() above.
+     */
+    public function requiresRubricJudgment(): bool
+    {
+        return collect($this->expectations)
+            ->contains(fn ($expectation) => ($expectation['kind'] ?? null) === ExpectationKind::RubricJudgment->value);
+    }
 }

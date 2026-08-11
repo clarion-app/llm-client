@@ -23,6 +23,7 @@ final class Expectation
         public readonly ?string $expectedInfo = null,
         public readonly ?string $action = null,
         public readonly ?string $note = null,
+        public readonly ?string $criteria = null,
     ) {
     }
 
@@ -57,6 +58,10 @@ final class Expectation
                     ? (string) $data['note']
                     : null,
             ),
+            ExpectationKind::RubricJudgment => new self(
+                kind: $kind,
+                criteria: trim((string) $data['criteria']),
+            ),
         };
     }
 
@@ -81,6 +86,10 @@ final class Expectation
             ExpectationKind::HumanJudgment => $this->note === null
                 ? ['kind' => $this->kind->value]
                 : ['kind' => $this->kind->value, 'note' => $this->note],
+            ExpectationKind::RubricJudgment => [
+                'kind' => $this->kind->value,
+                'criteria' => $this->criteria,
+            ],
         };
     }
 
@@ -113,6 +122,7 @@ final class Expectation
             ExpectationKind::InformationPresent => self::requireNonEmptyField($data, 'expected_info'),
             ExpectationKind::ActionTaken, ExpectationKind::ActionNotTaken => self::requireNonEmptyField($data, 'action'),
             ExpectationKind::HumanJudgment => self::validateOptionalField($data, 'note'),
+            ExpectationKind::RubricJudgment => self::requireNonEmptyField($data, 'criteria'),
         };
     }
 

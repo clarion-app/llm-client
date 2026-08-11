@@ -28,8 +28,6 @@ class EvalCaseJudge
             $attemptedActions,
         );
 
-        $hasHumanJudgment = false;
-        $hasUnmetCheckable = false;
         $expectationResults = [];
 
         foreach ($expectations as $expectation) {
@@ -61,20 +59,10 @@ class EvalCaseJudge
                 default => null,
             };
 
-            if ($kind === ExpectationKind::HumanJudgment->value) {
-                $hasHumanJudgment = true;
-            } elseif ($met === false) {
-                $hasUnmetCheckable = true;
-            }
-
             $expectationResults[] = $expectation + ['met' => $met];
         }
 
-        $outcome = match (true) {
-            $hasHumanJudgment => EvalCaseOutcome::NeedsHumanReview,
-            $hasUnmetCheckable => EvalCaseOutcome::Fail,
-            default => EvalCaseOutcome::Pass,
-        };
+        $outcome = EvalCaseOutcome::aggregate($expectationResults);
 
         return [
             'expectation_results' => $expectationResults,

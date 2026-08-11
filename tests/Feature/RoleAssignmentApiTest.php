@@ -117,7 +117,7 @@ class RoleAssignmentApiTest extends TestCase
     }
 
     #[Test]
-    public function get_role_assignment_returns_all_three_roles(): void
+    public function get_role_assignment_returns_all_four_roles(): void
     {
         $user = User::factory()->create();
 
@@ -127,7 +127,8 @@ class RoleAssignmentApiTest extends TestCase
         $this->assertArrayHasKey('inference', $result);
         $this->assertArrayHasKey('embedding', $result);
         $this->assertArrayHasKey('image', $result);
-        $this->assertCount(3, $result);
+        $this->assertArrayHasKey('judge', $result);
+        $this->assertCount(4, $result);
     }
 
     /* -----------------------------------------------------------------

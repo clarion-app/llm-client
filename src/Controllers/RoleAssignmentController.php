@@ -26,7 +26,7 @@ class RoleAssignmentController extends Controller
     public function update(Request $request)
     {
         $validated = $request->validate([
-            'role'      => ['required', Rule::in(['inference', 'embedding', 'image'])],
+            'role'      => ['required', Rule::in(['inference', 'embedding', 'image', 'judge'])],
             'scope'     => ['required', Rule::in(['user', 'installation'])],
             'server_id' => ['required', 'uuid', 'exists:llm_servers,id'],
             'model'     => ['required', 'string'],
@@ -51,7 +51,7 @@ class RoleAssignmentController extends Controller
     public function destroy(Request $request)
     {
         $validated = $request->validate([
-            'role'  => ['required', Rule::in(['inference', 'embedding', 'image'])],
+            'role'  => ['required', Rule::in(['inference', 'embedding', 'image', 'judge'])],
             'scope' => ['required', Rule::in(['user', 'installation'])],
         ]);
 
@@ -72,7 +72,7 @@ class RoleAssignmentController extends Controller
     public function test(Request $request)
     {
         $validated = $request->validate([
-            'role' => ['required', Rule::in(['inference', 'embedding', 'image'])],
+            'role' => ['required', Rule::in(['inference', 'embedding', 'image', 'judge'])],
         ]);
 
         $result = $this->roleTestRunner->run(

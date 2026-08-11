@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Unit\Services;
 
 use ClarionApp\LlmClient\Services\EvalCaseJudge;
 use ClarionApp\LlmClient\ValueObjects\EvalCaseOutcome;
+use ClarionApp\LlmClient\ValueObjects\ExpectationKind;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
@@ -245,6 +246,29 @@ class EvalCaseJudgeTest extends TestCase
             "It's sunny outside today.",
         );
 
+        $this->assertSame(EvalCaseOutcome::Pass, $result['outcome']);
+    }
+
+    // ---------------------------------------------------------------
+    // rubric_judgment passthrough — never evaluated here (that is
+    // RubricJudge's own job); this class must simply leave it alone and
+    // not misclassify it as an unmet checkable expectation
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function rubric_judgment_is_left_with_a_null_met_value_and_does_not_flip_the_outcome_to_fail_on_its_own(): void
+    {
+        $result = $this->judge(
+            [
+                ['kind' => 'text_match', 'expected_text' => '4'],
+                ['kind' => ExpectationKind::RubricJudgment->value, 'criteria' => 'Must be polite.'],
+            ],
+            '4',
+        );
+
+        $this->assertTrue($result['expectation_results'][0]['met']);
+        $this->assertNull($result['expectation_results'][1]['met']);
+        $this->assertSame(ExpectationKind::RubricJudgment->value, $result['expectation_results'][1]['kind']);
         $this->assertSame(EvalCaseOutcome::Pass, $result['outcome']);
     }
 }

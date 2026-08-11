@@ -95,6 +95,7 @@ final class RoleTestRunner
             $message = match ($role) {
                 ModelRole::Inference => $this->exerciseInference($provider),
                 ModelRole::Embedding => $this->exerciseEmbedding($provider),
+                ModelRole::Judge => $this->exerciseJudge($provider),
                 ModelRole::Image => throw new \LogicException('unreachable'),
             };
         } catch (Throwable $e) {
@@ -145,6 +146,21 @@ final class RoleTestRunner
         }
 
         return 'Embedding request succeeded.';
+    }
+
+    private function exerciseJudge(\ClarionApp\LlmClient\Contracts\LlmProvider $provider): string
+    {
+        $result = $provider->chat(
+            [['role' => 'user', 'content' => 'ping']],
+            [],
+            ['max_tokens' => 1, 'timeout_ms' => self::TIMEOUT_MS],
+        );
+
+        if (empty($result['choices'])) {
+            throw new \RuntimeException('Provider returned no choices.');
+        }
+
+        return 'Chat completion succeeded.';
     }
 
     private function elapsedMs(float $startedAt): int
