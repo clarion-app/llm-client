@@ -38,6 +38,7 @@ use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use Illuminate\Support\Str;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
 use GuzzleHttp\Client;
@@ -2027,6 +2028,19 @@ class AgentLoopService
 
     public function executeApiCall(string $operationId, string $method, string $pathTemplate, array $params, Conversation $conversation): string
     {
+        // research.md D3: the branch that matters most — execute_operation
+        // is the path every ordinary chat turn, and therefore every
+        // eval-run case, actually uses. Checked before any session/token
+        // resolution is attempted, so a null-user eval-run conversation
+        // never falls through to executeHttpCall()'s own token-minting
+        // guard.
+        if (Context::get('eval_run_simulating_tools', false)) {
+            $schema = $this->toolRegistry->inputSchemaForOperationId($operationId);
+            $result = $this->toolExecutor->simulateCall(['inputSchema' => $schema ?? []]);
+
+            return $this->extractResultContent($result);
+        }
+
         $session = $this->getOrCreateSession($conversation);
         $resolved = $this->toolExecutor->extractArguments($params, $pathTemplate);
         $result = $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);

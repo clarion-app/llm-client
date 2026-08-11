@@ -69,7 +69,8 @@ class ConversationLifecycleService
 
         $ended = 0;
 
-        Conversation::whereNull('ended_at')
+        Conversation::whereNotNull('user_id')
+            ->whereNull('ended_at')
             ->where('is_processing', false)
             ->where('updated_at', '<', $cutoff)
             ->chunkById(100, function ($conversations) use (&$ended) {

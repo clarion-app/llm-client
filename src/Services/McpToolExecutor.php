@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Services;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\LlmClient\Models\McpConfirmationToken;
 use ClarionApp\LlmClient\Models\McpSession;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
@@ -54,7 +55,8 @@ class McpToolExecutor
                 $session,
                 $operationId,
                 $method,
-                $pathTemplate
+                $pathTemplate,
+                $tool
             );
         }
 
@@ -72,7 +74,9 @@ class McpToolExecutor
                 return $this->createConfirmationToken($name, $cleanArguments, $session);
 
             case 'allow':
-                return $this->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
+                return Context::get('eval_run_simulating_tools', false)
+                    ? $this->simulateCall($tool)
+                    : $this->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
 
             default:
                 return $this->errorResult('Unexpected validation status');
@@ -86,7 +90,8 @@ class McpToolExecutor
         McpSession $session,
         string $operationId,
         string $method,
-        string $pathTemplate
+        string $pathTemplate,
+        array $tool
     ): array {
         $token = McpConfirmationToken::find($tokenId);
         if (!$token) {
@@ -108,7 +113,32 @@ class McpToolExecutor
         $token->consume();
 
         $resolved = $this->extractArguments($arguments, $pathTemplate);
-        return $this->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
+
+        return Context::get('eval_run_simulating_tools', false)
+            ? $this->simulateCall($tool)
+            : $this->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
+    }
+
+    /**
+     * Returns the same MCP content-envelope shape executeHttpCall()/
+     * errorResult() return — indistinguishable in shape to every
+     * downstream consumer — built from a schema-shaped synthetic result
+     * (research.md D3/D4) instead of a real HTTP call.
+     */
+    public function simulateCall(array $tool): array
+    {
+        $synthetic = app(ToolResponseSimulator::class)->simulate($tool['inputSchema'] ?? []);
+
+        return [
+            'content' => [
+                [
+                    'type' => 'text',
+                    'mimeType' => 'application/json',
+                    'text' => json_encode($synthetic),
+                ],
+            ],
+            'isError' => false,
+        ];
     }
 
     private function createConfirmationToken(string $toolName, array $arguments, McpSession $session): array

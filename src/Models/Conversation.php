@@ -26,6 +26,19 @@ class Conversation extends Model
         return $this->attributes['channel'] ?? 'web';
     }
 
+    /**
+     * A local, unconditional scope excluding system-owned conversations
+     * (user_id = null, e.g. an eval-run's dedicated conversation) from a
+     * user-facing query. Deliberately not auth()-gated — it says only "a
+     * system-owned row is never a valid answer to a user-facing question,"
+     * never which user is asking, so it stays correct for both an ordinary
+     * user's own query and an authorized cross-user admin query alike.
+     */
+    public function scopeOwnedByRealUser($query)
+    {
+        return $query->whereNotNull('user_id');
+    }
+
     protected static function newFactory()
     {
         return ConversationFactory::new();

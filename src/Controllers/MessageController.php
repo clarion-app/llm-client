@@ -22,7 +22,7 @@ class MessageController extends Controller
     public function index($conversation_id)
     {
         //TODO: Implement Spatie permissions
-        $conversation = Conversation::find($conversation_id);
+        $conversation = Conversation::ownedByRealUser()->find($conversation_id);
         if(!$conversation) return response()->json([], 404);
         
         if($conversation->user_id != Auth::id())
@@ -42,8 +42,8 @@ class MessageController extends Controller
             'conversation_id' => 'required|exists:conversations,id'
         ]);
 
-        $conversation = Conversation::find($validatedData['conversation_id']);
-        if($conversation->user_id != Auth::id())
+        $conversation = Conversation::ownedByRealUser()->find($validatedData['conversation_id']);
+        if(!$conversation || $conversation->user_id != Auth::id())
         {
             return response()->json([], 403);
         }
@@ -80,6 +80,11 @@ class MessageController extends Controller
 
     public function show(Message $message)
     {
+        $conversation = Conversation::ownedByRealUser()->find($message->conversation_id);
+        if (!$conversation || $conversation->user_id != Auth::id()) {
+            return response()->json([], 403);
+        }
+
         return response()->json($message, 200);
     }
 

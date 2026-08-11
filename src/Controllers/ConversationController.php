@@ -24,7 +24,7 @@ class ConversationController extends Controller
     {
         $userId = Auth::id();
         $searchTerm = $request->query('search');
-        $query = Conversation::where('user_id', $userId);
+        $query = Conversation::ownedByRealUser()->where('user_id', $userId);
 
         if(strlen($searchTerm))
         {
@@ -50,7 +50,7 @@ class ConversationController extends Controller
             return response()->json(["message"=>"No permission."], 403);
         }
 
-        $conversations = Conversation::where('user_id', $user_id)->orderBy('created_at', 'DESC')->get();
+        $conversations = Conversation::ownedByRealUser()->where('user_id', $user_id)->orderBy('created_at', 'DESC')->get();
         return response()->json($conversations, 200);
     }
 
@@ -117,7 +117,7 @@ class ConversationController extends Controller
      */
     public function show($id)
     {
-        $conversation = Conversation::findOrFail($id);
+        $conversation = Conversation::ownedByRealUser()->findOrFail($id);
 
         if ($conversation->user_id !== Auth::id()) {
             return response()->json(['message' => 'Forbidden'], 403);
@@ -146,7 +146,7 @@ class ConversationController extends Controller
             'server_id' => 'required|string'
         ]);
 
-        $conversation = Conversation::findOrFail($id);
+        $conversation = Conversation::ownedByRealUser()->findOrFail($id);
 
         if ($conversation->user_id !== Auth::id()) {
             return response()->json(['message' => 'Forbidden'], 403);
@@ -162,7 +162,7 @@ class ConversationController extends Controller
      */
     public function destroy($id)
     {
-        $conversation = Conversation::findOrFail($id);
+        $conversation = Conversation::ownedByRealUser()->findOrFail($id);
 
         if ($conversation->user_id !== Auth::id()) {
             return response()->json(['message' => 'Forbidden'], 403);
@@ -182,7 +182,7 @@ class ConversationController extends Controller
      */
     public function end($id, ConversationLifecycleService $lifecycle)
     {
-        $conversation = Conversation::findOrFail($id);
+        $conversation = Conversation::ownedByRealUser()->findOrFail($id);
 
         if ($conversation->user_id !== Auth::id()) {
             return response()->json(['message' => 'Forbidden'], 403);
@@ -199,7 +199,7 @@ class ConversationController extends Controller
 
     public function generateTitle($id)
     {
-        $conversation = Conversation::findOrFail($id);
+        $conversation = Conversation::ownedByRealUser()->findOrFail($id);
 
         if ($conversation->user_id !== Auth::id()) {
             return response()->json(['message' => 'Forbidden'], 403);
@@ -211,7 +211,7 @@ class ConversationController extends Controller
 
     public function confirmApiCall(Request $request, $id)
     {
-        $conversation = Conversation::findOrFail($id);
+        $conversation = Conversation::ownedByRealUser()->findOrFail($id);
 
         if ($conversation->user_id !== Auth::id()) {
             return response()->json(['message' => 'Forbidden'], 403);
