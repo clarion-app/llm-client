@@ -314,31 +314,74 @@ class StalledRunResumptionJourneyTest extends TestCase
     // RED.
     // =================================================================
 
+    /**
+     * research.md D8's own two-mechanism split, read carefully: manual
+     * resume dispatches only rows still `pending` — a case whose job was
+     * *dispatched* but whose worker died mid-execution is explicitly left
+     * to standard queue redelivery or the scheduled sweep (which itself
+     * resets `dispatched` -> `pending` before calling resume() — a step
+     * resume() itself deliberately does not take, since a `dispatched` row
+     * might just be a case a live worker is still genuinely processing,
+     * not a dead one; contracts §2 frames exactly this as "a harmless
+     * no-op"). This test previously simulated a dead-worker (`dispatched`,
+     * never handled) case and asserted resume() recovered it — it passed,
+     * but vacuously: the assertion only held because this file's own
+     * driveAllDispatchedJobs() helper re-scans *every* job Bus::fake() has
+     * ever captured, including the original, never-driven job for case 2,
+     * so that job finally got driven regardless of what resume() itself
+     * did. resume() was in fact a no-op for a `dispatched` row (confirmed
+     * by reading EvalRunService::resume(), which only queries
+     * status = Pending). Rewritten to exercise the actual mechanism
+     * resume() exists for (D8 mechanism 2: "a case's job was never
+     * dispatched at all," e.g. EvalRunService::start() died after writing
+     * the eval_run_cases snapshot but before dispatching every job) — the
+     * one scenario nothing else in this test suite (or
+     * EvalRunServiceTest's unit coverage) exercised.
+     */
     #[Test]
-    public function manually_resuming_a_stalled_run_recovers_it_immediately_without_waiting_for_the_sweep(): void
+    public function manually_resuming_a_run_dispatches_a_case_whose_job_never_reached_the_queue_at_all(): void
     {
         $started = $this->startRun($this->suiteId);
         $runId = $started['run']['id'];
 
-        // Identical dead-worker setup to the sweep scenario above, but this
-        // time the operator does not wait for the scheduled sweep at all.
         $started['jobs'][0]->handle(app(EvalCaseExecutor::class));
         $started['jobs'][1]->handle(app(EvalCaseExecutor::class));
 
+        // Simulate D8 mechanism 2 directly: case 2's eval_run_cases row was
+        // snapshotted but its RunEvalCaseJob::dispatch() call never actually
+        // happened (e.g. start() died mid-loop) — status reset to `pending`,
+        // the one signal resume() acts on. Left undriven in Bus::fake()'s
+        // own dispatched list, standing in for "nothing ever reached the
+        // queue for this case."
+        DB::table('eval_run_cases')
+            ->where('run_id', $runId)
+            ->where('eval_case_id', $this->caseIds[2])
+            ->update(['status' => 'pending']);
+
         $this->assertSame(0, EvalCaseResult::where('run_id', $runId)->where('eval_case_id', $this->caseIds[2])->count());
+
+        $dispatchedBefore = Bus::dispatched(RunEvalCaseJob::class)->count();
 
         $resumeResponse = $this->actingAs($this->operator)
             ->postJson($this->runsBase().'/'.$runId.'/resume');
 
         $resumeResponse->assertStatus(200);
 
-        $this->driveAllDispatchedJobs();
+        $this->assertSame(
+            $dispatchedBefore + 1,
+            Bus::dispatched(RunEvalCaseJob::class)->count(),
+            'resume() must itself dispatch exactly one new job for the case that was snapshotted but never reached the queue'
+        );
+
+        // Drive only the newly-dispatched job — proving resume() itself,
+        // not a stale pre-existing captured job, is what completes case 2.
+        Bus::dispatched(RunEvalCaseJob::class)->last()->handle(app(EvalCaseExecutor::class));
 
         $run = $this->getRun($runId);
         $this->assertSame(
             'completed',
             $run['status'],
-            'a manual resume must recover the stalled case immediately, under Cache::lock (research.md D8), with the identical outcome the sweep produces'
+            'a manual resume must recover a never-dispatched case immediately, under Cache::lock (research.md D8)'
         );
         $this->assertSame(3, $run['completed_count']);
         $this->assertSame(
@@ -418,5 +461,65 @@ class StalledRunResumptionJourneyTest extends TestCase
 
         $this->assertSame($beforeCase0, $afterCase0, "case 0's already-recorded result must be byte-identical before and after the sweep");
         $this->assertSame($beforeCase1, $afterCase1, "case 1's already-recorded result must be byte-identical before and after the sweep");
+    }
+
+    // =================================================================
+    // Reconciliation finding: data-model.md §1 states eval_runs.updated_at
+    // is load-bearing for staleness detection and that "every
+    // case-completion write that touches this row must bump it" — but
+    // EvalCaseExecutor::maybeCompleteRun() previously only touched the run
+    // row on the *final* case (the transition to `completed`), never on an
+    // intermediate case completion. A run that legitimately takes longer
+    // than stale_after_minutes (exactly the "runs may take a long time"/
+    // 500+-case shape this feature is designed for) would then have every
+    // one of its still-`dispatched`, genuinely-in-flight cases falsely
+    // reset to `pending` and redispatched by the next sweep tick — racing
+    // a live worker actually processing that case right now, with no
+    // single-flight guard anywhere in AgentLoopService::run() to prevent
+    // it. Fixed by having maybeCompleteRun() touch() the run on every case
+    // completion, not only the last one.
+    // =================================================================
+
+    #[Test]
+    public function a_case_completing_normally_bumps_the_runs_updated_at_so_an_actively_progressing_run_is_never_falsely_treated_as_stalled(): void
+    {
+        $started = $this->startRun($this->suiteId);
+        $runId = $started['run']['id'];
+
+        // Age the run past the stale threshold *before* any case completes
+        // — simulating a run that has legitimately been executing longer
+        // than stale_after_minutes, not one whose worker actually died.
+        $this->ageRunPastStaleThreshold($runId);
+
+        // Case 0 completes normally, exactly as a live, healthy worker
+        // would while the run is still genuinely in progress.
+        $started['jobs'][0]->handle(app(EvalCaseExecutor::class));
+
+        $freshUpdatedAt = \Carbon\Carbon::parse(
+            DB::table('eval_runs')->where('id', $runId)->value('updated_at')
+        );
+        $this->assertTrue(
+            $freshUpdatedAt->gt(now()->subMinutes(5)),
+            'a case completion must bump eval_runs.updated_at (data-model.md §1) so the sweep never mistakes active progress for a stall'
+        );
+
+        // Cases 1 and 2 are still legitimately `dispatched` — a live worker
+        // is presumably still processing them. The sweep must find nothing
+        // to do for this run at all now that its updated_at is fresh.
+        Artisan::call('llm-client:resolve-stalled-eval-runs');
+
+        $caseOneStatus = DB::table('eval_run_cases')
+            ->where('run_id', $runId)->where('eval_case_id', $this->caseIds[1])->value('status');
+        $caseTwoStatus = DB::table('eval_run_cases')
+            ->where('run_id', $runId)->where('eval_case_id', $this->caseIds[2])->value('status');
+
+        $this->assertSame('dispatched', $caseOneStatus, 'a genuinely in-flight case must not be reset to pending by a false-positive stale sweep');
+        $this->assertSame('dispatched', $caseTwoStatus, 'a genuinely in-flight case must not be reset to pending by a false-positive stale sweep');
+
+        $this->assertCount(
+            3,
+            Bus::dispatched(RunEvalCaseJob::class),
+            'no additional job should have been dispatched by a sweep that correctly found nothing stale'
+        );
     }
 }

@@ -186,6 +186,20 @@ class EvalCaseExecutor
             ->count();
 
         if ($stillIncomplete > 0) {
+            // data-model.md §1: eval_runs.updated_at is load-bearing for
+            // ResolveStalledEvalRunsCommand's staleness detection — "every
+            // case-completion write that touches this row must bump it,"
+            // not only the run's final transition to `completed`. Without
+            // this, a run that is still actively, successfully making
+            // progress past `stale_after_minutes` (a large, legitimately
+            // long-running suite — exactly the shape this feature targets)
+            // would be misdiagnosed as stalled by the next sweep tick, which
+            // resets every still-`dispatched` case (including ones a live
+            // worker is processing *right now*) back to `pending` and
+            // redispatches them — racing a real, in-flight case execution
+            // for no reason.
+            $run->touch();
+
             return;
         }
 
