@@ -135,9 +135,13 @@ class EvalSuiteController extends Controller
     }
 
     /**
+     * The §1.4 `suite` detail shape (contracts/eval-suites-api.md), reused
+     * by EvalSuiteExportController so a freshly imported suite renders
+     * identically to any other suite's detail view.
+     *
      * @return array<string, mixed>
      */
-    private function formatSuiteDetail(EvalSuite $suite): array
+    public function formatSuiteDetail(EvalSuite $suite): array
     {
         $cases = $suite->cases()->with('currentVersion')->get();
 

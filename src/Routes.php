@@ -25,6 +25,7 @@ use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
 use ClarionApp\LlmClient\Controllers\BudgetStandingController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteController;
 use ClarionApp\LlmClient\Controllers\EvalCaseController;
+use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -147,6 +148,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::put('agent-eval-suites/{suiteId}/cases/{caseId}', [EvalCaseController::class, "update"]);
     Route::delete('agent-eval-suites/{suiteId}/cases/{caseId}', [EvalCaseController::class, "destroy"]);
     Route::get('agent-eval-suites/{suiteId}/cases/{caseId}/versions', [EvalCaseController::class, "versions"]);
+
+    // Agent eval suite export/import (077 US4) — a self-contained document
+    // with no row ids, no version history, no source-installation
+    // timestamps (contracts/eval-suites-api.md §4).
+    Route::get('agent-eval-suites/{suiteId}/export', [EvalSuiteExportController::class, "export"]);
+    Route::post('agent-eval-suites/import', [EvalSuiteExportController::class, "import"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
