@@ -664,7 +664,7 @@ abstract class TestCase extends BaseTestCase
                 $table->text('given');
                 $table->text('expected_behavior');
                 $table->json('expectations');
-                $table->timestamp('created_at')->useCurrent();
+                $table->timestamps();
                 $table->softDeletes();
 
                 $table->unique(['case_id', 'version_number']);

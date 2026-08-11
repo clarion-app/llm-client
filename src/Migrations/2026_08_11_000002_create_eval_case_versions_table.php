@@ -34,9 +34,7 @@ return new class extends Migration
             // service layer, not a DB constraint).
             $table->json('expectations');
 
-            // No updated_at is meaningful for a row that is never updated
-            // after insert — this table is append-only in practice.
-            $table->timestamp('created_at')->useCurrent();
+            $table->timestamps();
 
             // Required by EloquentMultiChainBridge, not optional: the trait
             // declares `use SoftDeletes;` internally, so any model using it

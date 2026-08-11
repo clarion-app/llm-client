@@ -30,9 +30,6 @@ class EvalCaseVersion extends Model
 {
     use HasFactory, EloquentMultiChainBridge, SoftDeletes;
 
-    public const CREATED_AT = 'created_at';
-    public const UPDATED_AT = null;
-
     protected $table = 'eval_case_versions';
 
     protected $fillable = ['case_id', 'version_number', 'given', 'expected_behavior', 'expectations'];
