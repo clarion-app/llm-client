@@ -23,6 +23,8 @@ use ClarionApp\LlmClient\Controllers\LatencyController;
 use ClarionApp\LlmClient\Controllers\ToolReliabilityController;
 use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
 use ClarionApp\LlmClient\Controllers\BudgetStandingController;
+use ClarionApp\LlmClient\Controllers\EvalSuiteController;
+use ClarionApp\LlmClient\Controllers\EvalCaseController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -129,6 +131,13 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('budget/standing', [BudgetStandingController::class, "self"]);
     Route::get('budget/standing/users/{userId}', [BudgetStandingController::class, "user"]);
     Route::get('budget/standing/installation', [BudgetStandingController::class, "installation"]);
+
+    // Agent eval suite definitions (077 US1) — operator-only throughout,
+    // reads included (research.md D1, contracts/eval-suites-api.md §2-3).
+    Route::get('agent-eval-suites', [EvalSuiteController::class, "index"]);
+    Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);
+    Route::get('agent-eval-suites/{suiteId}', [EvalSuiteController::class, "show"]);
+    Route::post('agent-eval-suites/{suiteId}/cases', [EvalCaseController::class, "store"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
