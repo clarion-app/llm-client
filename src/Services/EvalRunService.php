@@ -10,12 +10,15 @@ use ClarionApp\LlmClient\Models\EvalSuite;
 use ClarionApp\LlmClient\ValueObjects\EvalRunCaseStatus;
 use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 /**
  * The sole write path for eval_runs/eval_run_cases (research.md D7/D12,
  * data-model.md §1/§5). start() and summarize() are this file's User
- * Story 1 surface; resume() is added in Phase 5 (US3).
+ * Story 1 surface; resume() (research.md D8) is this file's User Story
+ * 3 surface, called both from the operator-triggered resume endpoint and
+ * from ResolveStalledEvalRunsCommand's own sweep.
  */
 class EvalRunService
 {
@@ -133,5 +136,52 @@ class EvalRunService
             'remaining_count' => $run->case_count - $completedCount,
             'overall' => $overall,
         ];
+    }
+
+    /**
+     * Force-resumes a run whose dispatch itself was interrupted
+     * (research.md D8's "never dispatched at all" gap — the one thing
+     * standard queue redelivery cannot cover on its own). Guarded by the
+     * BulbStatusCheck/OperationCache overlap-prevention precedent so a
+     * concurrent automatic sweep (ResolveStalledEvalRunsCommand) and an
+     * operator-triggered resume can never double-dispatch the same case.
+     *
+     * Dispatches every still-`pending` eval_run_cases row and flips the
+     * run from `incomplete` back to `in_progress` when applicable. A
+     * resume with nothing actually pending — including one that loses
+     * the lock race to a concurrent sweep — is a harmless no-op
+     * (contracts §2: resuming is always safe to call speculatively).
+     */
+    public function resume(EvalRun $run): EvalRun
+    {
+        $lock = Cache::lock("eval-run:{$run->id}", 30);
+
+        if (!$lock->get()) {
+            return $run->fresh();
+        }
+
+        try {
+            $pendingCases = EvalRunCase::where('run_id', $run->id)
+                ->where('status', EvalRunCaseStatus::Pending)
+                ->get();
+
+            foreach ($pendingCases as $evalRunCase) {
+                RunEvalCaseJob::dispatch($run->id, $evalRunCase->id)
+                    ->onQueue(config('llm-client.eval_runs.queue', 'eval-runs'));
+
+                $evalRunCase->update([
+                    'status' => EvalRunCaseStatus::Dispatched,
+                    'dispatch_attempts' => $evalRunCase->dispatch_attempts + 1,
+                ]);
+            }
+
+            if ($run->status === EvalRunStatus::Incomplete) {
+                $run->update(['status' => EvalRunStatus::InProgress]);
+            }
+        } finally {
+            $lock->release();
+        }
+
+        return $run->fresh();
     }
 }

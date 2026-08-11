@@ -152,6 +152,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agent-eval-suites/{suiteId}/runs', [EvalRunController::class, "index"]);
     Route::get('eval-runs/{runId}', [EvalRunController::class, "show"]);
     Route::get('eval-runs/{runId}/cases', [EvalRunController::class, "cases"]);
+    Route::post('eval-runs/{runId}/resume', [EvalRunController::class, "resume"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

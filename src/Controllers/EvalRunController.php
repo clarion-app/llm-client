@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\EvalRun;
 use ClarionApp\LlmClient\Services\EvalRunService;
 use ClarionApp\LlmClient\Services\EvalSuiteService;
 use ClarionApp\LlmClient\Support\OperatorAccess;
+use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use Illuminate\Http\Request;
 use Auth;
 
@@ -18,8 +19,7 @@ use Auth;
  * including plain reads (FR-019).
  *
  * EvalRunService is the sole write path for eval_runs/eval_run_cases;
- * this controller only translates HTTP to it. resume() is added in
- * Phase 5 (US3).
+ * this controller only translates HTTP to it.
  */
 class EvalRunController extends Controller
 {
@@ -113,6 +113,28 @@ class EvalRunController extends Controller
         $results->getCollection()->transform(fn (EvalCaseResult $result) => $this->formatCaseResult($result));
 
         return response()->json($results, 200);
+    }
+
+    public function resume(string $runId)
+    {
+        if (!OperatorAccess::isOperator(Auth::id())) {
+            return $this->forbidden();
+        }
+
+        $run = EvalRun::find($runId);
+
+        if ($run === null) {
+            return $this->notFound();
+        }
+
+        // Both terminal states — nothing to resume (contracts §2).
+        if (in_array($run->status, [EvalRunStatus::Completed, EvalRunStatus::FailedToStart], true)) {
+            return $this->unprocessable('This run has already finished.');
+        }
+
+        $run = $this->service->resume($run);
+
+        return response()->json($this->formatRunDetail($run), 200);
     }
 
     /**

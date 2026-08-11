@@ -7,6 +7,7 @@ use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Middleware\RateLimited;
 use Illuminate\Queue\SerializesModels;
 
 /**
@@ -38,6 +39,20 @@ class RunEvalCaseJob implements ShouldQueue
     public function handle(EvalCaseExecutor $executor): void
     {
         $executor->execute($this->runId, $this->evalRunCaseId);
+    }
+
+    /**
+     * Bounds how many case executions may be admitted to run per minute,
+     * installation-wide (research.md D9) — independent of BudgetGate
+     * (money) and independent of how many cases a single run enqueues at
+     * once. The named 'eval-run-cases' limiter is registered in
+     * LlmClientServiceProvider.
+     *
+     * @return array<int, RateLimited>
+     */
+    public function middleware(): array
+    {
+        return [new RateLimited('eval-run-cases')];
     }
 
     public function failed(\Throwable $e): void

@@ -51,8 +51,10 @@ use ClarionApp\LlmClient\Presets\DecisionPreset;
 use ClarionApp\LlmClient\Presets\SummaryPreset;
 use ClarionApp\LlmClient\Presets\ExtractionPreset;
 use GuzzleHttp\Client;
+use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\RateLimiter;
 
 class LlmClientServiceProvider extends ClarionPackageServiceProvider
 {
@@ -118,8 +120,25 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand::class,
                 \ClarionApp\LlmClient\Commands\ForwardRunTracesCommand::class,
                 \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
+                \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
             ]);
         }
+
+        // Named rate limiter bounding how many eval-run case executions
+        // may be admitted to run per minute, installation-wide
+        // (research.md D9) — attached to every RunEvalCaseJob via its own
+        // middleware(). Independent of BudgetGate (money); this is a
+        // throughput/saturation concern, not a spend one.
+        RateLimiter::for('eval-run-cases', function () {
+            // Null-coalesced rather than relying solely on config()'s own
+            // default argument: Illuminate\Config\Repository::offsetUnset()
+            // sets a key's value to null rather than removing it, so an
+            // explicitly-null config value must fall back to the
+            // documented default the same way a genuinely absent key
+            // does — otherwise (int) null silently becomes 0, disabling
+            // eval-run case throughput entirely.
+            return Limit::perMinute((int) (config('llm-client.eval_runs.max_cases_per_minute') ?? 30));
+        });
 
         // Nothing else ends a conversation session, so this sweep is what makes
         // short-term memory cleanup and episodic capture happen at all. Registered
@@ -138,6 +157,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
             // Resolve abandoned (stale in_progress) agent runs every five minutes.
             $schedule->command('llm-client:resolve-abandoned-runs')
+                ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Resolve stalled (stale in_progress) eval runs every five
+            // minutes — the automatic half of research.md D8's
+            // resumption mechanism, so an operator does not have to
+            // notice and manually resume every interrupted run.
+            $schedule->command('llm-client:resolve-stalled-eval-runs')
                 ->everyFiveMinutes()
                 ->withoutOverlapping();
 
