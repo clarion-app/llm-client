@@ -175,6 +175,7 @@ class EvalSuiteController extends Controller
             'expected_behavior' => $version?->expected_behavior,
             'expectations' => $version?->expectations ?? [],
             'requires_human_judgment' => $version?->requiresHumanJudgment() ?? false,
+            'requires_rubric_judgment' => $version?->requiresRubricJudgment() ?? false,
             'created_at' => optional($case->created_at)->toJSON(),
             'updated_at' => optional($case->updated_at)->toJSON(),
         ];

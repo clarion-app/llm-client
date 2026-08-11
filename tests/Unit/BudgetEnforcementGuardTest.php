@@ -98,6 +98,16 @@ class BudgetEnforcementGuardTest extends TestCase
         // does; only the funnel differs.
         'Services/EmbeddingService.php',
 
+        // Rubric judging calls BudgetGate::admit() DIRECTLY, the same
+        // reason RoleTestRunner's null-user branch does rather than going
+        // through traceSystemRun(): the judge's user id is always null
+        // (system-initiated work), and traceSystemRun()'s own $userId
+        // parameter is non-nullable. admit() writes its own refusal
+        // record on a stop, and RubricJudge converts that refusal into an
+        // explicit unjudged result rather than propagating it — a refusal
+        // is exactly as visible to an operator either way.
+        'Services/RubricJudge.php',
+
         // Dead legacy classes. They are on the list because they genuinely
         // contain the constructs and the assertion is an equality — not
         // because they are gated. The separate assertion below is what keeps
@@ -127,6 +137,7 @@ class BudgetEnforcementGuardTest extends TestCase
         'Services/ConversationCondenser.php',
         'Services/EmbeddingService.php',
         'Services/RoleTestRunner.php',
+        'Services/RubricJudge.php',
         'Jobs/GenerateEpisodicMemoryJob.php',
         'Jobs/PreWarmChunkSummaryJob.php',
         'OpenAIGenerateConversationTitleRequest.php',

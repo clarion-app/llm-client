@@ -11,7 +11,9 @@ use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\ValueObjects\EvalCaseOutcome;
 use ClarionApp\LlmClient\ValueObjects\EvalRunCaseStatus;
 use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
+use ClarionApp\LlmClient\ValueObjects\ExpectationKind;
 use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Str;
 
 /**
  * The per-case unit of work (research.md D5/D6/D8): finds-or-creates the
@@ -71,18 +73,115 @@ class EvalCaseExecutor
                 ->values()
                 ->all();
 
-            $judged = $this->judge->judge($version->expectations, $producedResponse, $attemptedActions);
+            // Partition the version's expectations by kind, preserving each
+            // entry's original array index as its expectation_index
+            // (data-model.md §5) — a case may interleave rubric_judgment
+            // expectations with any of the five checkable/human-review
+            // kinds, and EvalCaseJudge has no arm for rubric_judgment at
+            // all (it is judged here, not there).
+            $rubricExpectations = [];
+            $nonRubricExpectations = [];
 
-            $this->recordResult(
+            foreach ($version->expectations as $index => $expectation) {
+                if (($expectation['kind'] ?? null) === ExpectationKind::RubricJudgment->value) {
+                    $rubricExpectations[$index] = $expectation;
+                } else {
+                    $nonRubricExpectations[$index] = $expectation;
+                }
+            }
+
+            $judged = $this->judge->judge(array_values($nonRubricExpectations), $producedResponse, $attemptedActions);
+
+            // EvalCaseJudge::judge() returns its results in the same order
+            // it was given $nonRubricExpectations, which array_values()
+            // preserved from $nonRubricExpectations's own (ascending,
+            // original) key order — so re-combining with those same keys
+            // is safe.
+            $resultsByIndex = array_combine(array_keys($nonRubricExpectations), $judged['expectation_results']);
+
+            // A case with zero rubric_judgment expectations never reaches
+            // any of the code below this guard — no dedicated judge
+            // Conversation is resolved, no RubricJudge call is made, no
+            // eval_judgments row is written. Byte-identical to the
+            // pre-rubric-judging path (data-model.md §5).
+            $pendingJudgments = [];
+
+            if ($rubricExpectations !== []) {
+                // One dedicated, system-owned judge Conversation per case
+                // (research.md D3), reused across however many
+                // rubric_judgment expectations this case has — distinct
+                // from the case's own agent Conversation resolved above.
+                $judgeConversation = Conversation::firstOrCreate(
+                    ['title' => 'eval-judgment:'.$evalRunCase->id],
+                    ['user_id' => null, 'character' => 'eval-judge'],
+                );
+
+                foreach ($rubricExpectations as $index => $expectation) {
+                    $criteria = (string) ($expectation['criteria'] ?? '');
+                    $judgmentId = (string) Str::uuid();
+
+                    $result = app(RubricJudge::class)->judge(
+                        $criteria,
+                        $version->given,
+                        $producedResponse,
+                        $attemptedActions,
+                        $judgeConversation,
+                        'eval_rubric_judgment',
+                    );
+
+                    $resultsByIndex[$index] = [
+                        'kind' => ExpectationKind::RubricJudgment->value,
+                        'criteria' => $criteria,
+                        'met' => $result->status === 'judged'
+                            ? $result->score >= (int) config('llm-client.eval_judging.passing_score', 7)
+                            : null,
+                        'score' => $result->score,
+                        'status' => $result->status,
+                        'judgment_id' => $judgmentId,
+                    ];
+
+                    $pendingJudgments[] = [
+                        'judgment_id' => $judgmentId,
+                        'expectation_index' => $index,
+                        'criteria' => $criteria,
+                        'result' => $result,
+                    ];
+                }
+            }
+
+            // Merge rubric and non-rubric expectation_results back into
+            // the version's original expectations[] index order.
+            ksort($resultsByIndex);
+            $expectationResults = array_values($resultsByIndex);
+
+            $outcome = EvalCaseOutcome::aggregate($expectationResults);
+
+            $caseResult = $this->recordResult(
                 $run,
                 $evalRunCase,
                 $conversation->id,
-                $judged['outcome'],
+                $outcome,
                 $producedResponse,
                 $attemptedActions,
-                $judged['expectation_results'],
+                $expectationResults,
                 null,
             );
+
+            // Written only after the EvalCaseResult row exists, so each
+            // judgment's eval_case_result_id can reference it in the same
+            // logical operation (data-model.md §1/§5's write-ordering
+            // note).
+            foreach ($pendingJudgments as $pending) {
+                app(EvalJudgmentService::class)->record(
+                    $pending['judgment_id'],
+                    $caseResult->id,
+                    $version->id,
+                    $pending['expectation_index'],
+                    $pending['criteria'],
+                    $producedResponse,
+                    $pending['result'],
+                );
+            }
         } catch (\Throwable $e) {
             $this->recordTimeoutOrFailure($runId, $evalRunCaseId, $e);
         }
@@ -151,8 +250,8 @@ class EvalCaseExecutor
         array $attemptedActions,
         array $expectationResults,
         ?string $errorMessage,
-    ): void {
-        EvalCaseResult::create([
+    ): EvalCaseResult {
+        $caseResult = EvalCaseResult::create([
             'run_id' => $run->id,
             'eval_run_case_id' => $evalRunCase->id,
             'eval_case_id' => $evalRunCase->eval_case_id,
@@ -168,6 +267,8 @@ class EvalCaseExecutor
         $evalRunCase->update(['status' => EvalRunCaseStatus::Completed]);
 
         $this->maybeCompleteRun($run);
+
+        return $caseResult;
     }
 
     /**

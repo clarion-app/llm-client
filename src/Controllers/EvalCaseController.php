@@ -145,6 +145,7 @@ class EvalCaseController extends Controller
                 'expected_behavior' => $version->expected_behavior,
                 'expectations' => $version->expectations,
                 'requires_human_judgment' => $version->requiresHumanJudgment(),
+                'requires_rubric_judgment' => $version->requiresRubricJudgment(),
                 'created_at' => optional($version->created_at)->toJSON(),
             ])
             ->values();
