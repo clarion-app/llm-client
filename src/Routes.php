@@ -23,6 +23,9 @@ use ClarionApp\LlmClient\Controllers\LatencyController;
 use ClarionApp\LlmClient\Controllers\ToolReliabilityController;
 use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
 use ClarionApp\LlmClient\Controllers\BudgetStandingController;
+use ClarionApp\LlmClient\Controllers\EvalSuiteController;
+use ClarionApp\LlmClient\Controllers\EvalCaseController;
+use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -129,6 +132,28 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('budget/standing', [BudgetStandingController::class, "self"]);
     Route::get('budget/standing/users/{userId}', [BudgetStandingController::class, "user"]);
     Route::get('budget/standing/installation', [BudgetStandingController::class, "installation"]);
+
+    // Agent eval suite definitions (077 US1) — operator-only throughout,
+    // reads included (research.md D1, contracts/eval-suites-api.md §2-3).
+    Route::get('agent-eval-suites', [EvalSuiteController::class, "index"]);
+    Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);
+    Route::get('agent-eval-suites/{suiteId}', [EvalSuiteController::class, "show"]);
+    Route::post('agent-eval-suites/{suiteId}/cases', [EvalCaseController::class, "store"]);
+
+    // Agent eval suite maintenance (077 US2) — rename/archive a suite,
+    // edit/archive a case (versioned, insert-only), and list a case's
+    // full version history (contracts/eval-suites-api.md §2-3).
+    Route::put('agent-eval-suites/{suiteId}', [EvalSuiteController::class, "update"]);
+    Route::delete('agent-eval-suites/{suiteId}', [EvalSuiteController::class, "destroy"]);
+    Route::put('agent-eval-suites/{suiteId}/cases/{caseId}', [EvalCaseController::class, "update"]);
+    Route::delete('agent-eval-suites/{suiteId}/cases/{caseId}', [EvalCaseController::class, "destroy"]);
+    Route::get('agent-eval-suites/{suiteId}/cases/{caseId}/versions', [EvalCaseController::class, "versions"]);
+
+    // Agent eval suite export/import (077 US4) — a self-contained document
+    // with no row ids, no version history, no source-installation
+    // timestamps (contracts/eval-suites-api.md §4).
+    Route::get('agent-eval-suites/{suiteId}/export', [EvalSuiteExportController::class, "export"]);
+    Route::post('agent-eval-suites/import', [EvalSuiteExportController::class, "import"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
