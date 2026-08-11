@@ -10,6 +10,7 @@ use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\McpConfirmationToken;
 use ClarionApp\Backend\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
@@ -772,6 +773,118 @@ class McpToolExecutorTest extends TestCase
 
         $this->assertFalse($result['isError']);
         $this->assertEquals('text', $result['content'][0]['type']);
+    }
+
+    // ---------------------------------------------------------------
+    // eval_run_simulating_tools Context flag (078-run-eval-suites,
+    // research.md D3, quickstart.md mutation-checklist row 3): the
+    // external MCP protocol surface — executeTool()'s 'allow' branch and
+    // handleConfirmedCall() — must simulate rather than really call out,
+    // whenever the flag is set, exactly like the execute_operation path
+    // AgentLoopService::executeApiCall() already covers. No existing test
+    // above drives this through executeTool()/handleConfirmedCall()
+    // directly; every other allow-branch test above deliberately runs
+    // with no flag set (the ordinary path), so it exercises the opposite
+    // branch of the same `Context::get('eval_run_simulating_tools',
+    // false)` conditional.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function simulates_allowed_tool_call_when_eval_run_simulating_tools_flag_is_set()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.index')
+            ->andReturn([
+                'name' => 'contacts.index',
+                'inputSchema' => [
+                    'properties' => ['query' => ['properties' => ['page' => ['type' => 'integer']]]],
+                ],
+                '_meta' => [
+                    'operationId' => 'listContacts',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact',
+                ],
+            ]);
+
+        $validatorMock = $this->mockValidator('allow');
+
+        // No Http::fake() response is registered for any URL — if the
+        // 'allow' branch ignored the flag and called executeHttpCall()
+        // anyway, Http::assertNothingSent() below would catch it.
+        Http::fake();
+
+        Context::add('eval_run_simulating_tools', true);
+        try {
+            $executor = new McpToolExecutor($registryMock, $validatorMock, fn () => 'test-token');
+            $result = $executor->executeTool('contacts.index', [], $this->session);
+        } finally {
+            Context::forget('eval_run_simulating_tools');
+        }
+
+        $this->assertFalse($result['isError']);
+        Http::assertNothingSent();
+
+        $decoded = json_decode($result['content'][0]['text'], true);
+        $this->assertIsArray($decoded, 'the simulated result must be JSON-decodable, per ToolResponseSimulator (D4)');
+        $this->assertTrue($decoded['success'] ?? false, 'the simulated result must report success at the top level');
+    }
+
+    #[Test]
+    public function simulates_confirmed_destructive_call_when_eval_run_simulating_tools_flag_is_set()
+    {
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.destroy')
+            ->andReturn([
+                'name' => 'contacts.destroy',
+                'inputSchema' => [
+                    'properties' => ['path' => ['properties' => ['contact' => ['type' => 'string']]]],
+                ],
+                '_meta' => [
+                    'operationId' => 'deleteContact',
+                    'method' => 'DELETE',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
+                ],
+            ]);
+
+        $arguments = ['path' => ['contact' => 'abc']];
+        $argumentsHash = hash('sha256', json_encode($arguments));
+
+        $token = McpConfirmationToken::create([
+            'session_id' => $this->session->id,
+            'tool_name' => 'contacts.destroy',
+            'arguments_hash' => $argumentsHash,
+            'arguments_snapshot' => $arguments,
+            'expires_at' => Carbon::now()->addMinutes(5),
+        ]);
+
+        $validatorMock = Mockery::mock(CallValidatorInterface::class);
+
+        Http::fake();
+
+        Context::add('eval_run_simulating_tools', true);
+        try {
+            $executor = new McpToolExecutor($registryMock, $validatorMock, fn () => 'test-token');
+            $result = $executor->executeTool('contacts.destroy', array_merge($arguments, [
+                '_confirmation_token' => $token->id,
+            ]), $this->session);
+        } finally {
+            Context::forget('eval_run_simulating_tools');
+        }
+
+        $this->assertFalse($result['isError']);
+        Http::assertNothingSent();
+
+        // The confirmation token itself must still be consumed exactly
+        // like the real path — simulation only replaces the outbound
+        // call, not the confirmation contract.
+        $token->refresh();
+        $this->assertNotNull($token->used_at);
+
+        $decoded = json_decode($result['content'][0]['text'], true);
+        $this->assertIsArray($decoded, 'the simulated result must be JSON-decodable, per ToolResponseSimulator (D4)');
+        $this->assertTrue($decoded['success'] ?? false, 'the simulated result must report success at the top level');
     }
 
     private function mockValidator(string $status, ?string $reason = null): Mockery\MockInterface

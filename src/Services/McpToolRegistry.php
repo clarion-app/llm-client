@@ -110,7 +110,26 @@ class McpToolRegistry
         ];
     }
 
-    private function buildInputSchema(array $opDetails): array
+    /**
+     * Resolves the MCP-shaped input schema for a bare operation id, reusing
+     * the exact ApiManager::getOperationDetails() call McpToolExecutor's
+     * confirmation path and AgentLoopService::handleExecuteOperation()
+     * already make — no second OpenAPI-reading path. Used by
+     * AgentLoopService::executeApiCall()'s tool-suppression branch, which
+     * only has an operation id, not the compound MCP tool name findTool()
+     * indexes on.
+     */
+    public function inputSchemaForOperationId(string $operationId): ?array
+    {
+        $details = ApiManager::getOperationDetails($operationId);
+        if (empty((array) $details) || !isset($details['details'])) {
+            return null;
+        }
+
+        return $this->buildInputSchema($details['details']);
+    }
+
+    protected function buildInputSchema(array $opDetails): array
     {
         $pathProps = [];
         $queryProps = [];

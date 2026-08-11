@@ -505,6 +505,39 @@ return [
         'supported_export_schema_versions' => [1],
     ],
 
+    // Batch evaluation runner — executing an eval_suites suite's cases
+    // against the installation's effective agent and recording outcomes.
+    'eval_runs' => [
+        // RunEvalCaseJob::$timeout — the bounded wait for one case's
+        // AgentLoopService::run() call before the queue worker kills the
+        // job and RunEvalCaseJob::failed() records it errored (FR-013).
+        'case_timeout_seconds' => 300,
+
+        // The per-minute cap the 'eval-run-cases' named RateLimiter
+        // (LlmClientServiceProvider) enforces via RunEvalCaseJob's
+        // RateLimited middleware — how many case executions may be
+        // admitted to run per minute, installation-wide (D9), so one
+        // large run cannot saturate the installation's model-call
+        // throughput.
+        'max_cases_per_minute' => 30,
+
+        // How long an eval_runs row may sit in_progress with its
+        // updated_at unchanged before ResolveStalledEvalRunsCommand (D8)
+        // treats it as stalled and attempts to resume it.
+        'stale_after_minutes' => 30,
+
+        // How many consecutive ResolveStalledEvalRunsCommand sweep
+        // cycles a single case may be redispatched through with no
+        // progress before it is given up on — marked errored, and the
+        // run marked incomplete rather than swept forever (D8).
+        'max_stale_sweeps' => 3,
+
+        // The queue RunEvalCaseJob is dispatched onto — a complementary,
+        // optional lever for operators who want to size workers for eval
+        // traffic separately from interactive traffic (D9).
+        'queue' => 'eval-runs',
+    ],
+
     // Response latency distributions — per-model and per-agent percentile
     // figures computed at read time from agent_runs.
     'latency' => [

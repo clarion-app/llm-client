@@ -48,6 +48,7 @@ class McpResourceHandler
         $pageSize = config('llm-client.mcp.page_size', 50);
 
         $conversations = Conversation::query()
+            ->ownedByRealUser()
             ->where('user_id', $userId)
             ->withCount('messages')
             ->orderBy('updated_at', 'desc')
