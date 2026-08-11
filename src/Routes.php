@@ -158,6 +158,10 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Consistency checks (contracts/eval-judgments-api.md §3)
     Route::post('agent-eval-suites/{suiteId}/cases/{caseId}/consistency-checks', [EvalJudgmentController::class, "consistencyChecks"]);
     Route::get('agent-eval-suites/{suiteId}/cases/{caseId}/consistency-checks', [EvalJudgmentController::class, "listConsistencyChecks"]);
+
+    // Judgment detail and override (contracts/eval-judgments-api.md §2)
+    Route::get('eval-judgments/{judgmentId}', [EvalJudgmentController::class, "show"]);
+    Route::post('eval-judgments/{judgmentId}/override', [EvalJudgmentController::class, "override"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

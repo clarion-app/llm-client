@@ -64,4 +64,26 @@ class EvalJudgment extends Model
     {
         return $this->hasMany(EvalJudgmentOverride::class, 'judgment_id')->orderBy('created_at');
     }
+
+    /**
+     * This judgment's current effective (score, justification): the
+     * latest override if one exists, else the judgment's own original
+     * values. Computed from the eager-loaded overrides() relation — no
+     * new query per judgment when the caller has already eager-loaded it
+     * with with('overrides').
+     *
+     * @return array{score: ?int, justification: ?string, overridden: bool, overridden_by: ?string, overridden_at: ?string}
+     */
+    public function effective(): array
+    {
+        $latest = $this->overrides->sortByDesc('created_at')->first();
+
+        return [
+            'score' => $latest->score ?? $this->score,
+            'justification' => $latest->justification ?? $this->justification,
+            'overridden' => $latest !== null,
+            'overridden_by' => $latest->user_id ?? null,
+            'overridden_at' => optional($latest?->created_at)->toJSON(),
+        ];
+    }
 }

@@ -34,6 +34,12 @@ class EvalCaseResult extends Model
         'expectation_results',
         'error_message',
         'created_at',
+        // Additive, nullable — written only by EvalJudgmentOverrideService
+        // the moment an override on one of this result's judgments is
+        // recorded. The original outcome/expectation_results columns
+        // above are written exactly once, at case-execution time, and
+        // never touched again.
+        'outcome_override',
     ];
 
     protected $casts = [

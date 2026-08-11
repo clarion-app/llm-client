@@ -106,10 +106,16 @@ class EvalRunService
      */
     public function summarize(EvalRun $run): array
     {
+        // COALESCE(outcome_override, outcome): once a judgment on a case
+        // has been overridden, the case's effective outcome is the
+        // recomputed outcome_override, not the original, untouched
+        // outcome column (data-model.md §4/research.md D12) — every
+        // downstream reader of a case's "current" pass/fail state must
+        // agree on this, not only the per-case detail endpoint.
         $counts = DB::table('eval_case_results')
             ->where('run_id', $run->id)
-            ->selectRaw('outcome, COUNT(*) as total')
-            ->groupBy('outcome')
+            ->selectRaw('COALESCE(outcome_override, outcome) as outcome, COUNT(*) as total')
+            ->groupBy(DB::raw('COALESCE(outcome_override, outcome)'))
             ->pluck('total', 'outcome')
             ->all();
 

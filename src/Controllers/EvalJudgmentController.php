@@ -9,7 +9,9 @@ use ClarionApp\LlmClient\Models\EvalCase;
 use ClarionApp\LlmClient\Models\EvalCaseResult;
 use ClarionApp\LlmClient\Models\EvalJudgment;
 use ClarionApp\LlmClient\Models\EvalJudgmentConsistencySample;
+use ClarionApp\LlmClient\Models\EvalJudgmentOverride;
 use ClarionApp\LlmClient\Services\EvalJudgmentConsistencyService;
+use ClarionApp\LlmClient\Services\EvalJudgmentOverrideService;
 use ClarionApp\LlmClient\Services\EvalSuiteService;
 use ClarionApp\LlmClient\Support\OperatorAccess;
 use ClarionApp\LlmClient\ValueObjects\ExpectationKind;
@@ -17,17 +19,75 @@ use Illuminate\Http\Request;
 
 /**
  * Operator-gated reads and writes for produced judgments and
- * operator-requested consistency checks. This file's own two actions —
- * consistencyChecks()/listConsistencyChecks() — cover consistency-check
- * requests; a judgment's own detail/override actions are added later,
- * extending this same file rather than a second controller.
+ * operator-requested consistency checks. consistencyChecks()/
+ * listConsistencyChecks() cover consistency-check requests; show()/
+ * override() cover reading a single judgment's full detail and
+ * recording an operator's correction to it.
  */
 class EvalJudgmentController extends Controller
 {
     public function __construct(
         private readonly EvalSuiteService $suiteService,
         private readonly EvalJudgmentConsistencyService $consistencyService,
+        private readonly EvalJudgmentOverrideService $overrideService,
     ) {}
+
+    public function show(string $judgmentId)
+    {
+        if (!OperatorAccess::isOperator(Auth::id())) {
+            return $this->forbidden();
+        }
+
+        $judgment = EvalJudgment::with('overrides')->find($judgmentId);
+
+        if ($judgment === null) {
+            return $this->notFound();
+        }
+
+        return response()->json($this->formatJudgment($judgment), 200);
+    }
+
+    public function override(Request $request, string $judgmentId)
+    {
+        if (!OperatorAccess::isOperator(Auth::id())) {
+            return $this->forbidden();
+        }
+
+        $judgment = EvalJudgment::with('overrides')->find($judgmentId);
+
+        if ($judgment === null) {
+            return $this->notFound();
+        }
+
+        if ($judgment->status === 'unjudged') {
+            return $this->unprocessable('An unjudged judgment cannot be overridden.');
+        }
+
+        $hasScore = $request->has('score') && $request->input('score') !== null;
+        $hasJustification = $request->has('justification') && $request->input('justification') !== null;
+
+        if (!$hasScore && !$hasJustification) {
+            return $this->unprocessable('score or justification is required.');
+        }
+
+        $scoreScaleMax = (int) config('llm-client.eval_judging.score_scale_max', 10);
+        $score = $hasScore ? (int) $request->input('score') : null;
+
+        if ($score !== null && ($score < 1 || $score > $scoreScaleMax)) {
+            return $this->unprocessable("score must be between 1 and {$scoreScaleMax}.");
+        }
+
+        $justification = $hasJustification ? (string) $request->input('justification') : null;
+
+        $this->overrideService->override($judgment, $score, $justification, (string) Auth::id());
+
+        // The judgment's overrides relation was mutated by the service
+        // call above (a new row now exists) — reload it before rendering
+        // so `effective`/`overrides` reflect the just-recorded correction.
+        $judgment->load('overrides');
+
+        return response()->json($this->formatJudgment($judgment), 200);
+    }
 
     public function consistencyChecks(Request $request, string $suiteId, string $caseId)
     {
@@ -120,6 +180,38 @@ class EvalJudgmentController extends Controller
             ->values();
 
         return response()->json(['data' => $samples], 200);
+    }
+
+    private function formatJudgment(EvalJudgment $judgment): array
+    {
+        return [
+            'id' => $judgment->id,
+            'eval_case_result_id' => $judgment->eval_case_result_id,
+            'eval_case_version_id' => $judgment->eval_case_version_id,
+            'expectation_index' => $judgment->expectation_index,
+            'criteria' => $judgment->criteria,
+            'response_text' => $judgment->response_text,
+            'status' => $judgment->status,
+            'score' => $judgment->score,
+            'justification' => $judgment->justification,
+            'unjudged_reason' => $judgment->unjudged_reason,
+            'model' => $judgment->model,
+            'server_id' => $judgment->server_id,
+            'conversation_id' => $judgment->conversation_id,
+            'consistency_sample_id' => $judgment->consistency_sample_id,
+            'created_at' => Carbon::parse($judgment->created_at)->toJSON(),
+            'effective' => $judgment->effective(),
+            'overrides' => $judgment->overrides
+                ->map(fn (EvalJudgmentOverride $override) => [
+                    'id' => $override->id,
+                    'user_id' => $override->user_id,
+                    'score' => $override->score,
+                    'justification' => $override->justification,
+                    'created_at' => Carbon::parse($override->created_at)->toJSON(),
+                ])
+                ->values()
+                ->all(),
+        ];
     }
 
     private function formatSample(EvalJudgmentConsistencySample $sample): array

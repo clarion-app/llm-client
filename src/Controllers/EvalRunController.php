@@ -207,6 +207,7 @@ class EvalRunController extends Controller
             'eval_case_id' => $result->eval_case_id,
             'eval_case_version_id' => $result->eval_case_version_id,
             'outcome' => $result->outcome->value,
+            'outcome_override' => $result->outcome_override,
             'produced_response' => $result->produced_response,
             'attempted_actions' => $result->attempted_actions,
             'expectation_results' => $result->expectation_results,

@@ -30,6 +30,14 @@ class EvalJudgmentOverride extends Model
         'created_at',
     ];
 
+    // $timestamps = false above means Eloquent's default date-casting for
+    // created_at (which only kicks in when timestamps are enabled) never
+    // applies here — cast it explicitly so callers reading created_at get
+    // a Carbon instance, not a raw DB string (the EvalCaseResult precedent).
+    protected $casts = [
+        'created_at' => 'datetime',
+    ];
+
     protected static function booted(): void
     {
         static::creating(function ($model) {
