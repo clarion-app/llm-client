@@ -269,6 +269,7 @@ abstract class TestCase extends BaseTestCase
 
         $this->defineBudgetSchema();
         $this->defineEvalSuiteSchema();
+        $this->defineEvalRunSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -668,6 +669,74 @@ abstract class TestCase extends BaseTestCase
                 $table->softDeletes();
 
                 $table->unique(['case_id', 'version_number']);
+            });
+        }
+    }
+
+    /**
+     * The three tables the batch evaluation runner reads and writes —
+     * eval_runs, eval_run_cases (the per-run case snapshot), and
+     * eval_case_results (the durable, operator-facing outcome of one
+     * case within one run). Mirrors data-model.md §§1-3 exactly. Guarded
+     * by Schema::hasTable() like every existing block here, and called
+     * from defineDatabaseMigrations() directly, matching
+     * defineEvalSuiteSchema()'s own call-site pattern.
+     */
+    protected function defineEvalRunSchema(): void
+    {
+        if (!Schema::hasTable('eval_runs')) {
+            Schema::create('eval_runs', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('suite_id');
+                $table->string('agent_label', 255);
+                $table->uuid('server_id')->nullable();
+                $table->string('model', 255)->nullable();
+                $table->string('status', 30);
+                $table->unsignedInteger('case_count');
+                $table->text('failure_reason')->nullable();
+                $table->timestamp('started_at');
+                $table->timestamp('completed_at')->nullable();
+                $table->timestamps();
+
+                $table->index('suite_id');
+                $table->index(['status', 'updated_at']);
+            });
+        }
+
+        if (!Schema::hasTable('eval_run_cases')) {
+            Schema::create('eval_run_cases', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('run_id');
+                $table->uuid('eval_case_id');
+                $table->uuid('eval_case_version_id');
+                $table->unsignedInteger('position');
+                $table->string('status', 20);
+                $table->unsignedInteger('dispatch_attempts')->default(0);
+                $table->timestamps();
+
+                $table->unique(['run_id', 'eval_case_id']);
+                $table->index(['run_id', 'status']);
+            });
+        }
+
+        if (!Schema::hasTable('eval_case_results')) {
+            Schema::create('eval_case_results', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('run_id');
+                $table->uuid('eval_run_case_id');
+                $table->uuid('eval_case_id');
+                $table->uuid('eval_case_version_id');
+                $table->uuid('conversation_id');
+                $table->string('outcome', 20);
+                $table->text('produced_response')->nullable();
+                $table->json('attempted_actions')->default('[]');
+                $table->json('expectation_results');
+                $table->text('error_message')->nullable();
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->unique(['run_id', 'eval_case_id']);
+                $table->index('run_id');
+                $table->index('conversation_id');
             });
         }
     }
