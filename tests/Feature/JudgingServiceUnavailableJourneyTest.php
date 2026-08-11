@@ -252,6 +252,20 @@ class JudgingServiceUnavailableJourneyTest extends TestCase
         $runDetail = $this->actingAs($this->operator)->getJson($this->runsBase().'/'.$runId)->assertStatus(200)->json();
         $this->assertSame('completed', $runDetail['status'], 'a judging-side failure must never prevent the run from completing');
 
+        // The run-level rollup must not launder the case-level honesty
+        // away: an unscored case is counted as unscored and nothing else,
+        // and the run it belongs to never reports itself as an outright
+        // pass (SC-004 at the level an operator actually reads).
+        $this->assertSame(0, $runDetail['outcome_counts']['pass']);
+        $this->assertSame(0, $runDetail['outcome_counts']['fail']);
+        $this->assertGreaterThan(0, $runDetail['outcome_counts']['unjudged']);
+        $this->assertSame('unjudged', $runDetail['overall']);
+        $this->assertSame(
+            $runDetail['case_count'],
+            $runDetail['completed_count'],
+            'an unjudged case is finished work — the run must not report it as still outstanding',
+        );
+
         $cases = $this->getRunCases($runId);
         $result = collect($cases['data'])->firstWhere('eval_case_id', $caseId);
 

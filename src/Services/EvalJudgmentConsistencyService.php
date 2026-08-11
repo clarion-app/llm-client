@@ -59,7 +59,12 @@ final class EvalJudgmentConsistencyService
             );
 
             app(EvalJudgmentService::class)->record(
-                (string) Str::uuid(),
+                // Time-ordered for the same reason the sample's own id is:
+                // every repeat in a sample lands within the same
+                // second-precision created_at, and a reader pairing a
+                // repeat with its place in `scores` needs them back in the
+                // order they were produced.
+                (string) Str::orderedUuid(),
                 null,
                 $version->id,
                 $expectationIndex,

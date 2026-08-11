@@ -102,7 +102,7 @@ class EvalRunService
      * §5) — never a stored column, computed fresh from eval_case_results
      * on every call.
      *
-     * @return array{total: int, pass: int, fail: int, needs_human_review: int, errored: int, completed_count: int, remaining_count: int, overall: ?string}
+     * @return array{total: int, pass: int, fail: int, needs_human_review: int, errored: int, unjudged: int, completed_count: int, remaining_count: int, overall: ?string}
      */
     public function summarize(EvalRun $run): array
     {
@@ -123,11 +123,25 @@ class EvalRunService
         $fail = (int) ($counts['fail'] ?? 0);
         $needsHumanReview = (int) ($counts['needs_human_review'] ?? 0);
         $errored = (int) ($counts['errored'] ?? 0);
-        $completedCount = $pass + $fail + $needsHumanReview + $errored;
+        // A case whose rubric expectation could not be scored is completed
+        // — it has a written result row like any other — it simply landed
+        // on an outcome that is neither a pass nor a fail. Leaving it out
+        // of this total would leave the run permanently reporting work
+        // still remaining that has in fact already been done.
+        $unjudged = (int) ($counts['unjudged'] ?? 0);
+        $completedCount = $pass + $fail + $needsHumanReview + $errored + $unjudged;
 
+        // A run-level rollup over many cases' already-computed outcomes —
+        // a different aggregation axis from EvalCaseOutcome::aggregate()'s
+        // within-one-case rule, and deliberately ordered differently: a
+        // real failure or an execution error anywhere in the run outranks
+        // everything, and an unscored case sits directly beneath it,
+        // above the by-design "a human must decide" state. An unjudged
+        // case must never let a run report itself as an outright pass.
         $overall = match (true) {
             $run->status !== EvalRunStatus::Completed => null,
             $fail > 0 || $errored > 0 => 'fail',
+            $unjudged > 0 => 'unjudged',
             $needsHumanReview > 0 => 'needs_human_review',
             default => 'pass',
         };
@@ -138,6 +152,7 @@ class EvalRunService
             'fail' => $fail,
             'needs_human_review' => $needsHumanReview,
             'errored' => $errored,
+            'unjudged' => $unjudged,
             'completed_count' => $completedCount,
             'remaining_count' => $run->case_count - $completedCount,
             'overall' => $overall,

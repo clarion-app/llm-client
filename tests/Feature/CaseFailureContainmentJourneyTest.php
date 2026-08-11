@@ -287,7 +287,10 @@ class CaseFailureContainmentJourneyTest extends TestCase
 
         $run = $this->getRun($runId);
         $this->assertSame('completed', $run['status'], 'the run as a whole must reach completed, not stuck or aborted by either problem case (SC-004)');
-        $this->assertSame(['pass' => 1, 'fail' => 0, 'needs_human_review' => 0, 'errored' => 2], $run['outcome_counts']);
+        $this->assertSame(
+            ['pass' => 1, 'fail' => 0, 'needs_human_review' => 0, 'errored' => 2, 'unjudged' => 0],
+            $run['outcome_counts'],
+        );
 
         $cases = $this->getRunCases($runId);
         $byCaseId = collect($cases['data'])->keyBy('eval_case_id');

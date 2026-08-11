@@ -60,9 +60,18 @@ class EvalJudgment extends Model
         });
     }
 
+    /**
+     * Oldest correction first — the order a reader wants when looking at
+     * a judgment's full history. `id` is the tie-break because
+     * eval_judgment_overrides.created_at is only second-precision while
+     * its id is time-ordered, so two corrections recorded within the same
+     * second still sort in the order they were actually made.
+     */
     public function overrides(): HasMany
     {
-        return $this->hasMany(EvalJudgmentOverride::class, 'judgment_id')->orderBy('created_at');
+        return $this->hasMany(EvalJudgmentOverride::class, 'judgment_id')
+            ->orderBy('created_at')
+            ->orderBy('id');
     }
 
     /**
@@ -76,7 +85,15 @@ class EvalJudgment extends Model
      */
     public function effective(): array
     {
-        $latest = $this->overrides->sortByDesc('created_at')->first();
+        // Sorted here rather than trusting the caller's load order, and
+        // by (created_at, id) rather than created_at alone — a plain
+        // created_at sort leaves two corrections made within the same
+        // wall-clock second tied, and a stable sort then hands back the
+        // *earliest* of them, silently reinstating a correction the
+        // operator has already superseded.
+        $latest = $this->overrides
+            ->sortBy([['created_at', 'asc'], ['id', 'asc']])
+            ->last();
 
         return [
             'score' => $latest->score ?? $this->score,

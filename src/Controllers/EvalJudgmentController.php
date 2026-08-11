@@ -60,21 +60,21 @@ class EvalJudgmentController extends Controller
         }
 
         if ($judgment->status === 'unjudged') {
-            return $this->unprocessable('An unjudged judgment cannot be overridden.');
+            return $this->unprocessable('An unjudged judgment cannot be overridden.', 'override');
         }
 
         $hasScore = $request->has('score') && $request->input('score') !== null;
         $hasJustification = $request->has('justification') && $request->input('justification') !== null;
 
         if (!$hasScore && !$hasJustification) {
-            return $this->unprocessable('score or justification is required.');
+            return $this->unprocessable('score or justification is required.', 'override');
         }
 
         $scoreScaleMax = (int) config('llm-client.eval_judging.score_scale_max', 10);
         $score = $hasScore ? (int) $request->input('score') : null;
 
         if ($score !== null && ($score < 1 || $score > $scoreScaleMax)) {
-            return $this->unprocessable("score must be between 1 and {$scoreScaleMax}.");
+            return $this->unprocessable("score must be between 1 and {$scoreScaleMax}.", 'score');
         }
 
         $justification = $hasJustification ? (string) $request->input('justification') : null;
@@ -232,8 +232,13 @@ class EvalJudgmentController extends Controller
             'flag_threshold_used' => $sample->flag_threshold_used,
             'requested_by' => $sample->requested_by,
             'created_at' => Carbon::parse($sample->created_at)->toJSON(),
+            // Ordered by id as well as created_at: a sample's repeats all
+            // land within the same second-precision created_at, and their
+            // ids are minted time-ordered precisely so "the order they
+            // were produced" survives that.
             'judgment_ids' => EvalJudgment::where('consistency_sample_id', $sample->id)
                 ->orderBy('created_at')
+                ->orderBy('id')
                 ->pluck('id')
                 ->values()
                 ->all(),
@@ -250,11 +255,17 @@ class EvalJudgmentController extends Controller
         return response()->json(['message' => 'Not found.'], 404);
     }
 
-    private function unprocessable(string $message)
+    /**
+     * The 422 shape 077/078's controllers already return. $field names
+     * the thing the caller got wrong so a client rendering field-level
+     * errors puts the message somewhere sensible — an override's
+     * rejection is not a consistency-check error.
+     */
+    private function unprocessable(string $message, string $field = 'consistency_check')
     {
         return response()->json([
             'message' => $message,
-            'errors' => ['consistency_check' => [$message]],
+            'errors' => [$field => [$message]],
         ], 422);
     }
 }

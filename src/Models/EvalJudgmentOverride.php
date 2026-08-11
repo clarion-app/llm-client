@@ -42,7 +42,14 @@ class EvalJudgmentOverride extends Model
     {
         static::creating(function ($model) {
             if (!$model->id) {
-                $model->id = (string) \Illuminate\Support\Str::uuid();
+                // A time-ordered UUID rather than a plain random one: this
+                // table's created_at column is only second-precision, so
+                // two corrections to the same judgment within one second
+                // are indistinguishable by timestamp alone. The id's own
+                // byte layout carries the ordering "which correction came
+                // last" depends on, portable across every supported
+                // database.
+                $model->id = (string) \Illuminate\Support\Str::orderedUuid();
             }
 
             if (!$model->created_at) {

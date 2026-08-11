@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Services\EvalRunConsumptionQuery;
 use ClarionApp\LlmClient\Services\EvalRunService;
 use ClarionApp\LlmClient\Services\EvalSuiteService;
 use ClarionApp\LlmClient\Support\OperatorAccess;
+use ClarionApp\LlmClient\ValueObjects\ConsumptionSummary;
 use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use Illuminate\Http\Request;
 use Auth;
@@ -173,8 +174,23 @@ class EvalRunController extends Controller
     private function formatRunDetail(EvalRun $run): array
     {
         $summary = $this->service->summarize($run);
-        $consumption = $this->consumptionQuery->summarize($run);
+        $agentConsumption = $this->consumptionQuery->summarize($run);
         $judging = $this->consumptionQuery->summarizeJudging($run);
+
+        // One object carrying both figures, never summed together: the
+        // agent-under-test's own five fields are exactly what
+        // summarize() produced, and judging's four sit alongside them.
+        $consumption = new ConsumptionSummary(
+            totalCost: $agentConsumption->totalCost,
+            totalTokens: $agentConsumption->totalTokens,
+            toolInvocationCount: $agentConsumption->toolInvocationCount,
+            totalDurationMs: $agentConsumption->totalDurationMs,
+            costUnpriced: $agentConsumption->costUnpriced,
+            judgingCost: $judging['cost'],
+            judgingTokens: $judging['tokens'],
+            judgingInvocationCount: $judging['invocationCount'],
+            judgingCostUnpriced: $judging['costUnpriced'],
+        );
 
         return array_merge($this->formatRunSummary($run), [
             'failure_reason' => $run->failure_reason,
@@ -184,6 +200,10 @@ class EvalRunController extends Controller
                 'fail' => $summary['fail'],
                 'needs_human_review' => $summary['needs_human_review'],
                 'errored' => $summary['errored'],
+                // A case whose rubric expectation could not be scored is
+                // counted here and nowhere else — never folded into pass
+                // or fail.
+                'unjudged' => $summary['unjudged'],
             ],
             'consumption' => [
                 'total_cost' => $consumption->totalCost,
@@ -197,10 +217,10 @@ class EvalRunController extends Controller
                 // above — always present, an all-zero object when nothing
                 // was judged, never an absent key.
                 'judging' => [
-                    'total_cost' => $judging['cost'],
-                    'total_tokens' => $judging['tokens'],
-                    'invocation_count' => $judging['invocationCount'],
-                    'cost_unpriced' => $judging['costUnpriced'],
+                    'total_cost' => $consumption->judgingCost,
+                    'total_tokens' => $consumption->judgingTokens,
+                    'invocation_count' => $consumption->judgingInvocationCount,
+                    'cost_unpriced' => $consumption->judgingCostUnpriced,
                 ],
             ],
         ]);

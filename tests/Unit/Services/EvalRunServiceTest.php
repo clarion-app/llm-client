@@ -287,4 +287,51 @@ class EvalRunServiceTest extends TestCase
 
         $this->assertSame('pass', $summary['overall']);
     }
+
+    #[Test]
+    public function summarize_counts_an_unjudged_case_as_completed_and_never_reports_the_run_as_an_outright_pass(): void
+    {
+        $run = $this->makeRun(EvalRunStatus::Completed, 2);
+        $this->makeResult($run, EvalCaseOutcome::Pass);
+        $this->makeResult($run, EvalCaseOutcome::Unjudged);
+
+        $summary = app(EvalRunService::class)->summarize($run);
+
+        $this->assertSame(1, $summary['unjudged']);
+        $this->assertSame(
+            2,
+            $summary['completed_count'],
+            'an unjudged case has a written result row like any other — leaving it out would report work still remaining that is already done'
+        );
+        $this->assertSame(0, $summary['remaining_count']);
+        $this->assertSame(
+            'unjudged',
+            $summary['overall'],
+            'a run containing a case the judge could never score must never roll up to an outright pass'
+        );
+    }
+
+    #[Test]
+    public function summarize_keeps_fail_ahead_of_unjudged_and_unjudged_ahead_of_needs_human_review(): void
+    {
+        $failing = $this->makeRun(EvalRunStatus::Completed, 2);
+        $this->makeResult($failing, EvalCaseOutcome::Fail);
+        $this->makeResult($failing, EvalCaseOutcome::Unjudged);
+
+        $this->assertSame(
+            'fail',
+            app(EvalRunService::class)->summarize($failing)['overall'],
+            'a real, known failure elsewhere in the run outranks a case the judge could not score'
+        );
+
+        $unscored = $this->makeRun(EvalRunStatus::Completed, 2);
+        $this->makeResult($unscored, EvalCaseOutcome::NeedsHumanReview);
+        $this->makeResult($unscored, EvalCaseOutcome::Unjudged);
+
+        $this->assertSame(
+            'unjudged',
+            app(EvalRunService::class)->summarize($unscored)['overall'],
+            'an unknown outranks a by-design "a human must decide"'
+        );
+    }
 }

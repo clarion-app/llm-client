@@ -200,6 +200,38 @@ class EvalJudgmentOverrideServiceTest extends TestCase
         );
     }
 
+    #[Test]
+    public function a_third_override_in_the_same_second_still_defaults_from_the_second_not_the_first(): void
+    {
+        // eval_judgment_overrides.created_at is second-precision, so all
+        // three corrections below share a timestamp. "Latest override
+        // wins" must still mean the one actually made last — ordering by
+        // created_at alone leaves them tied and hands back the earliest.
+        $judgment = $this->makeJudgment(score: 8, justification: 'Original automated justification.');
+
+        $this->service()->override($judgment, 5, 'First correction.', (string) Str::uuid());
+        $this->service()->override($judgment, 4, 'Second correction.', (string) Str::uuid());
+
+        $third = $this->service()->override($judgment, null, 'Third correction.', (string) Str::uuid());
+
+        $this->assertSame(
+            4,
+            $third->score,
+            'the third override must default its omitted score from the second override (4), not the first (5)',
+        );
+
+        $judgment->load('overrides');
+        $effective = $judgment->effective();
+
+        $this->assertSame(4, $effective['score']);
+        $this->assertSame('Third correction.', $effective['justification']);
+        $this->assertSame(
+            ['First correction.', 'Second correction.', 'Third correction.'],
+            $judgment->overrides->pluck('justification')->all(),
+            'the override history must read oldest-first even when every row shares a created_at second',
+        );
+    }
+
     // ---------------------------------------------------------------
     // outcome_override recomputation via EvalCaseOutcome::aggregate()
     // ---------------------------------------------------------------
