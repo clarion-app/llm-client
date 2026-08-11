@@ -268,6 +268,7 @@ abstract class TestCase extends BaseTestCase
         }
 
         $this->defineBudgetSchema();
+        $this->defineEvalSuiteSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -615,6 +616,58 @@ abstract class TestCase extends BaseTestCase
                     ['scope_type', 'scope_id', 'period_type', 'period_start', 'kind'],
                     'budget_threshold_notifications_latch_unique'
                 );
+            });
+        }
+    }
+
+    /**
+     * The three tables agent behavior test suite definitions read and
+     * write — eval_suites, eval_cases (the identity/version split's stable
+     * half), and eval_case_versions (the append-only content half).
+     * Mirrors data-model.md §§1-3 exactly. Guarded by Schema::hasTable()
+     * like every existing block here, and called from
+     * defineDatabaseMigrations() directly, matching defineBudgetSchema()'s
+     * own call-site pattern.
+     */
+    protected function defineEvalSuiteSchema(): void
+    {
+        if (!Schema::hasTable('eval_suites')) {
+            Schema::create('eval_suites', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('name', 255);
+                $table->string('agent_identifier', 255);
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index(['agent_identifier', 'name']);
+            });
+        }
+
+        if (!Schema::hasTable('eval_cases')) {
+            Schema::create('eval_cases', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('suite_id');
+                $table->uuid('current_version_id')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index('suite_id');
+                $table->index('current_version_id');
+            });
+        }
+
+        if (!Schema::hasTable('eval_case_versions')) {
+            Schema::create('eval_case_versions', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('case_id');
+                $table->unsignedInteger('version_number');
+                $table->text('given');
+                $table->text('expected_behavior');
+                $table->json('expectations');
+                $table->timestamp('created_at')->useCurrent();
+                $table->softDeletes();
+
+                $table->unique(['case_id', 'version_number']);
             });
         }
     }

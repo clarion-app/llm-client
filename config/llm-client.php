@@ -486,6 +486,25 @@ return [
         'degraded_notice_throttle_seconds' => env('LLM_CLIENT_BUDGET_DEGRADED_THROTTLE', 60),
     ],
 
+    // Agent behavior test suite definitions — bounds applied both at
+    // authoring time (EvalCaseService/EvalSuiteService) and on import
+    // (EvalSuiteImporter, where the document may originate outside the
+    // installation and is untrusted input). One rule set, not two: a case
+    // an operator could create by hand is exactly the set of cases an
+    // import can recreate. No master on/off toggle — there is no "off"
+    // question for eval suites the way there is for budget enforcement.
+    'eval_suites' => [
+        'max_cases_per_suite' => 200,
+        'max_expectations_per_case' => 20,
+        'max_text_length' => 10000,       // given / expected_behavior / expectation text fields
+        'max_identifier_length' => 255,   // name / agent_identifier
+
+        // schema_version values this installation's importer accepts. A
+        // version outside this set is rejected with a clear reason rather
+        // than guessed at.
+        'supported_export_schema_versions' => [1],
+    ],
+
     // Response latency distributions — per-model and per-agent percentile
     // figures computed at read time from agent_runs.
     'latency' => [
