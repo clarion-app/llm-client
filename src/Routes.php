@@ -27,6 +27,7 @@ use ClarionApp\LlmClient\Controllers\EvalSuiteController;
 use ClarionApp\LlmClient\Controllers\EvalCaseController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
 use ClarionApp\LlmClient\Controllers\EvalRunController;
+use ClarionApp\LlmClient\Controllers\EvalJudgmentController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -153,6 +154,10 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('eval-runs/{runId}', [EvalRunController::class, "show"]);
     Route::get('eval-runs/{runId}/cases', [EvalRunController::class, "cases"]);
     Route::post('eval-runs/{runId}/resume', [EvalRunController::class, "resume"]);
+
+    // Consistency checks (contracts/eval-judgments-api.md §3)
+    Route::post('agent-eval-suites/{suiteId}/cases/{caseId}/consistency-checks', [EvalJudgmentController::class, "consistencyChecks"]);
+    Route::get('agent-eval-suites/{suiteId}/cases/{caseId}/consistency-checks', [EvalJudgmentController::class, "listConsistencyChecks"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
