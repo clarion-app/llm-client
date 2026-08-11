@@ -174,6 +174,7 @@ class EvalRunController extends Controller
     {
         $summary = $this->service->summarize($run);
         $consumption = $this->consumptionQuery->summarize($run);
+        $judging = $this->consumptionQuery->summarizeJudging($run);
 
         return array_merge($this->formatRunSummary($run), [
             'failure_reason' => $run->failure_reason,
@@ -191,6 +192,16 @@ class EvalRunController extends Controller
                 'total_tokens' => $consumption->totalTokens,
                 'tool_invocation_count' => $consumption->toolInvocationCount,
                 'total_duration_ms' => $consumption->totalDurationMs,
+                // What rubric-based judging itself consumed for this run,
+                // kept visibly separate from the agent-under-test figures
+                // above — always present, an all-zero object when nothing
+                // was judged, never an absent key.
+                'judging' => [
+                    'total_cost' => $judging['cost'],
+                    'total_tokens' => $judging['tokens'],
+                    'invocation_count' => $judging['invocationCount'],
+                    'cost_unpriced' => $judging['costUnpriced'],
+                ],
             ],
         ]);
     }

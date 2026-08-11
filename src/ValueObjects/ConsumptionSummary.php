@@ -22,6 +22,14 @@ final class ConsumptionSummary
         // True if any contributing UsageRecord.cost_unpriced is true (076
         // precedent — never silently drop the caveat).
         public readonly bool $costUnpriced,
+        // What rubric-based judging itself consumed for this run, kept
+        // entirely separate from the five agent-under-test fields above —
+        // never merged into them. Defaulted so no existing call site
+        // building a ConsumptionSummary without these breaks.
+        public readonly string $judgingCost = '0.0000000000',
+        public readonly int $judgingTokens = 0,
+        public readonly int $judgingInvocationCount = 0,
+        public readonly bool $judgingCostUnpriced = false,
     ) {
     }
 }

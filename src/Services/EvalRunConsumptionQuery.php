@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Models\EvalCaseResult;
+use ClarionApp\LlmClient\Models\EvalJudgment;
 use ClarionApp\LlmClient\Models\EvalRun;
 use ClarionApp\LlmClient\Models\ToolInvocationRecord;
 use ClarionApp\LlmClient\Models\UsageRecord;
@@ -66,5 +67,49 @@ class EvalRunConsumptionQuery
             totalDurationMs: $totalDurationMs,
             costUnpriced: (bool) ($usage->any_unpriced ?? false),
         );
+    }
+
+    /**
+     * What rubric-based judging itself consumed for this run — resolved via
+     * the run's own eval_case_results rows, then eval_judgments.conversation_id
+     * (the judge's own dedicated conversation), never via user_id. Kept
+     * entirely separate from summarize()'s agent-under-test figures: no tool
+     * invocation or agent_runs duration is summed here, since a judge call
+     * never invokes a tool and its latency is not agent work duration.
+     *
+     * @return array{cost: string, tokens: int, invocationCount: int, costUnpriced: bool}
+     */
+    public function summarizeJudging(EvalRun $run): array
+    {
+        $caseResultIds = EvalCaseResult::where('run_id', $run->id)
+            ->pluck('id')
+            ->all();
+
+        $judgeConversationIds = EvalJudgment::whereIn('eval_case_result_id', $caseResultIds)
+            ->pluck('conversation_id')
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        if (empty($judgeConversationIds)) {
+            return [
+                'cost' => Decimal::round('0', self::COST_SCALE),
+                'tokens' => 0,
+                'invocationCount' => 0,
+                'costUnpriced' => false,
+            ];
+        }
+
+        $usage = UsageRecord::whereIn('conversation_id', $judgeConversationIds)
+            ->selectRaw('SUM(total_tokens) as tokens, SUM(total_cost) as cost, MAX(cost_unpriced) as any_unpriced, COUNT(*) as invocation_count')
+            ->first();
+
+        return [
+            'cost' => Decimal::round(Decimal::fromNumeric($usage->cost ?? '0'), self::COST_SCALE),
+            'tokens' => (int) ($usage->tokens ?? 0),
+            'invocationCount' => (int) ($usage->invocation_count ?? 0),
+            'costUnpriced' => (bool) ($usage->any_unpriced ?? false),
+        ];
     }
 }
