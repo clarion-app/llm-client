@@ -8,13 +8,18 @@ use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Jobs\RunEvalCaseJob;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\EvalCaseResult;
+use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\RoleAssignment;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\Services\CallValidatorInterface;
 use ClarionApp\LlmClient\Services\EvalCaseExecutor;
+use ClarionApp\LlmClient\Services\McpToolExecutor;
+use ClarionApp\LlmClient\Services\McpToolRegistry;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
@@ -487,5 +492,71 @@ class EvaluationIsolationJourneyTest extends TestCase
 
         $this->assertSame($countBefore, $countAfter);
         $this->assertNotEmpty($this->getRunCases($started['id'])['data']);
+    }
+
+    // ---------------------------------------------------------------
+    // The eval_run_simulating_tools Context flag must not leak into a
+    // later, unrelated call in the same PHP worker after an eval case
+    // has finished (mutation-checklist row 6, research.md D3's own
+    // `run_id` Context precedent). If the flag leaked, a real user's
+    // conversation processed by the same worker right after an eval case
+    // could have its tool calls wrongly simulated instead of really
+    // executed.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function the_simulating_tools_flag_does_not_leak_into_a_real_tool_call_made_after_an_eval_case_completes(): void
+    {
+        $started = $this->startRun($this->suiteId);
+        $this->driveDispatchedCaseJobsToCompletion();
+
+        // Belt: nothing real happened during the eval run itself (the
+        // same guarantee EvaluationIsolationJourneyTest's centerpiece
+        // test proves) — establishes the baseline before the leak check.
+        Http::assertNothingSent();
+
+        // Belt: the flag itself must be gone by the time control returns
+        // to this process after EvalCaseExecutor::execute()'s own
+        // try/finally.
+        $this->assertFalse(
+            Context::get('eval_run_simulating_tools', false),
+            'EvalCaseExecutor::execute() must clear the flag in its finally block, even after a case completes successfully',
+        );
+
+        // Suspenders — the genuinely discriminating half: a real,
+        // non-eval McpToolExecutor::executeTool() call made right
+        // afterward, in the same process, on the exact same 'allow'
+        // branch the eval run's own case just took, must reach the real
+        // executeHttpCall() — not be wrongly simulated because the flag
+        // leaked across the run/case boundary.
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.show')
+            ->andReturn([
+                'name' => 'contacts.show',
+                '_meta' => [
+                    'operationId' => 'showContact',
+                    'method' => 'GET',
+                    'path' => '/api/clarion-app/contacts/contact/{contact}',
+                ],
+            ]);
+
+        $validatorMock = Mockery::mock(CallValidatorInterface::class);
+        $validatorMock->shouldReceive('validate')->andReturn(['status' => 'allow']);
+
+        $session = McpSession::create([
+            'user_id' => $this->realTestUser->id,
+            'protocol_version' => '2025-03-26',
+        ]);
+
+        Http::fake([
+            '*' => Http::response(['data' => ['id' => 'abc', 'name' => 'Alice']], 200),
+        ]);
+
+        $executor = new McpToolExecutor($registryMock, $validatorMock, fn () => 'test-token');
+        $result = $executor->executeTool('contacts.show', ['path' => ['contact' => 'abc']], $session);
+
+        $this->assertFalse($result['isError']);
+        Http::assertSent(fn ($request) => str_contains($request->url(), '/contact/abc'));
     }
 }

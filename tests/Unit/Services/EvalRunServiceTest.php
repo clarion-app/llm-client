@@ -13,6 +13,7 @@ use ClarionApp\LlmClient\Services\EvalCaseService;
 use ClarionApp\LlmClient\Services\EvalRunService;
 use ClarionApp\LlmClient\Services\EvalSuiteService;
 use ClarionApp\LlmClient\ValueObjects\EvalCaseOutcome;
+use ClarionApp\LlmClient\ValueObjects\EvalRunCaseStatus;
 use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Str;
@@ -110,25 +111,51 @@ class EvalRunServiceTest extends TestCase
         $suite = $this->suite();
         $caseA = $this->addCase($suite, 'first given');
         $caseB = $this->addCase($suite, 'second given');
+        $caseC = $this->addCase($suite, 'third given');
 
         $run = app(EvalRunService::class)->start($suite);
 
         $this->assertSame(EvalRunStatus::InProgress, $run->status);
-        $this->assertSame(2, $run->case_count);
+        $this->assertSame(3, $run->case_count);
 
         // The snapshot rows exist and are correct regardless of whether
         // dispatch is faked/inspected — proving the write is not a side
         // effect of dispatching, but happens (and is durable) before it.
         $snapshotRows = EvalRunCase::where('run_id', $run->id)->orderBy('position')->get();
-        $this->assertCount(2, $snapshotRows);
+        $this->assertCount(3, $snapshotRows);
         $this->assertSame($caseA->id, $snapshotRows[0]->eval_case_id);
         $this->assertSame($caseA->current_version_id, $snapshotRows[0]->eval_case_version_id);
         $this->assertSame(0, $snapshotRows[0]->position);
         $this->assertSame($caseB->id, $snapshotRows[1]->eval_case_id);
         $this->assertSame($caseB->current_version_id, $snapshotRows[1]->eval_case_version_id);
         $this->assertSame(1, $snapshotRows[1]->position);
+        $this->assertSame($caseC->id, $snapshotRows[2]->eval_case_id);
+        $this->assertSame($caseC->current_version_id, $snapshotRows[2]->eval_case_version_id);
+        $this->assertSame(2, $snapshotRows[2]->position);
 
-        Bus::assertDispatchedTimes(RunEvalCaseJob::class, 2);
+        // mutation-checklist row 9's real, synchronously-provable target:
+        // "snapshot before dispatch" cannot be observed as literal
+        // wall-clock interleaving in a single-process test (dispatch is
+        // faked, so nothing ever actually races against the snapshot
+        // write) — but what it must guarantee for correctness is that,
+        // by the moment start() hands control back, the whole
+        // snapshot-then-dispatch cycle has completed as one atomic unit
+        // for every case, not just some. A partial/interleaved
+        // implementation — e.g. one that dispatches before the snapshot
+        // row it refers to is durably marked as dispatched, or that
+        // leaves a case behind mid-loop — would leave at least one row
+        // here still `pending` with `dispatch_attempts = 0` even though
+        // Bus recorded every dispatch call.
+        foreach ($snapshotRows as $row) {
+            $this->assertSame(
+                EvalRunCaseStatus::Dispatched,
+                $row->status,
+                "eval_run_case {$row->id} must already be marked dispatched by the time start() returns",
+            );
+            $this->assertSame(1, $row->dispatch_attempts);
+        }
+
+        Bus::assertDispatchedTimes(RunEvalCaseJob::class, 3);
     }
 
     // ---------------------------------------------------------------
