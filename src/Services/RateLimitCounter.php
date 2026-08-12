@@ -42,11 +42,27 @@ use Illuminate\Support\Facades\Log;
  * 2x pattern this codebase's BufferEvictionCounter already uses for its
  * own Cache::add()-then-increment() primitive.
  *
- * Any \Throwable from either Cache call yields RateLimitReading with
+ * A store that cannot be read or written yields RateLimitReading with
  * available = false and every other field genuinely null — never a
  * partial count, never a fabricated zero — and every occurrence is
  * logged. This class fails open unconditionally; that is not a decision
  * it makes, only a fact it reports for RateLimitGate to act on.
+ *
+ * "Cannot be read or written" covers two shapes, not one, and the second
+ * is easy to miss. Most stores signal failure by throwing, which the
+ * try/catch below handles. But several of Laravel's own stores report a
+ * failed increment by *return value* instead: `NullStore::increment()`
+ * always returns false, `DatabaseStore::increment()` returns false when
+ * the row is gone (evicted or expired between the add and the increment),
+ * and Memcached's `increment` returns false against an unreachable
+ * server. Taking that false at face value would produce a count of zero
+ * that reads as "this user has started no requests this window" — a
+ * fabricated figure that always compares under any limit, so enforcement
+ * would silently stop with no exception raised, no warning logged, and
+ * nothing anywhere recording that the count was never actually measured.
+ * That is a strictly worse failure than the deliberate fail-open, which
+ * is why a non-numeric increment result is treated as unavailable and
+ * logged like any other outage.
  */
 class RateLimitCounter
 {
@@ -65,10 +81,21 @@ class RateLimitCounter
             $store->add($key, 0, $ttl);
             $count = $store->increment($key);
 
+            // A store that reports failure by returning false rather than by
+            // throwing. Not a count of zero — no count at all.
+            if (!is_numeric($count)) {
+                return $this->unavailable(
+                    $userId,
+                    $windowSeconds,
+                    $windowStart,
+                    'the store returned no count from increment()',
+                );
+            }
+
             $windowStartAt = Carbon::createFromTimestamp($windowStart)->toImmutable();
 
             return new RateLimitReading(
-                count: $count,
+                count: (int) $count,
                 maxRequests: null,
                 windowSeconds: $windowSeconds,
                 windowStart: $windowStartAt,
@@ -76,18 +103,29 @@ class RateLimitCounter
                 available: true,
             );
         } catch (\Throwable $e) {
-            // Never a zero and never a partial figure: a zero would read
-            // as "no requests yet" and let a caller reason about a count
-            // that was never actually measured. Every occurrence is
-            // logged, even though it is never itself a refusal.
-            Log::warning('Rate limit counter could not be read or written', [
-                'user_id' => $userId,
-                'window_seconds' => $windowSeconds,
-                'window_start' => $windowStart,
-                'error' => $e->getMessage(),
-            ]);
-
-            return RateLimitReading::unavailable();
+            return $this->unavailable($userId, $windowSeconds, $windowStart, $e->getMessage());
         }
+    }
+
+    /**
+     * Report an unmeasurable window: never a zero and never a partial
+     * figure, because a zero would read as "no requests yet" and let a
+     * caller reason about a count that was never actually taken. Every
+     * occurrence is logged, even though it is never itself a refusal.
+     */
+    private function unavailable(
+        string $userId,
+        int $windowSeconds,
+        int $windowStart,
+        string $error,
+    ): RateLimitReading {
+        Log::warning('Rate limit counter could not be read or written', [
+            'user_id' => $userId,
+            'window_seconds' => $windowSeconds,
+            'window_start' => $windowStart,
+            'error' => $error,
+        ]);
+
+        return RateLimitReading::unavailable();
     }
 }

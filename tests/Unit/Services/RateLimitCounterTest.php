@@ -172,6 +172,36 @@ class RateLimitCounterTest extends TestCase
         });
     }
 
+    /**
+     * The failure shape that does not throw. Laravel's own NullStore always
+     * returns false from increment(); DatabaseStore returns false when the
+     * row is gone between the add and the increment; Memcached returns
+     * false against an unreachable server. Read at face value, false
+     * becomes an integer 0 — a count that was never taken, presented as a
+     * real measurement of "no requests yet", which compares under every
+     * possible limit. Enforcement would then stop silently: no exception,
+     * no warning, and a reading that claims to be available.
+     */
+    #[Test]
+    public function increment_fails_open_and_logs_when_the_store_reports_failure_by_returning_false(): void
+    {
+        $this->assertFailsOpenAndLogs(function () {
+            return new class implements Store {
+                public function get($key) { return null; }
+                public function many(array $keys) { return array_fill_keys($keys, null); }
+                public function put($key, $value, $seconds) { return true; }
+                public function putMany(array $values, $seconds) { return true; }
+                public function add($key, $value, $seconds) { return true; }
+                public function increment($key, $value = 1) { return false; }
+                public function decrement($key, $value = 1) { return false; }
+                public function forever($key, $value) { return true; }
+                public function forget($key) { return true; }
+                public function flush() { return true; }
+                public function getPrefix() { return ''; }
+            };
+        });
+    }
+
     private function assertFailsOpenAndLogs(\Closure $makeStore): void
     {
         static $driverSuffix = 0;
