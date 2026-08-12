@@ -179,6 +179,10 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     // Agent quality dashboard overview (contracts/eval-dashboard-api.md §1)
     Route::get('agent-eval-dashboard/{agentLabel}', [EvalDashboardController::class, "index"]);
+
+    // Case detail composition — given/expected_behavior/produced_response/
+    // judgment reasoning (contracts/eval-dashboard-api.md §2)
+    Route::get('eval-runs/{runId}/cases/{caseResultId}/detail', [EvalDashboardController::class, "caseDetail"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
