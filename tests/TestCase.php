@@ -271,6 +271,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineReservationSchema();
         $this->defineRateLimitSchema();
         $this->defineConversationWorkSchema();
+        $this->defineDegradationSchema();
         $this->defineEvalSuiteSchema();
         $this->defineEvalRunSchema();
         $this->defineEvalJudgmentSchema();
@@ -738,6 +739,74 @@ abstract class TestCase extends BaseTestCase
 
                 // Plain index, not unique — see the migration's own comment.
                 $table->index(['scope_type', 'scope_id']);
+            });
+        }
+    }
+
+    /**
+     * The three degradation tables (reduction_steps, degradation_events,
+     * degradation_summaries) — Constitution §V, no migrations run under
+     * test. Column shapes mirror the migrations exactly. Every entry-path
+     * test that exercises AgentLoopService::admitInteractiveWork() now
+     * potentially crosses DegradationGate's deepened, ladder-aware path
+     * once a ladder is configured in a fixture, so a schema without these
+     * three tables no longer describes a deployment this package can run
+     * in.
+     *
+     * Extracted, guarded by Schema::hasTable(), and called from
+     * defineDatabaseMigrations() directly, matching
+     * defineConversationWorkSchema()'s own shape and call-site pattern so
+     * the same handful of test classes that hand-declare a schema of their
+     * own can call it too.
+     */
+    protected function defineDegradationSchema(): void
+    {
+        if (!Schema::hasTable('reduction_steps')) {
+            Schema::create('reduction_steps', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('axis', 20);
+                $table->decimal('threshold_ratio', 5, 4);
+                $table->string('substitute_model')->nullable();
+                $table->uuid('substitute_server_id')->nullable();
+                $table->json('withheld_tools')->nullable();
+                $table->decimal('history_budget_ratio', 5, 4)->nullable();
+                $table->boolean('enabled')->default(true);
+                $table->timestamps();
+                $table->softDeletes();
+
+                // Plain index, not unique — see the migration's own comment.
+                $table->index(['axis', 'threshold_ratio']);
+            });
+        }
+
+        if (!Schema::hasTable('degradation_events')) {
+            Schema::create('degradation_events', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('run_id')->nullable();
+                $table->uuid('conversation_id');
+                $table->uuid('user_id')->nullable();
+                $table->uuid('reduction_step_id');
+                $table->string('axis', 20);
+                $table->decimal('ratio', 5, 4);
+                $table->timestamp('applied_at');
+
+                $table->index(['conversation_id']);
+                $table->index(['user_id']);
+                $table->index(['run_id']);
+            });
+        }
+
+        if (!Schema::hasTable('degradation_summaries')) {
+            Schema::create('degradation_summaries', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('entity_type');
+                $table->uuid('entity_id');
+                $table->unsignedInteger('degraded_response_count')->default(0);
+                $table->timestamp('last_degraded_at')->nullable();
+                $table->timestamp('updated_at')->useCurrent();
+
+                // The genuine unique constraint — insertOrIgnore()'s target.
+                $table->unique(['entity_type', 'entity_id']);
             });
         }
     }

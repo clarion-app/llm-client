@@ -36,6 +36,7 @@ class ConversationLifecycleTest extends TestCase
         $this->defineReservationSchema();
         $this->defineRateLimitSchema();
         $this->defineConversationWorkSchema();
+        $this->defineDegradationSchema();
 
         Schema::create('users', function (Blueprint $table) {
             $table->uuid('id')->primary();

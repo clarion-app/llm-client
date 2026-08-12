@@ -108,6 +108,46 @@ class RateLimitCounter
     }
 
     /**
+     * A non-mutating read of the current window's count — never
+     * Cache::add()/Cache::increment(), only Cache::get() (research.md D9,
+     * contracts §3). Added for DegradationGate/DegradationStatusController,
+     * neither of which may consume any of the allowance they are only
+     * trying to report on.
+     *
+     * A key that does not exist yet is a fact ("nothing has happened this
+     * window"), not a failure: this returns a zero-count, available = true
+     * reading, never unavailable() — the one place this method's contract
+     * genuinely differs from increment()'s. windowStart/resetsAt are
+     * derived from the identical arithmetic increment() itself uses,
+     * duplicated read-only rather than shared, so a reader can never
+     * accidentally call the write half.
+     */
+    public function peek(string $userId, int $windowSeconds): RateLimitReading
+    {
+        $now = Carbon::now()->timestamp;
+        $windowStart = intdiv($now, $windowSeconds) * $windowSeconds;
+        $key = self::KEY_PREFIX.$userId.':'.$windowSeconds.':'.$windowStart;
+
+        try {
+            $store = Cache::store(config('llm-client.rate_limit.store'));
+            $count = $store->get($key);
+
+            $windowStartAt = Carbon::createFromTimestamp($windowStart)->toImmutable();
+
+            return new RateLimitReading(
+                count: $count === null ? 0 : (int) $count,
+                maxRequests: null,
+                windowSeconds: $windowSeconds,
+                windowStart: $windowStartAt,
+                resetsAt: $windowStartAt->addSeconds($windowSeconds),
+                available: true,
+            );
+        } catch (\Throwable $e) {
+            return $this->unavailable($userId, $windowSeconds, $windowStart, $e->getMessage());
+        }
+    }
+
+    /**
      * Report an unmeasurable window: never a zero and never a partial
      * figure, because a zero would read as "no requests yet" and let a
      * caller reason about a count that was never actually taken. Every

@@ -20,6 +20,7 @@ class ConversationObserverTest extends TestCase
         $this->defineReservationSchema();
         $this->defineRateLimitSchema();
         $this->defineConversationWorkSchema();
+        $this->defineDegradationSchema();
 
         // Create minimal tables needed for Conversation model.
         // Parent creates users table.

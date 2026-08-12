@@ -131,6 +131,48 @@ class ConversationWorkCounter
     }
 
     /**
+     * A non-mutating read of the current window's count — never
+     * Cache::add()/Cache::increment(), only Cache::get() (research.md D9,
+     * contracts §3), mirroring RateLimitCounter::peek() one level down.
+     * Added for DegradationGate/DegradationStatusController, neither of
+     * which may consume any of the allowance they are only trying to
+     * report on.
+     *
+     * A key that does not exist yet is a fact ("no work yet this window"),
+     * not a failure: this returns a zero-count, available = true reading,
+     * never unavailable(). windowStart/resetsAt are derived from the
+     * identical arithmetic increment() itself uses, duplicated read-only.
+     */
+    public function peek(string $conversationId, int $windowSeconds): ConversationWorkReading
+    {
+        if ($windowSeconds <= 0) {
+            return $this->unavailable($conversationId, $windowSeconds, 0, 'the ceiling names no positive window');
+        }
+
+        $now = Carbon::now()->timestamp;
+        $windowStart = intdiv($now, $windowSeconds) * $windowSeconds;
+        $key = self::KEY_PREFIX.$conversationId.':'.$windowSeconds.':'.$windowStart;
+
+        try {
+            $store = Cache::store(config('llm-client.conversation_work.store'));
+            $count = $store->get($key);
+
+            $windowStartAt = Carbon::createFromTimestamp($windowStart)->toImmutable();
+
+            return new ConversationWorkReading(
+                count: $count === null ? 0 : (int) $count,
+                maxWorkUnits: null,
+                windowSeconds: $windowSeconds,
+                windowStart: $windowStartAt,
+                resetsAt: $windowStartAt->addSeconds($windowSeconds),
+                available: true,
+            );
+        } catch (\Throwable $e) {
+            return $this->unavailable($conversationId, $windowSeconds, $windowStart, $e->getMessage());
+        }
+    }
+
+    /**
      * Report an unmeasurable window: never a zero and never a partial
      * figure, because a zero would read as "no work yet" and let a
      * caller reason about a count that was never actually taken. Every

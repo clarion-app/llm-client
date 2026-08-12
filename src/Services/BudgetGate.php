@@ -69,9 +69,30 @@ class BudgetGate
 
     /**
      * Scopes already admitted during this request or job, keyed by the same
-     * scope key the ledger uses. Per-instance and never static.
+     * scope key the ledger uses. Per-instance and never static. Holds the
+     * EnforcementDecision admission produced, not merely a boolean marker —
+     * widened for research.md D2/085-graceful-degradation: admit() now
+     * returns an EnforcementDecision, and the already-admitted early-return
+     * path (see admit() below) must answer with *something*.
      *
-     * @var array<string, true>
+     * Resolved identically to RateLimitGate's own sibling memo, for
+     * consistency between the two gates admitInteractiveWork() calls back
+     * to back: "remember," not "recompute via a fresh evaluate() call."
+     * evaluate() here performs no mutation of its own (unlike
+     * RateLimitCounter::increment()), so recomputing would not double-count
+     * anything — but it is still not the same fact a nested caller is
+     * entitled to rely on. The already-admitted memo exists specifically so
+     * a unit of work admitted *inside* a live turn is never re-evaluated
+     * against standing that may have moved on since the turn started (the
+     * class docblock's own "abandoning a half-built response" scenario); a
+     * fresh evaluate() call on that path would defeat that guarantee for
+     * the returned decision even though it would not defeat it for whether
+     * the call throws. Remembering keeps both the "never re-evaluate"
+     * behavior and the returned decision consistent with each other, and
+     * costs no new class property: the existing memo's value type is
+     * widened from `true` to the decision it already implicitly stood for.
+     *
+     * @var array<string, EnforcementDecision>
      */
     private array $admitted = [];
 
@@ -145,6 +166,14 @@ class BudgetGate
      * exception leaves, so a stop is visible to an operator whether or not
      * anybody was waiting on a status code.
      *
+     * Returns the EnforcementDecision on an allow/allow_with_warning outcome
+     * — additive (research.md D2): source-compatible, since PHP never
+     * requires a caller to consume a non-void return, and every existing
+     * call site ignores it today (grep-confirmed at edit time: the two
+     * AgentLoopService::admitInteractiveWork() call sites, MessageController,
+     * and the five system-initiated call sites named in 076/084's own
+     * research).
+     *
      * @throws BudgetExceededException on a stop outcome, and nothing else.
      */
     public function admit(
@@ -153,14 +182,17 @@ class BudgetGate
         ?string $conversationId = null,
         ?string $source = null,
         ?string $existingRunId = null,
-    ): void {
+    ): EnforcementDecision {
         $scopeKey = $this->scopeKey($userId);
 
         // Already admitted in this request or job: nested work inside a live
         // unit is not re-evaluated. See the class comment — this is what keeps
-        // an in-flight response from being abandoned mid-build.
+        // an in-flight response from being abandoned mid-build. The decision
+        // returned here is the one this instance already computed for this
+        // scope's admission — never a fresh evaluate() call, which would
+        // re-evaluate standing that may have moved on since the turn started.
         if (isset($this->admitted[$scopeKey])) {
-            return;
+            return $this->admitted[$scopeKey];
         }
 
         $decision = $this->evaluate($userId);
@@ -191,7 +223,9 @@ class BudgetGate
 
         $this->attemptReservation($userId, $kind, $conversationId, $source, $existingRunId, $decision, $scopeKey);
 
-        $this->admitted[$scopeKey] = true;
+        $this->admitted[$scopeKey] = $decision;
+
+        return $decision;
     }
 
     /**

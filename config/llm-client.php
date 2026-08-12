@@ -542,6 +542,27 @@ return [
         'store' => env('LLM_CLIENT_CONVERSATION_WORK_STORE', null),
     ],
 
+    // Graceful degradation — an operator-authored ladder of reductions
+    // (substitute model, withheld tools, reduced history budget) applied
+    // before any of budget/rate-limit/conversation-work refuses a request
+    // outright. Placed as a top-level sibling, not nested inside 'budget',
+    // because degradation spans all four axes (both budget scopes, the
+    // rate limit, and conversation work), not one.
+    'degradation' => [
+        // Master toggle. DegradationGate::evaluate() also force-disables
+        // itself whenever run_trace.enabled is false (research.md D3) —
+        // not a second copy of that toggle, just a dependency this one
+        // checks, since a decision with nowhere durable to be anchored
+        // cannot survive a streamed response's later re-entries.
+        'enabled' => env('LLM_CLIENT_DEGRADATION_ENABLED', true),
+
+        // Reserved for a future operator-authored override of the
+        // disclosure sentence's fixed template. Unused today — research.md
+        // D10 is deliberately "one composer, one sentence," no
+        // per-installation customization built in this feature.
+        'degraded_notice' => null,
+    ],
+
     // Agent behavior test suite definitions — bounds applied both at
     // authoring time (EvalCaseService/EvalSuiteService) and on import
     // (EvalSuiteImporter, where the document may originate outside the

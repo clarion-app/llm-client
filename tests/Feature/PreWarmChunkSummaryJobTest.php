@@ -40,6 +40,7 @@ class PreWarmChunkSummaryJobTest extends TestCase
         $this->defineReservationSchema();
         $this->defineRateLimitSchema();
         $this->defineConversationWorkSchema();
+        $this->defineDegradationSchema();
 
         // Create all required tables manually to avoid migration conflicts.
         // Parent defineDatabaseMigrations() creates users, llm_memory_entries, declarative_memories.

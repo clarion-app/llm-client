@@ -41,9 +41,26 @@ use ClarionApp\LlmClient\ValueObjects\RateLimitDecision;
 class RateLimitGate
 {
     /**
-     * Users already admitted during this request or job.
+     * Users already admitted during this request or job, keyed by user id.
+     * Holds the RateLimitDecision that admission produced, not merely a
+     * boolean marker — widened for research.md D2/085-graceful-degradation:
+     * admit() now returns a RateLimitDecision, and the already-admitted
+     * early-return path (see admit() below) must answer with *something*,
+     * not nothing.
      *
-     * @var array<string, true>
+     * Recomputing via a fresh evaluate() call on that path was considered
+     * and rejected: evaluate() unconditionally calls
+     * RateLimitCounter::increment(), so calling it a second time for the
+     * one legitimate double-call site this memo exists to collapse (see
+     * the class docblock) would increment the user's request counter a
+     * second time for what the user experiences as one action — exactly
+     * the double-count this memo was built to prevent in the first place.
+     * Remembering the decision already computed is therefore not simply
+     * "simpler," it is the only choice that does not reintroduce that bug.
+     * It costs no new class property: the existing memo's value type is
+     * widened from `true` to the decision it already implicitly stood for.
+     *
+     * @var array<string, RateLimitDecision>
      */
     private array $admitted = [];
 
@@ -89,15 +106,22 @@ class RateLimitGate
     /**
      * Decide, and refuse the work if the decision is a stop.
      *
+     * Returns the RateLimitDecision on an allow outcome — additive
+     * (research.md D2): source-compatible, since PHP never requires a
+     * caller to consume a non-void return, and every existing call site
+     * ignores it today (grep-confirmed at edit time).
+     *
      * @throws RateLimitExceededException on a stop outcome, and nothing else.
      */
-    public function admit(string $userId, BudgetWorkKind $kind, ?string $conversationId = null): void
+    public function admit(string $userId, BudgetWorkKind $kind, ?string $conversationId = null): RateLimitDecision
     {
         // Already admitted in this request or job: the second call at the
         // one legitimate double-call site is not re-evaluated. See the
-        // class comment.
+        // class comment. The decision returned here is the one this
+        // instance already computed for $userId's admission — never a
+        // fresh evaluate() call, which would increment the counter again.
         if (isset($this->admitted[$userId])) {
-            return;
+            return $this->admitted[$userId];
         }
 
         $decision = $this->evaluate($userId);
@@ -106,6 +130,8 @@ class RateLimitGate
             throw new RateLimitExceededException($decision, $kind);
         }
 
-        $this->admitted[$userId] = true;
+        $this->admitted[$userId] = $decision;
+
+        return $decision;
     }
 }
