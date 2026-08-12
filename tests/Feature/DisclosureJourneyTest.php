@@ -299,6 +299,12 @@ class DisclosureJourneyTest extends TestCase
         );
         $this->assertSame('budget_user', $degradation['axis']);
         $this->assertSame('small-model', $degradation['substitute_model']);
+        $this->assertSame(
+            '2026-09-01T00:00:00+00:00',
+            $degradation['resets_at'],
+            'resets_at must carry the governing axis\'s real reset time through DegradationEvent, '
+            .'not the "next reset" placeholder forRun() falls back to when nothing was snapshotted'
+        );
 
         $message = Message::find($result['message_id']);
         $this->assertNotNull($message);
@@ -392,6 +398,11 @@ class DisclosureJourneyTest extends TestCase
             array_keys($degradation ?? []),
             'the degradation block must match contracts §4\'s shape exactly'
         );
+        $this->assertSame(
+            '2026-09-01T00:00:00+00:00',
+            $degradation['resets_at'] ?? null,
+            'resumeSync()\'s disclosure must carry the real reset time too, not just run()\'s'
+        );
 
         $savedMessage = Message::find($result['message_id'] ?? null);
         $this->assertNotNull($savedMessage);
@@ -475,6 +486,11 @@ class DisclosureJourneyTest extends TestCase
         );
         $this->assertSame('budget_user', $degradation['axis']);
         $this->assertSame('small-model', $degradation['substitute_model']);
+        $this->assertSame(
+            '2026-09-01T00:00:00+00:00',
+            $degradation['resets_at'],
+            'the streamed path\'s disclosure must carry the real reset time too, not just run()\'s'
+        );
     }
 
     #[Test]

@@ -50,6 +50,15 @@ return new class extends Migration
             // snapshotted.
             $table->decimal('ratio', 5, 4);
 
+            // The governing axis's own reset time, snapshotted verbatim
+            // from the DegradationDecision evaluate() produced (never
+            // recomputed) — so forRun() can hand it back to a later
+            // re-entry into the same response without a fresh read of
+            // standing (research.md D3/D9; DegradationDecision::$resetsAt).
+            // Nullable: an axis reading legitimately carries no reset time
+            // in some fail-open/unreadable-standing paths (research.md D8).
+            $table->timestamp('resets_at')->nullable();
+
             $table->timestamp('applied_at');
 
             // No created_at/updated_at — matches cost_reservations's own

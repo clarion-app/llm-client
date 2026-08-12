@@ -788,6 +788,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('reduction_step_id');
                 $table->string('axis', 20);
                 $table->decimal('ratio', 5, 4);
+                $table->timestamp('resets_at')->nullable();
                 $table->timestamp('applied_at');
 
                 $table->index(['conversation_id']);

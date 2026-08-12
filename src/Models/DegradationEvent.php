@@ -29,11 +29,13 @@ class DegradationEvent extends Model
         'reduction_step_id',
         'axis',
         'ratio',
+        'resets_at',
         'applied_at',
     ];
 
     protected $casts = [
         'ratio' => PlainDecimalCast::class.':4',
+        'resets_at' => 'immutable_datetime',
         'applied_at' => 'datetime',
     ];
 

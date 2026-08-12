@@ -214,6 +214,7 @@ class DegradationGate
             $decision->governingStep,
             $decision->axis,
             $decision->ratio,
+            $decision->resetsAt,
         );
     }
 
@@ -258,7 +259,7 @@ class DegradationGate
             effectiveServerId: $step?->substitute_server_id,
             withheldTools: $step?->withheld_tools ?? [],
             historyBudgetRatio: $step?->history_budget_ratio,
-            resetsAt: null,
+            resetsAt: $event->resets_at,
         );
     }
 

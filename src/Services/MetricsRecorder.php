@@ -849,6 +849,7 @@ class MetricsRecorder
         ReductionStep $step,
         string $axis,
         string $ratio,
+        ?\Carbon\CarbonImmutable $resetsAt = null,
     ): void {
         try {
             DegradationEvent::create([
@@ -858,6 +859,7 @@ class MetricsRecorder
                 'reduction_step_id' => $step->id,
                 'axis' => $axis,
                 'ratio' => $ratio,
+                'resets_at' => $resetsAt,
                 'applied_at' => now(),
             ]);
 
