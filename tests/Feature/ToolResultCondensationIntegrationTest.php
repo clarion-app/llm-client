@@ -34,6 +34,7 @@ class ToolResultCondensationIntegrationTest extends TestCase
         // parent's. Every entry path now crosses the budget gate, whose
         // first act is to ask whether any ceiling exists.
         $this->defineBudgetSchema();
+        $this->defineRateLimitSchema();
 
         Schema::create('users', function (Blueprint $table) {
             $table->uuid('id')->primary();

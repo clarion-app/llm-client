@@ -486,6 +486,20 @@ return [
         'degraded_notice_throttle_seconds' => env('LLM_CLIENT_BUDGET_DEGRADED_THROTTLE', 60),
     ],
 
+    // Per-user request-rate limiting — how many requests a user may start
+    // within a configured time window. Deliberately NO master on/off
+    // toggle and no config-level default max_requests/window_seconds:
+    // "off" already means "no rate_limits row configured for the scope",
+    // and a config-level default would be a second, competing notion of
+    // what the default is. There is also no on_unreadable-style toggle —
+    // an unreadable counter always fails open here and that is not
+    // operator-configurable.
+    'rate_limit' => [
+        // The Cache store the fixed-window counter is kept in. Null uses
+        // the application's own configured default store.
+        'store' => env('LLM_CLIENT_RATE_LIMIT_STORE', null),
+    ],
+
     // Agent behavior test suite definitions — bounds applied both at
     // authoring time (EvalCaseService/EvalSuiteService) and on import
     // (EvalSuiteImporter, where the document may originate outside the

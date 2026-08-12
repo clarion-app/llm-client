@@ -268,6 +268,7 @@ abstract class TestCase extends BaseTestCase
         }
 
         $this->defineBudgetSchema();
+        $this->defineRateLimitSchema();
         $this->defineEvalSuiteSchema();
         $this->defineEvalRunSchema();
         $this->defineEvalJudgmentSchema();
@@ -620,6 +621,37 @@ abstract class TestCase extends BaseTestCase
                     ['scope_type', 'scope_id', 'period_type', 'period_start', 'kind'],
                     'budget_threshold_notifications_latch_unique'
                 );
+            });
+        }
+    }
+
+    /**
+     * The rate_limits table — operator-authored, per-user request-rate
+     * configuration. Governs admission, not reporting, so every entry-path
+     * test that exercises AgentLoopService/MessageController now
+     * potentially crosses this gate: a schema without rate_limits no
+     * longer describes a deployment this package can run in.
+     *
+     * Extracted, guarded by Schema::hasTable(), and called from
+     * defineDatabaseMigrations() directly, matching defineBudgetSchema()'s
+     * own shape and call-site pattern so the same handful of test classes
+     * that hand-declare a schema of their own can call it too.
+     */
+    protected function defineRateLimitSchema(): void
+    {
+        if (!Schema::hasTable('rate_limits')) {
+            Schema::create('rate_limits', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('scope_type', 16);
+                $table->uuid('scope_id');
+                $table->unsignedInteger('max_requests')->nullable();
+                $table->unsignedInteger('window_seconds')->nullable();
+                $table->boolean('waived')->default(false);
+                $table->timestamps();
+                $table->softDeletes();
+
+                // Plain index, not unique — see the migration's own comment.
+                $table->index(['scope_type', 'scope_id']);
             });
         }
     }

@@ -37,6 +37,7 @@ class PreWarmChunkSummaryJobTest extends TestCase
         // parent's. Every entry path now crosses the budget gate, whose
         // first act is to ask whether any ceiling exists.
         $this->defineBudgetSchema();
+        $this->defineRateLimitSchema();
 
         // Create all required tables manually to avoid migration conflicts.
         // Parent defineDatabaseMigrations() creates users, llm_memory_entries, declarative_memories.
