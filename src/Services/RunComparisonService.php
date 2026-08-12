@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\ValueObjects\CaseComparisonCategory;
 use ClarionApp\LlmClient\ValueObjects\CaseComparisonResult;
 use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use ClarionApp\LlmClient\ValueObjects\ExpectationKind;
+use ClarionApp\LlmClient\ValueObjects\VarianceConfidence;
 
 /**
  * The core comparison: matches a compared run's eval_run_cases against
@@ -17,15 +18,20 @@ use ClarionApp\LlmClient\ValueObjects\ExpectationKind;
  * Never persists its result (research.md D1) — computed fresh on every
  * call.
  *
- * This phase leaves every entry's confidence/driftedExpectationIndex
- * unconditionally null — the empirical-precedent classification is a
- * later addition on top of this same classification rule, not a
- * property this file computes itself yet.
+ * A matched case landing on Regressed or MateriallyDrifted then has its
+ * confidence (and, for MateriallyDrifted, driftedExpectationIndex)
+ * populated from this agent's own accumulated run history via a single
+ * batched EvalCaseHistoryQuery call plus CaseVarianceAnalyzer's pure
+ * decision rules — never a fabricated statistical model, never one
+ * history query per case. Every other category keeps confidence and
+ * driftedExpectationIndex strictly null.
  */
 class RunComparisonService
 {
     public function __construct(
         private readonly EvalReferenceService $referenceService,
+        private readonly EvalCaseHistoryQuery $historyQuery,
+        private readonly CaseVarianceAnalyzer $varianceAnalyzer,
     ) {
     }
 
@@ -77,6 +83,8 @@ class RunComparisonService
                 $comparedCases[$evalCaseId] ?? null,
             );
         }
+
+        $results = $this->attachVarianceConfidence($results, $run->agent_label, $referenceRun?->id, $run->id, $referenceCases, $comparedCases);
 
         return [
             'reference_run_id' => $designation->run_id,
@@ -244,29 +252,110 @@ class RunComparisonService
         );
     }
 
-    private function inconclusiveReasonFor(string $side, string $outcome): ?string
-    {
-        return match ($outcome) {
-            'pass', 'fail' => null,
-            'unjudged' => "{$side}_unjudged",
-            'needs_human_review' => "{$side}_needs_human_review",
-            'errored' => "{$side}_errored",
-            default => null,
-        };
+    /**
+     * Populates confidence (and, for MateriallyDrifted, the winning
+     * driftedExpectationIndex) for every Regressed/MateriallyDrifted
+     * entry, using a single batched historical query for the whole
+     * comparison rather than one per case. Every other category is
+     * returned unchanged.
+     *
+     * @param  array<string, CaseComparisonResult>  $results
+     * @return array<string, CaseComparisonResult>
+     */
+    private function attachVarianceConfidence(
+        array $results,
+        string $agentLabel,
+        ?string $referenceRunId,
+        string $comparedRunId,
+        array $referenceCases,
+        array $comparedCases,
+    ): array {
+        $caseVersionPairs = [];
+
+        foreach ($results as $evalCaseId => $result) {
+            if (!in_array($result->category, [CaseComparisonCategory::Regressed, CaseComparisonCategory::MateriallyDrifted], true)) {
+                continue;
+            }
+
+            $caseVersionPairs[] = [
+                'eval_case_id' => $evalCaseId,
+                'eval_case_version_id' => $comparedCases[$evalCaseId]['eval_case_version_id'],
+            ];
+        }
+
+        if (empty($caseVersionPairs)) {
+            return $results;
+        }
+
+        $excludeRunIds = array_values(array_filter([$referenceRunId, $comparedRunId], fn ($id) => $id !== null));
+        $limitPerCase = (int) config('llm-client.eval_regression.history_lookback_limit', 20);
+
+        $histories = $this->historyQuery->historiesFor(
+            $agentLabel,
+            $caseVersionPairs,
+            $excludeRunIds,
+            $limitPerCase,
+        );
+
+        foreach ($caseVersionPairs as $pair) {
+            $evalCaseId = $pair['eval_case_id'];
+            $result = $results[$evalCaseId];
+            $history = $histories[$evalCaseId] ?? ['outcomes' => [], 'scores_by_expectation_index' => []];
+
+            if ($result->category === CaseComparisonCategory::Regressed) {
+                $confidence = $this->varianceAnalyzer->classifyBooleanTransition($history['outcomes']);
+                $results[$evalCaseId] = $this->withVariance($result, $confidence, null);
+
+                continue;
+            }
+
+            // MateriallyDrifted: run the numeric-drift rule once per
+            // expectation index that dropped materially, keeping the
+            // single most severe verdict (likely_regression > ordinary_
+            // variation > insufficient_history, ties broken by lowest
+            // index — research.md D8).
+            $droppedIndices = $this->materiallyDroppedIndices($referenceCases[$evalCaseId], $comparedCases[$evalCaseId]);
+
+            $bestConfidence = null;
+            $bestIndex = null;
+
+            foreach ($droppedIndices as $index) {
+                $comparedScore = $comparedCases[$evalCaseId]['result']['expectation_results'][$index]['score'] ?? null;
+
+                if ($comparedScore === null) {
+                    continue;
+                }
+
+                $priorScores = $history['scores_by_expectation_index'][$index] ?? [];
+                $confidence = $this->varianceAnalyzer->classifyNumericDrift($priorScores, $comparedScore);
+
+                if ($bestConfidence === null || $this->severity($confidence) > $this->severity($bestConfidence)) {
+                    $bestConfidence = $confidence;
+                    $bestIndex = $index;
+                }
+            }
+
+            $results[$evalCaseId] = $this->withVariance($result, $bestConfidence, $bestIndex);
+        }
+
+        return $results;
     }
 
     /**
-     * True iff any rubric_judgment expectation, judged on both sides at
-     * the same index, dropped by at least material_score_drop. Applies
-     * only where both sides have a real score at that index (research.md
-     * D10) — a case with no rubric_judgment expectations, or one that is
-     * unjudged on either side, simply never enters this axis.
+     * Every rubric_judgment expectation index, judged on both sides, that
+     * dropped by at least material_score_drop — the same predicate
+     * hasMaterialScoreDrop() checks, but collecting every qualifying
+     * index rather than stopping at the first.
+     *
+     * @return array<int, int>
      */
-    private function hasMaterialScoreDrop(array $reference, array $compared): bool
+    private function materiallyDroppedIndices(array $reference, array $compared): array
     {
         $referenceExpectations = $reference['result']['expectation_results'] ?? [];
         $comparedExpectations = $compared['result']['expectation_results'] ?? [];
         $threshold = (int) config('llm-client.eval_regression.material_score_drop', 2);
+
+        $indices = [];
 
         foreach ($referenceExpectations as $index => $referenceExpectation) {
             if (($referenceExpectation['kind'] ?? null) !== ExpectationKind::RubricJudgment->value) {
@@ -293,11 +382,59 @@ class RunComparisonService
             }
 
             if (($referenceScore - $comparedScore) >= $threshold) {
-                return true;
+                $indices[] = $index;
             }
         }
 
-        return false;
+        return $indices;
+    }
+
+    /** likely_regression > ordinary_variation > insufficient_history. */
+    private function severity(VarianceConfidence $confidence): int
+    {
+        return match ($confidence) {
+            VarianceConfidence::LikelyRegression => 2,
+            VarianceConfidence::OrdinaryVariation => 1,
+            VarianceConfidence::InsufficientHistory => 0,
+        };
+    }
+
+    private function withVariance(CaseComparisonResult $result, ?VarianceConfidence $confidence, ?int $driftedExpectationIndex): CaseComparisonResult
+    {
+        return new CaseComparisonResult(
+            evalCaseId: $result->evalCaseId,
+            category: $result->category,
+            confidence: $confidence,
+            referenceEvalRunCaseId: $result->referenceEvalRunCaseId,
+            comparedEvalRunCaseId: $result->comparedEvalRunCaseId,
+            referenceOutcome: $result->referenceOutcome,
+            comparedOutcome: $result->comparedOutcome,
+            inconclusiveReason: $result->inconclusiveReason,
+            driftedExpectationIndex: $driftedExpectationIndex,
+        );
+    }
+
+    private function inconclusiveReasonFor(string $side, string $outcome): ?string
+    {
+        return match ($outcome) {
+            'pass', 'fail' => null,
+            'unjudged' => "{$side}_unjudged",
+            'needs_human_review' => "{$side}_needs_human_review",
+            'errored' => "{$side}_errored",
+            default => null,
+        };
+    }
+
+    /**
+     * True iff any rubric_judgment expectation, judged on both sides at
+     * the same index, dropped by at least material_score_drop. Applies
+     * only where both sides have a real score at that index (research.md
+     * D10) — a case with no rubric_judgment expectations, or one that is
+     * unjudged on either side, simply never enters this axis.
+     */
+    private function hasMaterialScoreDrop(array $reference, array $compared): bool
+    {
+        return !empty($this->materiallyDroppedIndices($reference, $compared));
     }
 
     /**

@@ -321,11 +321,16 @@ class RegressionReportJourneyTest extends TestCase
     }
 
     // ---------------------------------------------------------------
-    // AC1/AC2/AC4: regressed / improved / unchanged, no confidence yet
+    // AC1/AC2/AC4: regressed / improved / unchanged. Confidence is
+    // strictly null for improved/unchanged; a regressed case always
+    // carries a real (non-null) VarianceConfidence verdict once the
+    // variance-analysis phase is wired in — here it is
+    // insufficient_history, since this fixture builds no prior run
+    // history for "bravo" beyond the reference/compared pair themselves.
     // ---------------------------------------------------------------
 
     #[Test]
-    public function a_second_run_after_a_change_correctly_classifies_regressed_improved_and_unchanged_cases_with_null_confidence(): void
+    public function a_second_run_after_a_change_correctly_classifies_regressed_improved_and_unchanged_cases(): void
     {
         $this->bravoShouldPass = true;
         $this->charlieShouldPass = false;
@@ -356,7 +361,11 @@ class RegressionReportJourneyTest extends TestCase
 
         $bravo = $byCaseId[$this->caseIds['bravo']];
         $this->assertSame('regressed', $bravo['category']);
-        $this->assertNull($bravo['confidence'], 'confidence must stay null in this phase — CaseVarianceAnalyzer is a later phase');
+        $this->assertSame(
+            'insufficient_history',
+            $bravo['confidence'],
+            'a regressed case always carries a real confidence verdict; with no prior history built up for this case it is insufficient_history, never null'
+        );
         $this->assertSame('pass', $bravo['reference_outcome']);
         $this->assertSame('fail', $bravo['compared_outcome']);
 
