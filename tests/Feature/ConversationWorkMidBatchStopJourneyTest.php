@@ -197,6 +197,43 @@ class ConversationWorkMidBatchStopJourneyTest extends TestCase
     }
 
     /**
+     * Unlike RateLimitGate, which has no user to charge and skips entirely
+     * when a conversation has no owning user, ConversationWorkGate keys on
+     * the conversation id alone and has no dependency on user_id being
+     * present at all — a system-adjacent conversation with no owner is
+     * still bound by whatever ceiling applies to it.
+     */
+    #[Test]
+    public function a_conversation_with_no_owning_user_is_still_stopped_by_its_ceiling(): void
+    {
+        $this->declareConversationDefault(5, 60);
+
+        $conversation = Conversation::create([
+            'user_id' => null,
+            'server_id' => $this->server->id,
+            'model' => 'test-model',
+            'character' => 'Clarion',
+        ]);
+
+        $service = $this->serviceWithScriptedProvider([
+            ['choices' => [['message' => ['content' => '', 'tool_calls' => $this->toolCallBurst(7)]]]],
+        ]);
+
+        $result = $service->run($conversation, 'Do seven things in one go.');
+
+        $this->assertSame('stopped', $result['status']);
+        $this->assertSame('conversation_work_ceiling_reached', $result['code'] ?? null);
+
+        $message = Message::where('conversation_id', $conversation->id)
+            ->where('role', 'assistant')
+            ->latest('created_at')
+            ->first();
+
+        $this->assertNotNull($message);
+        $this->assertCoherentMixedBatch($message->tool_data['tool_calls'], $message->tool_data['tool_results'], 5);
+    }
+
+    /**
      * Call site 2 — run()'s schema-validation retry branch. This branch has
      * no tool calls in flight at all (T001's grounding: it is reached only
      * when the model's response carried none), so there is nothing to
