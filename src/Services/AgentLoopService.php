@@ -37,6 +37,7 @@ use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
+use ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision;
 use Illuminate\Support\Str;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use Illuminate\Support\Facades\Context;
@@ -408,6 +409,66 @@ class AgentLoopService
     }
 
     /**
+     * The close-out a conversation work ceiling stop performs, shared by
+     * every in-loop call site in this class (the tool-call loop and the
+     * schema-validation retry branch in run(), and resumeSync()'s own
+     * tool-call loop): identical in shape to the existing max_iterations
+     * clean stop each of those methods already reaches at the bottom of
+     * its own loop, so a conversation stopped for this reason stays
+     * coherent and resumable the exact same way.
+     *
+     * $toolCalls/$toolResults are empty for the schema-validation retry
+     * call site, which has no tool call in flight to answer at all.
+     */
+    private function stopForConversationWorkCeiling(
+        Conversation $conversation,
+        ?string $runId,
+        ?string $currentStepId,
+        array $toolCalls,
+        array $toolResults,
+        int $iteration,
+        ConversationWorkDecision $workDecision,
+    ): array {
+        $assistantMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $workDecision->reason ?? '',
+            'role' => 'assistant',
+            'user' => $conversation->character,
+            'responseTime' => 0,
+            'tool_data' => empty($toolCalls) ? null : [
+                'tool_calls' => $toolCalls,
+                'tool_results' => $toolResults,
+                'iteration' => $iteration,
+                'pending_confirmation' => null,
+            ],
+        ]);
+
+        $conversation->update(['is_processing' => false]);
+
+        if ($this->runTraceRecorder !== null && $runId !== null) {
+            if ($currentStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $currentStepId,
+                    RunEndState::StoppedEarly,
+                    $workDecision->reason,
+                );
+            }
+            $this->runTraceRecorder->closeRun(
+                $runId,
+                RunEndState::StoppedEarly,
+                $workDecision->reason,
+            );
+        }
+
+        return [
+            'status' => 'stopped',
+            'content' => $workDecision->reason,
+            'message_id' => $assistantMessage->id,
+            'code' => 'conversation_work_ceiling_reached',
+        ];
+    }
+
+    /**
      * Synchronous agent loop execution for external channel integrations.
      * Returns the final response array or a confirmation-required structure.
      *
@@ -587,6 +648,26 @@ class AgentLoopService
 
                             // Check if we should retry
                             if ($retryOnValidationFailure && $schemaRetryCount < $maxSchemaRetries && !$e->isRetryExhausted()) {
+                                // A schema-validation retry is a unit of
+                                // agent-initiated work in its own right
+                                // (research.md D2) — this branch is reached
+                                // only when $toolCalls is empty, so there is
+                                // no unanswered tool call to synthesize a
+                                // result for; the stop is a plain refusal in
+                                // place of the correction-prompt flow below.
+                                $workDecision = app(ConversationWorkGate::class)->evaluate($conversation->id);
+                                if ($workDecision->isStop()) {
+                                    return $this->stopForConversationWorkCeiling(
+                                        $conversation,
+                                        $runId,
+                                        $currentStepId,
+                                        [],
+                                        [],
+                                        $iteration,
+                                        $workDecision,
+                                    );
+                                }
+
                                 $schemaRetryCount++;
 
                                 // Record the retry attempt but keep the step open —
@@ -667,10 +748,37 @@ class AgentLoopService
                 $toolResults = [];
                 $pendingConfirmation = null;
 
-                foreach ($toolCalls as $toolCall) {
+                foreach ($toolCalls as $tcIndex => $toolCall) {
                     $toolName = $toolCall['function']['name'] ?? '';
                     $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
                     $toolCallId = $toolCall['id'] ?? '';
+
+                    // Checked before every individual tool-call execution,
+                    // not just between iterations, so a single LLM turn
+                    // requesting a large batch of tool calls can be stopped
+                    // mid-batch (research.md D3). Every tool call from this
+                    // point on — including the current one — is given a
+                    // synthesized tool_result rather than left unanswered,
+                    // mirroring the existing declined-confirmation shape.
+                    $workDecision = app(ConversationWorkGate::class)->evaluate($conversation->id);
+                    if ($workDecision->isStop()) {
+                        foreach (array_slice($toolCalls, $tcIndex) as $unexecutedCall) {
+                            $toolResults[] = [
+                                'tool_call_id' => $unexecutedCall['id'] ?? '',
+                                'content' => ConversationWorkDecision::UNEXECUTED_TOOL_RESULT,
+                            ];
+                        }
+
+                        return $this->stopForConversationWorkCeiling(
+                            $conversation,
+                            $runId,
+                            $currentStepId,
+                            $toolCalls,
+                            $toolResults,
+                            $iteration,
+                            $workDecision,
+                        );
+                    }
 
                     // Site 2: ToolInvocation around executeMetaTool in run().
                     $activeActionId = null;
@@ -1151,9 +1259,34 @@ class AgentLoopService
 
             // Handle tool calls in the continuation
             $toolResults = [];
-            foreach ($toolCalls as $toolCall) {
+            foreach ($toolCalls as $tcIndex => $toolCall) {
                 $toolName = $toolCall['function']['name'] ?? '';
                 $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+
+                // See the identical check in run()'s own tool-call loop:
+                // checked before every individual tool-call execution so a
+                // burst within one LLM turn can be stopped mid-batch, with
+                // every not-yet-executed call in the batch left coherently
+                // answered.
+                $workDecision = app(ConversationWorkGate::class)->evaluate($conversation->id);
+                if ($workDecision->isStop()) {
+                    foreach (array_slice($toolCalls, $tcIndex) as $unexecutedCall) {
+                        $toolResults[] = [
+                            'tool_call_id' => $unexecutedCall['id'] ?? '',
+                            'content' => ConversationWorkDecision::UNEXECUTED_TOOL_RESULT,
+                        ];
+                    }
+
+                    return $this->stopForConversationWorkCeiling(
+                        $conversation,
+                        $runId,
+                        $currentStepId,
+                        $toolCalls,
+                        $toolResults,
+                        $iteration,
+                        $workDecision,
+                    );
+                }
 
                 // Site 6: ToolInvocation around executeMetaTool in resumeSync().
                 $toolActionId = null;

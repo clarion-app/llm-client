@@ -24,6 +24,7 @@ use ClarionApp\LlmClient\Controllers\ToolReliabilityController;
 use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
 use ClarionApp\LlmClient\Controllers\BudgetStandingController;
 use ClarionApp\LlmClient\Controllers\RateLimitController;
+use ClarionApp\LlmClient\Controllers\ConversationWorkCeilingController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteController;
 use ClarionApp\LlmClient\Controllers\EvalCaseController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
@@ -147,6 +148,18 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::delete('rate-limits/user-default', [RateLimitController::class, "destroyUserDefault"]);
     Route::put('rate-limits/users/{userId}', [RateLimitController::class, "putUser"]);
     Route::delete('rate-limits/users/{userId}', [RateLimitController::class, "destroyUser"]);
+
+    // Per-conversation work ceiling configuration (spec 083, contracts
+    // §2) — operator-only, and never itself subject to conversation-work
+    // enforcement. The conversation-default endpoints are this feature's
+    // US1 surface; putConversation/destroyConversation exist so the
+    // operator gate applies uniformly to a per-conversation override too,
+    // ahead of US3's own dedicated raise/lower/waive acceptance tests.
+    Route::get('conversation-work-ceilings', [ConversationWorkCeilingController::class, "index"]);
+    Route::put('conversation-work-ceilings/conversation-default', [ConversationWorkCeilingController::class, "putConversationDefault"]);
+    Route::delete('conversation-work-ceilings/conversation-default', [ConversationWorkCeilingController::class, "destroyConversationDefault"]);
+    Route::put('conversation-work-ceilings/conversations/{conversationId}', [ConversationWorkCeilingController::class, "putConversation"]);
+    Route::delete('conversation-work-ceilings/conversations/{conversationId}', [ConversationWorkCeilingController::class, "destroyConversation"]);
 
     Route::get('agent-eval-suites', [EvalSuiteController::class, "index"]);
     Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);

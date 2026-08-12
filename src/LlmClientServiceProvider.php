@@ -459,6 +459,32 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        // All three conversation-work-ceiling services are singleton(),
+        // deliberately diverging from RateLimitGate/RateLimitCounter's own
+        // scoped()/singleton() split above. Every one of them is stateless:
+        // ConversationWorkCeilingService and ConversationWorkCounter hold no
+        // per-instance property at all (the same reason RateLimitCounter is
+        // already singleton()), and ConversationWorkGate carries no
+        // per-instance "already evaluated" memo the way RateLimitGate does —
+        // every one of its four in-loop call sites is a genuinely distinct
+        // unit of work that must be counted, not the same unit of work
+        // reachable two ways in one request, so there is no admitted-once
+        // state a request or job boundary ever needs to reset.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ConversationWorkCeilingService::class, function () {
+            return new \ClarionApp\LlmClient\Services\ConversationWorkCeilingService();
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ConversationWorkCounter::class, function () {
+            return new \ClarionApp\LlmClient\Services\ConversationWorkCounter();
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ConversationWorkGate::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\ConversationWorkGate(
+                $app->make(\ClarionApp\LlmClient\Services\ConversationWorkCeilingService::class),
+                $app->make(\ClarionApp\LlmClient\Services\ConversationWorkCounter::class),
+            );
+        });
+
         // bind(), not singleton() and not scoped(). The notifier holds no
         // state of its own, but it reads through BudgetLedger, whose memo is
         // deliberately per-request/per-job: a longer-lived notifier would

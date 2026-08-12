@@ -117,6 +117,11 @@ class AgentController extends Controller
         $statusCode = match ($result['status'] ?? 'error') {
             'completed' => 200,
             'confirmation_required' => 202,
+            // A conversation work ceiling correctly stopping a response is
+            // not a server failure — it is a policy-correct outcome that
+            // deserves its own, more precise status than the sibling
+            // max_iterations outcome currently, imprecisely, falls into.
+            'stopped' => 200,
             default => 500,
         };
 

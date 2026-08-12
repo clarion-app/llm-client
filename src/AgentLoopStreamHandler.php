@@ -344,10 +344,29 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $metaToolNames = ['list_applications', 'execute_operation', 'search_operations'];
         $registry = app(\ClarionApp\LlmClient\Services\McpToolRegistry::class);
 
-        foreach ($this->toolCalls as $toolCall) {
+        foreach ($this->toolCalls as $tcIndex => $toolCall) {
             $toolName = $toolCall['function']['name'] ?? '';
             $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
             $toolCallId = $toolCall['id'] ?? '';
+
+            // Checked before every individual tool-call execution, not just
+            // between iterations, so a single LLM turn requesting a large
+            // batch of tool calls can be stopped mid-batch. Every tool call
+            // from this point on — including the current one — is given a
+            // synthesized tool_result rather than left unanswered.
+            $workDecision = app(\ClarionApp\LlmClient\Services\ConversationWorkGate::class)->evaluate($conversationId);
+            if ($workDecision->isStop()) {
+                foreach (array_slice($this->toolCalls, $tcIndex) as $unexecutedCall) {
+                    $toolResults[] = [
+                        'tool_call_id' => $unexecutedCall['id'] ?? '',
+                        'content' => \ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision::UNEXECUTED_TOOL_RESULT,
+                    ];
+                }
+
+                $this->handleWorkCeilingReached($conversation, $workDecision, $toolResults);
+
+                return;
+            }
 
             // Open ToolInvocation action for this tool call.
             $toolActionId = null;
@@ -664,6 +683,57 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         );
 
         event(new FinishOpenAIConversationResponseEvent($conversation->id, $errorContent));
+        $conversation->update(['is_processing' => false]);
+    }
+
+    /**
+     * A conversation work ceiling was reached mid-batch. Mirrors
+     * handleMaxIterationReached()'s exact close-out sequence — the visible
+     * assistant message, the step/run closed stopped_early, the finish
+     * event, is_processing cleared — with two differences: the message's
+     * tool_data carries the mixed real/synthesized tool_results the caller
+     * already built (§3.3), and the reason names the work ceiling rather
+     * than the iteration count.
+     */
+    private function handleWorkCeilingReached(
+        Conversation $conversation,
+        \ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision $workDecision,
+        array $toolResults,
+    ): void {
+        $content = $workDecision->reason ?? '';
+
+        if ($this->message === null) {
+            $this->message = Message::create([
+                'conversation_id' => $conversation->id,
+                'responseTime' => 0,
+                'user' => $conversation->character,
+                'role' => 'assistant',
+                'content' => $content,
+            ]);
+            event(new NewConversationMessageEvent($conversation->id, $this->message->id));
+        }
+
+        $this->message->update([
+            'content' => $content,
+            'tool_data' => [
+                'tool_calls' => $this->toolCalls,
+                'tool_results' => $toolResults,
+                'pending_confirmation' => null,
+            ],
+        ]);
+
+        // Close the step and run as stopped_early.
+        $this->closeCurrentStep(
+            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+            $workDecision->reason,
+        );
+        $this->closeRun(
+            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+            null,
+            $workDecision->reason,
+        );
+
+        event(new FinishOpenAIConversationResponseEvent($conversation->id, $content));
         $conversation->update(['is_processing' => false]);
     }
 
