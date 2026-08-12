@@ -571,6 +571,27 @@ return [
         'consistency_flag_threshold' => 3,
     ],
 
+    // Thresholds RunComparisonService/CaseVarianceAnalyzer/
+    // EvalCaseHistoryQuery use when classifying a case's difference
+    // between a reference run and a later run of the same agent.
+    'eval_regression' => [
+        // The floor below which a regressed/materially_drifted case's
+        // variance verdict is insufficient_history regardless of what
+        // the (too-small) sample shows, on both the boolean-transition
+        // and numeric-drift axes independently.
+        'min_history_for_variance' => 5,
+
+        // The rubric_judgment score drop, on the eval_judging.
+        // score_scale_max scale, that makes a still-passing case
+        // materially_drifted.
+        'material_score_drop' => 2,
+
+        // The per-case cap EvalCaseHistoryQuery truncates each case's
+        // historical series to, applied after filtering to comparable
+        // (pass/fail, or judged score) results, not before.
+        'history_lookback_limit' => 20,
+    ],
+
     // Response latency distributions — per-model and per-agent percentile
     // figures computed at read time from agent_runs.
     'latency' => [

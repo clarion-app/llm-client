@@ -271,6 +271,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineEvalSuiteSchema();
         $this->defineEvalRunSchema();
         $this->defineEvalJudgmentSchema();
+        $this->defineEvalReferenceSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -820,6 +821,30 @@ abstract class TestCase extends BaseTestCase
         if (!Schema::hasColumn('eval_case_results', 'outcome_override')) {
             Schema::table('eval_case_results', function (Blueprint $table) {
                 $table->string('outcome_override', 20)->nullable();
+            });
+        }
+    }
+
+    /**
+     * The one new table the regression-detection feature reads and
+     * writes — eval_reference_designations, one row per designate-or-move
+     * event. Mirrors the production migration exactly. Guarded by
+     * Schema::hasTable() like every existing block here, and called from
+     * defineDatabaseMigrations() directly, immediately after
+     * defineEvalJudgmentSchema(), matching its own call-site pattern.
+     */
+    protected function defineEvalReferenceSchema(): void
+    {
+        if (!Schema::hasTable('eval_reference_designations')) {
+            Schema::create('eval_reference_designations', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('agent_label', 255);
+                $table->uuid('run_id');
+                $table->uuid('designated_by')->nullable();
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index(['agent_label', 'created_at']);
+                $table->index('run_id');
             });
         }
     }
