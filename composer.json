@@ -13,7 +13,8 @@
         "clarion-app/http-queue": "dev-main",
         "php-webdriver/webdriver": "dev-main",
         "clarion-app/backend": "dev-main",
-        "justinrainbow/json-schema": "^6.0"
+        "justinrainbow/json-schema": "^6.0",
+        "symfony/yaml": "^7.0.3"
     },
     "license": "MIT",
     "autoload": {

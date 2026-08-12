@@ -703,5 +703,25 @@ return [
         // is always the median (p50) and is not separately configurable.
         'worst_case_percentile' => env('LLM_CLIENT_LATENCY_WORST_CASE_PERCENTILE', 95),
     ],
+
+    // Agent Definition File Format (086-agent-yaml-schema) — the YAML
+    // schema AgentDefinitionParser reads and the bounds it enforces.
+    'agent_definitions' => [
+        // The format_version stamped on a definition when the document
+        // omits the key entirely.
+        'current_format_version' => '1.0',
+
+        // format_version values this installation's parser accepts. A
+        // version outside this set is rejected with a clear reason rather
+        // than guessed at (mirrors the eval_suites.supported_export_schema_versions
+        // precedent above).
+        'supported_format_versions' => ['1.0'],
+
+        // The token bound a definition's instructions field is checked
+        // against (via ToolResultCondenser::estimateTokens()). Left null,
+        // this falls back to context_window.injected_section_reserve at
+        // resolution time — never copied into a second hardcoded number.
+        'instructions_max_tokens' => env('LLM_CLIENT_AGENT_DEFINITIONS_INSTRUCTIONS_MAX_TOKENS', null),
+    ],
 ];
 
