@@ -601,6 +601,7 @@ class BudgetGate
                     ? self::SOURCE_OVERRIDE
                     : self::SOURCE_DEFAULT,
                 $this->ledger->forUser((string) $userId, $userRow->period_type),
+                $userId,
             );
         }
 
@@ -611,6 +612,7 @@ class BudgetGate
                 BudgetScope::Installation->value,
                 self::SOURCE_INSTALLATION,
                 $this->ledger->forInstallation($installationCeiling->period_type),
+                $userId,
             );
 
         return [
@@ -639,11 +641,19 @@ class BudgetGate
      */
     private static function blockIsDegraded(array $block): bool
     {
-        return ($block['consumption']['available'] ?? true) === false;
+        return ($block['consumption']['available'] ?? true) === false
+            || ($block['held']['available'] ?? true) === false;
     }
 
     /**
      * One applicable ceiling, its figure, and the headroom between them.
+     *
+     * $userId is only used to build the held-reservation scope key ('user:'
+     * .$userId for the user axis, 'installation' for the installation axis
+     * regardless of who is asking — an installation-wide figure never
+     * depends on the caller) — the same scope key evaluate() already uses
+     * via ReservationLedger::heldFor(), so a standing report and a live
+     * admission decision read the identical held total.
      *
      * @return array<string, mixed>
      */
@@ -652,8 +662,13 @@ class BudgetGate
         string $axis,
         string $source,
         ConsumptionSnapshot $snapshot,
+        ?string $userId,
     ): array {
-        $assessment = $this->assess($ceiling, $axis, $snapshot);
+        $heldSnapshot = $this->reservations->heldFor(
+            $axis === BudgetScope::Installation->value ? 'installation' : 'user:'.$userId
+        );
+
+        $assessment = $this->assess($ceiling, $axis, $snapshot, $heldSnapshot);
 
         // The same value object a refusal and a warning are rendered from —
         // which is what makes remaining()'s flooring, the ceiling shape, and
@@ -666,6 +681,7 @@ class BudgetGate
             governingCeiling: $ceiling,
             snapshot: $snapshot,
             degraded: !$snapshot->available,
+            held: $heldSnapshot,
         );
 
         return [
@@ -674,6 +690,7 @@ class BudgetGate
             'ceiling' => $decision->ceilingArray(),
             'period' => $decision->periodArray(),
             'consumption' => $snapshot->toArray(),
+            'held' => $heldSnapshot->toArray(),
             // Null when the figure could not be read: no headroom can be
             // computed from a number nobody has.
             'remaining' => $decision->remaining(),

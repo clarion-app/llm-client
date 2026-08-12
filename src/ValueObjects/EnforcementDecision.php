@@ -51,6 +51,10 @@ final readonly class EnforcementDecision
      *   policy applied
      * @param  string|null  $reason  the single plain-language sentence naming the
      *   ceiling amount, the consumption to date, and the reset time
+     * @param  ReservationSnapshot|null  $held  what the governing scope currently
+     *   holds in reservation, additive to $snapshot for remaining() — null for
+     *   every 076-era caller that constructs this class without it, which
+     *   leaves remaining() byte-identical to its pre-084 behavior
      */
     public function __construct(
         public string $outcome,
@@ -58,6 +62,7 @@ final readonly class EnforcementDecision
         public ?ConsumptionSnapshot $snapshot = null,
         public bool $degraded = false,
         public ?string $reason = null,
+        public ?ReservationSnapshot $held = null,
     ) {
     }
 
@@ -102,6 +107,14 @@ final readonly class EnforcementDecision
      * invites an interface to render a negative allowance. The *unfloored*
      * figure is what chooses the governing ceiling, and that comparison
      * lives in BudgetGate — the two are different questions.
+     *
+     * When $held is present and available, it is netted out alongside
+     * $snapshot: a currently-held reservation is allowance that is already
+     * spoken for, even though nothing has been recorded as spent yet, so a
+     * standing report's remaining figure must already reflect it (contracts
+     * §1) — otherwise a predictive decline (US1) would refuse work the same
+     * report just claimed there was room for. $held being null or
+     * unavailable leaves this method byte-identical to its pre-084 shape.
      */
     public function remaining(): ?string
     {
@@ -113,6 +126,10 @@ final readonly class EnforcementDecision
         }
 
         $remaining = bcsub((string) $this->governingCeiling->amount, (string) $this->snapshot->amount, self::SCALE);
+
+        if ($this->held !== null && $this->held->available) {
+            $remaining = bcsub($remaining, (string) $this->held->amount, self::SCALE);
+        }
 
         return bccomp($remaining, '0', self::SCALE) < 0
             ? bcadd('0', '0', self::SCALE)
