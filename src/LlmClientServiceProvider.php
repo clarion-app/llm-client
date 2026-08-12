@@ -554,6 +554,13 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\BudgetLedger::class),
             );
         });
+
+        // singleton() is safe here: AgentDefinitionParser::parse() holds no
+        // state across calls — every config/catalog/model lookup it makes
+        // is read fresh on each call (086-agent-yaml-schema).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class, function () {
+            return new \ClarionApp\LlmClient\Services\AgentDefinitionParser();
+        });
     }
 
     /**
