@@ -8,7 +8,11 @@ use ClarionApp\LlmClient\Models\UsageSummary;
 use ClarionApp\LlmClient\Models\ContextManagementRecord;
 use ClarionApp\LlmClient\Models\ContextManagementSummary;
 use ClarionApp\LlmClient\Models\CostSummary;
+use ClarionApp\LlmClient\Models\DegradationEvent;
+use ClarionApp\LlmClient\Models\DegradationSummary;
 use ClarionApp\LlmClient\Models\ModelPrice;
+use ClarionApp\LlmClient\Models\ReductionStep;
+use ClarionApp\LlmClient\Models\SpendingCeiling;
 use ClarionApp\LlmClient\Models\ToolReliabilitySummary;
 use ClarionApp\LlmClient\Services\Concerns\RetriesConcurrencyAborts;
 use ClarionApp\LlmClient\Support\Decimal;
@@ -820,6 +824,81 @@ class MetricsRecorder
                 'condense_activations' => DB::raw("condense_activations + {$condenseActivations}"),
                 'total_tokens_saved' => DB::raw("total_tokens_saved + {$totalTokensSaved}"),
                 'total_requests' => DB::raw("total_requests + {$totalRequests}"),
+                'updated_at' => now(),
+            ]);
+    }
+
+    /**
+     * Record one degraded response — the only write for this fact
+     * (research.md D11): called once, from inside
+     * DegradationGate::linkRun(), the same moment the decision is first
+     * persisted for a fresh run. Writes one DegradationEvent detail row
+     * and upserts DegradationSummary rows for both the conversation's user
+     * (when known) and the installation, using the identical
+     * insertOrIgnore + column = column + n atomic-upsert idiom
+     * upsertContextManagementSummary() already establishes — never a
+     * read-modify-write (mutation-testing row 14).
+     *
+     * Never throws — mirrors recordContextManagement()'s own outer
+     * try/catch shape.
+     */
+    public function recordDegradation(
+        string $conversationId,
+        ?string $userId,
+        ?string $runId,
+        ReductionStep $step,
+        string $axis,
+        string $ratio,
+    ): void {
+        try {
+            DegradationEvent::create([
+                'run_id' => $runId,
+                'conversation_id' => $conversationId,
+                'user_id' => $userId,
+                'reduction_step_id' => $step->id,
+                'axis' => $axis,
+                'ratio' => $ratio,
+                'applied_at' => now(),
+            ]);
+
+            if ($userId !== null) {
+                $this->upsertDegradationSummary(DegradationSummary::ENTITY_USER, $userId);
+            }
+
+            $this->upsertDegradationSummary(DegradationSummary::ENTITY_INSTALLATION, SpendingCeiling::INSTALLATION_SCOPE_ID);
+        } catch (\Throwable $e) {
+            Log::warning('MetricsRecorder: failed to record degradation', [
+                'conversation_id' => $conversationId,
+                'user_id' => $userId,
+                'run_id' => $runId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Upsert a degradation summary row using an atomic DB-side increment —
+     * same pattern as upsertContextManagementSummary(): insertOrIgnore +
+     * column = column + n UPDATE, so concurrent writers cannot lose
+     * updates via a read-modify-write race.
+     */
+    private function upsertDegradationSummary(string $entityType, string $entityId): void
+    {
+        DB::table('degradation_summaries')->insertOrIgnore([
+            'id' => (string) Str::uuid(),
+            'entity_type' => $entityType,
+            'entity_id' => $entityId,
+            'degraded_response_count' => 0,
+            'last_degraded_at' => null,
+            'updated_at' => now(),
+        ]);
+
+        DB::table('degradation_summaries')
+            ->where('entity_type', $entityType)
+            ->where('entity_id', $entityId)
+            ->update([
+                'degraded_response_count' => DB::raw('degraded_response_count + 1'),
+                'last_degraded_at' => now(),
                 'updated_at' => now(),
             ]);
     }

@@ -201,6 +201,23 @@ class RunTraceRecorder
             // opening.
             app(BudgetGate::class)->linkRun($userId, $runId);
 
+            // Same best-effort, never-throws shape as BudgetGate::linkRun()
+            // above — links this run to whatever DegradationGate::evaluate()
+            // decided a few lines earlier in this same request/job
+            // (085-graceful-degradation, research.md D3), so a later
+            // re-entry into the same response can read the frozen decision
+            // back via DegradationGate::forRun() rather than re-evaluating
+            // standing that may have moved on. DegradationGate::linkRun()
+            // takes a non-nullable $conversationId (unlike this method's own
+            // $conversationId, nullable for the system-initiated call sites
+            // that pass none) — skipped entirely when this run has no
+            // conversation, since evaluate() is never reached for those
+            // either (DegradationGate::evaluate() is only ever called from
+            // AgentLoopService::admitInteractiveWork(), which always has one).
+            if ($conversationId !== null) {
+                app(\ClarionApp\LlmClient\Services\DegradationGate::class)->linkRun($userId, $conversationId, $runId);
+            }
+
             Context::add('run_id', $runId);
 
             return $runId;

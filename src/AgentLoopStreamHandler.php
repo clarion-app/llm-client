@@ -17,6 +17,8 @@ use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
 use ClarionApp\LlmClient\Services\ToolResultCondenser;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
+use ClarionApp\LlmClient\Services\DegradationGate;
+use ClarionApp\LlmClient\ValueObjects\DegradationDecision;
 use Illuminate\Support\Facades\Log;
 
 class AgentLoopStreamHandler extends HandleHttpStreamResponse
@@ -298,8 +300,28 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             }
         }
 
+        // A reduced response is disclosed here, the same point this method
+        // already amends $this->reply for schema compliance, right before
+        // it is persisted (085-graceful-degradation, research.md D10).
+        // forRun() reads back the decision frozen at this response's own
+        // admission — never re-evaluates standing (FR-006/SC-003).
+        $degradationDecision = app(DegradationGate::class)->forRun($this->runId);
+        $degradationBlock = null;
+        if ($degradationDecision->outcome === DegradationDecision::OUTCOME_REDUCED) {
+            $disclosure = $degradationDecision->composeDisclosure();
+            if ($disclosure !== null) {
+                $this->reply = $disclosure.' '.$this->reply;
+            }
+            $degradationBlock = $degradationDecision->toDisclosureArray();
+        }
+
         $this->message->content = $this->reply;
         $this->message->responseTime = $seconds;
+        if ($degradationBlock !== null) {
+            $this->message->tool_data = array_merge($this->message->tool_data ?? [], [
+                'degradation' => $degradationBlock,
+            ]);
+        }
         $this->message->save();
 
         // Close the step and run for the plain-reply branch.
@@ -344,6 +366,11 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $metaToolNames = ['list_applications', 'execute_operation', 'search_operations'];
         $registry = app(\ClarionApp\LlmClient\Services\McpToolRegistry::class);
 
+        // Resolved once, before the loop below — the whole batch uses one
+        // frozen decision, never re-evaluated per tool call
+        // (085-graceful-degradation, FR-006/SC-003).
+        $degradationDecision = app(DegradationGate::class)->forRun($this->runId);
+
         // Iterated by position, not by key: this array is accumulated under
         // whatever index each streamed delta declared, so its keys are the
         // provider's, not necessarily 0..n-1. The mid-batch stop below slices
@@ -370,6 +397,22 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 }
 
                 $this->handleWorkCeilingReached($conversation, $workDecision, $toolResults);
+
+                return;
+            }
+
+            // See the identical check in AgentLoopService::run()'s own
+            // tool-call loop (085-graceful-degradation, research.md D6):
+            // beside, never inside, the ConversationWorkGate check above.
+            if (in_array($toolName, $degradationDecision->withheldTools, true)) {
+                foreach (array_slice($this->toolCalls, $tcIndex) as $unexecutedCall) {
+                    $toolResults[] = [
+                        'tool_call_id' => $unexecutedCall['id'] ?? '',
+                        'content' => DegradationDecision::UNEXECUTED_TOOL_RESULT,
+                    ];
+                }
+
+                $this->handleWithheldToolRefusal($conversation, $degradationDecision, $toolResults);
 
                 return;
             }
@@ -737,6 +780,56 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
             null,
             $workDecision->reason,
+        );
+
+        event(new FinishOpenAIConversationResponseEvent($conversation->id, $content));
+        $conversation->update(['is_processing' => false]);
+    }
+
+    /**
+     * A withheld-tool call was attempted mid-batch. Mirrors
+     * handleWorkCeilingReached()'s exact close-out sequence — the visible
+     * assistant message, the step/run closed stopped_early, the finish
+     * event, is_processing cleared — with a distinct refusal message and a
+     * distinct `code` in the eventual JSON response
+     * (085-graceful-degradation, research.md D6, contracts §4).
+     */
+    private function handleWithheldToolRefusal(
+        Conversation $conversation,
+        DegradationDecision $decision,
+        array $toolResults,
+    ): void {
+        $content = $decision->composeWithheldToolRefusal();
+
+        if ($this->message === null) {
+            $this->message = Message::create([
+                'conversation_id' => $conversation->id,
+                'responseTime' => 0,
+                'user' => $conversation->character,
+                'role' => 'assistant',
+                'content' => $content,
+            ]);
+            event(new NewConversationMessageEvent($conversation->id, $this->message->id));
+        }
+
+        $this->message->update([
+            'content' => $content,
+            'tool_data' => [
+                'tool_calls' => $this->toolCalls,
+                'tool_results' => $toolResults,
+                'pending_confirmation' => null,
+            ],
+        ]);
+
+        // Close the step and run as stopped_early.
+        $this->closeCurrentStep(
+            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+            $content,
+        );
+        $this->closeRun(
+            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+            null,
+            $content,
         );
 
         event(new FinishOpenAIConversationResponseEvent($conversation->id, $content));

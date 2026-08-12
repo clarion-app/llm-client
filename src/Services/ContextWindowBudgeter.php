@@ -60,6 +60,11 @@ final class ContextWindowBudgeter
      * @param string $conversationId For the event payload.
      * @param ContextManagementOutcome|null $outcome Optional out-parameter populated with capacity, budget,
      *        tokens before/after, and a trim step when trimming occurs.
+     * @param int|null $historyBudgetOverride When non-null, used verbatim in place of the value
+     *        resolveHistoryBudget() would otherwise compute — the degradation ladder's
+     *        history_budget_ratio lever (085-graceful-degradation, research.md D5). Nothing else in
+     *        this method changes: the reduction changes only the number being fit against, never the
+     *        fitting algorithm itself.
      *
      * @return list<array{role: string, content: string|null, tool_calls?: array, tool_call_id?: string}>
      *         Trimmed array (system pinned; newest kept, possibly truncated).
@@ -70,7 +75,8 @@ final class ContextWindowBudgeter
         ProviderType $provider,
         callable $estimator,
         string $conversationId,
-        ?ContextManagementOutcome &$outcome = null
+        ?ContextManagementOutcome &$outcome = null,
+        ?int $historyBudgetOverride = null,
     ): array {
         // Check master toggle — passthrough when disabled.
         if (!($this->config['enabled'] ?? true)) {
@@ -112,7 +118,7 @@ final class ContextWindowBudgeter
 
         // Compute history budget.
         $systemEstimate = $systemMessage ? $this->estimateMessage($systemMessage, $estimator) : 0;
-        $historyBudget = $this->resolveHistoryBudget($model, $provider, $systemEstimate);
+        $historyBudget = $historyBudgetOverride ?? $this->resolveHistoryBudget($model, $provider, $systemEstimate);
 
         // Group history messages into turn units.
         $units = $this->groupIntoTurnUnits($historyMessages, $estimator);

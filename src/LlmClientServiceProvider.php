@@ -517,6 +517,18 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        // scoped(), matching BudgetGate/RateLimitGate above — NOT
+        // singleton() like ConversationWorkGate just above, and for the
+        // same reason BudgetGate/RateLimitGate are scoped(): linkRun()
+        // needs a same-request instance property to read back the
+        // decision evaluate() just computed a few lines earlier in the
+        // same request/job (research.md D3, corrected), the identical
+        // shape BudgetGate::linkRun() already relies on for its own
+        // $this->reservationIds.
+        $this->app->scoped(\ClarionApp\LlmClient\Services\DegradationGate::class, function () {
+            return new \ClarionApp\LlmClient\Services\DegradationGate();
+        });
+
         // bind(), not singleton() and not scoped(). The notifier holds no
         // state of its own, but it reads through BudgetLedger, whose memo is
         // deliberately per-request/per-job: a longer-lived notifier would

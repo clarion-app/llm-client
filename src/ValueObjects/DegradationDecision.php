@@ -27,6 +27,14 @@ final readonly class DegradationDecision
     public const OUTCOME_REDUCED = 'reduced';
 
     /**
+     * The synthesized tool_result content for every not-yet-executed call
+     * in a batch when one of them names a withheld tool — mirroring
+     * ConversationWorkDecision::UNEXECUTED_TOOL_RESULT one axis over
+     * (research.md D6).
+     */
+    public const UNEXECUTED_TOOL_RESULT = 'This tool call was not executed: the requested capability is unavailable in the current reduced operating mode.';
+
+    /**
      * @param  string  $outcome  one of OUTCOME_FULL, OUTCOME_REDUCED
      * @param  ReductionStep|null  $governingStep  the rung that produced the
      *   outcome — null only when `outcome === 'full'`
@@ -114,6 +122,47 @@ final readonly class DegradationDecision
             implode('; ', $levers),
             $resets,
         );
+    }
+
+    /**
+     * The refusal sentence for a mid-response attempt to call a tool this
+     * decision withholds (contracts §4, research.md D6) — a distinct fact
+     * from composeDisclosure()'s "reduced but still usable" sentence, never
+     * reused verbatim: this one always ends the response rather than
+     * continuing it.
+     */
+    public function composeWithheldToolRefusal(): string
+    {
+        $resets = $this->resetsAt !== null
+            ? $this->resetsAt->format('Y-m-d H:i').' UTC'
+            : 'the next reset';
+
+        return sprintf(
+            'This capability is unavailable in the current reduced operating mode, and the request cannot be '
+            .'completed without it, so it has been refused rather than answered without it. Full capability is '
+            .'expected back %s.',
+            $resets,
+        );
+    }
+
+    /**
+     * The wire shape both the synchronous and streamed completion paths
+     * attach as `degradation` (contracts §4) — null on `full`, so a caller
+     * can key its own `degraded` flag off whether this returns null.
+     */
+    public function toDisclosureArray(): ?array
+    {
+        if ($this->outcome !== self::OUTCOME_REDUCED) {
+            return null;
+        }
+
+        return [
+            'axis' => $this->axis,
+            'substitute_model' => $this->effectiveModel,
+            'withheld_tools' => $this->withheldTools,
+            'history_budget_ratio' => $this->historyBudgetRatio,
+            'resets_at' => $this->resetsAt?->toIso8601String(),
+        ];
     }
 
     private static function axisLabel(?string $axis): string

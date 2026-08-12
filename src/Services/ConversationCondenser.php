@@ -65,14 +65,19 @@ class ConversationCondenser
         ?Server $server = null,
         ?ContextManagementOutcome &$outcome = null
     ): array {
-        // Fallback: condensation disabled
+        // Fallback: condensation disabled. $historyBudget is forwarded
+        // verbatim as trim()'s own historyBudgetOverride — null passes
+        // through to trim()'s own default resolution unchanged; a caller-
+        // supplied override (085-graceful-degradation's history_budget_ratio
+        // lever, research.md D5) is honored even when condensation itself
+        // never runs, rather than silently dropped.
         if (!($this->config['enabled'] ?? true)) {
-            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId, $outcome);
+            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId, $outcome, $historyBudget);
         }
 
-        // Fallback: in cooldown
+        // Fallback: in cooldown. Same forwarding as the disabled fallback above.
         if ($this->store->inCooldown($conversationId)) {
-            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId, $outcome);
+            return $this->budgeter->trim($messages, $model, $provider, $estimator, $conversationId, $outcome, $historyBudget);
         }
 
         // Deep-copy to avoid mutation
@@ -327,7 +332,12 @@ class ConversationCondenser
             $outcome->addStep(ContextManagementStep::smartTrim($smartTrimTokensBefore, $smartTrimTokensAfter));
         }
 
-        return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome);
+        // $historyBudget here is this method's own required parameter —
+        // already resolved (or overridden) by the caller — forwarded
+        // verbatim as trim()'s historyBudgetOverride so the budget
+        // smart-trim just sized against is the same one the budgeter's
+        // own final pass fits against, never independently recomputed.
+        return $this->budgeter->trim($afterSmartTrim, $model, $provider, $estimator, $conversationId, $outcome, $historyBudget);
     }
 
     /**

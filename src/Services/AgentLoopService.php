@@ -38,6 +38,8 @@ use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision;
+use ClarionApp\LlmClient\ValueObjects\DegradationDecision;
+use ClarionApp\LlmClient\ValueObjects\RateLimitDecision;
 use Illuminate\Support\Str;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use Illuminate\Support\Facades\Context;
@@ -161,20 +163,36 @@ class AgentLoopService
         // no installation-wide axis for a rate limit to fall back to — a
         // conversation with no owning user has no user whose allowance
         // could be consumed.
+        $rateLimitDecision = null;
         if ($conversation->user_id !== null) {
-            app(RateLimitGate::class)->admit(
+            $rateLimitDecision = app(RateLimitGate::class)->admit(
                 (string) $conversation->user_id,
                 $kind,
                 $conversation->id,
             );
         }
 
-        app(BudgetGate::class)->admit(
+        $budgetDecision = app(BudgetGate::class)->admit(
             $conversation->user_id === null ? null : (string) $conversation->user_id,
             $kind,
             $conversation->id,
             null,
             $existingRunId,
+        );
+
+        // The one call site DegradationGate::evaluate() is ever reached
+        // from (085-graceful-degradation, research.md D1) — immediately
+        // after both admits above have already succeeded, so this can
+        // never itself refuse the request (FR-003/SC-005 hold by
+        // construction, not by a check this call performs). The decision
+        // is stored on the gate's own scoped instance for
+        // RunTraceRecorder::openRun()'s linkRun() call to read back a few
+        // lines later in this same request/job.
+        app(DegradationGate::class)->evaluate(
+            $conversation->user_id === null ? null : (string) $conversation->user_id,
+            $conversation->id,
+            $rateLimitDecision ?? RateLimitDecision::noLimitConfigured(),
+            $budgetDecision,
         );
     }
 
@@ -262,7 +280,13 @@ class AgentLoopService
             }
         }
 
-        $tools = $this->buildToolsPayload();
+        // Resolved once per dispatch, before buildToolsPayload()/
+        // applyContextWindowTrim() are called (085-graceful-degradation,
+        // tasks.md T001 point 1) — never re-evaluated inside this method,
+        // so the whole response uses one frozen decision (FR-006/SC-003).
+        $decision = app(DegradationGate::class)->forRun($runId);
+
+        $tools = $this->buildToolsPayload($decision->withheldTools);
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
 
@@ -270,19 +294,19 @@ class AgentLoopService
         $reshapeTuple = null;
         if ($this->runTraceRecorder !== null) {
             $trimStartedAt = new \DateTimeImmutable();
-            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null, $decision);
             $trimEndedAt = new \DateTimeImmutable();
             $reshapeTuple = [
                 'started_at' => $trimStartedAt,
                 'ended_at' => $trimEndedAt,
             ];
         } else {
-            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null, $decision);
         }
 
         $formatted = $this->formatMessages($conversation, $trimmed);
 
-        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId, $reshapeTuple);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId, $reshapeTuple, $decision->effectiveModel, $decision->effectiveServerId);
     }
 
     public function resume(Conversation $conversation, Message $message, bool $approved): void
@@ -385,8 +409,13 @@ class AgentLoopService
         $toolData['pending_confirmation'] = null;
         $message->update(['tool_data' => $toolData]);
 
-        // Continue the agent loop
-        $tools = $this->buildToolsPayload();
+        // Continue the agent loop. Resolved once, before buildToolsPayload()/
+        // applyContextWindowTrim() (085-graceful-degradation, tasks.md T001
+        // point 1) — resume() never mints a run of its own, so this reads
+        // back whatever the original start()/run() dispatch decided.
+        $decision = app(DegradationGate::class)->forRun($runId);
+
+        $tools = $this->buildToolsPayload($decision->withheldTools);
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation);
 
@@ -394,18 +423,18 @@ class AgentLoopService
         $reshapeTuple = null;
         if ($this->runTraceRecorder !== null) {
             $trimStartedAt = new \DateTimeImmutable();
-            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null, $decision);
             $trimEndedAt = new \DateTimeImmutable();
             $reshapeTuple = [
                 'started_at' => $trimStartedAt,
                 'ended_at' => $trimEndedAt,
             ];
         } else {
-            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null);
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, null, $decision);
         }
 
         $formatted = $this->formatMessages($conversation, $trimmed);
-        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId, $reshapeTuple);
+        $this->dispatchStreamRequest($conversation, $formatted['messages'], $formattedTools, $iteration, $formatted['system'], null, $runId, $reshapeTuple, $decision->effectiveModel, $decision->effectiveServerId);
     }
 
     /**
@@ -469,6 +498,67 @@ class AgentLoopService
     }
 
     /**
+     * The close-out a withheld-tool refusal performs, shared by every
+     * in-loop call site in this class — mirrors
+     * stopForConversationWorkCeiling()'s exact shape (085-graceful-
+     * degradation, research.md D6): the tool the model attempted is not
+     * executed, every not-yet-executed call in the batch already has a
+     * synthesized tool_result by the time this is called, and the run
+     * closes StoppedEarly with a distinct refusal message/code — a
+     * capability the current reduced mode does not offer is refused
+     * outright, never silently completed without it (FR-008/FR-009).
+     */
+    private function stopForWithheldTool(
+        Conversation $conversation,
+        ?string $runId,
+        ?string $currentStepId,
+        array $toolCalls,
+        array $toolResults,
+        int $iteration,
+        DegradationDecision $decision,
+    ): array {
+        $reason = $decision->composeWithheldToolRefusal();
+
+        $assistantMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $reason,
+            'role' => 'assistant',
+            'user' => $conversation->character,
+            'responseTime' => 0,
+            'tool_data' => [
+                'tool_calls' => $toolCalls,
+                'tool_results' => $toolResults,
+                'iteration' => $iteration,
+                'pending_confirmation' => null,
+            ],
+        ]);
+
+        $conversation->update(['is_processing' => false]);
+
+        if ($this->runTraceRecorder !== null && $runId !== null) {
+            if ($currentStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $currentStepId,
+                    RunEndState::StoppedEarly,
+                    $reason,
+                );
+            }
+            $this->runTraceRecorder->closeRun(
+                $runId,
+                RunEndState::StoppedEarly,
+                $reason,
+            );
+        }
+
+        return [
+            'status' => 'stopped',
+            'content' => $reason,
+            'message_id' => $assistantMessage->id,
+            'code' => 'degradation_capability_required',
+        ];
+    }
+
+    /**
      * Synchronous agent loop execution for external channel integrations.
      * Returns the final response array or a confirmation-required structure.
      *
@@ -500,6 +590,13 @@ class AgentLoopService
                 agentId: $conversation->character ?? $conversation->id,
             );
         }
+
+        // Resolved once per dispatch, before buildToolsPayload()/
+        // applyContextWindowTrim() are called (085-graceful-degradation,
+        // tasks.md T001 point 1) — never re-evaluated inside this method's
+        // own loop, so every iteration of this response uses one frozen
+        // decision (FR-006/SC-003).
+        $decision = app(DegradationGate::class)->forRun($runId);
 
         // Resolve preset schema if a preset name is specified
         $presetName = $options['preset'] ?? null;
@@ -544,7 +641,7 @@ class AgentLoopService
         }
 
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
-        $tools = $this->buildToolsPayload();
+        $tools = $this->buildToolsPayload($decision->withheldTools);
         $formattedTools = $this->formatTools($conversation, $tools);
 
         $shouldValidate = $this->schemaValidator->shouldValidate($options);
@@ -586,7 +683,7 @@ class AgentLoopService
                         $attemptGroupId,
                     );
                 }
-                $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId);
+                $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId, $decision);
                 if ($this->runTraceRecorder !== null && $activeActionId !== null) {
                     $this->runTraceRecorder->closeAction($activeActionId, ActionOutcome::Success);
                     $activeActionId = null;
@@ -615,7 +712,14 @@ class AgentLoopService
                         $attemptGroupId,
                     );
                 }
-                $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $systemPrompt);
+                $response = $this->callLlmSync(
+                    $conversation,
+                    $formatted['messages'],
+                    $formattedTools,
+                    $systemPrompt,
+                    modelOverride: $decision->effectiveModel,
+                    serverIdOverride: $decision->effectiveServerId,
+                );
                 if ($this->runTraceRecorder !== null && $activeActionId !== null) {
                     $this->runTraceRecorder->closeAction($activeActionId, ActionOutcome::Success);
                     $activeActionId = null;
@@ -702,12 +806,29 @@ class AgentLoopService
                         }
                     }
 
+                    // A response completing under a crossed reduction
+                    // threshold is disclosed, never silently returned as if
+                    // it were ordinary (085-graceful-degradation, FR-004,
+                    // research.md D10) — the disclosure sentence is
+                    // prepended to the same $content both the stored
+                    // message and the returned array read below, so the
+                    // two can never disagree about what the user was told.
+                    $degradationBlock = null;
+                    if ($decision->outcome === DegradationDecision::OUTCOME_REDUCED) {
+                        $disclosure = $decision->composeDisclosure();
+                        if ($disclosure !== null) {
+                            $content = $disclosure.' '.$content;
+                        }
+                        $degradationBlock = $decision->toDisclosureArray();
+                    }
+
                     $assistantMessage = Message::create([
                         'conversation_id' => $conversation->id,
                         'content' => $content,
                         'role' => 'assistant',
                         'user' => $conversation->character,
                         'responseTime' => 0,
+                        'tool_data' => $degradationBlock !== null ? ['degradation' => $degradationBlock] : null,
                     ]);
 
                     $agentId = $conversation->character ?? $conversation->id;
@@ -741,7 +862,7 @@ class AgentLoopService
                         'content' => $validatedContent !== null ? json_encode($validatedContent) : $content,
                         'validated' => $validatedContent,
                         'message_id' => $assistantMessage->id,
-                    ];
+                    ] + ($degradationBlock !== null ? ['degraded' => true, 'degradation' => $degradationBlock] : []);
                 }
 
                 // Handle tool calls
@@ -777,6 +898,33 @@ class AgentLoopService
                             $toolResults,
                             $iteration,
                             $workDecision,
+                        );
+                    }
+
+                    // Beside, never inside, the ConversationWorkGate check
+                    // above (085-graceful-degradation, research.md D6): a
+                    // called name found in the governing decision's
+                    // withheldTools set stops the entire batch, mirroring
+                    // the ceiling stop's own synthesized-tool_result shape,
+                    // but with a distinct refusal message and code — this
+                    // is a capability the current reduced mode does not
+                    // offer, never a ceiling.
+                    if (in_array($toolName, $decision->withheldTools, true)) {
+                        foreach (array_slice($toolCalls, $tcIndex) as $unexecutedCall) {
+                            $toolResults[] = [
+                                'tool_call_id' => $unexecutedCall['id'] ?? '',
+                                'content' => DegradationDecision::UNEXECUTED_TOOL_RESULT,
+                            ];
+                        }
+
+                        return $this->stopForWithheldTool(
+                            $conversation,
+                            $runId,
+                            $currentStepId,
+                            $toolCalls,
+                            $toolResults,
+                            $iteration,
+                            $decision,
                         );
                     }
 
@@ -1162,9 +1310,15 @@ class AgentLoopService
         $toolData['pending_confirmation'] = null;
         $message->update(['tool_data' => $toolData]);
 
-        // Continue with synchronous loop
+        // Continue with synchronous loop. Resolved once, before
+        // buildToolsPayload()/applyContextWindowTrim() are called
+        // (085-graceful-degradation, tasks.md T001 point 1) — never
+        // re-evaluated inside this method's own loop, so every iteration
+        // of this continuation uses one frozen decision (FR-006/SC-003).
+        $decision = app(DegradationGate::class)->forRun($runId);
+
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
-        $tools = $this->buildToolsPayload();
+        $tools = $this->buildToolsPayload($decision->withheldTools);
         $formattedTools = $this->formatTools($conversation, $tools);
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
@@ -1181,7 +1335,7 @@ class AgentLoopService
                     $attemptGroupId,
                 );
             }
-            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId);
+            $trimmed = $this->applyContextWindowTrim($conversation, $rawMessages, $attemptGroupId, $decision);
             if ($this->runTraceRecorder !== null && $reshapeActionId !== null) {
                 $this->runTraceRecorder->closeAction($reshapeActionId, ActionOutcome::Success);
             }
@@ -1202,7 +1356,14 @@ class AgentLoopService
                     $attemptGroupId,
                 );
             }
-            $response = $this->callLlmSync($conversation, $formatted['messages'], $formattedTools, $formatted['system']);
+            $response = $this->callLlmSync(
+                $conversation,
+                $formatted['messages'],
+                $formattedTools,
+                $formatted['system'],
+                modelOverride: $decision->effectiveModel,
+                serverIdOverride: $decision->effectiveServerId,
+            );
             if ($this->runTraceRecorder !== null && $llmActionId !== null) {
                 $this->runTraceRecorder->closeAction($llmActionId, ActionOutcome::Success);
             }
@@ -1285,6 +1446,28 @@ class AgentLoopService
                         $toolResults,
                         $iteration,
                         $workDecision,
+                    );
+                }
+
+                // See the identical check in run()'s own tool-call loop
+                // (085-graceful-degradation, research.md D6): beside, never
+                // inside, the ConversationWorkGate check above.
+                if (in_array($toolName, $decision->withheldTools, true)) {
+                    foreach (array_slice($toolCalls, $tcIndex) as $unexecutedCall) {
+                        $toolResults[] = [
+                            'tool_call_id' => $unexecutedCall['id'] ?? '',
+                            'content' => DegradationDecision::UNEXECUTED_TOOL_RESULT,
+                        ];
+                    }
+
+                    return $this->stopForWithheldTool(
+                        $conversation,
+                        $runId,
+                        $currentStepId,
+                        $toolCalls,
+                        $toolResults,
+                        $iteration,
+                        $decision,
                     );
                 }
 
@@ -1478,16 +1661,30 @@ class AgentLoopService
      *
      * @param Conversation $conversation The conversation context.
      * @param array $messages Canonical OpenAI-shaped message array from buildMessagesPayload().
+     * @param DegradationDecision|null $decision The governing degradation decision for this
+     *        response, resolved once by the caller via DegradationGate::forRun() — when
+     *        'reduced', resolves the effective model and scales the history budget
+     *        (085-graceful-degradation, research.md D4/D5).
      * @return array Trimmed canonical message array.
      */
-    private function applyContextWindowTrim(Conversation $conversation, array $messages, ?string $attemptGroupId = null): array
+    private function applyContextWindowTrim(Conversation $conversation, array $messages, ?string $attemptGroupId = null, ?DegradationDecision $decision = null): array
     {
-        $providerType = $conversation->effectiveProviderType;
-        $server = $conversation->server;
+        // A rung's substitute_server_id, when set, must govern here too —
+        // not only at dispatch (callLlmSync()/dispatchStreamRequest()) —
+        // since the token estimator below is resolved from whichever
+        // provider is about to actually receive the request; trimming
+        // against the wrong provider's tokenizer would silently mis-size
+        // the budget (085-graceful-degradation, research.md D4a).
+        $server = $decision?->effectiveServerId !== null
+            ? (Server::find($decision->effectiveServerId) ?? $conversation->server)
+            : $conversation->server;
+        $providerType = $server !== null
+            ? ($conversation->provider_override ?? $server->provider_type)
+            : $conversation->effectiveProviderType;
 
         // Resolve the provider and build the estimator closure.
         $provider = $this->providerRegistry->resolveByType($providerType, $server);
-        $model = $conversation->model;
+        $model = $decision?->effectiveModel ?? $conversation->model;
         $estimator = fn (string $text) => $provider->countTokens($text, $model);
 
         /** @var \ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome $outcome */
@@ -1500,6 +1697,24 @@ class AgentLoopService
             providerType: null,
         );
 
+        // The degradation ladder's history_budget_ratio lever
+        // (085-graceful-degradation, research.md D5): resolve the
+        // ordinary model-aware budget first, then scale it by the
+        // governing rung's ratio — never a second trimming algorithm,
+        // only a different number handed to the existing one. Composes
+        // correctly with a simultaneously-substituted model because
+        // $model above is already the substitute's, so the budget being
+        // scaled here is the substitute's own, not the original model's.
+        $historyBudgetOverride = null;
+        if ($decision !== null && $decision->historyBudgetRatio !== null) {
+            $overrideSystemEstimate = 0;
+            if (!empty($messages) && ($messages[0]['role'] ?? null) === 'system') {
+                $overrideSystemEstimate = $estimator((string) ($messages[0]['content'] ?? ''));
+            }
+            $ordinaryHistoryBudget = $this->contextWindowBudgeter->resolveHistoryBudget($model, $providerType, $overrideSystemEstimate);
+            $historyBudgetOverride = (int) bcmul((string) $ordinaryHistoryBudget, (string) $decision->historyBudgetRatio, 0);
+        }
+
         // Try condensation first if available, then fall back to trimming
         if ($this->conversationCondenser) {
             $result = $this->conversationCondenser->condenseOrTrim(
@@ -1508,7 +1723,7 @@ class AgentLoopService
                 $providerType,
                 $estimator,
                 $conversation->id,
-                null,
+                $historyBudgetOverride,
                 $server,
                 $outcome
             );
@@ -1519,7 +1734,8 @@ class AgentLoopService
                 $providerType,
                 $estimator,
                 $conversation->id,
-                $outcome
+                $outcome,
+                $historyBudgetOverride,
             );
         }
 
@@ -1559,18 +1775,37 @@ class AgentLoopService
      * Make a synchronous (non-streaming) LLM API call.
      * Delegates to the resolved provider based on the conversation's effective provider type.
      */
-    private function callLlmSync(Conversation $conversation, array $messages, array $tools, string $system = '', ?string $responseFormat = null): array
-    {
-        $server = $conversation->server;
+    private function callLlmSync(
+        Conversation $conversation,
+        array $messages,
+        array $tools,
+        string $system = '',
+        ?string $responseFormat = null,
+        ?string $modelOverride = null,
+        ?string $serverIdOverride = null,
+    ): array {
+        // A rung's substitute_server_id, when set, must actually change
+        // dispatch (085-graceful-degradation, research.md D4a) — a
+        // since-deleted substitute falls back to the conversation's own
+        // server, never throws, matching DegradationGate::forRun()'s own
+        // tolerance for a since-deleted governing rung (research.md D3).
+        $server = $serverIdOverride !== null
+            ? (Server::find($serverIdOverride) ?? $conversation->server)
+            : $conversation->server;
         if (!$server) {
             throw new \RuntimeException('No LLM server configured');
         }
 
-        $providerType = $conversation->effectiveProviderType;
+        // Re-derived from the RESOLVED $server, not $conversation->server —
+        // Conversation::effectiveProviderType is always anchored to the
+        // conversation's own server, which would silently ignore a
+        // substitute server naming a different provider family.
+        $providerType = $conversation->provider_override ?? $server->provider_type;
         $provider = $this->providerRegistry->resolveByType($providerType, $server);
 
-        // Use provider-specific default model when conversation model is null
-        $model = $conversation->model;
+        // Use the degradation ladder's substitute model, then the
+        // provider-specific default model when the conversation names none.
+        $model = $modelOverride ?? $conversation->model;
         if ($model === null) {
             $model = config('llm-client.providers.' . $providerType->value . '.default_model');
         }
@@ -1593,9 +1828,16 @@ class AgentLoopService
         return $provider->chat($messages, $tools, $options);
     }
 
-    public function buildToolsPayload(): array
+    /**
+     * @param array $withheld Tool names to exclude from the returned payload —
+     *        the degradation ladder's governing rung, if any
+     *        (085-graceful-degradation, research.md D6). Additive, default
+     *        [] — every existing call site continues to receive the full,
+     *        unfiltered tool set when no reduction applies.
+     */
+    public function buildToolsPayload(array $withheld = []): array
     {
-        return [
+        $tools = [
             [
                 'type' => 'function',
                 'function' => [
@@ -1760,6 +2002,15 @@ class AgentLoopService
                 ],
             ],
         ];
+
+        if (empty($withheld)) {
+            return $tools;
+        }
+
+        return array_values(array_filter(
+            $tools,
+            fn (array $tool) => !in_array($tool['function']['name'] ?? null, $withheld, true),
+        ));
     }
 
     /**
@@ -2425,13 +2676,23 @@ class AgentLoopService
         ?string $responseFormat = null,
         ?string $runId = null,
         ?array $reshapeTuple = null,
+        ?string $modelOverride = null,
+        ?string $serverIdOverride = null,
     ): void {
-        $server = Server::find($conversation->server_id);
+        // A rung's substitute_server_id, when set, must actually change
+        // dispatch (085-graceful-degradation, research.md D4a) — a
+        // since-deleted substitute falls back to the conversation's own
+        // server, never throws. EndpointResolver reads the resolved
+        // $server's own provider_type internally, so no separate provider
+        // type override is needed here (unlike callLlmSync()).
+        $server = $serverIdOverride !== null
+            ? (Server::find($serverIdOverride) ?? $conversation->server)
+            : Server::find($conversation->server_id);
         $resolver = app(EndpointResolver::class);
 
         $body = new \stdClass();
         $body->temperature = 1.0;
-        $body->model = $conversation->model;
+        $body->model = $modelOverride ?? $conversation->model;
         $body->stream = true;
         $body->messages = $messages;
 
