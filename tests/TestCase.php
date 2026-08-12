@@ -268,6 +268,7 @@ abstract class TestCase extends BaseTestCase
         }
 
         $this->defineBudgetSchema();
+        $this->defineReservationSchema();
         $this->defineRateLimitSchema();
         $this->defineConversationWorkSchema();
         $this->defineEvalSuiteSchema();
@@ -622,6 +623,58 @@ abstract class TestCase extends BaseTestCase
                     ['scope_type', 'scope_id', 'period_type', 'period_start', 'kind'],
                     'budget_threshold_notifications_latch_unique'
                 );
+            });
+        }
+    }
+
+    /**
+     * The budget_reservation_ledger/cost_reservations tables — the
+     * atomic reservation-anchor and per-admission identity rows this
+     * feature adds (data-model.md §1/§2). Once a stop-mode ceiling is
+     * configured in a test's fixtures, BudgetGate::admit()'s deepened,
+     * reservation-aware path can reach these tables, so a schema without
+     * them no longer describes a deployment this package can run in.
+     *
+     * Extracted, guarded by Schema::hasTable(), and called from
+     * defineDatabaseMigrations() directly, matching defineBudgetSchema()'s
+     * own shape and call-site pattern so the same handful of test classes
+     * that hand-declare a schema of their own can call it too.
+     */
+    protected function defineReservationSchema(): void
+    {
+        // budget_reservation_ledger table (the atomic per-scope anchor row).
+        if (!Schema::hasTable('budget_reservation_ledger')) {
+            Schema::create('budget_reservation_ledger', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('scope_type', 16);
+                $table->uuid('scope_id');
+                $table->decimal('reserved_total', 20, 10)->default(0);
+                $table->timestamp('updated_at')->useCurrent();
+
+                // A genuine unique constraint, not a plain index — see the
+                // migration's own comment.
+                $table->unique(['scope_type', 'scope_id']);
+            });
+        }
+
+        // cost_reservations table (one row per admitted unit of work's
+        // reservation).
+        if (!Schema::hasTable('cost_reservations')) {
+            Schema::create('cost_reservations', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->json('scope_keys');
+                $table->uuid('user_id')->nullable();
+                $table->uuid('conversation_id')->nullable();
+                $table->uuid('run_id')->nullable();
+                $table->string('work_kind', 16);
+                $table->decimal('estimated_amount', 20, 10);
+                $table->decimal('actual_amount', 20, 10)->nullable();
+                $table->string('status', 16);
+                $table->timestamp('held_at');
+                $table->timestamp('resolved_at')->nullable();
+
+                $table->index(['status', 'held_at']);
+                $table->index(['run_id']);
             });
         }
     }

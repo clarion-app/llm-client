@@ -430,6 +430,28 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        // Stateless — no memo, no per-instance admitted-once state. It
+        // reads the conversation's already-persisted message history and
+        // the live model_prices table fresh on every call, so an operator's
+        // price change takes effect on the next estimate with no restart.
+        // singleton() is safe here for the same reason it is for
+        // SpendingCeilingService above.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\CostEstimator::class, function () {
+            return new \ClarionApp\LlmClient\Services\CostEstimator();
+        });
+
+        // Stateless — like BudgetLedger it reads through to durable storage
+        // on every call, but unlike BudgetLedger it keeps no per-instance
+        // memo to become stale across a queue worker's jobs: every read and
+        // write goes straight to budget_reservation_ledger/cost_reservations,
+        // so singleton() carries none of BudgetLedger's cross-job staleness
+        // risk.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ReservationLedger::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\ReservationLedger(
+                $app->make(\ClarionApp\LlmClient\Services\SpendingCeilingService::class),
+            );
+        });
+
         // Stateless — it holds no memo and reads every rate_limits row
         // live, so an operator's change takes effect on the next admission
         // decision with no restart. singleton() is safe here for the same

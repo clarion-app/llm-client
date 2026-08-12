@@ -484,6 +484,33 @@ return [
         // Seconds between repeat degraded-enforcement broadcasts while the
         // degraded condition persists. Every occurrence is still logged.
         'degraded_notice_throttle_seconds' => env('LLM_CLIENT_BUDGET_DEGRADED_THROTTLE', 60),
+
+        // Admission-time reservation settings (research.md D2/D6).
+        'reservation' => [
+            // The output-token half of an admission-time estimate — there
+            // is no output text yet to run UsageEstimator::estimateOutput()
+            // against, so a configured default stands in for it.
+            'estimated_output_tokens_default' => env('LLM_CLIENT_BUDGET_RESERVATION_OUTPUT_TOKENS_DEFAULT', 1000),
+
+            // The abandonment sweep's cutoff, in minutes. Deliberately
+            // shorter than run_trace.abandonment_minutes (default 60): a
+            // leaked reservation directly reduces a still-live user's
+            // spending headroom, whereas a leaked-but-unswept run row is
+            // inert until read.
+            'abandonment_minutes' => env('LLM_CLIENT_BUDGET_RESERVATION_ABANDONMENT_MINUTES', 30),
+        ],
+
+        // What to do when a not-yet-executed request targets a model with
+        // no configured price (research.md D8). 'stop' (default) refuses
+        // admission under a stop-mode ceiling, exactly like an unreadable
+        // consumption figure; 'admit_untracked' always admits with no
+        // reservation placed; 'reserve_flat_estimate' reserves
+        // unpriced_model_flat_estimate below instead of a computed amount.
+        'on_unpriced_model' => env('LLM_CLIENT_BUDGET_ON_UNPRICED_MODEL', 'stop'),
+
+        // Required, plain-decimal string, only when on_unpriced_model is
+        // 'reserve_flat_estimate'.
+        'unpriced_model_flat_estimate' => env('LLM_CLIENT_BUDGET_UNPRICED_MODEL_FLAT_ESTIMATE', null),
     ],
 
     // Per-user request-rate limiting — how many requests a user may start

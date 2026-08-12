@@ -17,6 +17,7 @@ class ConversationObserverTest extends TestCase
         // parent's. Every entry path now crosses the budget gate, whose
         // first act is to ask whether any ceiling exists.
         $this->defineBudgetSchema();
+        $this->defineReservationSchema();
         $this->defineRateLimitSchema();
         $this->defineConversationWorkSchema();
 
