@@ -592,6 +592,33 @@ return [
         'history_lookback_limit' => 20,
     ],
 
+    // Thresholds/windows EvalDashboardQuery/EvalPersistentFailureQuery use
+    // when composing the agent quality overview and its persistent-failure
+    // ranking.
+    'eval_dashboard' => [
+        // The default window (days) EvalDashboardQuery::trend() reads when
+        // the caller does not specify one — how far back "how that rate has
+        // moved over time" looks by default.
+        'default_trend_window_days' => 30,
+
+        // The upper bound a requested trend window is clamped to, so a
+        // caller cannot force an arbitrarily large eval_pass_rate_summaries
+        // scan (still O(days), but bounded regardless of what a caller
+        // asks for).
+        'max_trend_window_days' => 180,
+
+        // Per-case recent-history cap EvalPersistentFailureQuery applies
+        // before ranking — mirrors eval_regression.history_lookback_limit's
+        // role but kept as its own key, since this feature's "recent" and
+        // eval_regression's "recent" are independent, separately-tunable
+        // notions even though they default to the same value.
+        'persistent_failure_lookback' => 20,
+
+        // How many ranked cases the "most persistently failing" list
+        // returns.
+        'persistent_failure_limit' => 10,
+    ],
+
     // Response latency distributions — per-model and per-agent percentile
     // figures computed at read time from agent_runs.
     'latency' => [
