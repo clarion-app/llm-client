@@ -121,6 +121,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\ForwardRunTracesCommand::class,
                 \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
+                \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
             ]);
         }
 

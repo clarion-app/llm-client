@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Models;
 
 use ClarionApp\LlmClient\ValueObjects\EvalCaseOutcome;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 /**
  * The durable, operator-facing outcome of one case within one run
@@ -65,5 +66,11 @@ class EvalCaseResult extends Model
                 $model->created_at = now();
             }
         });
+    }
+
+    /** The run this result belongs to — mirrors EvalRunCase::run() exactly. */
+    public function run(): BelongsTo
+    {
+        return $this->belongsTo(EvalRun::class, 'run_id');
     }
 }

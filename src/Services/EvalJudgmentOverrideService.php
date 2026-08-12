@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Models\EvalCaseResult;
 use ClarionApp\LlmClient\Models\EvalJudgment;
 use ClarionApp\LlmClient\Models\EvalJudgmentOverride;
 use ClarionApp\LlmClient\ValueObjects\EvalCaseOutcome;
+use Illuminate\Support\Facades\Log;
 
 /**
  * The sole write path for eval_judgment_overrides. An override is a new,
@@ -21,6 +22,11 @@ use ClarionApp\LlmClient\ValueObjects\EvalCaseOutcome;
  */
 class EvalJudgmentOverrideService
 {
+    public function __construct(
+        private readonly EvalPassRateRollupService $passRateRollup,
+    ) {
+    }
+
     public function override(EvalJudgment $judgment, ?int $score, ?string $justification, string $userId): EvalJudgmentOverride
     {
         // Force a fresh load of the overrides relation rather than trusting
@@ -88,6 +94,25 @@ class EvalJudgmentOverrideService
 
         $outcome = EvalCaseOutcome::aggregate($expectationResults);
 
+        // Captured before the update below, from whatever was effective a
+        // moment ago — the original, untouched outcome column when this is
+        // the case's first override, or a prior override's value on a
+        // second correction.
+        $oldEffective = $caseResult->outcome_override ?? $caseResult->outcome->value;
+
         $caseResult->update(['outcome_override' => $outcome->value]);
+
+        if ($outcome->value !== $oldEffective) {
+            try {
+                $this->passRateRollup->adjustForOverride($caseResult, $oldEffective, $outcome->value);
+            } catch (\Throwable $e) {
+                Log::warning('EvalJudgmentOverrideService: failed to adjust pass-rate rollup', [
+                    'eval_case_result_id' => $caseResult->id,
+                    'old_effective' => $oldEffective,
+                    'new_effective' => $outcome->value,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
     }
 }

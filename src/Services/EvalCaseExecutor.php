@@ -13,6 +13,7 @@ use ClarionApp\LlmClient\ValueObjects\EvalRunCaseStatus;
 use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use ClarionApp\LlmClient\ValueObjects\ExpectationKind;
 use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 /**
@@ -30,6 +31,7 @@ class EvalCaseExecutor
     public function __construct(
         private readonly EvalCaseJudge $judge,
         private readonly AgentLoopService $agentLoop,
+        private readonly EvalPassRateRollupService $passRateRollup,
     ) {
     }
 
@@ -263,6 +265,16 @@ class EvalCaseExecutor
             'expectation_results' => $expectationResults,
             'error_message' => $errorMessage,
         ]);
+
+        try {
+            $this->passRateRollup->recordResult($run, $caseResult);
+        } catch (\Throwable $e) {
+            Log::warning('EvalCaseExecutor: failed to record pass-rate rollup', [
+                'run_id' => $run->id,
+                'eval_case_result_id' => $caseResult->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
 
         $evalRunCase->update(['status' => EvalRunCaseStatus::Completed]);
 

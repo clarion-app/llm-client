@@ -34,7 +34,13 @@ class EvalPassRateSummary extends Model
     ];
 
     protected $casts = [
-        'period_date' => 'date',
+        // Explicit Y-m-d format: a bare 'date' cast still persists via the
+        // connection's full datetime format on write (Eloquent's own
+        // fromDateTime()/getDateFormat() behavior), which would otherwise
+        // desynchronize this column's stored value from every plain
+        // 'Y-m-d' string this table's raw-query writers (the rollup
+        // service, the recompute command) already use.
+        'period_date' => 'date:Y-m-d',
         'pass_count' => 'integer',
         'fail_count' => 'integer',
         'needs_human_review_count' => 'integer',

@@ -30,6 +30,7 @@ use ClarionApp\LlmClient\Controllers\EvalRunController;
 use ClarionApp\LlmClient\Controllers\EvalJudgmentController;
 use ClarionApp\LlmClient\Controllers\EvalReferenceController;
 use ClarionApp\LlmClient\Controllers\EvalRunComparisonController;
+use ClarionApp\LlmClient\Controllers\EvalDashboardController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -175,6 +176,9 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     // Case-level comparison detail (contracts/eval-regression-api.md §4)
     Route::get('eval-runs/{runId}/comparison/cases/{evalCaseId}', [EvalRunComparisonController::class, "caseDetail"]);
+
+    // Agent quality dashboard overview (contracts/eval-dashboard-api.md §1)
+    Route::get('agent-eval-dashboard/{agentLabel}', [EvalDashboardController::class, "index"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
