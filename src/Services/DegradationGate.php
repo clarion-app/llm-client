@@ -2,11 +2,13 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ReductionStep;
 use ClarionApp\LlmClient\ValueObjects\DegradationDecision;
 use ClarionApp\LlmClient\ValueObjects\EnforcementDecision;
 use ClarionApp\LlmClient\ValueObjects\LimitAxis;
 use ClarionApp\LlmClient\ValueObjects\RateLimitDecision;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -148,48 +150,7 @@ class DegradationGate
             // whose representative rung has been overshot by the widest
             // fraction governs overall, ties broken installation-first
             // (AXIS_TIE_ORDER).
-            $axisCandidates = [];
-
-            foreach ($axisReadings as $axisValue => $reading) {
-                $ratio = $reading['ratio'];
-                $resetsAt = $reading['resetsAt'];
-
-                $tightest = null;
-                foreach ($steps->get($axisValue, collect()) as $step) {
-                    if (bccomp($ratio, (string) $step->threshold_ratio, self::COMPARE_SCALE) < 0) {
-                        continue; // Not yet crossed.
-                    }
-
-                    $margin = bcsub($ratio, (string) $step->threshold_ratio, self::SCALE);
-
-                    if ($tightest === null || bccomp($margin, $tightest['margin'], self::SCALE) < 0) {
-                        $tightest = ['step' => $step, 'margin' => $margin];
-                    }
-                }
-
-                if ($tightest !== null) {
-                    $axisCandidates[$axisValue] = [
-                        'step' => $tightest['step'],
-                        'margin' => $tightest['margin'],
-                        'ratio' => $ratio,
-                        'resetsAt' => $resetsAt,
-                    ];
-                }
-            }
-
-            $best = null;
-
-            foreach (self::AXIS_TIE_ORDER as $axisValue) {
-                if (!isset($axisCandidates[$axisValue])) {
-                    continue;
-                }
-
-                $candidate = $axisCandidates[$axisValue];
-
-                if ($best === null || bccomp($candidate['margin'], $best['margin'], self::SCALE) > 0) {
-                    $best = $candidate + ['axis' => $axisValue];
-                }
-            }
+            $best = $this->selectGoverningCandidate($steps, $axisReadings);
 
             if ($best === null) {
                 return $this->remember($conversationId, DegradationDecision::full());
@@ -301,11 +262,200 @@ class DegradationGate
         );
     }
 
+    /**
+     * The GET /degradation/status read path (contracts §2, research.md D9,
+     * US4/FR-007/SC-004) — live, non-persisted, non-mutating. Computes each
+     * axis's *current* ratio the same way evaluate() would for a fresh
+     * admission right now, reusing the identical D7 margin-based selection
+     * (selectGoverningCandidate()) — but every read here is a live one,
+     * never a decision reused from an in-flight admission (contracts §2's
+     * "not the same value forRun() would return for an in-progress
+     * response").
+     *
+     * BudgetGate::standingFor($userId) is the one legitimate fresh read for
+     * the two budget axes — there is no in-flight admission's
+     * EnforcementDecision to reuse for a standalone status check.
+     * RateLimitCounter::peek() (never increment()) supplies the rate-limit
+     * axis. ConversationWorkCounter::peek() supplies the conversation_work
+     * axis, and only when $conversationId is both supplied AND owned by
+     * $userId — a conversation_id failing the ownership check is treated
+     * IDENTICALLY to no conversation_id at all, never a distinguishable
+     * response (Constitution §IV): this is enforced by simply never
+     * reading that axis at all in the unowned case, the same code path a
+     * wholly-absent conversation_id takes.
+     *
+     * Never throws — a read failure on any one axis excludes that axis
+     * (research.md D8), and a failure anywhere in this method as a whole
+     * falls back to a full-capacity report, exactly as evaluate() falls
+     * back to DegradationDecision::full().
+     */
+    public function statusFor(?string $userId, ?string $conversationId): array
+    {
+        try {
+            $steps = ReductionStep::where('enabled', true)->get()->groupBy('axis');
+
+            $axisReadings = [];
+            $axesReport = [];
+
+            $standing = app(BudgetGate::class)->standingFor($userId);
+
+            foreach ([
+                LimitAxis::BudgetUser->value => $standing['user_ceiling'] ?? null,
+                LimitAxis::BudgetInstallation->value => $standing['installation_ceiling'] ?? null,
+            ] as $axisValue => $block) {
+                $result = $this->budgetStatusAxis($block);
+                $axesReport[$axisValue] = $result['report'];
+                if ($result['reading'] !== null) {
+                    $axisReadings[$axisValue] = $result['reading'];
+                }
+            }
+
+            $rateLimitResult = $this->rateLimitStatusAxis($userId);
+            $axesReport[LimitAxis::RateLimit->value] = $rateLimitResult['report'];
+            if ($rateLimitResult['reading'] !== null) {
+                $axisReadings[LimitAxis::RateLimit->value] = $rateLimitResult['reading'];
+            }
+
+            // A conversation_id failing ownership never reaches
+            // conversationWorkStatusAxis() at all — the exact same code
+            // path a wholly-absent conversation_id takes, so the two can
+            // never be distinguished by a caller (mutation-checklist row 17).
+            $ownsConversation = $userId !== null
+                && $conversationId !== null
+                && Conversation::where('id', $conversationId)->where('user_id', $userId)->exists();
+
+            if ($ownsConversation) {
+                $conversationResult = $this->conversationWorkStatusAxis($conversationId);
+                $axesReport[LimitAxis::ConversationWork->value] = $conversationResult['report'];
+                if ($conversationResult['reading'] !== null) {
+                    $axisReadings[LimitAxis::ConversationWork->value] = $conversationResult['reading'];
+                }
+            } else {
+                $axesReport[LimitAxis::ConversationWork->value] = [
+                    'applies' => false,
+                    'reason' => 'no_conversation_id_supplied',
+                ];
+            }
+
+            $best = $this->selectGoverningCandidate($steps, $axisReadings);
+
+            if ($best === null) {
+                return [
+                    'reduced' => false,
+                    'axis' => null,
+                    'reason' => null,
+                    'governing_step' => null,
+                    'expected_return_at' => null,
+                    'axes' => $axesReport,
+                ];
+            }
+
+            /** @var ReductionStep $step */
+            $step = $best['step'];
+
+            $decision = new DegradationDecision(
+                outcome: DegradationDecision::OUTCOME_REDUCED,
+                governingStep: $step,
+                axis: $best['axis'],
+                ratio: $best['ratio'],
+                effectiveModel: $step->substitute_model,
+                effectiveServerId: $step->substitute_server_id,
+                withheldTools: $step->withheld_tools ?? [],
+                historyBudgetRatio: $step->history_budget_ratio,
+                resetsAt: $best['resetsAt'],
+            );
+
+            return [
+                'reduced' => true,
+                'axis' => $decision->axis,
+                'reason' => $decision->composeDisclosure(),
+                'governing_step' => $this->formatStep($step),
+                'expected_return_at' => $decision->resetsAt?->toIso8601String(),
+                'axes' => $axesReport,
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('DegradationGate: statusFor() failed, defaulting to full capacity', [
+                'user_id' => $userId,
+                'conversation_id' => $conversationId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'reduced' => false,
+                'axis' => null,
+                'reason' => null,
+                'governing_step' => null,
+                'expected_return_at' => null,
+                'axes' => [],
+            ];
+        }
+    }
+
     private function remember(string $conversationId, DegradationDecision $decision): DegradationDecision
     {
         $this->decisions[$conversationId] = $decision;
 
         return $decision;
+    }
+
+    /**
+     * D7's two-level margin-based selection (within-axis tightest, then
+     * across-axis widest-margin, installation-first ties), factored out so
+     * evaluate() (live admission) and statusFor() (live status check) make
+     * the identical selection from whatever axis readings each supplies —
+     * contracts §2's "computed the same way DegradationGate::evaluate()
+     * would decide a fresh admission right now."
+     *
+     * @param  \Illuminate\Support\Collection<string, \Illuminate\Support\Collection<int, ReductionStep>>  $steps
+     * @param  array<string, array{ratio: string, resetsAt: ?CarbonImmutable}>  $axisReadings
+     * @return array{step: ReductionStep, margin: string, ratio: string, resetsAt: ?CarbonImmutable, axis: string}|null
+     */
+    private function selectGoverningCandidate($steps, array $axisReadings): ?array
+    {
+        $axisCandidates = [];
+
+        foreach ($axisReadings as $axisValue => $reading) {
+            $ratio = $reading['ratio'];
+            $resetsAt = $reading['resetsAt'];
+
+            $tightest = null;
+            foreach ($steps->get($axisValue, collect()) as $step) {
+                if (bccomp($ratio, (string) $step->threshold_ratio, self::COMPARE_SCALE) < 0) {
+                    continue; // Not yet crossed.
+                }
+
+                $margin = bcsub($ratio, (string) $step->threshold_ratio, self::SCALE);
+
+                if ($tightest === null || bccomp($margin, $tightest['margin'], self::SCALE) < 0) {
+                    $tightest = ['step' => $step, 'margin' => $margin];
+                }
+            }
+
+            if ($tightest !== null) {
+                $axisCandidates[$axisValue] = [
+                    'step' => $tightest['step'],
+                    'margin' => $tightest['margin'],
+                    'ratio' => $ratio,
+                    'resetsAt' => $resetsAt,
+                ];
+            }
+        }
+
+        $best = null;
+
+        foreach (self::AXIS_TIE_ORDER as $axisValue) {
+            if (!isset($axisCandidates[$axisValue])) {
+                continue;
+            }
+
+            $candidate = $axisCandidates[$axisValue];
+
+            if ($best === null || bccomp($candidate['margin'], $best['margin'], self::SCALE) > 0) {
+                $best = $candidate + ['axis' => $axisValue];
+            }
+        }
+
+        return $best;
     }
 
     /**
@@ -391,5 +541,135 @@ class DegradationGate
         $ratio = bcdiv((string) $reading->count, (string) $ceiling->max_work_units, self::SCALE);
 
         return ['ratio' => $ratio, 'resetsAt' => $reading->resetsAt];
+    }
+
+    /**
+     * The budget_user/budget_installation axis, live, for statusFor() —
+     * built from BudgetGate::standingFor()'s own block shape (the one
+     * legitimate fresh call, research.md D9) rather than from an
+     * EnforcementDecision, since a standalone status check has no in-flight
+     * admission's decision to reuse. Mirrors budgetAxisReading()'s
+     * arithmetic exactly, just reading the figures out of an array instead
+     * of an object.
+     *
+     * @param  array<string, mixed>|null  $block
+     * @return array{reading: array{ratio: string, resetsAt: ?CarbonImmutable}|null, report: array<string, mixed>}
+     */
+    private function budgetStatusAxis(?array $block): array
+    {
+        if ($block === null || !($block['applies'] ?? false)) {
+            return [
+                'reading' => null,
+                'report' => ['applies' => false, 'reason' => $block['reason'] ?? 'no_ceiling_configured'],
+            ];
+        }
+
+        $consumption = $block['consumption'] ?? [];
+
+        if (!($consumption['available'] ?? false)) {
+            return ['reading' => null, 'report' => ['applies' => false, 'reason' => 'consumption_unavailable']];
+        }
+
+        $ceilingAmount = $block['ceiling']['amount'] ?? null;
+        if ($ceilingAmount === null || bccomp((string) $ceilingAmount, '0', self::SCALE) <= 0) {
+            return ['reading' => null, 'report' => ['applies' => false, 'reason' => 'no_ceiling_configured']];
+        }
+
+        $held = $block['held'] ?? [];
+        $heldAmount = ($held['available'] ?? false) ? (string) ($held['amount'] ?? '0') : '0';
+
+        $numerator = bcadd((string) $consumption['amount'], $heldAmount, self::SCALE);
+        $ratio = bcdiv($numerator, (string) $ceilingAmount, self::SCALE);
+
+        $resetsAtRaw = $block['period']['resets_at'] ?? null;
+        $resetsAt = $resetsAtRaw !== null ? CarbonImmutable::parse($resetsAtRaw) : null;
+
+        return [
+            'reading' => ['ratio' => $ratio, 'resetsAt' => $resetsAt],
+            'report' => ['applies' => true, 'ratio' => $ratio, 'resets_at' => $resetsAt?->toIso8601String()],
+        ];
+    }
+
+    /**
+     * The rate_limit axis, live, for statusFor() — RateLimitCounter::peek()
+     * (never increment()) against the RateLimit row RateLimitGate::evaluate()
+     * would itself resolve (RateLimitService::resolveForUser()).
+     *
+     * @return array{reading: array{ratio: string, resetsAt: ?CarbonImmutable}|null, report: array<string, mixed>}
+     */
+    private function rateLimitStatusAxis(?string $userId): array
+    {
+        if ($userId === null) {
+            return ['reading' => null, 'report' => ['applies' => false, 'reason' => 'no_limit_configured']];
+        }
+
+        $limit = app(RateLimitService::class)->resolveForUser($userId);
+
+        if ($limit === null || (int) $limit->max_requests <= 0) {
+            return ['reading' => null, 'report' => ['applies' => false, 'reason' => 'no_limit_configured']];
+        }
+
+        $reading = app(RateLimitCounter::class)->peek($userId, (int) $limit->window_seconds);
+
+        if (!$reading->available) {
+            return ['reading' => null, 'report' => ['applies' => false, 'reason' => 'consumption_unavailable']];
+        }
+
+        $ratio = bcdiv((string) $reading->count, (string) $limit->max_requests, self::SCALE);
+
+        return [
+            'reading' => ['ratio' => $ratio, 'resetsAt' => $reading->resetsAt],
+            'report' => ['applies' => true, 'ratio' => $ratio, 'resets_at' => $reading->resetsAt?->toIso8601String()],
+        ];
+    }
+
+    /**
+     * The conversation_work axis, live, for statusFor() — only ever called
+     * once ownership has already been confirmed by the caller. Mirrors
+     * conversationWorkAxisReading()'s arithmetic exactly, via the same
+     * non-mutating ConversationWorkCounter::peek().
+     *
+     * @return array{reading: array{ratio: string, resetsAt: ?CarbonImmutable}|null, report: array<string, mixed>}
+     */
+    private function conversationWorkStatusAxis(string $conversationId): array
+    {
+        $ceiling = app(ConversationWorkCeilingService::class)->resolveForConversation($conversationId);
+
+        if ($ceiling === null || (int) $ceiling->max_work_units <= 0) {
+            return ['reading' => null, 'report' => ['applies' => false, 'reason' => 'no_ceiling_configured']];
+        }
+
+        $reading = app(ConversationWorkCounter::class)->peek($conversationId, (int) $ceiling->window_seconds);
+
+        if (!$reading->available) {
+            return ['reading' => null, 'report' => ['applies' => false, 'reason' => 'consumption_unavailable']];
+        }
+
+        $ratio = bcdiv((string) $reading->count, (string) $ceiling->max_work_units, self::SCALE);
+
+        return [
+            'reading' => ['ratio' => $ratio, 'resetsAt' => $reading->resetsAt],
+            'report' => ['applies' => true, 'ratio' => $ratio, 'resets_at' => $reading->resetsAt?->toIso8601String()],
+        ];
+    }
+
+    /**
+     * The governing_step wire shape (contracts §2) — mirrors
+     * ReductionStepController::formatStep()'s field selection, minus
+     * substitute_server_id/enabled, which the status contract's own example
+     * does not include.
+     *
+     * @return array<string, mixed>
+     */
+    private function formatStep(ReductionStep $step): array
+    {
+        return [
+            'id' => $step->id,
+            'axis' => $step->axis,
+            'threshold_ratio' => $step->threshold_ratio,
+            'substitute_model' => $step->substitute_model,
+            'withheld_tools' => $step->withheld_tools ?? [],
+            'history_budget_ratio' => $step->history_budget_ratio,
+        ];
     }
 }

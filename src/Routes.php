@@ -26,6 +26,7 @@ use ClarionApp\LlmClient\Controllers\BudgetStandingController;
 use ClarionApp\LlmClient\Controllers\RateLimitController;
 use ClarionApp\LlmClient\Controllers\ConversationWorkCeilingController;
 use ClarionApp\LlmClient\Controllers\ReductionStepController;
+use ClarionApp\LlmClient\Controllers\DegradationStatusController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteController;
 use ClarionApp\LlmClient\Controllers\EvalCaseController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
@@ -170,6 +171,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::put('reduction-steps', [ReductionStepController::class, "store"]);
     Route::put('reduction-steps/{id}', [ReductionStepController::class, "update"]);
     Route::delete('reduction-steps/{id}', [ReductionStepController::class, "destroy"]);
+
+    // GET /degradation/status (contracts §2, US4) — a user's own live,
+    // non-persisted "would a fresh request be reduced right now" check, no
+    // operator gate (FR-007/SC-004).
+    Route::get('degradation/status', [DegradationStatusController::class, "self"]);
 
     Route::get('agent-eval-suites', [EvalSuiteController::class, "index"]);
     Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);
