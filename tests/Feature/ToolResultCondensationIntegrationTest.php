@@ -35,6 +35,7 @@ class ToolResultCondensationIntegrationTest extends TestCase
         // first act is to ask whether any ceiling exists.
         $this->defineBudgetSchema();
         $this->defineRateLimitSchema();
+        $this->defineConversationWorkSchema();
 
         Schema::create('users', function (Blueprint $table) {
             $table->uuid('id')->primary();

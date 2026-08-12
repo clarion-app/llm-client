@@ -18,6 +18,7 @@ class ConversationObserverTest extends TestCase
         // first act is to ask whether any ceiling exists.
         $this->defineBudgetSchema();
         $this->defineRateLimitSchema();
+        $this->defineConversationWorkSchema();
 
         // Create minimal tables needed for Conversation model.
         // Parent creates users table.

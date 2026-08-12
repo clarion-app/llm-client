@@ -269,6 +269,7 @@ abstract class TestCase extends BaseTestCase
 
         $this->defineBudgetSchema();
         $this->defineRateLimitSchema();
+        $this->defineConversationWorkSchema();
         $this->defineEvalSuiteSchema();
         $this->defineEvalRunSchema();
         $this->defineEvalJudgmentSchema();
@@ -645,6 +646,38 @@ abstract class TestCase extends BaseTestCase
                 $table->string('scope_type', 16);
                 $table->uuid('scope_id');
                 $table->unsignedInteger('max_requests')->nullable();
+                $table->unsignedInteger('window_seconds')->nullable();
+                $table->boolean('waived')->default(false);
+                $table->timestamps();
+                $table->softDeletes();
+
+                // Plain index, not unique — see the migration's own comment.
+                $table->index(['scope_type', 'scope_id']);
+            });
+        }
+    }
+
+    /**
+     * The conversation_work_ceilings table — operator-authored, per-
+     * conversation work-ceiling configuration. Governs mid-loop admission,
+     * so every entry-path test that exercises AgentLoopService::run()/
+     * resumeSync() or AgentLoopStreamHandler now potentially crosses this
+     * gate: a schema without conversation_work_ceilings no longer
+     * describes a deployment this package can run in.
+     *
+     * Extracted, guarded by Schema::hasTable(), and called from
+     * defineDatabaseMigrations() directly, matching defineRateLimitSchema()'s
+     * own shape and call-site pattern so the same handful of test classes
+     * that hand-declare a schema of their own can call it too.
+     */
+    protected function defineConversationWorkSchema(): void
+    {
+        if (!Schema::hasTable('conversation_work_ceilings')) {
+            Schema::create('conversation_work_ceilings', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('scope_type', 20);
+                $table->uuid('scope_id');
+                $table->unsignedInteger('max_work_units')->nullable();
                 $table->unsignedInteger('window_seconds')->nullable();
                 $table->boolean('waived')->default(false);
                 $table->timestamps();

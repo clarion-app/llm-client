@@ -45,6 +45,7 @@ class ConversationCondensationTest extends TestCase
         // first act is to ask whether any ceiling exists.
         $this->defineBudgetSchema();
         $this->defineRateLimitSchema();
+        $this->defineConversationWorkSchema();
 
         // Create all required tables manually to avoid migration conflicts.
         // Parent defineDatabaseMigrations() creates users, llm_memory_entries, declarative_memories.

@@ -500,6 +500,21 @@ return [
         'store' => env('LLM_CLIENT_RATE_LIMIT_STORE', null),
     ],
 
+    // An operator-authored per-conversation work ceiling: how much tool-call
+    // and schema-validation-retry work a single conversation may perform
+    // within a configured time window. Deliberately NO master on/off
+    // toggle and no config-level default max_work_units/window_seconds:
+    // "off" already means "no conversation_work_ceilings row configured
+    // for the scope", and a config-level default would be a second,
+    // competing notion of what the default is. There is also no
+    // on_unreadable-style toggle — an unreadable counter always fails
+    // open here and that is not operator-configurable.
+    'conversation_work' => [
+        // The Cache store the fixed-window counter is kept in. Null uses
+        // the application's own configured default store.
+        'store' => env('LLM_CLIENT_CONVERSATION_WORK_STORE', null),
+    ],
+
     // Agent behavior test suite definitions — bounds applied both at
     // authoring time (EvalCaseService/EvalSuiteService) and on import
     // (EvalSuiteImporter, where the document may originate outside the
