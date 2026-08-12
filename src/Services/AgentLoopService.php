@@ -1399,12 +1399,30 @@ class AgentLoopService
                     );
                 }
 
+                // A response completing under a crossed reduction threshold
+                // is disclosed, never silently returned as if it were
+                // ordinary (085-graceful-degradation, FR-004, research.md
+                // D10) — mirrors run()'s own completion-branch wiring
+                // verbatim (T048), the disclosure sentence prepended to the
+                // same $content both the stored message and the returned
+                // array read below, so the two can never disagree about
+                // what the user was told.
+                $degradationBlock = null;
+                if ($decision->outcome === DegradationDecision::OUTCOME_REDUCED) {
+                    $disclosure = $decision->composeDisclosure();
+                    if ($disclosure !== null) {
+                        $content = $disclosure.' '.$content;
+                    }
+                    $degradationBlock = $decision->toDisclosureArray();
+                }
+
                 $assistantMessage = Message::create([
                     'conversation_id' => $conversation->id,
                     'content' => $content,
                     'role' => 'assistant',
                     'user' => $conversation->character,
                     'responseTime' => 0,
+                    'tool_data' => $degradationBlock !== null ? ['degradation' => $degradationBlock] : null,
                 ]);
 
                 $agentId = $conversation->character ?? $conversation->id;
@@ -1415,7 +1433,7 @@ class AgentLoopService
                     'status' => 'completed',
                     'content' => $content,
                     'message_id' => $assistantMessage->id,
-                ];
+                ] + ($degradationBlock !== null ? ['degraded' => true, 'degradation' => $degradationBlock] : []);
             }
 
             // Handle tool calls in the continuation
