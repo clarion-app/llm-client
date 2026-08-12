@@ -172,6 +172,9 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     // Run comparison against a reference (contracts/eval-regression-api.md §3)
     Route::get('eval-runs/{runId}/comparison', [EvalRunComparisonController::class, "index"]);
+
+    // Case-level comparison detail (contracts/eval-regression-api.md §4)
+    Route::get('eval-runs/{runId}/comparison/cases/{evalCaseId}', [EvalRunComparisonController::class, "caseDetail"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
