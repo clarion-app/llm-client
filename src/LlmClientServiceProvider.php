@@ -427,6 +427,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new \ClarionApp\LlmClient\Services\BudgetGate(
                 $app->make(\ClarionApp\LlmClient\Services\SpendingCeilingService::class),
                 $app->make(\ClarionApp\LlmClient\Services\BudgetLedger::class),
+                $app->make(\ClarionApp\LlmClient\Services\CostEstimator::class),
+                $app->make(\ClarionApp\LlmClient\Services\ReservationLedger::class),
             );
         });
 

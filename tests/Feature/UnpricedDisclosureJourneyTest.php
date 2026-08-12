@@ -101,6 +101,15 @@ class UnpricedDisclosureJourneyTest extends TestCase
             'title' => 'Already titled',
         ]);
 
+        // 084 added an admission-time cost estimate: by default, a request
+        // on a model with no configured price is refused outright under a
+        // stop-mode ceiling (research.md D8) — but this entire file's
+        // premise is admitting unpriced work and then asserting how it is
+        // disclosed once recorded, which is precisely what the
+        // 'admit_untracked' policy preserves (076's own prior implicit
+        // behaviour, made explicit and operator-chosen per D8).
+        config(['llm-client.budget.on_unpriced_model' => 'admit_untracked']);
+
         $this->declarePrice();
         $this->fakeProvider();
     }

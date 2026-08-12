@@ -4,12 +4,15 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Events\SpendingEnforcementDegraded;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\SpendingCeiling;
 use ClarionApp\LlmClient\ValueObjects\BudgetScope;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\ConsumptionSnapshot;
 use ClarionApp\LlmClient\ValueObjects\EnforcementDecision;
 use ClarionApp\LlmClient\ValueObjects\EnforcementMode;
+use ClarionApp\LlmClient\ValueObjects\ReservationSnapshot;
+use ClarionApp\LlmClient\ValueObjects\UnpricedModelPolicy;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
@@ -70,9 +73,22 @@ class BudgetGate
      */
     private array $admitted = [];
 
+    /**
+     * The reservation id placed for each scope key already admitted during
+     * this request or job, keyed the same way $admitted is. Read by
+     * linkRun()/reconcileHeld() (Phase 4/US2) so a reservation placed here
+     * can later be attached to the run it belongs to, or reconciled once
+     * real usage lands, without a second lookup.
+     *
+     * @var array<string, string>
+     */
+    private array $reservationIds = [];
+
     public function __construct(
         private readonly SpendingCeilingService $ceilings,
         private readonly BudgetLedger $ledger,
+        private readonly CostEstimator $estimator,
+        private readonly ReservationLedger $reservations,
     ) {
     }
 
@@ -103,6 +119,7 @@ class BudgetGate
                 $installationCeiling,
                 BudgetScope::Installation->value,
                 $this->ledger->forInstallation($installationCeiling->period_type),
+                $this->reservations->heldFor('installation'),
             );
         }
 
@@ -111,6 +128,7 @@ class BudgetGate
                 $userCeiling,
                 'user',
                 $this->ledger->forUser($userId, $userCeiling->period_type),
+                $this->reservations->heldFor('user:'.$userId),
             );
         }
 
@@ -146,16 +164,7 @@ class BudgetGate
         $decision = $this->evaluate($userId);
 
         if ($decision->isStop()) {
-            app(RunTraceRecorder::class)->recordRefusedRun(
-                $userId,
-                $conversationId,
-                $source,
-                (string) $decision->reason,
-                $kind,
-                $existingRunId,
-            );
-
-            throw new BudgetExceededException($decision, $kind);
+            $this->refuseWork($decision, $kind, $userId, $conversationId, $source, $existingRunId);
         }
 
         // The second of the two moments a threshold can be crossed. The
@@ -178,7 +187,287 @@ class BudgetGate
             }
         }
 
+        $this->attemptReservation($userId, $kind, $conversationId, $source, $existingRunId, $decision, $scopeKey);
+
         $this->admitted[$scopeKey] = true;
+    }
+
+    /**
+     * Compute an estimate for the unit of work evaluate() just allowed and
+     * atomically attempt to hold it (research.md D4/D5/D8/D9). A no-op — no
+     * estimate computed, nothing reserved — whenever there is nothing to
+     * estimate against ($conversationId null: the same shape every existing
+     * direct-admit() call site with no conversation already has, e.g.
+     * EmbeddingService's unresolvable-owner fallback and RoleTestRunner),
+     * whenever an unpriced model's policy says to skip tracking, or whenever
+     * every axis this admission would otherwise reserve against is
+     * warn-mode. Refuses exactly like evaluate()'s own stop path — via the
+     * same refuseWork() — when the atomic reservation itself finds no room,
+     * when an unpriced model is refused under an active stop-mode ceiling,
+     * or when the reservation ledger itself fails to write under a
+     * stop-mode ceiling and the default fail-closed policy applies.
+     */
+    private function attemptReservation(
+        ?string $userId,
+        BudgetWorkKind $kind,
+        ?string $conversationId,
+        ?string $source,
+        ?string $existingRunId,
+        EnforcementDecision $decision,
+        string $scopeKey,
+    ): void {
+        if ($conversationId === null) {
+            return;
+        }
+
+        // Nothing configured costs nothing — the same short-circuit
+        // evaluate() itself opens with. A null governingCeiling here means
+        // no installation or user ceiling applied at all (noCeilingConfigured()),
+        // so there is nothing an estimate or a reservation could ever be
+        // measured against; computing one anyway would add a Message-history
+        // scan and a model_prices query to every admission everywhere, the
+        // exact "quietly add a scan to every request" failure mode this
+        // class's own docblock names.
+        if ($decision->governingCeiling === null) {
+            return;
+        }
+
+        $conversation = Conversation::find($conversationId);
+        $providerType = null;
+        $model = null;
+
+        if ($conversation !== null) {
+            $model = $conversation->model;
+
+            try {
+                $providerType = $conversation->effective_provider_type?->value;
+            } catch (\Throwable) {
+                // getEffectiveProviderTypeAttribute() throws when the
+                // conversation's server is missing — treated the same as an
+                // unresolvable provider, never as a reason to fail
+                // admission itself.
+                $providerType = null;
+            }
+        }
+
+        $estimate = $this->estimator->estimate($conversationId, $providerType, $model);
+
+        if ($estimate->unpriced) {
+            $policy = UnpricedModelPolicy::from((string) config('llm-client.budget.on_unpriced_model', 'stop'));
+
+            if ($policy === UnpricedModelPolicy::AdmitUntracked) {
+                return;
+            }
+
+            if ($policy === UnpricedModelPolicy::Stop) {
+                $this->declineIfGoverningCeilingStops(
+                    $decision,
+                    $kind,
+                    $userId,
+                    $conversationId,
+                    $source,
+                    $existingRunId,
+                    degraded: true,
+                );
+
+                return;
+            }
+
+            // ReserveFlatEstimate: $estimate->amount already carries the
+            // configured flat figure (CostEstimator resolves the policy
+            // internally) — fall through to the ordinary reservation
+            // attempt below using it.
+        }
+
+        if ($estimate->amount === null) {
+            // Nothing to reserve — a priced estimate could not be formed
+            // for some other reason, or an unpriced estimate reached here
+            // under a policy that carries no numeric amount.
+            return;
+        }
+
+        $scopeKeys = $this->stopModeScopeKeys($userId);
+
+        if ($scopeKeys === []) {
+            // Every applicable axis is warn-mode: a warn ceiling can never
+            // block admission regardless of what is held against it, so
+            // there is nothing to bound a reservation against
+            // (research.md D5, corrected).
+            return;
+        }
+
+        try {
+            $reservation = $this->reservations->reserve(
+                $scopeKeys,
+                $estimate->amount,
+                $kind,
+                userId: $userId,
+                conversationId: $conversationId,
+                runId: $existingRunId,
+            );
+        } catch (\Throwable $e) {
+            Log::warning('Reservation ledger write failed while admitting work', [
+                'scope' => $scopeKey,
+                'error' => $e->getMessage(),
+            ]);
+
+            $this->declineIfGoverningCeilingStops(
+                $decision,
+                $kind,
+                $userId,
+                $conversationId,
+                $source,
+                $existingRunId,
+                degraded: true,
+                policyConfigKey: 'llm-client.budget.on_unreadable_consumption',
+            );
+
+            return;
+        }
+
+        if ($reservation === null) {
+            // The atomic bound rejected it — indistinguishable, by design,
+            // from a plain evaluate()-level stop (contracts §2).
+            $this->refuseWork(
+                $this->stopDecisionFrom($decision, degraded: false),
+                $kind,
+                $userId,
+                $conversationId,
+                $source,
+                $existingRunId,
+            );
+
+            return;
+        }
+
+        $this->reservationIds[$scopeKey] = $reservation->id;
+    }
+
+    /**
+     * The scope keys admit() may reserve against for this admission —
+     * mirroring which of the installation/user ceilings evaluate() just
+     * measured, filtered to the axes whose ceiling is in stop mode only
+     * (research.md D5, corrected: ReservationLedger::reserve() carries no
+     * per-axis enforcement-mode information, so a warn-mode axis is never
+     * passed to it at all — its held figure in a standing report is always
+     * "0.0000000000").
+     *
+     * @return list<string>
+     */
+    private function stopModeScopeKeys(?string $userId): array
+    {
+        $scopeKeys = [];
+
+        $installationCeiling = $this->ceilings->resolveInstallation();
+
+        if ($installationCeiling !== null && $installationCeiling->enforcement_mode === EnforcementMode::Stop->value) {
+            $scopeKeys[] = 'installation';
+        }
+
+        if ($userId !== null) {
+            $userCeiling = $this->ceilings->resolveForUser($userId);
+
+            if ($userCeiling !== null && $userCeiling->enforcement_mode === EnforcementMode::Stop->value) {
+                $scopeKeys[] = 'user:'.$userId;
+            }
+        }
+
+        return $scopeKeys;
+    }
+
+    /**
+     * Refuse exactly like evaluate()'s own stop path — reusing the
+     * already-allowed $decision's governing ceiling/snapshot — when, and
+     * only when, that governing ceiling is itself in stop mode. A warn-mode
+     * governing ceiling (or no ceiling at all) means nothing here may block
+     * admission, so this is a no-op: an unpriced model or an unreadable
+     * reservation ledger must never start refusing work a warn-only scope
+     * would otherwise let through.
+     *
+     * $policyConfigKey selects which configured policy gates the block —
+     * on_unpriced_model's own 'stop' branch has already chosen to be here
+     * (the caller only reaches this method once it knows it must), so it
+     * passes no key and always blocks when the ceiling is stop-mode; a
+     * reservation-ledger write failure instead reuses
+     * on_unreadable_consumption, exactly as handleUnreadable() applies it
+     * to an unreadable consumption figure.
+     */
+    private function declineIfGoverningCeilingStops(
+        EnforcementDecision $decision,
+        BudgetWorkKind $kind,
+        ?string $userId,
+        ?string $conversationId,
+        ?string $source,
+        ?string $existingRunId,
+        bool $degraded,
+        ?string $policyConfigKey = null,
+    ): void {
+        if ($policyConfigKey !== null && (string) config($policyConfigKey, 'stop') !== 'stop') {
+            return;
+        }
+
+        if ($decision->governingCeiling === null
+            || $decision->governingCeiling->enforcement_mode !== EnforcementMode::Stop->value) {
+            return;
+        }
+
+        $this->refuseWork(
+            $this->stopDecisionFrom($decision, $degraded),
+            $kind,
+            $userId,
+            $conversationId,
+            $source,
+            $existingRunId,
+        );
+    }
+
+    /**
+     * A fresh STOP decision that reuses an already-allowed $decision's
+     * governing ceiling/snapshot — the shape every reservation-driven
+     * refusal in this class throws, so a caller can never tell it apart
+     * from a plain evaluate()-level stop (contracts §2). governingCeiling
+     * and snapshot are always set or unset together on any EnforcementDecision
+     * this class constructs, so the one guard below covers both.
+     */
+    private function stopDecisionFrom(EnforcementDecision $decision, bool $degraded): EnforcementDecision
+    {
+        return new EnforcementDecision(
+            outcome: EnforcementDecision::STOP,
+            governingCeiling: $decision->governingCeiling,
+            snapshot: $decision->snapshot,
+            degraded: $degraded,
+            reason: $decision->governingCeiling === null || $decision->snapshot === null ? null : EnforcementDecision::composeReason(
+                $decision->governingCeiling,
+                $decision->snapshot,
+                (string) $decision->governingScope(),
+                degraded: $degraded,
+            ),
+        );
+    }
+
+    /**
+     * Record the refusal and throw — the single sequence every stop path in
+     * this class uses, so a caller can never distinguish a plain
+     * evaluate()-level stop from a reservation-driven one (contracts §2).
+     */
+    private function refuseWork(
+        EnforcementDecision $decision,
+        BudgetWorkKind $kind,
+        ?string $userId,
+        ?string $conversationId,
+        ?string $source,
+        ?string $existingRunId,
+    ): never {
+        app(RunTraceRecorder::class)->recordRefusedRun(
+            $userId,
+            $conversationId,
+            $source,
+            (string) $decision->reason,
+            $kind,
+            $existingRunId,
+        );
+
+        throw new BudgetExceededException($decision, $kind);
     }
 
     /**
@@ -346,6 +635,16 @@ class BudgetGate
     /**
      * One ceiling measured against one figure.
      *
+     * $held is the scope's currently-held reservation total (evaluate()'s
+     * own, already-existing figure — see the class docblock's reservation
+     * note): when present and available, every comparison below measures
+     * consumption *plus* held against the ceiling, not consumption alone.
+     * When $held is null or unavailable, held is treated as 0 for this
+     * arithmetic, but the returned 'heldAvailable' key still reports the
+     * failure so combine() can route it through the same fail-closed/
+     * fail-open policy a consumption-read failure already gets — the
+     * degraded policy itself is never applied here.
+     *
      * @return array{
      *   ceiling: SpendingCeiling,
      *   axis: string,
@@ -353,11 +652,17 @@ class BudgetGate
      *   reached: bool,
      *   thresholdCrossed: bool,
      *   headroom: ?string,
+     *   heldAvailable: bool,
      * }
      */
-    private function assess(SpendingCeiling $ceiling, string $axis, ConsumptionSnapshot $snapshot): array
-    {
+    private function assess(
+        SpendingCeiling $ceiling,
+        string $axis,
+        ConsumptionSnapshot $snapshot,
+        ?ReservationSnapshot $held = null,
+    ): array {
         $amount = (string) $ceiling->amount;
+        $heldAvailable = $held === null || $held->available;
 
         if (!$snapshot->available) {
             return [
@@ -367,17 +672,21 @@ class BudgetGate
                 'reached' => false,
                 'thresholdCrossed' => false,
                 'headroom' => null,
+                'heldAvailable' => $heldAvailable,
             ];
         }
 
         $consumption = (string) $snapshot->amount;
+        $heldAmount = $held !== null && $held->available ? (string) $held->amount : '0';
+        $projected = bcadd($consumption, $heldAmount, self::SCALE);
 
         // "Reached" is at-or-above, not strictly above: a scope that has spent
-        // exactly its ceiling has no headroom left.
-        $reached = bccomp($consumption, $amount, self::SCALE) >= 0;
+        // (or currently holds in reservation) at least its ceiling has no
+        // headroom left.
+        $reached = bccomp($projected, $amount, self::SCALE) >= 0;
 
         $thresholdAmount = bcmul($amount, (string) $ceiling->approach_threshold, self::SCALE);
-        $thresholdCrossed = bccomp($consumption, $thresholdAmount, self::SCALE) >= 0;
+        $thresholdCrossed = bccomp($projected, $thresholdAmount, self::SCALE) >= 0;
 
         return [
             'ceiling' => $ceiling,
@@ -388,7 +697,8 @@ class BudgetGate
             // Signed, deliberately unfloored: a scope 30 over its ceiling is
             // tighter than one 10 over, and flooring both at zero would make
             // every over-spent ceiling tie with every other.
-            'headroom' => bcsub($amount, $consumption, self::SCALE),
+            'headroom' => bcsub($amount, $projected, self::SCALE),
+            'heldAvailable' => $heldAvailable,
         ];
     }
 
@@ -397,7 +707,10 @@ class BudgetGate
      */
     private function combine(array $assessments, ?string $userId): EnforcementDecision
     {
-        $unreadable = array_values(array_filter($assessments, fn (array $a) => !$a['snapshot']->available));
+        $unreadable = array_values(array_filter(
+            $assessments,
+            fn (array $a) => !$a['snapshot']->available || !$a['heldAvailable']
+        ));
 
         if ($unreadable !== []) {
             $decision = $this->handleUnreadable($unreadable, $userId);

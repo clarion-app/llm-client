@@ -95,6 +95,8 @@ class InFlightWorkCompletesJourneyTest extends TestCase
 
         \Illuminate\Support\Facades\Http::fake();
         Queue::fake([SendHttpStreamRequest::class]);
+
+        $this->seedZeroRatePrice();
     }
 
     protected function tearDown(): void
@@ -104,10 +106,38 @@ class InFlightWorkCompletesJourneyTest extends TestCase
         DB::table('cost_summaries')->delete();
         DB::table('spending_ceilings')->delete();
         DB::table('agent_runs')->delete();
+        DB::table('model_prices')->delete();
 
         Mockery::close();
 
         parent::tearDown();
+    }
+
+    /**
+     * A priced (zero-rate) row for this file's test-model. 084 added an
+     * admission-time cost estimate that treats a genuinely unpriced model
+     * under a stop-mode ceiling as refused by default (research.md D8) — a
+     * policy this file's tests are not about. A zero-rate price keeps every
+     * request here priced (so that policy never engages) while adding
+     * nothing measurable to what is held.
+     *
+     * provider_type is 'openai', not this file's own 'llama_cpp' server
+     * value: Server::getProviderTypeAttribute() maps any string ProviderType
+     * does not recognize — 'llama_cpp' is not 'llama.cpp' — back to
+     * ProviderType::OpenAI, and that resolved value is what
+     * Conversation::getEffectiveProviderTypeAttribute() actually returns.
+     */
+    private function seedZeroRatePrice(): void
+    {
+        \ClarionApp\LlmClient\Models\ModelPrice::create([
+            'provider_type' => 'openai',
+            'model' => 'test-model',
+            'reused_input_rate' => '0.00000000',
+            'fresh_input_rate' => '0.00000000',
+            'output_rate' => '0.00000000',
+            'effective_from' => Carbon::now()->subDay(),
+            'effective_until' => null,
+        ]);
     }
 
     // ---------------------------------------------------------------
