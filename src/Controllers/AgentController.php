@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
+use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\RoleResolver;
@@ -96,6 +97,10 @@ class AgentController extends Controller
             // refusal is a decision with its own 402 body, not an unexplained
             // failure. Left to the catch below it would surface as exactly the
             // generic 500 this feature exists to replace.
+            throw $e;
+        } catch (RateLimitExceededException $e) {
+            // Same reasoning, second refusal type: a rate-limit refusal is a
+            // decision with its own 429 body, not an unexplained failure.
             throw $e;
         } catch (\Throwable $e) {
             Log::error('AgentController: agent loop error', [

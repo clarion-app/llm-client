@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
+use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
@@ -146,6 +147,27 @@ class AgentLoopService
         BudgetWorkKind $kind,
         ?string $existingRunId = null,
     ): void {
+        // Rate limit first: it is strictly cheaper than the budget check
+        // even in its best case (zero database queries when nothing is
+        // configured for the user, versus a ceiling-resolution query), and
+        // the two limits are orthogonal, so there is no "most restrictive
+        // governs" ordering to get backwards — whichever throws first is
+        // what the caller sees.
+        //
+        // Skipped entirely, rather than passed as null, when the
+        // conversation has no owning user: RateLimitGate::admit() takes a
+        // non-nullable $userId, unlike BudgetGate::admit(), because there is
+        // no installation-wide axis for a rate limit to fall back to — a
+        // conversation with no owning user has no user whose allowance
+        // could be consumed.
+        if ($conversation->user_id !== null) {
+            app(RateLimitGate::class)->admit(
+                (string) $conversation->user_id,
+                $kind,
+                $conversation->id,
+            );
+        }
+
         app(BudgetGate::class)->admit(
             $conversation->user_id === null ? null : (string) $conversation->user_id,
             $kind,
@@ -173,6 +195,17 @@ class AgentLoopService
         try {
             $this->admitInteractiveWork($conversation, BudgetWorkKind::Resumed, $runId);
         } catch (BudgetExceededException $e) {
+            $conversation->update(['is_processing' => false]);
+
+            throw $e;
+        } catch (RateLimitExceededException $e) {
+            // Identical cleanup, second exception type: a rate-limit
+            // refusal during a resumed conversation must leave it usable
+            // again, exactly as a spending-ceiling refusal already does.
+            // Unlike BudgetExceededException, this writes no run record of
+            // its own — the run the conversation inherited is left open
+            // rather than closed as stopped_early, since a rate limit has
+            // no operator-visible run record to close.
             $conversation->update(['is_processing' => false]);
 
             throw $e;

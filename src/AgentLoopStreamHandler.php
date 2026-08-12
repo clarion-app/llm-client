@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient;
 
 use ClarionApp\HttpQueue\HandleHttpStreamResponse;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
+use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
@@ -699,6 +700,14 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 // handleToolCalls(): that path carries the open run id and is
                 // never gated in the first place.
                 Log::info('AgentLoopStreamHandler: unprocessed message not started, spending ceiling reached', [
+                    'conversation_id' => $conversation->id,
+                    'reason' => $e->getMessage(),
+                ]);
+            } catch (RateLimitExceededException $e) {
+                // Same reasoning, second refusal type: nobody is awaiting a
+                // 429 here either, so this turns a failed job into a
+                // recorded, logged stop rather than an uncaught exception.
+                Log::info('AgentLoopStreamHandler: unprocessed message not started, rate limit reached', [
                     'conversation_id' => $conversation->id,
                     'reason' => $e->getMessage(),
                 ]);

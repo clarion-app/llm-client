@@ -15,6 +15,7 @@ use ClarionApp\LlmClient\OpenAIConversationRequest;
 use ClarionApp\LlmClient\OpenAIConversationStreamRequest;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\BudgetGate;
+use ClarionApp\LlmClient\Services\RateLimitGate;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 
 class MessageController extends Controller
@@ -56,9 +57,20 @@ class MessageController extends Controller
         // the next turn's context will include it.
         //
         // This is an ordering requirement layered on the funnel, not a second
-        // decision point: it calls the same BudgetGate, and the check inside
-        // start() below remains as defence in depth, free because the gate
+        // decision point: it calls the same gates, and the checks inside
+        // start() below remain as defence in depth, free because each gate
         // admits a scope once per request.
+        //
+        // Rate limit first — cheaper on the common case (zero database
+        // queries when nothing is configured for the user) and orthogonal to
+        // the spending ceiling, so there is no ordering between the two to
+        // get backwards.
+        app(RateLimitGate::class)->admit(
+            (string) Auth::id(),
+            BudgetWorkKind::Interactive,
+            $conversation->id,
+        );
+
         app(BudgetGate::class)->admit(
             (string) Auth::id(),
             BudgetWorkKind::Interactive,

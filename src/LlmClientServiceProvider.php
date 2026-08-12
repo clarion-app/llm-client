@@ -430,6 +430,35 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        // Stateless — it holds no memo and reads every rate_limits row
+        // live, so an operator's change takes effect on the next admission
+        // decision with no restart. singleton() is safe here for the same
+        // reason it is safe for SpendingCeilingService above.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RateLimitService::class, function () {
+            return new \ClarionApp\LlmClient\Services\RateLimitService();
+        });
+
+        // Stateless — it holds no per-instance property at all and reads
+        // and writes an external Cache-backed key on every call, so one
+        // shared instance is safe for the life of the process. singleton()
+        // here, unlike RateLimitGate just below.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RateLimitCounter::class, function () {
+            return new \ClarionApp\LlmClient\Services\RateLimitCounter();
+        });
+
+        // scoped(), deliberately — and NOT singleton(), mirroring
+        // BudgetGate above. RateLimitGate keeps its own per-instance record
+        // of which users it has already admitted this request or job, and a
+        // singleton would carry job n's admitted-once memo into every later
+        // job for the life of a queue worker, silently exempting every
+        // later job's user from rate limiting.
+        $this->app->scoped(\ClarionApp\LlmClient\Services\RateLimitGate::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\RateLimitGate(
+                $app->make(\ClarionApp\LlmClient\Services\RateLimitService::class),
+                $app->make(\ClarionApp\LlmClient\Services\RateLimitCounter::class),
+            );
+        });
+
         // bind(), not singleton() and not scoped(). The notifier holds no
         // state of its own, but it reads through BudgetLedger, whose memo is
         // deliberately per-request/per-job: a longer-lived notifier would

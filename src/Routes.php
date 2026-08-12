@@ -23,6 +23,7 @@ use ClarionApp\LlmClient\Controllers\LatencyController;
 use ClarionApp\LlmClient\Controllers\ToolReliabilityController;
 use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
 use ClarionApp\LlmClient\Controllers\BudgetStandingController;
+use ClarionApp\LlmClient\Controllers\RateLimitController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteController;
 use ClarionApp\LlmClient\Controllers\EvalCaseController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
@@ -137,6 +138,16 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('budget/standing', [BudgetStandingController::class, "self"]);
     Route::get('budget/standing/users/{userId}', [BudgetStandingController::class, "user"]);
     Route::get('budget/standing/installation', [BudgetStandingController::class, "installation"]);
+
+    // Per-user rate limit configuration — operator-only, and never itself
+    // subject to rate-limit enforcement, so raising or waiving a limit
+    // stays reachable to an operator whom that limit has stopped. Only the
+    // user-default scope routes here; the per-specific-user override
+    // routes (PUT/DELETE rate-limits/users/{userId}) are a later story's
+    // addition.
+    Route::get('rate-limits', [RateLimitController::class, "index"]);
+    Route::put('rate-limits/user-default', [RateLimitController::class, "putUserDefault"]);
+    Route::delete('rate-limits/user-default', [RateLimitController::class, "destroyUserDefault"]);
 
     Route::get('agent-eval-suites', [EvalSuiteController::class, "index"]);
     Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);
