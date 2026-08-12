@@ -26,6 +26,9 @@ class RecomputeEvalPassRateSummariesCommand extends Command
 
     protected $description = 'Rebuild eval_pass_rate_summaries from eval_case_results, for one agent label or every agent';
 
+    /** Rows pulled per source-scan chunk — memory stays flat as history grows. */
+    private const SCAN_CHUNK_SIZE = 1000;
+
     private const OUTCOME_COLUMNS = [
         'pass' => 'pass_count',
         'fail' => 'fail_count',
@@ -39,7 +42,16 @@ class RecomputeEvalPassRateSummariesCommand extends Command
         $agentLabel = $this->option('agent-label');
         $dryRun = (bool) $this->option('dry-run');
 
-        $rows = DB::table('eval_case_results')
+        $buckets = [];
+        $scanned = 0;
+
+        // Chunked, never one unbounded get(): this command exists to be run
+        // against an installation that may already hold months of
+        // eval_case_results history, so the source scan's memory cost must
+        // stay flat regardless of how many rows it walks. Only the derived
+        // buckets accumulate, and those are bounded by
+        // (agent labels x days active), never by result volume.
+        DB::table('eval_case_results')
             ->join('eval_runs', 'eval_runs.id', '=', 'eval_case_results.run_id')
             ->when($agentLabel !== null, fn ($query) => $query->where('eval_runs.agent_label', $agentLabel))
             ->select(
@@ -47,13 +59,15 @@ class RecomputeEvalPassRateSummariesCommand extends Command
                 'eval_case_results.outcome',
                 'eval_case_results.outcome_override',
                 'eval_case_results.created_at',
+                'eval_case_results.id',
             )
-            ->orderBy('eval_case_results.created_at')
-            ->get();
+            ->orderBy('eval_case_results.id')
+            ->chunk(self::SCAN_CHUNK_SIZE, function ($rows) use (&$buckets, &$scanned) {
+                $scanned += count($rows);
+                $this->accumulateBuckets($rows, $buckets);
+            });
 
-        $buckets = $this->deriveBuckets($rows);
-
-        $this->info(count($rows).' case result(s) scanned; '.count($buckets).' bucket(s) would be written.');
+        $this->info($scanned.' case result(s) scanned; '.count($buckets).' bucket(s) would be written.');
 
         if ($dryRun) {
             $this->comment('Dry-run complete — no changes were made.');
@@ -86,13 +100,15 @@ class RecomputeEvalPassRateSummariesCommand extends Command
     }
 
     /**
+     * Folds one chunk of source rows into the running bucket set, keyed by
+     * (agent_label, the result's own created_at date) and counted by
+     * COALESCE(outcome_override, outcome) — never the raw outcome alone.
+     *
      * @param  \Illuminate\Support\Collection<int, object>  $rows
-     * @return array<string, array<string, mixed>>
+     * @param  array<string, array<string, mixed>>  $buckets
      */
-    private function deriveBuckets($rows): array
+    private function accumulateBuckets($rows, array &$buckets): void
     {
-        $buckets = [];
-
         foreach ($rows as $row) {
             $periodDate = Carbon::parse($row->created_at)->toDateString();
             $key = $row->agent_label.'|'.$periodDate;
@@ -119,7 +135,5 @@ class RecomputeEvalPassRateSummariesCommand extends Command
             $buckets[$key][$column]++;
             $buckets[$key]['total_count']++;
         }
-
-        return $buckets;
     }
 }
