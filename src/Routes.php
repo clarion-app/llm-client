@@ -149,12 +149,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::put('rate-limits/users/{userId}', [RateLimitController::class, "putUser"]);
     Route::delete('rate-limits/users/{userId}', [RateLimitController::class, "destroyUser"]);
 
-    // Per-conversation work ceiling configuration (spec 083, contracts
-    // §2) — operator-only, and never itself subject to conversation-work
-    // enforcement. The conversation-default endpoints are this feature's
-    // US1 surface; putConversation/destroyConversation exist so the
-    // operator gate applies uniformly to a per-conversation override too,
-    // ahead of US3's own dedicated raise/lower/waive acceptance tests.
+    // Per-conversation work ceiling configuration — operator-only, and
+    // never itself subject to conversation-work enforcement. Covers both
+    // the conversation-default ceiling that applies to any conversation
+    // with no override, and a specific conversation's own override
+    // (raise, lower, or waive), through the identical operator gate.
     Route::get('conversation-work-ceilings', [ConversationWorkCeilingController::class, "index"]);
     Route::put('conversation-work-ceilings/conversation-default', [ConversationWorkCeilingController::class, "putConversationDefault"]);
     Route::delete('conversation-work-ceilings/conversation-default', [ConversationWorkCeilingController::class, "destroyConversationDefault"]);

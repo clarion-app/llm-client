@@ -29,10 +29,10 @@ use PHPUnit\Framework\Attributes\Test;
  *
  * Only the conversation_default scope is exercised through HTTP here. The
  * per-conversation override surface (PUT/DELETE
- * /conversation-work-ceilings/conversations/{conversationId}) is a later
- * story's addition — ConversationWorkCeilingService already resolves both
- * scope kinds internally, but nothing routes to the per-conversation
- * endpoints yet.
+ * /conversation-work-ceilings/conversations/{conversationId}) does route
+ * and is exercised here only incidentally, for the non-operator rejection
+ * case above — its own dedicated raise/lower/waive acceptance proof lives
+ * in ConversationWorkPerConversationOverrideJourneyTest.
  */
 class ConversationWorkConfigurationJourneyTest extends TestCase
 {
