@@ -132,6 +132,15 @@ class AgentController extends Controller
             'status' => $result['status'] ?? 'error',
         ];
 
+        // The agent loop names *which* ceiling or condition ended a response
+        // whenever one did. Dropping that key here would leave an HTTP caller
+        // with the status alone, unable to tell a work-ceiling stop apart from
+        // any other limit by anything other than prose — the exact ambiguity
+        // the distinct code values exist to remove.
+        if (isset($result['code'])) {
+            $response['code'] = $result['code'];
+        }
+
         if (isset($result['confirmation'])) {
             $response['confirmation'] = $result['confirmation'];
         }

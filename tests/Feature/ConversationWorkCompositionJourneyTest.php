@@ -201,6 +201,16 @@ class ConversationWorkCompositionJourneyTest extends TestCase
         $statusA = $httpResponse->getStatusCode();
         $this->assertSame('stopped', $httpResponse->json('status'));
 
+        // The distinguishing code must survive the trip through HTTP, not
+        // only exist in the service's own return array: an HTTP caller that
+        // received the status alone could not tell this stop apart from any
+        // future non-failure stop without reading the prose.
+        $this->assertSame(
+            'conversation_work_ceiling_reached',
+            $httpResponse->json('code'),
+            'The stop reason must be reported over HTTP, not dropped by the controller'
+        );
+
         DB::table('conversation_work_ceilings')->delete();
 
         // --- The per-user rate limit: rate_limit_exceeded / 429 ---

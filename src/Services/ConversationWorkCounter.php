@@ -82,6 +82,17 @@ class ConversationWorkCounter
 
     public function increment(string $conversationId, int $windowSeconds): ConversationWorkReading
     {
+        // A window that is not a positive number of seconds cannot be
+        // bucketed at all — intdiv() by it would raise, and this class is
+        // called from a gate documented never to throw. The sole write path
+        // rejects such a ceiling outright, so reaching here means a row was
+        // written around it; report an unmeasurable window exactly as any
+        // other unreadable one is reported, and log it, rather than turning
+        // an operator's malformed row into a fatal error on every response.
+        if ($windowSeconds <= 0) {
+            return $this->unavailable($conversationId, $windowSeconds, 0, 'the ceiling names no positive window');
+        }
+
         $now = Carbon::now()->timestamp;
         $windowStart = intdiv($now, $windowSeconds) * $windowSeconds;
         $key = self::KEY_PREFIX.$conversationId.':'.$windowSeconds.':'.$windowStart;

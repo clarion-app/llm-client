@@ -130,6 +130,50 @@ class ConversationWorkMultiProcessTest extends TestCase
             expiration INTEGER
         )');
 
+        // The ceiling configuration itself, so a subprocess can resolve a
+        // real ceiling and reach a real decision rather than having the
+        // comparison performed for it by the parent test.
+        $pdo->exec('CREATE TABLE IF NOT EXISTS conversation_work_ceilings (
+            id VARCHAR PRIMARY KEY,
+            scope_type VARCHAR,
+            scope_id VARCHAR,
+            max_work_units INTEGER,
+            window_seconds INTEGER,
+            waived TINYINT DEFAULT 0,
+            created_at DATETIME,
+            updated_at DATETIME,
+            deleted_at DATETIME
+        )');
+
+        $pdo = null;
+    }
+
+    /**
+     * Write a conversation-scoped ceiling straight into the scratch file the
+     * subprocesses share, so each one resolves it independently.
+     */
+    private function declareConversationCeiling(string $conversationId, int $maxWorkUnits, int $windowSeconds): void
+    {
+        $pdo = new \PDO('sqlite:'.$this->tempDbPath);
+        $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+
+        $statement = $pdo->prepare(
+            'INSERT INTO conversation_work_ceilings
+                (id, scope_type, scope_id, max_work_units, window_seconds, waived, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?)'
+        );
+
+        $now = date('Y-m-d H:i:s');
+        $statement->execute([
+            (string) \Illuminate\Support\Str::uuid(),
+            'conversation',
+            $conversationId,
+            $maxWorkUnits,
+            $windowSeconds,
+            $now,
+            $now,
+        ]);
+
         $pdo = null;
     }
 
@@ -308,6 +352,70 @@ class ConversationWorkMultiProcessTest extends TestCase
         );
     }
 
+    /**
+     * The two cases above prove the counting *primitive* is atomic across
+     * processes; the gate's own boundary comparison is proven, separately,
+     * by ConversationWorkGateTest in a single process. FR-009 is the
+     * conjunction of the two — "the ceiling is enforced accurately no matter
+     * which process does the work" — and nothing so far exercises the
+     * conjunction itself: a mutation to the comparison would leave both of
+     * those tests' own properties intact from the other's point of view.
+     *
+     * This case closes that: every subprocess resolves a real ceiling from
+     * the shared configuration table and reaches a real
+     * ConversationWorkDecision, with no comparison performed by the parent
+     * test at all. Exactly max_work_units of the concurrent burst may be
+     * allowed, and every remaining process must be stopped — whatever order
+     * they happen to arrive in.
+     */
+    #[Test]
+    public function the_gate_itself_admits_exactly_max_work_units_across_genuine_concurrent_processes(): void
+    {
+        $conversationId = (string) \Illuminate\Support\Str::uuid();
+        $windowSeconds = 3600;
+        $maxWorkUnits = 3;
+        $processCount = 10;
+
+        $this->declareConversationCeiling($conversationId, $maxWorkUnits, $windowSeconds);
+
+        $processes = [];
+        for ($i = 0; $i < $processCount; $i++) {
+            $script = $this->makeGateWorkerScript($conversationId);
+            $process = Process::fromShellCommandline(PHP_BINARY.' '.escapeshellarg($script), dirname(__DIR__));
+            $process->start();
+            $processes[] = $process;
+        }
+
+        $outcomes = [];
+        foreach ($processes as $process) {
+            $process->wait();
+            $this->assertTrue($process->isSuccessful(), 'Subprocess failed: '.$process->getErrorOutput());
+
+            $data = json_decode(trim($process->getOutput()), true);
+            $this->assertIsArray($data, 'Worker output was not valid JSON: '.$process->getOutput());
+            $this->assertTrue(
+                $data['ceiling_resolved'],
+                'Precondition: every worker must have resolved the shared ceiling, or it decided nothing at all'
+            );
+
+            $outcomes[] = $data['outcome'];
+        }
+
+        $allowed = array_filter($outcomes, fn ($outcome) => $outcome === 'allow');
+        $stopped = array_filter($outcomes, fn ($outcome) => $outcome === 'stop');
+
+        $this->assertCount(
+            $maxWorkUnits,
+            $allowed,
+            'Exactly max_work_units work units may be admitted across every process combined'
+        );
+        $this->assertCount(
+            $processCount - $maxWorkUnits,
+            $stopped,
+            'Every work unit past the ceiling must be stopped, whichever process happens to carry it'
+        );
+    }
+
     // ------------------------------------------------------------------
     // Worker scripts
     // ------------------------------------------------------------------
@@ -382,6 +490,53 @@ for (\$i = 0; \$i < {$burstSize}; \$i++) {
 echo json_encode([
     'counts' => \$counts,
     'available' => true,
+]) . "\n";
+PHP;
+
+        file_put_contents($scriptFile, $code);
+
+        return $scriptFile;
+    }
+
+    /**
+     * A worker that reaches a genuine ConversationWorkDecision: it resolves
+     * the ceiling from the shared configuration table itself and compares
+     * against its own atomically assigned count, exactly as an in-loop call
+     * site does. The retry loop is the same scratch-SQLite locking
+     * accommodation the increment workers carry, and only ever retries a
+     * decision the gate reported as unmeasurable — never one it decided.
+     */
+    private function makeGateWorkerScript(string $conversationId): string
+    {
+        $scriptFile = sys_get_temp_dir().'/conversation_work_gate_worker_'.uniqid('', true).'.php';
+        $gateClass = '\\ClarionApp\\LlmClient\\Services\\ConversationWorkGate';
+        $serviceClass = '\\ClarionApp\\LlmClient\\Services\\ConversationWorkCeilingService';
+        $counterClass = '\\ClarionApp\\LlmClient\\Services\\ConversationWorkCounter';
+
+        $code = $this->getBootstrapTemplate();
+        $code .= <<<PHP
+\Illuminate\Database\Eloquent\Model::setConnectionResolver(\$app['db']);
+\Illuminate\Database\Eloquent\Model::setEventDispatcher(\$app['events']);
+
+\$ceilings = new {$serviceClass}();
+\$gate = new {$gateClass}(\$ceilings, new {$counterClass}());
+
+\$decision = null;
+for (\$attempt = 0; \$attempt < 25; \$attempt++) {
+    \$decision = \$gate->evaluate("{$conversationId}");
+
+    // An unmeasurable counter fails open by design, so a decision reached
+    // that way says nothing about the ceiling — retry rather than record it.
+    if (\$decision->reading !== null && \$decision->reading->available) {
+        break;
+    }
+    usleep(random_int(5000, 20000));
+}
+
+echo json_encode([
+    'outcome' => \$decision->outcome,
+    'ceiling_resolved' => \$decision->ceiling !== null,
+    'count' => \$decision->reading?->count,
 ]) . "\n";
 PHP;
 

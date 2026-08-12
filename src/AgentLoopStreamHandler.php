@@ -344,7 +344,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $metaToolNames = ['list_applications', 'execute_operation', 'search_operations'];
         $registry = app(\ClarionApp\LlmClient\Services\McpToolRegistry::class);
 
-        foreach ($this->toolCalls as $tcIndex => $toolCall) {
+        // Iterated by position, not by key: this array is accumulated under
+        // whatever index each streamed delta declared, so its keys are the
+        // provider's, not necessarily 0..n-1. The mid-batch stop below slices
+        // by offset, and a key that is not its own position would make that
+        // slice answer the wrong tool calls — leaving a real one unanswered,
+        // the single state the synthesized results exist to prevent.
+        foreach (array_values($this->toolCalls) as $tcIndex => $toolCall) {
             $toolName = $toolCall['function']['name'] ?? '';
             $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
             $toolCallId = $toolCall['id'] ?? '';

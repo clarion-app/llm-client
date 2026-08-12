@@ -13,8 +13,10 @@ use RegexIterator;
  * mechanism of its own. That guard already proves the set of files calling
  * ConversationWorkGate::evaluate() is exactly {Services/AgentLoopService.php,
  * AgentLoopStreamHandler.php} — which, read the other way round, is the
- * same fact FR-010's "not penalized for activity it never initiated"
- * concern needs one layer further: no system-initiated path (a scheduled
+ * same fact FR-002's scoping of the counted quantity to "work the agent
+ * generates on its own within a response" needs one layer further, so a
+ * conversation is never charged for work it never initiated: no
+ * system-initiated path (a scheduled
  * job, a queued embedding generation, a title-generation request, or any
  * other caller of RunTraceRecorder::traceSystemRun()) is ever presented to
  * ConversationWorkGate at all, because none of those files appear in the
@@ -136,9 +138,10 @@ class SystemInitiatedWorkExemptGuardTest extends TestCase
     }
 
     /**
-     * EmbeddingService::generate() is named explicitly by FR-010's own
-     * "not penalized for activity it never initiated" concern (a queued
-     * embedding run is exactly this kind of system-initiated work). Named
+     * EmbeddingService::generate() is the clearest instance of work that
+     * falls outside FR-002's "work the agent generates on its own within a
+     * response" (a queued embedding run is system-initiated, not part of a
+     * live response). Named
      * directly here, not only implicitly via the traceSystemRun() scan
      * above, so a future refactor that stops routing embeddings through
      * traceSystemRun() cannot silently drop this file from coverage.

@@ -394,4 +394,48 @@ class ConversationWorkMidBatchStopJourneyTest extends TestCase
         $conversation->refresh();
         $this->assertFalse($conversation->is_processing);
     }
+
+    /**
+     * The streamed tool-call array is accumulated under whatever index each
+     * delta declared, so its keys are the provider's own and need not be
+     * 0..n-1. A mid-batch stop that treated a key as a position would answer
+     * the wrong slice of the batch and leave a real tool call unanswered —
+     * exactly the invalid state the synthesized results exist to prevent, and
+     * one no test using a conventionally-keyed batch can see.
+     */
+    #[Test]
+    public function the_streaming_handler_answers_every_call_even_when_the_provider_indexes_the_batch_from_one(): void
+    {
+        Event::fake([FinishOpenAIConversationResponseEvent::class]);
+
+        $this->declareConversationDefault(1, 60);
+
+        $conversation = $this->newConversation();
+        $conversation->update(['is_processing' => true]);
+
+        $handler = new AgentLoopStreamHandler();
+
+        // Keyed 1, 2, 3 — as a provider that numbers its tool-call deltas
+        // from one would leave them.
+        $handler->toolCalls = array_combine([1, 2, 3], $this->toolCallBurst(3));
+
+        $handler->message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+        ]);
+
+        $handler->finish(json_encode([
+            'conversation_id' => $conversation->id,
+            'iteration' => 1,
+        ]), 2);
+
+        $handler->message->refresh();
+        $toolResults = $handler->message->tool_data['tool_results'] ?? null;
+
+        $this->assertNotNull($toolResults);
+        $this->assertCoherentMixedBatch(array_values($handler->toolCalls), $toolResults, 1);
+    }
 }

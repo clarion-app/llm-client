@@ -235,6 +235,35 @@ class ConversationWorkCounterTest extends TestCase
         Log::shouldHaveReceived('warning')->atLeast()->once();
     }
 
+    /**
+     * A window of zero (or a negative one) cannot be bucketed: the fixed
+     * window's own arithmetic divides by it. The sole write path rejects
+     * such a ceiling, so this state is only reachable from a row written
+     * around that path — but the gate this counter serves is documented to
+     * never throw, and a fatal error on every single tool call of every
+     * conversation is a far worse answer to a malformed configuration row
+     * than the same unmeasurable-window report any other unreadable store
+     * produces.
+     */
+    #[Test]
+    public function increment_reports_an_unmeasurable_window_rather_than_dividing_by_zero(): void
+    {
+        Log::spy();
+
+        $counter = new ConversationWorkCounter();
+
+        foreach ([0, -60] as $windowSeconds) {
+            $reading = $counter->increment((string) Str::uuid(), $windowSeconds);
+
+            $this->assertFalse($reading->available, "A window of {$windowSeconds} seconds cannot be measured");
+            $this->assertNull($reading->count);
+            $this->assertNull($reading->windowSeconds);
+            $this->assertNull($reading->resetsAt);
+        }
+
+        Log::shouldHaveReceived('warning')->twice();
+    }
+
     #[Test]
     public function it_returns_a_conversation_work_reading_instance(): void
     {
