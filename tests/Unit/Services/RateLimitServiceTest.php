@@ -386,4 +386,137 @@ class RateLimitServiceTest extends TestCase
         $this->assertSame($waiver->id, $applicable->id);
         $this->assertTrue($applicable->waived);
     }
+
+    // ---------------------------------------------------------------
+    // Per-user override: precedence, waiver alongside a default,
+    // removal/fallback, and restore-not-duplicate
+    // ---------------------------------------------------------------
+
+    /**
+     * A user-scoped row takes precedence over user_default: resolution
+     * must not fall through to the default once an override exists, even
+     * though the default is checked second in the chain and would resolve
+     * to something too.
+     */
+    #[Test]
+    public function resolve_for_user_returns_the_user_row_when_one_exists_and_does_not_fall_through_to_user_default(): void
+    {
+        $service = $this->service();
+
+        $service->upsert(
+            RateLimitScope::UserDefault,
+            $this->sentinel(),
+            $this->limitAttributes(['max_requests' => 5, 'window_seconds' => 60]),
+        );
+
+        $override = $service->upsert(
+            RateLimitScope::User,
+            $this->userA,
+            $this->limitAttributes(['max_requests' => 100, 'window_seconds' => 60]),
+        );
+
+        $resolved = $service->resolveForUser($this->userA);
+
+        $this->assertNotNull($resolved);
+        $this->assertSame($override->id, $resolved->id);
+        $this->assertSame('user', $resolved->scope_type);
+        $this->assertSame(100, $resolved->max_requests, 'The override must win, not the default');
+
+        // A different, untouched user still resolves to the default alone.
+        $untouched = $service->resolveForUser($this->userB);
+        $this->assertNotNull($untouched);
+        $this->assertSame('user_default', $untouched->scope_type);
+        $this->assertSame(5, $untouched->max_requests);
+    }
+
+    /**
+     * A waiver on a user-scoped row wins over a configured default too:
+     * the resolved outcome for that one user is "no limit," while every
+     * other user remains bound by the default.
+     */
+    #[Test]
+    public function a_waived_user_row_wins_over_a_configured_user_default_for_that_user_alone(): void
+    {
+        $service = $this->service();
+
+        $service->upsert(
+            RateLimitScope::UserDefault,
+            $this->sentinel(),
+            $this->limitAttributes(['max_requests' => 5, 'window_seconds' => 60]),
+        );
+
+        $service->upsert(
+            RateLimitScope::User,
+            $this->userA,
+            ['waived' => true, 'max_requests' => null, 'window_seconds' => null],
+        );
+
+        $this->assertNull($service->resolveForUser($this->userA), 'A waived override must resolve to no limit even with a default configured');
+
+        $untouched = $service->resolveForUser($this->userB);
+        $this->assertNotNull($untouched);
+        $this->assertSame(5, $untouched->max_requests, 'A different user must still be bound by the default');
+    }
+
+    #[Test]
+    public function removing_a_users_override_soft_deletes_it_and_resolution_falls_back_to_the_default(): void
+    {
+        $service = $this->service();
+
+        $service->upsert(
+            RateLimitScope::UserDefault,
+            $this->sentinel(),
+            $this->limitAttributes(['max_requests' => 5, 'window_seconds' => 60]),
+        );
+
+        $service->upsert(
+            RateLimitScope::User,
+            $this->userA,
+            $this->limitAttributes(['max_requests' => 100, 'window_seconds' => 60]),
+        );
+
+        $this->assertSame(2, $this->liveRowCount());
+
+        $service->remove(RateLimitScope::User, $this->userA);
+
+        $this->assertSame(1, $this->liveRowCount(), 'Only the default row remains live');
+
+        $resolved = $service->resolveForUser($this->userA);
+        $this->assertNotNull($resolved, 'A must fall back to the default rather than resolving to no limit');
+        $this->assertSame('user_default', $resolved->scope_type);
+        $this->assertSame(5, $resolved->max_requests);
+    }
+
+    #[Test]
+    public function re_adding_an_override_for_a_previously_removed_user_restores_and_updates_that_row_rather_than_inserting_a_duplicate(): void
+    {
+        $service = $this->service();
+
+        $original = $service->upsert(
+            RateLimitScope::User,
+            $this->userA,
+            $this->limitAttributes(['max_requests' => 20, 'window_seconds' => 60]),
+        );
+
+        $service->remove(RateLimitScope::User, $this->userA);
+        $this->assertSame(0, $this->liveRowCount());
+
+        $restored = $service->upsert(
+            RateLimitScope::User,
+            $this->userA,
+            $this->limitAttributes(['max_requests' => 50, 'window_seconds' => 120]),
+        );
+
+        $this->assertSame($original->id, $restored->id, 'The soft-deleted override must be restored, not duplicated');
+        $this->assertNull($restored->deleted_at);
+        $this->assertSame(50, $restored->max_requests);
+        $this->assertSame(120, $restored->window_seconds);
+
+        $this->assertSame(1, $this->liveRowCount());
+        $this->assertSame(1, $this->totalRowCount());
+
+        $resolved = $service->resolveForUser($this->userA);
+        $this->assertNotNull($resolved);
+        $this->assertSame($restored->id, $resolved->id);
+    }
 }

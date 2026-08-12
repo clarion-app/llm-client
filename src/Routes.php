@@ -141,13 +141,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     // Per-user rate limit configuration — operator-only, and never itself
     // subject to rate-limit enforcement, so raising or waiving a limit
-    // stays reachable to an operator whom that limit has stopped. Only the
-    // user-default scope routes here; the per-specific-user override
-    // routes (PUT/DELETE rate-limits/users/{userId}) are a later story's
-    // addition.
+    // stays reachable to an operator whom that limit has stopped.
     Route::get('rate-limits', [RateLimitController::class, "index"]);
     Route::put('rate-limits/user-default', [RateLimitController::class, "putUserDefault"]);
     Route::delete('rate-limits/user-default', [RateLimitController::class, "destroyUserDefault"]);
+    Route::put('rate-limits/users/{userId}', [RateLimitController::class, "putUser"]);
+    Route::delete('rate-limits/users/{userId}', [RateLimitController::class, "destroyUser"]);
 
     Route::get('agent-eval-suites', [EvalSuiteController::class, "index"]);
     Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);

@@ -27,9 +27,10 @@ use Auth;
  * HTTP to it, and translates its \InvalidArgumentException rejections to a
  * 422.
  *
- * putUser()/destroyUser() (the per-specific-user override surface) are a
- * later story's addition — RateLimitService already resolves the user
- * scope kind internally, but nothing routes to it yet.
+ * putUser()/destroyUser() raise, lower, or waive one specific user's limit
+ * without touching the default that applies to everyone else — the same
+ * operator gate, the same validation, the same restore-not-duplicate
+ * write path, just a different scope id.
  */
 class RateLimitController extends Controller
 {
@@ -58,6 +59,16 @@ class RateLimitController extends Controller
     public function destroyUserDefault()
     {
         return $this->destroy(RateLimitScope::UserDefault, RateLimit::INSTALLATION_SCOPE_ID);
+    }
+
+    public function putUser(Request $request, string $userId)
+    {
+        return $this->put($request, RateLimitScope::User, $userId);
+    }
+
+    public function destroyUser(string $userId)
+    {
+        return $this->destroy(RateLimitScope::User, $userId);
     }
 
     private function put(Request $request, RateLimitScope $scopeType, string $scopeId)
