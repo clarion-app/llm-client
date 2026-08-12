@@ -28,6 +28,8 @@ use ClarionApp\LlmClient\Controllers\EvalCaseController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
 use ClarionApp\LlmClient\Controllers\EvalRunController;
 use ClarionApp\LlmClient\Controllers\EvalJudgmentController;
+use ClarionApp\LlmClient\Controllers\EvalReferenceController;
+use ClarionApp\LlmClient\Controllers\EvalRunComparisonController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -162,6 +164,14 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Judgment detail and override (contracts/eval-judgments-api.md §2)
     Route::get('eval-judgments/{judgmentId}', [EvalJudgmentController::class, "show"]);
     Route::post('eval-judgments/{judgmentId}/override', [EvalJudgmentController::class, "override"]);
+
+    // Reference designation and audit history (contracts/eval-regression-api.md §2)
+    Route::post('eval-runs/{runId}/reference', [EvalReferenceController::class, "designate"]);
+    Route::get('agent-eval-suites/{suiteId}/reference', [EvalReferenceController::class, "current"]);
+    Route::get('agent-eval-suites/{suiteId}/reference/history', [EvalReferenceController::class, "history"]);
+
+    // Run comparison against a reference (contracts/eval-regression-api.md §3)
+    Route::get('eval-runs/{runId}/comparison', [EvalRunComparisonController::class, "index"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
