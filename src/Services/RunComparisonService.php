@@ -54,9 +54,15 @@ class RunComparisonService
             throw new \InvalidArgumentException('This run has not finished yet.');
         }
 
+        // A run is never its own baseline: a designation naming this very
+        // run is skipped, so an agent whose only designation points at the
+        // run being looked at falls through to the plain "no reference is
+        // set" shape below rather than comparing the run against itself
+        // and reporting every case identically "unchanged".
         $designation = $this->referenceService->activeAt(
             $run->agent_label,
             $run->completed_at ?? $run->updated_at,
+            $run->id,
         );
 
         if ($designation === null) {
@@ -237,17 +243,20 @@ class RunComparisonService
             default => CaseComparisonCategory::Unchanged,
         };
 
+        // confidence and driftedExpectationIndex are deliberately left
+        // null here and filled in afterwards by attachVarianceConfidence()
+        // for the two categories that carry them, so the whole
+        // comparison's historical evidence can be gathered in one batched
+        // query rather than one per case classified.
         return new CaseComparisonResult(
             evalCaseId: $evalCaseId,
             category: $category,
-            // Phase 4/US2 populates confidence for Regressed/MateriallyDrifted.
             confidence: null,
             referenceEvalRunCaseId: $reference['eval_run_case_id'],
             comparedEvalRunCaseId: $compared['eval_run_case_id'],
             referenceOutcome: $referenceOutcome,
             comparedOutcome: $comparedOutcome,
             inconclusiveReason: null,
-            // Phase 4/US2 populates the drifted expectation index.
             driftedExpectationIndex: null,
         );
     }

@@ -71,12 +71,29 @@ class EvalReferenceService
      * anchored to that run's own completion instant rather than to
      * "whatever is current now" (research.md D6). Null when no
      * designation existed yet at that time.
+     *
+     * $excludeRunId, when given, skips every designation naming that run,
+     * continuing further back through the history rather than stopping.
+     * A comparison passes the compared run's own id here: created_at is
+     * only second-precision, so designating a run in the same wall-clock
+     * second it completed would otherwise resolve that run as its own
+     * baseline — reporting every case "unchanged" against itself, which
+     * is a misleading report rather than the plain "no reference is set
+     * for this run yet" answer such a run actually warrants. Skipping it
+     * also keeps an already-shown comparison stable when its own run is
+     * later promoted to reference: the earlier designation that was
+     * genuinely active when that run finished still wins.
      */
-    public function activeAt(string $agentLabel, \DateTimeInterface $at): ?EvalReferenceDesignation
+    public function activeAt(string $agentLabel, \DateTimeInterface $at, ?string $excludeRunId = null): ?EvalReferenceDesignation
     {
-        return $this->historyQuery($agentLabel)
-            ->where('created_at', '<=', $at)
-            ->first();
+        $query = $this->historyQuery($agentLabel)
+            ->where('created_at', '<=', $at);
+
+        if ($excludeRunId !== null) {
+            $query->where('run_id', '!=', $excludeRunId);
+        }
+
+        return $query->first();
     }
 
     private function historyQuery(string $agentLabel)

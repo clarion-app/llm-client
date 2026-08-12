@@ -289,5 +289,26 @@ class SuiteDriftComparisonJourneyTest extends TestCase
         // matching ---
         $alpha = $byCaseId[$this->caseIds['alpha']];
         $this->assertSame('unchanged', $alpha['category']);
+
+        // --- the documented response ordering: every case carrying a
+        // compared-run position first, in that position order, then every
+        // removed case (which has no compared-run position at all) after
+        // them, in its own reference-run position order. An operator
+        // reading this list sees the same order the compared run's own
+        // case list already shows, with nothing silently dropped off the
+        // end because it no longer exists in the suite.
+        $orderedCaseIds = collect($comparison->json('cases'))->pluck('eval_case_id')->all();
+
+        $expectedComparedOrder = $comparedRunCases
+            ->sortBy('position')
+            ->pluck('eval_case_id')
+            ->values()
+            ->all();
+
+        $this->assertSame(
+            array_merge($expectedComparedOrder, [$this->caseIds['bravo']]),
+            $orderedCaseIds,
+            'cases must be ordered by compared-run position, with removed cases appended after every case that has one'
+        );
     }
 }

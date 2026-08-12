@@ -10,6 +10,7 @@ use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\EvalCaseExecutor;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -318,6 +319,93 @@ class RegressionReportJourneyTest extends TestCase
         $history = $this->actingAs($this->operator)->getJson($this->suiteReferenceHistoryUrl($otherSuiteId));
         $history->assertStatus(200);
         $this->assertSame([], $history->json('data'));
+    }
+
+    // ---------------------------------------------------------------
+    // The other half of the same edge case: an agent that has only ever
+    // had the reference run and nothing since. Looking at that run's own
+    // comparison must say plainly that there is nothing to compare
+    // against — never a report of the run measured against itself, which
+    // would show every case "unchanged" and read as a clean bill of
+    // health that no comparison actually produced.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function the_reference_run_itself_is_never_compared_against_itself_even_when_designated_the_same_second_it_finished(): void
+    {
+        // Frozen so the designation's second-precision created_at lands
+        // exactly on the run's own completed_at — the timestamp collision
+        // that would otherwise let this run resolve as its own baseline.
+        // Laravel's own tearDown clears it again.
+        Carbon::setTestNow(Carbon::parse('2026-01-01 00:00:00'));
+
+        $suiteId = $this->createSuiteWithOneCheckableCase('regression-report-only-reference-agent');
+        $referenceRun = $this->runToCompletion($suiteId);
+
+        $this->designate($referenceRun['id'])->assertStatus(201);
+
+        $designatedAt = DB::table('eval_reference_designations')->where('run_id', $referenceRun['id'])->value('created_at');
+        $completedAt = DB::table('eval_runs')->where('id', $referenceRun['id'])->value('completed_at');
+        $this->assertSame(
+            (string) $completedAt,
+            (string) $designatedAt,
+            'sanity: this test is only meaningful while the designation and the run completion share one second'
+        );
+
+        $response = $this->getComparison($referenceRun['id']);
+
+        $response->assertStatus(200);
+        $this->assertNull(
+            $response->json('reference_run_id'),
+            'a run must never resolve itself as its own reference'
+        );
+        $this->assertSame(
+            [],
+            $response->json('cases'),
+            'no case may be reported as "unchanged" against its own identical result row'
+        );
+
+        // The designation itself is untouched and still fully readable —
+        // this is about what a comparison resolves to, never about hiding
+        // an audit record.
+        $current = $this->actingAs($this->operator)->getJson($this->suiteReferenceUrl($suiteId));
+        $current->assertStatus(200);
+        $this->assertSame($referenceRun['id'], $current->json('run_id'));
+    }
+
+    // ---------------------------------------------------------------
+    // The same skip must not swallow an older, genuinely-active
+    // designation: promoting a run to reference in the same second it
+    // finished still leaves it compared against whatever was the
+    // reference before it.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_run_promoted_to_reference_the_same_second_it_finished_still_compares_against_the_previous_reference(): void
+    {
+        // Frozen, so every designation and both runs' completion share one
+        // second — the hardest form of this case, where the self-naming
+        // designation is also the newest row by the (created_at DESC, id
+        // DESC) tie-break and would win outright if it were not skipped.
+        Carbon::setTestNow(Carbon::parse('2026-01-01 00:00:00'));
+
+        $suiteId = $this->createSuiteWithOneCheckableCase('regression-report-promoted-run-agent');
+
+        $firstRun = $this->runToCompletion($suiteId);
+        $this->designate($firstRun['id'])->assertStatus(201);
+
+        $secondRun = $this->runToCompletion($suiteId);
+        $this->designate($secondRun['id'])->assertStatus(201);
+
+        $response = $this->getComparison($secondRun['id']);
+
+        $response->assertStatus(200);
+        $this->assertSame(
+            $firstRun['id'],
+            $response->json('reference_run_id'),
+            'skipping a self-designation must fall back to the previous reference, not to "no reference at all"'
+        );
+        $this->assertNotEmpty($response->json('cases'));
     }
 
     // ---------------------------------------------------------------
