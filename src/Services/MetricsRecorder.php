@@ -315,6 +315,33 @@ class MetricsRecorder
                         'error' => $e->getMessage(),
                     ]);
                 }
+
+                // Reservation reconciliation (US2, research.md D7) — the
+                // exact same $summaryCost figure the cost_summaries
+                // increments above just used, so the reconciled amount and
+                // the recorded amount can never disagree (FR-014). Isolated
+                // in its own try/catch, matching the cost_summaries block
+                // immediately above: a concurrency abort is rethrown for
+                // the retry wrapper, since this reconciliation touches
+                // budget_reservation_ledger inside the same transaction and
+                // carries the identical abort risk; everything else is
+                // logged and swallowed, because a reservation-specific
+                // failure must never suppress the UsageRecord/
+                // usage_summaries/cost_summaries writes already committed
+                // above in this same closure.
+                try {
+                    app(BudgetGate::class)->reconcileHeld($userId, $summaryCost ?? '0.0000000000');
+                } catch (\Throwable $e) {
+                    if ($this->isConcurrencyAbort($e)) {
+                        throw $e;
+                    }
+
+                    Log::warning('MetricsRecorder: failed to reconcile a held reservation', [
+                        'conversation_id' => $conversationId,
+                        'user_id' => $userId,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             });
 
             // Spending thresholds are evaluated here because this is the

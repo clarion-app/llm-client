@@ -115,6 +115,20 @@ class ReservationLedger
     }
 
     /**
+     * The abandonment sweep's own terminal transition
+     * (ReleaseAbandonedReservationsCommand, research.md D6) — the same
+     * idempotent, affected-row-gated resolve() mechanism as
+     * reconcile()/release(), reused rather than re-derived, with its own
+     * distinct terminal status: a reservation the sweep resolves was never
+     * reported against (reconcile()) or released by the process that held
+     * it (release()) — it was found stale by an independent, later sweep.
+     */
+    public function abandon(CostReservation $reservation): void
+    {
+        $this->resolve($reservation, CostReservation::STATUS_ABANDONED, null);
+    }
+
+    /**
      * Sole reader, mirroring BudgetLedger::forUser()/forInstallation()
      * exactly — including on failure: a \Throwable from the underlying
      * read is caught internally and reported as

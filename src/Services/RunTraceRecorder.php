@@ -6,6 +6,7 @@ use Carbon\CarbonInterface;
 use ClarionApp\LlmClient\Events\RunActionUpdated;
 use ClarionApp\LlmClient\Events\RunStepUpdated;
 use ClarionApp\LlmClient\Events\RunUpdated;
+use ClarionApp\LlmClient\Models\CostReservation;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
@@ -189,6 +190,16 @@ class RunTraceRecorder
                 'model' => $model,
                 'agent_id' => $agentId,
             ]);
+
+            // Attach this run to whatever reservation admit() just placed
+            // for this same admission, so closeRun()'s own fallback release
+            // (below) can find it later by run_id even from a different
+            // process. Resolved lazily via app() to avoid a circular
+            // binding between the two classes -- BudgetGate itself depends
+            // on this class for recordRefusedRun(). Best-effort: linkRun()
+            // never throws, so a failure here can never stop the run from
+            // opening.
+            app(BudgetGate::class)->linkRun($userId, $runId);
 
             Context::add('run_id', $runId);
 
@@ -626,6 +637,35 @@ class RunTraceRecorder
                 Log::warning('RunTraceRecorder: failed to update run terminal state', [
                     'run_id' => $runId,
                     'end_state' => $endState->value,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            // The fallback release (US2): a reservation admit() placed for
+            // this run may never reach MetricsRecorder::recordUsage()'s own
+            // reconciliation -- the run can close from a different
+            // request/job than the one that admitted the work (a
+            // conversation resumed after a confirmation pause), where a
+            // freshly-scoped BudgetGate's in-memory reservationIds memo
+            // would be empty even though a reservation genuinely exists.
+            // Looked up by run_id directly and released straight through
+            // ReservationLedger -- deliberately bypassing BudgetGate
+            // entirely, since there is no per-instance state here to route
+            // through. Isolated in its own inner try/catch, matching this
+            // method's own established isolation discipline (see the
+            // comment on the terminal UPDATE above): a release failure here
+            // must never suppress enqueueForwarding() below.
+            try {
+                $reservation = CostReservation::where('run_id', $runId)
+                    ->where('status', CostReservation::STATUS_HELD)
+                    ->first();
+
+                if ($reservation !== null) {
+                    app(ReservationLedger::class)->release($reservation);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('RunTraceRecorder: failed to release the fallback reservation for a closed run', [
+                    'run_id' => $runId,
                     'error' => $e->getMessage(),
                 ]);
             }

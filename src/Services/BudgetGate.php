@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Services;
 use ClarionApp\LlmClient\Events\SpendingEnforcementDegraded;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\CostReservation;
 use ClarionApp\LlmClient\Models\SpendingCeiling;
 use ClarionApp\LlmClient\ValueObjects\BudgetScope;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
@@ -14,6 +15,7 @@ use ClarionApp\LlmClient\ValueObjects\EnforcementMode;
 use ClarionApp\LlmClient\ValueObjects\ReservationSnapshot;
 use ClarionApp\LlmClient\ValueObjects\UnpricedModelPolicy;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -190,6 +192,82 @@ class BudgetGate
         $this->attemptReservation($userId, $kind, $conversationId, $source, $existingRunId, $decision, $scopeKey);
 
         $this->admitted[$scopeKey] = true;
+    }
+
+    /**
+     * Attach the reservation this instance placed for $userId's scope to
+     * the run that admission just opened. Called by
+     * RunTraceRecorder::openRun(), which always runs immediately after
+     * admit() in both funnels (see the class docblock's reservation note),
+     * so at the moment this fires $this->reservationIds still holds the
+     * reservation id from that same admission.
+     *
+     * A no-op when $runId is null or when no reservation was ever placed
+     * for this admission (admit_untracked policy, no ceiling configured,
+     * or every applicable axis was warn-mode) — never a reason to fail an
+     * already-open run.
+     */
+    public function linkRun(?string $userId, ?string $runId): void
+    {
+        if ($runId === null) {
+            return;
+        }
+
+        $reservationId = $this->reservationIds[$this->scopeKey($userId)] ?? null;
+
+        if ($reservationId === null) {
+            return;
+        }
+
+        try {
+            DB::table('cost_reservations')
+                ->where('id', $reservationId)
+                ->whereNull('run_id')
+                ->update(['run_id' => $runId]);
+        } catch (\Throwable $e) {
+            Log::warning('Failed to link a reservation to its run', [
+                'reservation_id' => $reservationId,
+                'run_id' => $runId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Reconcile the reservation this instance placed for $userId's scope
+     * against a real recorded cost. Safe to call only from within the same
+     * request/job that ran admit() — it reads $this->reservationIds, this
+     * instance's own per-request/job memo (research.md D7's grounding for
+     * why MetricsRecorder::recordUsage()'s reconciliation is safe to route
+     * through BudgetGate at all, unlike RunTraceRecorder::closeRun()'s
+     * fallback, which may run from a different process entirely).
+     *
+     * A no-op when no reservation was ever placed for this admission.
+     * Never throws into the caller.
+     */
+    public function reconcileHeld(string $userId, string $actualAmount): void
+    {
+        $reservationId = $this->reservationIds['user:'.$userId] ?? null;
+
+        if ($reservationId === null) {
+            return;
+        }
+
+        try {
+            $reservation = CostReservation::find($reservationId);
+
+            if ($reservation === null) {
+                return;
+            }
+
+            $this->reservations->reconcile($reservation, $actualAmount);
+        } catch (\Throwable $e) {
+            Log::warning('Failed to reconcile a held reservation', [
+                'reservation_id' => $reservationId,
+                'user_id' => $userId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
