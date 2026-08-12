@@ -41,6 +41,16 @@ class ResponseBoundaryOnlyJourneyTest extends TestCase
     {
         parent::setUp();
 
+        if (!\Illuminate\Support\Facades\Schema::hasTable('condensation_states')) {
+            \Illuminate\Support\Facades\Schema::create('condensation_states', function (\Illuminate\Database\Schema\Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id')->unique();
+                $table->unsignedInteger('consecutive_failures')->default(0);
+                $table->timestamp('cooldown_until')->nullable();
+                $table->timestamps();
+            });
+        }
+
         Carbon::setTestNow(Carbon::parse('2026-08-12 10:00:00', 'UTC'));
 
         $this->user = User::factory()->create();
@@ -215,6 +225,81 @@ class ResponseBoundaryOnlyJourneyTest extends TestCase
             'small-model',
             $dispatchedModel,
             'a genuinely NEW response (a fresh run), started after standing already crossed the threshold, must reflect the reduction'
+        );
+    }
+
+    /**
+     * Mutation-checklist rows 2/3, exercised at the exact call site row 2
+     * names: AgentLoopService::start()'s own "$runId === null" gate around
+     * RunTraceRecorder::openRun() (and, inside it, DegradationGate::
+     * linkRun()). AgentLoopStreamHandler re-enters start($conversation,
+     * $iteration + 1, $this->runId) on every streaming iteration with the
+     * run id carried forward (verbatim the same re-entry
+     * RateLimitInFlightWorkCompletesJourneyTest proves for the rate
+     * limiter's own identically-shaped gate) — a continuing re-entry must
+     * never re-open the run or re-link the already-recorded degradation
+     * event, or a multi-iteration streamed response would accumulate one
+     * degradation_events row per iteration instead of exactly one per
+     * response.
+     */
+    #[Test]
+    public function a_streaming_continuation_carrying_a_run_id_never_relinks_the_degradation_event(): void
+    {
+        \Illuminate\Support\Facades\Queue::fake([\ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest::class]);
+        \Illuminate\Support\Facades\Http::fake();
+
+        // Standing already past the 0.75 rung from setUp(), so the decision
+        // openRun()'s linkRun() call links is genuinely 'reduced' — the
+        // branch mutation-checklist row 15 already covers is "full", this
+        // test is specifically about the "reduced" branch relinking.
+        $this->recordSpend('80.0000000000');
+
+        $recorder = app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class);
+
+        // Populate DegradationGate's scoped $decisions memo exactly as
+        // admitInteractiveWork() would, then mint the run — openRun()'s own
+        // internal DegradationGate::linkRun() call fires exactly once here,
+        // the fresh-mint branch.
+        app(\ClarionApp\LlmClient\Services\DegradationGate::class)->evaluate(
+            (string) $this->user->id,
+            $this->conversation->id,
+            \ClarionApp\LlmClient\ValueObjects\RateLimitDecision::noLimitConfigured(),
+            app(\ClarionApp\LlmClient\Services\BudgetGate::class)->evaluate((string) $this->user->id),
+        );
+
+        $runId = $recorder->openRun(
+            \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+            (string) $this->user->id,
+            $this->conversation->id,
+            streamed: true,
+        );
+        $this->assertNotNull($runId);
+
+        $this->assertSame(
+            1,
+            \ClarionApp\LlmClient\Models\DegradationEvent::where('run_id', $runId)->count(),
+            'the fresh-mint openRun() call must link exactly one degradation_events row'
+        );
+
+        $agentLoop = app(AgentLoopService::class);
+
+        // Every subsequent iteration is a re-entry into start() with the
+        // run id carried forward — verbatim the call AgentLoopStreamHandler
+        // makes at each iteration. Deliberately NOT calling
+        // forgetScopedInstances() between iterations: a real streamed
+        // continuation within the same request/job shares the same
+        // scoped DegradationGate instance, so its $decisions memo for this
+        // conversation is still populated as 'reduced' on every iteration —
+        // exactly the condition under which a guard-removed regression
+        // would relink.
+        for ($iteration = 2; $iteration <= 4; $iteration++) {
+            $agentLoop->start($this->conversation, $iteration, $runId);
+        }
+
+        $this->assertSame(
+            1,
+            \ClarionApp\LlmClient\Models\DegradationEvent::where('run_id', $runId)->count(),
+            'a continuation carrying an existing run id must never re-open the run or relink its degradation event — exactly one row must exist for the whole response, not one per iteration'
         );
     }
 }
