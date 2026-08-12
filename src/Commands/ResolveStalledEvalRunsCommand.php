@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Commands;
 
+use ClarionApp\LlmClient\Events\EvalRunUpdated;
 use ClarionApp\LlmClient\Models\EvalRun;
 use ClarionApp\LlmClient\Models\EvalRunCase;
 use ClarionApp\LlmClient\Services\EvalCaseExecutor;
@@ -39,6 +40,15 @@ use Illuminate\Support\Facades\Log;
  *     Cache::lock("eval-run:{$run->id}", 30), the same lock a concurrent
  *     operator-triggered resume shares, so the two can never
  *     double-dispatch the same case.
+ *
+ * Both branches leave an operator watching a run live with exactly one
+ * accurate announcement of what happened: the exhausted branch fires its
+ * own EvalRunUpdated after the incomplete override lands (suppressing the
+ * transient "completed" broadcast EvalCaseExecutor's own last-job-out
+ * check would otherwise have fired first); the recoverable branch fires
+ * none of its own, since EvalRunService::resume() already announces its
+ * own redispatch when it does real work — adding a second one here would
+ * double-announce the same event.
  *
  * Usage:
  *   php artisan llm-client:resolve-stalled-eval-runs [--dry-run]
@@ -93,10 +103,19 @@ class ResolveStalledEvalRunsCommand extends Command
 
                 if (!$dryRun) {
                     foreach ($exhaustedCases as $case) {
+                        // The completion broadcast is suppressed here: if
+                        // this happens to be the run's last outstanding
+                        // case, EvalCaseExecutor's own "last job out"
+                        // check would otherwise announce the run as
+                        // completed a moment before the very next line
+                        // overrides it back to incomplete. This command's
+                        // own broadcast below is the single, accurate
+                        // announcement of what actually happened.
                         $executor->recordTimeoutOrFailure(
                             $run->id,
                             $case->id,
-                            new \RuntimeException('This case did not complete after repeated recovery attempts.')
+                            new \RuntimeException('This case did not complete after repeated recovery attempts.'),
+                            suppressRunCompletionBroadcast: true,
                         );
                     }
 
@@ -107,6 +126,15 @@ class ResolveStalledEvalRunsCommand extends Command
                     // (run above via recordTimeoutOrFailure) has no way
                     // to distinguish from an ordinary case failure.
                     $run->fresh()->update(['status' => EvalRunStatus::Incomplete]);
+
+                    try {
+                        event(new EvalRunUpdated($run->id));
+                    } catch (\Throwable $e) {
+                        Log::warning('ResolveStalledEvalRunsCommand: failed to broadcast EvalRunUpdated', [
+                            'run_id' => $run->id,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
 
                     Log::info('Eval run case exhausted recovery attempts', [
                         'run_id' => $run->id,

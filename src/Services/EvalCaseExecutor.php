@@ -2,6 +2,8 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Events\EvalRunCaseResultRecorded;
+use ClarionApp\LlmClient\Events\EvalRunUpdated;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\EvalCaseResult;
 use ClarionApp\LlmClient\Models\EvalCaseVersion;
@@ -195,9 +197,28 @@ class EvalCaseExecutor
      * thrown inside AgentLoopService::run(), including a
      * BudgetExceededException (research.md D10 — no exemption, contained
      * per-case like any other failure, never aborting the run).
+     *
+     * $suppressRunCompletionBroadcast exists for exactly one caller:
+     * ResolveStalledEvalRunsCommand's own give-up sweep, which records an
+     * exhausted case's terminal failure here and then, immediately
+     * afterward and unconditionally, overrides the run's status to
+     * incomplete itself — even when this call happens to be the run's
+     * last outstanding case, which would otherwise make maybeCompleteRun()
+     * below transition (and broadcast) the run as completed a moment
+     * before the sweep's own override corrects it back to incomplete. A
+     * live viewer would see that transient, incorrect "completed" push;
+     * suppressing the broadcast here (never the underlying write — the
+     * command still needs maybeCompleteRun()'s own eval_run_cases
+     * bookkeeping to run normally) leaves the sweep's own subsequent
+     * broadcast as the single, accurate announcement of what actually
+     * happened to this run.
      */
-    public function recordTimeoutOrFailure(string $runId, string $evalRunCaseId, \Throwable $e): void
-    {
+    public function recordTimeoutOrFailure(
+        string $runId,
+        string $evalRunCaseId,
+        \Throwable $e,
+        bool $suppressRunCompletionBroadcast = false,
+    ): void {
         $evalRunCase = EvalRunCase::find($evalRunCaseId);
 
         if ($evalRunCase === null || $evalRunCase->status === EvalRunCaseStatus::Completed) {
@@ -216,6 +237,7 @@ class EvalCaseExecutor
             [],
             [],
             $e->getMessage(),
+            $suppressRunCompletionBroadcast,
         );
     }
 
@@ -252,6 +274,7 @@ class EvalCaseExecutor
         array $attemptedActions,
         array $expectationResults,
         ?string $errorMessage,
+        bool $suppressRunCompletionBroadcast = false,
     ): EvalCaseResult {
         $caseResult = EvalCaseResult::create([
             'run_id' => $run->id,
@@ -276,9 +299,22 @@ class EvalCaseExecutor
             ]);
         }
 
+        // Its own inner try/catch, isolated from the rollup write above —
+        // a rollup failure must never mask a broadcast failure or vice
+        // versa.
+        try {
+            event(new EvalRunCaseResultRecorded($caseResult->id));
+        } catch (\Throwable $e) {
+            Log::warning('EvalCaseExecutor: failed to broadcast EvalRunCaseResultRecorded', [
+                'run_id' => $run->id,
+                'eval_case_result_id' => $caseResult->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         $evalRunCase->update(['status' => EvalRunCaseStatus::Completed]);
 
-        $this->maybeCompleteRun($run);
+        $this->maybeCompleteRun($run, $suppressRunCompletionBroadcast);
 
         return $caseResult;
     }
@@ -289,7 +325,7 @@ class EvalCaseExecutor
      * lacking a matching eval_case_results row. If none remain, the run
      * is complete.
      */
-    private function maybeCompleteRun(EvalRun $run): void
+    private function maybeCompleteRun(EvalRun $run, bool $suppressCompletionBroadcast = false): void
     {
         $stillIncomplete = EvalRunCase::where('run_id', $run->id)
             ->whereNotIn(
@@ -320,6 +356,19 @@ class EvalCaseExecutor
             'status' => EvalRunStatus::Completed,
             'completed_at' => now(),
         ]);
+
+        if ($suppressCompletionBroadcast) {
+            return;
+        }
+
+        try {
+            event(new EvalRunUpdated($run->id));
+        } catch (\Throwable $e) {
+            Log::warning('EvalCaseExecutor: failed to broadcast EvalRunUpdated', [
+                'run_id' => $run->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**

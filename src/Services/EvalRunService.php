@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Events\EvalRunUpdated;
 use ClarionApp\LlmClient\Jobs\RunEvalCaseJob;
 use ClarionApp\LlmClient\Models\EvalCaseResult;
 use ClarionApp\LlmClient\Models\EvalRun;
@@ -12,6 +13,7 @@ use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * The sole write path for eval_runs/eval_run_cases (research.md D7/D12,
@@ -57,7 +59,15 @@ class EvalRunService
                 'completed_at' => now(),
             ]);
 
-            return $run->fresh();
+            $run = $run->fresh();
+
+            // in_progress is the row's own first, only state at creation --
+            // it has no prior state to notify a change from, so this is the
+            // one branch of start() worth announcing: a run that never got
+            // to make any progress at all.
+            $this->broadcastRunUpdated($run->id);
+
+            return $run;
         }
 
         $evalRunCases = DB::transaction(function () use ($suite, $run, $resolution) {
@@ -181,6 +191,8 @@ class EvalRunService
             return $run->fresh();
         }
 
+        $dispatchedAny = false;
+
         try {
             $pendingCases = EvalRunCase::where('run_id', $run->id)
                 ->where('status', EvalRunCaseStatus::Pending)
@@ -196,6 +208,8 @@ class EvalRunService
                 ]);
             }
 
+            $dispatchedAny = $pendingCases->isNotEmpty();
+
             if ($run->status === EvalRunStatus::Incomplete) {
                 $run->update(['status' => EvalRunStatus::InProgress]);
             }
@@ -203,6 +217,38 @@ class EvalRunService
             $lock->release();
         }
 
+        // A resume that actually redispatched at least one case is real,
+        // externally meaningful progress on a run an operator may be
+        // watching live -- this covers both an operator-triggered resume
+        // and an automatic sweep's own redispatch of a recoverable case,
+        // whether or not the run's own status field happened to move as
+        // part of it (a run swept while still in_progress, with only a
+        // stale dispatched case reset and redispatched, has no status
+        // change to report but is still worth telling a live viewer
+        // about). A resume that found nothing pending is a pure no-op and
+        // reports nothing, matching contracts' "always safe to call
+        // speculatively" guarantee.
+        if ($dispatchedAny) {
+            $this->broadcastRunUpdated($run->id);
+        }
+
         return $run->fresh();
+    }
+
+    /**
+     * Isolated in its own try/catch so a broadcast failure can never mask
+     * or undo the write it reports on, nor change the calling method's
+     * return value -- the RunTraceRecorder::broadcast() precedent.
+     */
+    private function broadcastRunUpdated(string $runId): void
+    {
+        try {
+            event(new EvalRunUpdated($runId));
+        } catch (\Throwable $e) {
+            Log::warning('EvalRunService: failed to broadcast EvalRunUpdated', [
+                'run_id' => $runId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 }
