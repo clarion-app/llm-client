@@ -740,6 +740,7 @@ abstract class TestCase extends BaseTestCase
                 $table->unique(['run_id', 'eval_case_id']);
                 $table->index('run_id');
                 $table->index('conversation_id');
+                $table->index(['eval_case_id', 'created_at']);
             });
         }
     }

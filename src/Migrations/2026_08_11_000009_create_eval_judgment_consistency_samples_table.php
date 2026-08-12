@@ -67,7 +67,14 @@ return new class extends Migration
             $table->timestamp('created_at')->useCurrent();
 
             $table->index('eval_case_id');
-            $table->index('source_eval_case_result_id');
+
+            // An explicit, shortened name: the auto-generated default
+            // (table name + column name + "_index") exceeds MySQL/MariaDB's
+            // 64-character identifier limit for this table/column pair,
+            // which made this migration fail outright against any real
+            // MySQL/MariaDB target (SQLite has no such limit, so every
+            // hand-declared test schema masked this).
+            $table->index('source_eval_case_result_id', 'eval_judgment_consistency_samples_source_result_idx');
         });
     }
 
