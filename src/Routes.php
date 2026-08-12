@@ -25,6 +25,7 @@ use ClarionApp\LlmClient\Controllers\BudgetCeilingController;
 use ClarionApp\LlmClient\Controllers\BudgetStandingController;
 use ClarionApp\LlmClient\Controllers\RateLimitController;
 use ClarionApp\LlmClient\Controllers\ConversationWorkCeilingController;
+use ClarionApp\LlmClient\Controllers\ReductionStepController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteController;
 use ClarionApp\LlmClient\Controllers\EvalCaseController;
 use ClarionApp\LlmClient\Controllers\EvalSuiteExportController;
@@ -159,6 +160,16 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::delete('conversation-work-ceilings/conversation-default', [ConversationWorkCeilingController::class, "destroyConversationDefault"]);
     Route::put('conversation-work-ceilings/conversations/{conversationId}', [ConversationWorkCeilingController::class, "putConversation"]);
     Route::delete('conversation-work-ceilings/conversations/{conversationId}', [ConversationWorkCeilingController::class, "destroyConversation"]);
+
+    // Operator-defined reduction ladder configuration (contracts §1, US3)
+    // — never itself subject to any of the enforcement axes it governs,
+    // and read fresh (no cache) by DegradationGate::evaluate() on every
+    // admitted request, so a change here governs the very next request
+    // with no restart or deployment (FR-011/SC-008).
+    Route::get('reduction-steps', [ReductionStepController::class, "index"]);
+    Route::put('reduction-steps', [ReductionStepController::class, "store"]);
+    Route::put('reduction-steps/{id}', [ReductionStepController::class, "update"]);
+    Route::delete('reduction-steps/{id}', [ReductionStepController::class, "destroy"]);
 
     Route::get('agent-eval-suites', [EvalSuiteController::class, "index"]);
     Route::post('agent-eval-suites', [EvalSuiteController::class, "store"]);

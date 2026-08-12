@@ -529,6 +529,18 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new \ClarionApp\LlmClient\Services\DegradationGate();
         });
 
+        // singleton(), unlike DegradationGate just above — this is a
+        // stateless CRUD write path with no per-instance memo of any kind
+        // (the identical reasoning ConversationWorkCeilingService/
+        // RateLimitService are already singleton() for): every method
+        // reads or writes the live reduction_steps table directly, so one
+        // shared instance is safe for the life of the process, and an
+        // operator's change is visible to the very next
+        // DegradationGate::evaluate() call with no restart (FR-011/SC-008).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ReductionLadderService::class, function () {
+            return new \ClarionApp\LlmClient\Services\ReductionLadderService();
+        });
+
         // bind(), not singleton() and not scoped(). The notifier holds no
         // state of its own, but it reads through BudgetLedger, whose memo is
         // deliberately per-request/per-job: a longer-lived notifier would
