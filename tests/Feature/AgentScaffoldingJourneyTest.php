@@ -72,6 +72,14 @@ class AgentScaffoldingJourneyTest extends TestCase
     }
 
     /**
+     * @return string[] non-"."/".." entries directly inside $dir
+     */
+    private function directoryEntries(string $dir): array
+    {
+        return array_values(array_diff(scandir($dir) ?: [], ['.', '..']));
+    }
+
+    /**
      * Every one of the 15 leaf settings quickstart.md step 1 names, each
      * immediately preceded (skipping only blank lines) by a non-empty "#"
      * comment line. Tolerant of either a nested-YAML or a dotted-key
@@ -164,6 +172,142 @@ class AgentScaffoldingJourneyTest extends TestCase
         $this->assertArrayHasKey('denylist', $parsed['safety']);
 
         $this->assertLeafSettingsHaveComments($content);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4 (US3) — generation never silently damages or fails
+    // invisibly (T021). AgentCreateCommand does not yet catch
+    // AgentScaffoldCollisionException/AgentScaffoldDestinationException
+    // (that wiring is Phase 4's own Implementation scope, T022) — the
+    // first two cases below are expected to fail RED against Phase 3's
+    // code: the exception propagates rather than producing the clean
+    // exit-1/message behavior asserted here. The last two cases exercise
+    // already-built Phase 3 behavior and are expected to pass.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_same_name_collision_is_refused_and_the_existing_file_is_untouched(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        $firstExitCode = Artisan::call('agent:create', [
+            'name' => 'dup',
+            '--path' => $dir,
+        ]);
+        $this->assertSame(0, $firstExitCode);
+
+        $path = $dir.'/dup.yaml';
+        $this->assertFileExists($path);
+        $originalContent = file_get_contents($path);
+        $originalMtime = filemtime($path);
+
+        $secondExitCode = Artisan::call('agent:create', [
+            'name' => 'dup',
+            '--path' => $dir,
+        ]);
+
+        $this->assertSame(1, $secondExitCode, 'A same-name collision must be refused with exit 1.');
+
+        $output = Artisan::output();
+        $this->assertStringContainsString('An agent definition already exists at', $output);
+        $this->assertStringContainsString($path, $output);
+
+        $this->assertSame(
+            $originalContent,
+            file_get_contents($path),
+            'The pre-existing file\'s content must be byte-for-byte unchanged after the refused attempt.'
+        );
+        $this->assertSame(
+            $originalMtime,
+            filemtime($path),
+            'The pre-existing file\'s mtime must be unchanged after the refused attempt.'
+        );
+    }
+
+    #[Test]
+    public function an_unwritable_destination_fails_clearly_with_nothing_left_behind(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        // (a) --path pointing at a directory that does not exist.
+        $missingDir = $dir.'/does-not-exist';
+
+        $exitCodeA = Artisan::call('agent:create', [
+            'name' => 'x',
+            '--path' => $missingDir,
+        ]);
+
+        $this->assertSame(1, $exitCodeA, 'A missing destination directory must be refused with exit 1.');
+        $this->assertStringContainsString('Destination directory does not exist:', Artisan::output());
+        $this->assertDirectoryDoesNotExist($missingDir);
+
+        // (b) --path pointing at a real temp directory chmod'd to 0500
+        // (non-writable). Restore unconditionally, even on assertion
+        // failure, so the directory can still be cleaned up in tearDown().
+        chmod($dir, 0500);
+
+        try {
+            $exitCodeB = Artisan::call('agent:create', [
+                'name' => 'x',
+                '--path' => $dir,
+            ]);
+
+            $this->assertSame(1, $exitCodeB, 'An unwritable destination directory must be refused with exit 1.');
+            $this->assertStringContainsString('Destination directory is not writable:', Artisan::output());
+        } finally {
+            chmod($dir, 0777);
+        }
+
+        $this->assertSame(
+            [],
+            $this->directoryEntries($dir),
+            'No file may be created anywhere as a result of either sub-case.'
+        );
+    }
+
+    #[Test]
+    public function a_whitespace_only_name_is_distinguishable_from_a_collision(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        $exitCode = Artisan::call('agent:create', [
+            'name' => '   ',
+            '--path' => $dir,
+        ]);
+
+        $this->assertSame(1, $exitCode);
+
+        $output = Artisan::output();
+        $this->assertStringContainsString('A definition must state a non-empty "name".', $output);
+        $this->assertStringNotContainsString('An agent definition already exists at', $output);
+        $this->assertSame([], $this->directoryEntries($dir), 'No file may be written for a refused name.');
+    }
+
+    #[Test]
+    public function every_generated_result_validates_immediately_via_the_real_cli_path(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        $exitCode = Artisan::call('agent:create', [
+            'name' => 'validate-me',
+            '--path' => $dir,
+        ]);
+
+        $this->assertSame(0, $exitCode);
+
+        $path = $dir.'/validate-me.yaml';
+        $this->assertFileExists($path);
+        $content = file_get_contents($path);
+
+        $validator = $this->app->make(AgentDefinitionValidator::class);
+        $result = $validator->check($content);
+
+        $this->assertTrue($result->valid);
+        $this->assertSame([], $result->problems);
     }
 
     // ---------------------------------------------------------------
