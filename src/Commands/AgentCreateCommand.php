@@ -4,6 +4,8 @@ namespace ClarionApp\LlmClient\Commands;
 
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
+use ClarionApp\LlmClient\Exceptions\AgentScaffoldCollisionException;
+use ClarionApp\LlmClient\Exceptions\AgentScaffoldDestinationException;
 use ClarionApp\LlmClient\Services\AgentDefinitionScaffolder;
 use ClarionApp\LlmClient\Services\AgentDefinitionScaffoldWriter;
 use Illuminate\Console\Command;
@@ -12,11 +14,12 @@ use Illuminate\Support\Str;
 /**
  * `agent:create {name} {--path=}` — generates one complete, immediately
  * valid agent definition file and writes it to disk
- * (089-agent-scaffolding-cli, contracts §1 rows 2/3/8; rows 1 and 4-7 are
- * Phase 4/5's own additions, not this phase's scope). No `--kind` option
- * yet (Phase 5), and no catch around AgentScaffoldCollisionException/
- * AgentScaffoldDestinationException yet (Phase 4) — both deliberately left
- * for later phases per this feature's own tasks.md Ordering grounding note.
+ * (089-agent-scaffolding-cli, contracts §1 rows 2/3/8; row 1 is Phase 5's
+ * own addition, not this phase's scope). No `--kind` option yet (Phase 5).
+ * Phase 4 adds the catch around AgentScaffoldCollisionException/
+ * AgentScaffoldDestinationException so a collision or an unusable
+ * destination fails cleanly (exit 1, clear message) instead of an
+ * uncaught exception propagating out of the command.
  */
 class AgentCreateCommand extends Command
 {
@@ -42,7 +45,22 @@ class AgentCreateCommand extends Command
             return self::FAILURE;
         }
 
-        $absolutePath = $writer->write($path, $scaffold->filename, $scaffold->content);
+        try {
+            $absolutePath = $writer->write($path, $scaffold->filename, $scaffold->content);
+        } catch (AgentScaffoldCollisionException $e) {
+            $destination = rtrim($path, '/').'/'.$scaffold->filename;
+            $this->error(sprintf('An agent definition already exists at %s. Choose a different name, or remove it first if you intend to replace it.', $destination));
+
+            return self::FAILURE;
+        } catch (AgentScaffoldDestinationException $e) {
+            $this->error(match ($e->getReason()) {
+                'not_found' => sprintf('Destination directory does not exist: %s.', $path),
+                'not_writable' => sprintf('Destination directory is not writable: %s.', $path),
+                'write_failed' => $e->getMessage(),
+            });
+
+            return self::FAILURE;
+        }
 
         $this->info("Agent definition written to {$absolutePath}.");
 
