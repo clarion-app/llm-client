@@ -700,4 +700,177 @@ class AgentHandoffJourneyTest extends TestCase
             'no new ConversationHandoff row may be written by either loop-back attempt — the chain must stay at its pre-attempt length of 2',
         );
     }
+
+    // =================================================================
+    // US6 (quickstart steps 12, 13) — sequenced after T013/T014/T029/T033,
+    // same file.
+    //
+    // Message has no attribution-stamping `creating` listener yet (Phase 7,
+    // T039) — every test below is expected to FAIL: agent_id/agent_version_id
+    // stay null on every Message created regardless of handoff state, until
+    // the listener is added.
+    // =================================================================
+
+    #[Test]
+    public function each_message_is_attributed_to_the_agent_actually_responsible_for_it_at_creation_time(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+        $agentC = app(AgentService::class)->create($this->user->id, "name: agent-c\ninstructions: I am agent C.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $messageUnderA = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => 'Reply from A.',
+            'responseTime' => 0,
+        ]);
+
+        $this->assertSame(
+            $agentA->id,
+            $messageUnderA->agent_id,
+            'a message created before any handoff must be attributed to the conversation\'s own original agent_id',
+        );
+        $this->assertSame($agentA->current_version_id, $messageUnderA->agent_version_id);
+
+        $first = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($first['success'] ?? false, 'fixture sanity: the first handoff (A -> B) must succeed');
+        $conversation = $conversation->fresh();
+
+        $messageUnderB = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => 'Reply from B.',
+            'responseTime' => 0,
+        ]);
+
+        $this->assertSame(
+            $agentB->id,
+            $messageUnderB->agent_id,
+            'a message created after a handoff must be attributed to the RECEIVING agent (B), never the original (A)',
+        );
+        $this->assertSame($agentB->current_version_id, $messageUnderB->agent_version_id);
+
+        $second = $this->handoff($conversation, $agentC->id);
+        $this->assertTrue($second['success'] ?? false, 'fixture sanity: the second handoff (B -> C) must succeed');
+        $conversation = $conversation->fresh();
+
+        $messageUnderC = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => 'Reply from C.',
+            'responseTime' => 0,
+        ]);
+
+        $this->assertSame(
+            $agentC->id,
+            $messageUnderC->agent_id,
+            'a message created after a second handoff (a chain of 2+) must be attributed to the LATEST receiving agent (C), never an intermediate one (B)',
+        );
+        $this->assertSame($agentC->current_version_id, $messageUnderC->agent_version_id);
+
+        $this->assertNotSame($messageUnderA->agent_id, $messageUnderB->agent_id, 'the three messages\' attribution must genuinely differ, not all read the same agent');
+        $this->assertNotSame($messageUnderB->agent_id, $messageUnderC->agent_id);
+        $this->assertNotSame($messageUnderA->agent_id, $messageUnderC->agent_id);
+    }
+
+    #[Test]
+    public function a_pre_handoff_messages_attribution_is_never_retroactively_rewritten_by_a_later_handoff(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+        $agentC = app(AgentService::class)->create($this->user->id, "name: agent-c\ninstructions: I am agent C.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $priorMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => 'Reply from A, before any handoff.',
+            'responseTime' => 0,
+        ]);
+
+        $this->assertSame($agentA->id, $priorMessage->agent_id, 'fixture sanity: the prior message must be attributed to agent A at creation time');
+
+        $first = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($first['success'] ?? false, 'fixture sanity: the first handoff (A -> B) must succeed');
+        $conversation = $conversation->fresh();
+
+        $second = $this->handoff($conversation, $agentC->id);
+        $this->assertTrue($second['success'] ?? false, 'fixture sanity: the second handoff (B -> C) must succeed');
+
+        $reread = Message::find($priorMessage->id);
+        $this->assertNotNull($reread);
+        $this->assertSame(
+            $agentA->id,
+            $reread->agent_id,
+            'a pre-handoff message\'s attribution must never be retroactively rewritten by a later handoff — it must still read agent A',
+        );
+        $this->assertSame($agentA->current_version_id, $reread->agent_version_id);
+    }
+
+    #[Test]
+    public function a_message_on_a_conversation_with_no_handoffs_at_all_stamps_from_the_original_binding(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => 'Reply from A, no handoff ever performed.',
+            'responseTime' => 0,
+        ]);
+
+        $this->assertSame(
+            $agentA->id,
+            $message->agent_id,
+            'a message on a conversation with no handoffs at all must stamp from the conversation\'s own original agent_id (090\'s still-common path)',
+        );
+        $this->assertSame($agentA->current_version_id, $message->agent_version_id);
+    }
+
+    #[Test]
+    public function a_message_with_agent_id_already_explicitly_set_is_left_untouched_by_the_new_listener(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $handoffResult = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($handoffResult['success'] ?? false, 'fixture sanity: the handoff (A -> B) must succeed, so the effective agent at creation time would otherwise be B');
+        $conversation = $conversation->fresh();
+
+        $explicitAgentId = (string) Str::uuid();
+        $explicitAgentVersionId = (string) Str::uuid();
+
+        // agent_id/agent_version_id are deliberately NOT mass-assignable
+        // (data-model.md §2 — mirrors run_id's own posture), so setting
+        // them explicitly at creation time means assigning the attribute
+        // directly, then saving — never via Message::create()'s own fill().
+        $message = new Message([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => 'Explicitly attributed message.',
+            'responseTime' => 0,
+        ]);
+        $message->agent_id = $explicitAgentId;
+        $message->agent_version_id = $explicitAgentVersionId;
+        $message->save();
+
+        $this->assertSame(
+            $explicitAgentId,
+            $message->fresh()->agent_id,
+            'a message with agent_id already explicitly set at creation time must be left untouched by the new attribution listener — it must never be overwritten with the conversation\'s current effective agent (B)',
+        );
+        $this->assertSame($explicitAgentVersionId, $message->fresh()->agent_version_id);
+    }
 }
