@@ -72,11 +72,25 @@ class ConversationController extends Controller
             'model' => 'nullable|string',
             'server_id' => 'nullable|string',
             'channel' => 'nullable|string|max:50|regex:/^[a-z0-9_-]+$/',
+            'agent_id' => 'nullable|string',
         ]);
 
         $validatedData['user_id'] = Auth::id();
         $validatedData['character'] = "Clarion";
         $validatedData['channel'] = $validatedData['channel'] ?? 'web';
+
+        $agentId = $validatedData['agent_id'] ?? null;
+        if ($agentId !== null) {
+            $agent = app(\ClarionApp\LlmClient\Services\AgentQuery::class)->findAgent(Auth::id(), $agentId);
+            if ($agent === null) {
+                return response()->json([
+                    'error' => 'Agent not found',
+                    'code' => 'agent_not_found',
+                ], 404);
+            }
+            $validatedData['agent_id'] = $agent->id;
+            $validatedData['agent_version_id'] = $agent->current_version_id;
+        }
 
         // Use validated server_id/model if provided, otherwise resolve via RoleResolver
         $serverId = $validatedData['server_id'] ?? null;
