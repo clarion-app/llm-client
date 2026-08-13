@@ -723,5 +723,13 @@ return [
         // resolution time — never copied into a second hardcoded number.
         'instructions_max_tokens' => env('LLM_CLIENT_AGENT_DEFINITIONS_INSTRUCTIONS_MAX_TOKENS', null),
     ],
+
+    // Agent Version History (087-agent-model-versioning) — bounds for
+    // GET /agents/{id}/versions, so a long-lived, frequently-edited agent's
+    // version list stays readable as versions accumulate rather than
+    // returning every row unpaginated.
+    'agents' => [
+        'versions_per_page' => (int) env('LLM_CLIENT_AGENT_VERSIONS_PER_PAGE', 25),
+    ],
 ];
 

@@ -1,0 +1,50 @@
+<?php
+
+namespace ClarionApp\LlmClient\Models;
+
+use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\SoftDeletes;
+
+/**
+ * The stable, editable-in-place identity for a stored agent (data-model.md
+ * §1) — the identity a listing is keyed on, unaffected by how many times
+ * its definition has changed. The content itself lives on AgentVersion,
+ * pointed at by current_version_id.
+ *
+ * AgentService is the sole write path for this table and for
+ * agent_versions.
+ */
+class Agent extends Model
+{
+    use HasFactory, EloquentMultiChainBridge, SoftDeletes;
+
+    protected $table = 'agents';
+
+    protected $fillable = [
+        'user_id',
+        'name',
+        'current_version_id',
+        'linked_repository_path',
+        'linked_file_path',
+        'linked_synced_file_hash',
+    ];
+
+    /** The version currently in effect for this agent. */
+    public function currentVersion(): BelongsTo
+    {
+        return $this->belongsTo(AgentVersion::class, 'current_version_id');
+    }
+
+    /**
+     * Every version this agent has ever had, oldest first — the shape
+     * `GET /agents/{id}/versions` returns.
+     */
+    public function versions(): HasMany
+    {
+        return $this->hasMany(AgentVersion::class, 'agent_id')->orderBy('version_number');
+    }
+}

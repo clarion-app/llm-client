@@ -277,6 +277,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineEvalJudgmentSchema();
         $this->defineEvalReferenceSchema();
         $this->defineEvalPassRateSchema();
+        $this->defineAgentSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -860,6 +861,55 @@ abstract class TestCase extends BaseTestCase
                 $table->softDeletes();
 
                 $table->unique(['case_id', 'version_number']);
+            });
+        }
+    }
+
+    /**
+     * The two tables Agent Version History (087) reads and writes —
+     * agents (the identity/version-split's stable half) and agent_versions
+     * (the append-only content half). Mirrors data-model.md §§1-2 exactly.
+     * Guarded by Schema::hasTable() like every existing block here, and
+     * called from defineDatabaseMigrations() directly, matching
+     * defineEvalSuiteSchema()'s own call-site pattern.
+     */
+    protected function defineAgentSchema(): void
+    {
+        if (!Schema::hasTable('agents')) {
+            Schema::create('agents', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id');
+                $table->string('name', 255);
+                $table->uuid('current_version_id')->nullable();
+                $table->string('linked_repository_path', 1024)->nullable();
+                $table->string('linked_file_path', 1024)->nullable();
+                $table->string('linked_synced_file_hash', 64)->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index('user_id');
+                $table->index('current_version_id');
+            });
+        }
+
+        if (!Schema::hasTable('agent_versions')) {
+            Schema::create('agent_versions', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('agent_id');
+                $table->unsignedInteger('version_number');
+                $table->text('raw_definition');
+                $table->string('content_hash', 64);
+                $table->string('source', 16);
+                $table->uuid('changed_by_user_id')->nullable();
+                $table->uuid('restored_from_version_id')->nullable();
+                $table->string('git_commit_hash', 40)->nullable();
+                $table->string('git_author_name', 255)->nullable();
+                $table->timestamp('git_committed_at')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->unique(['agent_id', 'version_number']);
+                $table->index('agent_id');
             });
         }
     }
