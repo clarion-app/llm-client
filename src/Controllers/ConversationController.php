@@ -272,4 +272,33 @@ class ConversationController extends Controller
             return response()->json(['message' => 'API call cancelled'], 200);
         }
     }
+
+    public function handoffs($id)
+    {
+        $conversation = Conversation::ownedByRealUser()->findOrFail($id);
+
+        if ($conversation->user_id !== Auth::id()) {
+            return response()->json(['message' => 'Forbidden'], 403);
+        }
+
+        $rows = \ClarionApp\LlmClient\Models\ConversationHandoff::where('conversation_id', $id)
+            ->orderBy('position')
+            ->get()
+            ->map(function ($row) {
+                return [
+                    'position' => $row->position,
+                    'from_agent_id' => $row->from_agent_id,
+                    'from_agent_name' => $row->from_agent_id !== null
+                        ? \ClarionApp\LlmClient\Models\Agent::withTrashed()->find($row->from_agent_id)?->name
+                        : null,
+                    'to_agent_id' => $row->to_agent_id,
+                    'to_agent_name' => \ClarionApp\LlmClient\Models\Agent::withTrashed()->find($row->to_agent_id)?->name,
+                    'to_agent_version_id' => $row->to_agent_version_id,
+                    'created_at' => $row->created_at,
+                    'disclosed_at' => $row->disclosed_at,
+                ];
+            });
+
+        return response()->json($rows, 200);
+    }
 }

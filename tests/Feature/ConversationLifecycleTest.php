@@ -83,6 +83,12 @@ class ConversationLifecycleTest extends TestCase
             $table->integer('responseTime')->nullable();
             $table->json('tool_data')->nullable();
             $table->uuid('run_id')->nullable()->index();
+            // 093-agent-handoff: Message::creating() now stamps agent_id/
+            // agent_version_id from ConversationHandoff::currentAgentIdentityFor()
+            // on every Message::create() call, regardless of whether this test
+            // ever performs a handoff.
+            $table->uuid('agent_id')->nullable();
+            $table->uuid('agent_version_id')->nullable();
             $table->timestamps();
             $table->softDeletes();
         });

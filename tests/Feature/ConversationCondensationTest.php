@@ -87,6 +87,7 @@ class ConversationCondensationTest extends TestCase
             $table->boolean('is_processing')->default(false);
             $table->string('channel')->nullable();
             $table->timestamps();
+            $table->softDeletes();
         });
 
         // messages table
@@ -98,6 +99,12 @@ class ConversationCondensationTest extends TestCase
             $table->unsignedInteger('token_count')->nullable();
             $table->json('tool_data')->nullable();
             $table->uuid('run_id')->nullable()->index();
+            // 093-agent-handoff: Message::creating() now stamps agent_id/
+            // agent_version_id from ConversationHandoff::currentAgentIdentityFor()
+            // on every Message::create() call, regardless of whether this test
+            // ever performs a handoff.
+            $table->uuid('agent_id')->nullable();
+            $table->uuid('agent_version_id')->nullable();
             $table->timestamps();
             $table->softDeletes();
         });
@@ -124,6 +131,22 @@ class ConversationCondensationTest extends TestCase
             $table->unsignedInteger('consecutive_failures')->default(0);
             $table->timestamp('cooldown_until')->nullable();
             $table->timestamps();
+        });
+
+        // 093-agent-handoff: Message::creating() now queries
+        // conversation_handoffs on every Message::create() call, regardless
+        // of whether this test ever performs a handoff.
+        Schema::create('conversation_handoffs', function (Blueprint $table) {
+            $table->uuid('id')->primary();
+            $table->uuid('conversation_id');
+            $table->unsignedInteger('position');
+            $table->uuid('from_agent_id')->nullable();
+            $table->uuid('to_agent_id');
+            $table->uuid('to_agent_version_id');
+            $table->timestamp('created_at');
+            $table->timestamp('disclosed_at')->nullable();
+
+            $table->index('conversation_id');
         });
     }
 

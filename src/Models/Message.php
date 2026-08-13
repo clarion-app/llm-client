@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Context;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
+use ClarionApp\LlmClient\Models\ConversationHandoff;
 
 class Message extends Model
 {
@@ -38,6 +39,17 @@ class Message extends Model
         static::creating(function ($model) {
             if ($model->run_id === null) {
                 $model->run_id = Context::get('run_id');
+            }
+        });
+
+        static::creating(function ($model) {
+            if ($model->agent_id === null && $model->conversation_id !== null) {
+                $conversation = Conversation::find($model->conversation_id);
+                if ($conversation !== null) {
+                    $identity = ConversationHandoff::currentAgentIdentityFor($conversation);
+                    $model->agent_id = $identity['agent_id'];
+                    $model->agent_version_id = $identity['agent_version_id'];
+                }
             }
         });
     }
