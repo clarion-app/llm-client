@@ -167,6 +167,16 @@ class AgentDefinitionScaffolder
      */
     private function renderListLine(string $key, array $values): string
     {
+        // Yaml::dump() cannot distinguish an empty list from an empty map
+        // (PHP has one array type for both) and defaults to rendering an
+        // empty array as "{  }" — a map, not the list this field is
+        // documented to hold. Render the empty case explicitly as "[]" so
+        // a human editing the file sees the list syntax they need to use
+        // to add an entry, rather than mapping syntax that doesn't apply.
+        if ($values === []) {
+            return $key . ': []';
+        }
+
         $dumped = trim(Yaml::dump([$key => $values], 2, 2));
 
         return $dumped;
@@ -177,6 +187,10 @@ class AgentDefinitionScaffolder
      */
     private function renderIndentedListLine(string $key, array $values): string
     {
+        if ($values === []) {
+            return '  ' . $key . ': []';
+        }
+
         $dumped = trim(Yaml::dump([$key => $values], 2, 2));
 
         $indented = implode("\n", array_map(
