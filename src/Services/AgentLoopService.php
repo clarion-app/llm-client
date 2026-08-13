@@ -2961,9 +2961,17 @@ class AgentLoopService
             return json_encode(['error' => 'agent_id is required']);
         }
 
+        if ($conversation->user_id === null) {
+            return json_encode(['error' => 'Handoff is not available for this conversation.']);
+        }
+
         $target = app(AgentQuery::class)->findAgent($conversation->user_id, $targetAgentId);
         if ($target === null) {
             return json_encode(['error' => 'Agent not found or not available to hand off to.']);
+        }
+
+        if ($target->is_active === false) {
+            return json_encode(['error' => "The agent \"{$target->name}\" is deactivated and cannot receive a handoff."]);
         }
 
         $from = ConversationHandoff::where('conversation_id', $conversation->id)
