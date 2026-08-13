@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
 use ClarionApp\LlmClient\Services\AgentService;
+use ClarionApp\LlmClient\Services\GitDefinitionFileReader;
 use ClarionApp\LlmClient\ValueObjects\AgentChangeSource;
 use Dedoc\Scramble\Generator;
 use Illuminate\Support\Facades\DB;
@@ -46,7 +47,10 @@ class AgentServiceTest extends TestCase
 
     private function service(): AgentService
     {
-        return new AgentService(new AgentDefinitionParser());
+        // GitDefinitionFileReader is only exercised by link()/syncFromFile()
+        // (Phase 5/US3's own scope, not covered by this file) — a plain
+        // instance is enough to satisfy AgentService's constructor here.
+        return new AgentService(new AgentDefinitionParser(), new GitDefinitionFileReader());
     }
 
     private function user(): User

@@ -572,7 +572,23 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         $this->app->singleton(\ClarionApp\LlmClient\Services\AgentService::class, function ($app) {
             return new \ClarionApp\LlmClient\Services\AgentService(
-                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class)
+                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class),
+                $app->make(\ClarionApp\LlmClient\Services\GitDefinitionFileReader::class)
+            );
+        });
+
+        // GitDefinitionFileReader holds no state (every call is a fresh
+        // filesystem/process read); AgentDivergenceChecker holds only the
+        // already-singleton GitDefinitionFileReader — both safe as
+        // singleton() for the identical reason as AgentQuery/AgentService
+        // above (087-agent-model-versioning, Phase 5/US3).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\GitDefinitionFileReader::class, function () {
+            return new \ClarionApp\LlmClient\Services\GitDefinitionFileReader();
+        });
+
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentDivergenceChecker::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\AgentDivergenceChecker(
+                $app->make(\ClarionApp\LlmClient\Services\GitDefinitionFileReader::class)
             );
         });
     }

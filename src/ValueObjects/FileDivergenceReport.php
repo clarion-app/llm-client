@@ -7,12 +7,14 @@ namespace ClarionApp\LlmClient\ValueObjects;
  * data, no logic. Computed fresh on every call, never stored (research.md
  * D9/D10).
  *
- * `governs` is always the literal 'stored_agent' whenever `state` is not
- * NotLinked (research.md D10 — the stored agent is always what actually
- * governs behavior, regardless of drift direction); null for NotLinked.
- * `liveFileHash` is null for NotLinked/Unavailable. `currentVersionHash` is
- * null only for NotLinked. `unavailableReason` is set only for
- * Unavailable.
+ * `governs` is the literal 'stored_agent' for the four "linked and
+ * successfully checked" states (InStep/FileAhead/StoredAhead/BothChanged
+ * — research.md D10, never varies with drift direction); null for
+ * NotLinked and for Unavailable alike (contracts §10's own worked
+ * examples), since neither has a meaningful drift direction to report
+ * governance for. `liveFileHash` is null for NotLinked/Unavailable.
+ * `currentVersionHash` is null only for NotLinked. `unavailableReason` is
+ * set only for Unavailable.
  */
 final readonly class FileDivergenceReport
 {

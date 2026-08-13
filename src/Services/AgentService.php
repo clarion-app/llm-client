@@ -14,8 +14,10 @@ use Illuminate\Support\Facades\DB;
  * (research.md D1/D4).
  *
  * create()/update() are Phase 3/US1's own surface. restore() is Phase
- * 4/US2's own addition — link()/syncFromFile()/unlink() remain User Story
- * 3's own scope, added later.
+ * 4/US2's own addition. link()/syncFromFile()/unlink() are Phase 5/US3's
+ * own addition (research.md D8/D9/D11) — the only methods that read a
+ * file off disk (via the injected GitDefinitionFileReader) rather than
+ * accepting raw YAML text directly.
  *
  * Every method that writes an AgentVersion calls
  * AgentDefinitionParser::parse() first, before any write, and propagates
@@ -27,6 +29,7 @@ class AgentService
 {
     public function __construct(
         private readonly AgentDefinitionParser $parser,
+        private readonly GitDefinitionFileReader $fileReader,
     ) {
     }
 
@@ -143,5 +146,96 @@ class AgentService
 
             return $agent->fresh();
         });
+    }
+
+    /**
+     * Link an agent to a definition file in a git-tracked project (contracts
+     * §8, US3 AC1): reads the file's current working-tree content
+     * (propagating AgentFileUnreadableException on a filesystem-level
+     * failure), validates it via the parser (propagating a parse/resolution
+     * exception, nothing changed on failure), then always imports it as a
+     * new version immediately — linking always starts in-step, regardless
+     * of what the stored agent held immediately before linking.
+     *
+     * The new version is attributed to the file's own git commit, never to
+     * $userId (research.md D8) — changed_by_user_id is always null for a
+     * file_sync version; $userId is accepted only to keep this method's
+     * signature consistent with every other write method in this class
+     * (contracts §12), not because it is ever recorded.
+     *
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException
+     */
+    public function link(Agent $agent, string $userId, string $repositoryPath, string $filePath): Agent
+    {
+        $rawYaml = $this->fileReader->readWorkingTreeContent($repositoryPath, $filePath);
+        $definition = $this->parser->parse($rawYaml);
+
+        return DB::transaction(function () use ($agent, $repositoryPath, $filePath, $rawYaml, $definition) {
+            $contentHash = hash('sha256', $rawYaml);
+            $nextVersionNumber = (int) AgentVersion::where('agent_id', $agent->id)->max('version_number') + 1;
+            $commit = $this->fileReader->latestCommitFor($repositoryPath, $filePath);
+
+            $version = AgentVersion::create([
+                'agent_id' => $agent->id,
+                'version_number' => $nextVersionNumber,
+                'raw_definition' => $rawYaml,
+                'content_hash' => $contentHash,
+                'source' => AgentChangeSource::FileSync->value,
+                'changed_by_user_id' => null,
+                'git_commit_hash' => $commit?->hash,
+                'git_author_name' => $commit?->authorName,
+                'git_committed_at' => $commit?->committedAt,
+            ]);
+
+            $agent->current_version_id = $version->id;
+            $agent->name = $definition->name;
+            $agent->linked_repository_path = $repositoryPath;
+            $agent->linked_file_path = $filePath;
+            $agent->linked_synced_file_hash = $contentHash;
+            $agent->save();
+
+            return $agent->fresh();
+        });
+    }
+
+    /**
+     * Re-import an already-linked agent's current file content as a new
+     * version (contracts §11) — the one explicit action that resolves a
+     * FileAhead/BothChanged divergence. Identical import step to link()
+     * (same attribution, same "always writes a new version" posture), just
+     * against the agent's own already-recorded link columns rather than a
+     * caller-supplied path — reuses link() directly rather than
+     * duplicating its logic.
+     *
+     * Callers must confirm the agent is actually linked before calling
+     * this (StoredAgentController does so, contracts §11's 422
+     * "not_linked" case) — this method trusts linked_repository_path/
+     * linked_file_path are both already set.
+     *
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException
+     */
+    public function syncFromFile(Agent $agent, string $userId): Agent
+    {
+        return $this->link($agent, $userId, $agent->linked_repository_path, $agent->linked_file_path);
+    }
+
+    /**
+     * Clear an agent's link (contracts §9) — resets all three linked_*
+     * columns to null together and touches no agent_versions row at all.
+     * History is never rewritten by unlinking: every prior file_sync-
+     * sourced version stays exactly as it was written.
+     */
+    public function unlink(Agent $agent): Agent
+    {
+        $agent->linked_repository_path = null;
+        $agent->linked_file_path = null;
+        $agent->linked_synced_file_hash = null;
+        $agent->save();
+
+        return $agent->fresh();
     }
 }

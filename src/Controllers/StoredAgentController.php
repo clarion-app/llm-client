@@ -5,24 +5,28 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
+use ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
+use ClarionApp\LlmClient\Services\AgentDivergenceChecker;
 use ClarionApp\LlmClient\Services\AgentQuery;
 use ClarionApp\LlmClient\Services\AgentService;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionParseErrorKind;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionResolutionErrorKind;
+use ClarionApp\LlmClient\ValueObjects\FileDivergenceReport;
 use Auth;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 /**
- * HTTP surface for `agents`/`agent_versions` (contracts §1/§4/§5/§6/§7).
- * store()/update() are Phase 3/US1's own scope. index()/show()/versions()/
- * versionDetail()/restore() are Phase 4/US2's own addition — show() is
- * deliberately built here *without* the `link`/`divergence` blocks
- * contracts §3 also describes, since those are User Story 3's own scope
- * (Phase 5). link()/unlink()/divergence()/syncFromFile() remain Phase 5's.
+ * HTTP surface for `agents`/`agent_versions` (contracts §1/§4/§5/§6/§7/§8/
+ * §9/§10/§11). store()/update() are Phase 3/US1's own scope. index()/
+ * show()/versions()/versionDetail()/restore() are Phase 4/US2's own
+ * addition. link()/unlink()/divergence()/syncFromFile() are Phase 5/US3's
+ * own addition — show() now also embeds the `link`/`divergence` blocks
+ * contracts §3 describes, but only when the agent is actually linked
+ * (never present-but-null).
  *
  * AgentService is the sole write path this controller ever calls; every
  * ownership-scoped lookup goes through AgentQuery, whose null return is
@@ -34,6 +38,7 @@ class StoredAgentController extends Controller
         private readonly AgentService $service,
         private readonly AgentQuery $query,
         private readonly AgentDefinitionParser $parser,
+        private readonly AgentDivergenceChecker $divergenceChecker,
     ) {}
 
     /**
@@ -95,10 +100,10 @@ class StoredAgentController extends Controller
     }
 
     /**
-     * GET /agents/{id} (contracts §3, minus the `link`/`divergence` blocks
-     * — Phase 5/US3's own addition). Resolves the current definition
+     * GET /agents/{id} (contracts §3). Resolves the current definition
      * directly via AgentDefinitionParser::parse(), not through a cached or
-     * denormalized copy (research.md D6).
+     * denormalized copy (research.md D6). Embeds `link`/`divergence` only
+     * when the agent is actually linked — never present-but-null.
      */
     public function show(Request $request, string $id): JsonResponse
     {
@@ -108,12 +113,109 @@ class StoredAgentController extends Controller
             return $this->notFoundResponse();
         }
 
-        $definition = $this->parser->parse($agent->currentVersion->raw_definition);
+        return response()->json($this->agentDetailResource($agent));
+    }
 
-        return response()->json([
-            ...$this->agentResource($agent),
-            'definition' => $definition,
+    /**
+     * PUT /agents/{id}/link (contracts §8, US3 AC1). Reads the file's
+     * current working-tree content, validates it, then always imports it
+     * as a new version immediately — linking always starts in-step.
+     */
+    public function link(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $request->validate([
+            'repository_path' => 'required|string',
+            'file_path' => 'required|string',
         ]);
+
+        try {
+            $agent = $this->service->link(
+                $agent,
+                Auth::id(),
+                $request->input('repository_path'),
+                $request->input('file_path')
+            );
+        } catch (AgentFileUnreadableException $e) {
+            return $this->fileUnreadableResponse($e);
+        } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
+            return $this->definitionErrorResponse($e);
+        }
+
+        return response()->json($this->agentDetailResource($agent), 200);
+    }
+
+    /**
+     * DELETE /agents/{id}/link (contracts §9). Clears the link; touches no
+     * agent_versions row — history is never rewritten by unlinking.
+     */
+    public function unlink(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $agent = $this->service->unlink($agent);
+
+        return response()->json($this->agentDetailResource($agent), 200);
+    }
+
+    /**
+     * GET /agents/{id}/divergence (contracts §10, FR-009/FR-010). Always
+     * 200 — an unreadable file is a reportable state, not an HTTP failure
+     * of this endpoint itself.
+     */
+    public function divergence(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $report = $this->divergenceChecker->check($agent);
+
+        return response()->json($this->divergenceResource($report), 200);
+    }
+
+    /**
+     * POST /agents/{id}/sync-from-file (contracts §11). The one explicit
+     * action that resolves a FileAhead/BothChanged divergence — always
+     * imports whatever the file currently holds, overwriting nothing (the
+     * stored agent's own unreconciled changes remain fully readable as the
+     * version immediately prior).
+     */
+    public function syncFromFile(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        if ($agent->linked_repository_path === null) {
+            return response()->json([
+                'error' => 'not_linked',
+                'message' => 'This agent is not linked to a definition file.',
+            ], 422);
+        }
+
+        try {
+            $agent = $this->service->syncFromFile($agent, Auth::id());
+        } catch (AgentFileUnreadableException $e) {
+            return $this->fileUnreadableResponse($e);
+        } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
+            return $this->definitionErrorResponse($e);
+        }
+
+        return response()->json($this->agentDetailResource($agent), 200);
     }
 
     /**
@@ -207,6 +309,76 @@ class StoredAgentController extends Controller
         }
 
         return response()->json($this->agentResource($agent), 200);
+    }
+
+    /**
+     * The shape show()/link()/unlink()/syncFromFile() all share (contracts
+     * §3): the current definition, plus `link`/`divergence` embedded only
+     * when the agent is actually linked — never present-but-null
+     * (contracts §3's own "omit the whole block when the concept doesn't
+     * apply" convention).
+     */
+    private function agentDetailResource(Agent $agent): array
+    {
+        $resource = [
+            ...$this->agentResource($agent),
+            'definition' => $this->parser->parse($agent->currentVersion->raw_definition),
+        ];
+
+        if ($agent->linked_repository_path !== null) {
+            $resource['link'] = $this->linkResource($agent);
+            $resource['divergence'] = $this->divergenceResource($this->divergenceChecker->check($agent));
+        }
+
+        return $resource;
+    }
+
+    /**
+     * The `link` block embedded in agentDetailResource() (contracts §3).
+     */
+    private function linkResource(Agent $agent): array
+    {
+        return [
+            'repository_path' => $agent->linked_repository_path,
+            'file_path' => $agent->linked_file_path,
+        ];
+    }
+
+    /**
+     * The shape both the embedded `divergence` block (contracts §3) and
+     * the standalone GET /agents/{id}/divergence endpoint (contracts §10)
+     * share. `unavailable_reason` is included only when set — omitted
+     * entirely for every state but Unavailable, matching contracts §10's
+     * own worked examples (the in_step/not_linked examples show only
+     * three keys).
+     */
+    private function divergenceResource(FileDivergenceReport $report): array
+    {
+        $resource = [
+            'state' => $report->state->value,
+            'governs' => $report->governs,
+            'checked_at' => $report->checkedAt->format(\DateTimeInterface::ATOM),
+        ];
+
+        if ($report->unavailableReason !== null) {
+            $resource['unavailable_reason'] = $report->unavailableReason;
+        }
+
+        return $resource;
+    }
+
+    /**
+     * The 422 body for `link`()/syncFromFile() when the file itself
+     * cannot be read (contracts §8's distinct `error: "file_unreadable"`
+     * — a filesystem-level failure, distinct from definitionErrorResponse()'s
+     * content-validation failure).
+     */
+    private function fileUnreadableResponse(AgentFileUnreadableException $e): JsonResponse
+    {
+        return response()->json([
+            'error' => 'file_unreadable',
+            'message' => $e->getMessage(),
+        ], 422);
     }
 
     /**

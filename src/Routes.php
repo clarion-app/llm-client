@@ -238,6 +238,14 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agents/{id}/versions', [StoredAgentController::class, "versions"]);
     Route::get('agents/{id}/versions/{versionId}', [StoredAgentController::class, "versionDetail"]);
     Route::post('agents/{id}/versions/{versionId}/restore', [StoredAgentController::class, "restore"]);
+
+    // Agent version history — link/unlink/divergence/sync-from-file
+    // (contracts/agent-versioning-api.md §8/§9/§10/§11,
+    // 087-agent-model-versioning, Phase 5/US3).
+    Route::put('agents/{id}/link', [StoredAgentController::class, "link"]);
+    Route::delete('agents/{id}/link', [StoredAgentController::class, "unlink"]);
+    Route::get('agents/{id}/divergence', [StoredAgentController::class, "divergence"]);
+    Route::post('agents/{id}/sync-from-file', [StoredAgentController::class, "syncFromFile"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
