@@ -498,4 +498,98 @@ class AgentCloneJourneyTest extends TestCase
         $this->assertSame($agentsBefore, DB::table('agents')->count(), 'a refused clone must write no agent row');
         $this->assertSame($versionsBefore, DB::table('agent_versions')->count(), 'a refused clone must write no version row');
     }
+
+    // =================================================================
+    // T021 — US2 (quickstart steps 6-9)
+    //
+    // Written first, confirmed RED: agentResource() (StoredAgentController
+    // L513-522/547-556) has no `cloned_from` block yet — Phase 4's own
+    // implementation (T022) comes after these tests.
+    // =================================================================
+
+    #[Test]
+    public function a_copy_records_which_agent_it_came_from(): void
+    {
+        $sourceId = $this->createAgent('name: provenance-source');
+
+        $cloneResponse = $this->actingAs($this->user)->postJson($this->base($sourceId), ['name' => 'provenance-copy']);
+        $cloneResponse->assertStatus(201);
+        $cloneId = $cloneResponse->json('id');
+
+        $this->assertSame($sourceId, $cloneResponse->json('cloned_from.id'), 'the 201 response itself must name the source agent');
+
+        $show = $this->actingAs($this->user)->getJson($this->agentUrl($cloneId));
+        $show->assertStatus(200);
+        $this->assertSame($sourceId, $show->json('cloned_from.id'), 'a later, separate GET must still show the identical origin id');
+    }
+
+    #[Test]
+    public function the_recorded_origin_survives_the_original_being_edited(): void
+    {
+        $sourceId = $this->createAgent('name: weather-bot');
+
+        $cloneId = $this->actingAs($this->user)
+            ->postJson($this->base($sourceId), ['name' => 'weather-bot-copy'])
+            ->assertStatus(201)
+            ->json('id');
+
+        $this->actingAs($this->user)->putJson($this->agentUrl($sourceId), [
+            'definition' => 'name: weather-bot-v2',
+        ])->assertStatus(200);
+
+        $show = $this->actingAs($this->user)->getJson($this->agentUrl($cloneId));
+        $show->assertStatus(200);
+
+        $this->assertSame($sourceId, $show->json('cloned_from.id'), 'cloned_from.id must be unchanged by the source being edited');
+        $this->assertSame('weather-bot-v2', $show->json('cloned_from.name'), 'cloned_from.name must reflect the source\'s CURRENT name, not a frozen snapshot');
+    }
+
+    #[Test]
+    public function the_recorded_origin_survives_the_original_being_removed(): void
+    {
+        $sourceId = $this->createAgent('name: soon-to-be-retired');
+
+        $cloneId = $this->actingAs($this->user)
+            ->postJson($this->base($sourceId), ['name' => 'retired-origin-copy'])
+            ->assertStatus(201)
+            ->json('id');
+
+        Agent::find($sourceId)->delete();
+        $this->assertNotNull(Agent::withTrashed()->find($sourceId)->deleted_at, 'fixture sanity: the origin must actually be soft-deleted');
+
+        $show = $this->actingAs($this->user)->getJson($this->agentUrl($cloneId));
+        $show->assertStatus(200, 'the copy itself must still be ordinarily readable');
+        $this->assertNotNull($show->json('cloned_from'), 'cloned_from must remain present and readable after the origin is removed');
+        $this->assertSame($sourceId, $show->json('cloned_from.id'));
+        $this->assertSame('soon-to-be-retired', $show->json('cloned_from.name'), 'the origin\'s name must still resolve via findAgentIncludingTrashed(), not silently drop to null or error');
+    }
+
+    #[Test]
+    public function copying_a_copy_records_the_immediate_source_not_the_original_further_back(): void
+    {
+        $agentAId = $this->createAgent('name: chain-agent-a');
+
+        $copyBId = $this->actingAs($this->user)
+            ->postJson($this->base($agentAId), ['name' => 'chain-agent-b'])
+            ->assertStatus(201)
+            ->json('id');
+
+        $copyCResponse = $this->actingAs($this->user)->postJson($this->base($copyBId), ['name' => 'chain-agent-c']);
+        $copyCResponse->assertStatus(201);
+
+        $this->assertSame($copyBId, $copyCResponse->json('cloned_from.id'), 'C\'s cloned_from must name B, its immediate source');
+        $this->assertNotSame($agentAId, $copyCResponse->json('cloned_from.id'), 'C\'s cloned_from must never name A, further back in the chain');
+    }
+
+    #[Test]
+    public function an_agent_with_no_recorded_origin_omits_the_cloned_from_block_entirely(): void
+    {
+        $agentId = $this->createAgent('name: never-cloned');
+
+        $show = $this->actingAs($this->user)->getJson($this->agentUrl($agentId));
+        $show->assertStatus(200);
+
+        $show->assertJsonMissingPath('cloned_from');
+        $this->assertArrayNotHasKey('cloned_from', $show->json(), 'a plain, directly-created agent must have no cloned_from key at all — not null, not an empty object');
+    }
 }
