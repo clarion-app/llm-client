@@ -548,4 +548,66 @@ class AgentActivationJourneyTest extends TestCase
         $response->assertStatus(409);
         $this->assertSame('agent_deactivated', $response->json('code'));
     }
+
+    // =================================================================
+    // T021 — US3 (quickstart steps 9, 10)
+    // =================================================================
+
+    #[Test]
+    public function a_listing_plainly_distinguishes_active_from_deactivated_agents(): void
+    {
+        $agentAId = $this->createAgent('name: agent-a');
+        $agentBId = $this->createAgent('name: agent-b');
+        $agentCId = $this->createAgent('name: agent-c');
+
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentBId))->assertStatus(200);
+
+        $listing = $this->actingAs($this->user)->getJson($this->agentsUrl());
+        $listing->assertStatus(200);
+
+        $entries = collect($listing->json('data'));
+        $this->assertCount(3, $entries, 'fixture sanity: all three agents must be listed');
+
+        $entryA = $entries->firstWhere('id', $agentAId);
+        $entryB = $entries->firstWhere('id', $agentBId);
+        $entryC = $entries->firstWhere('id', $agentCId);
+
+        $this->assertArrayHasKey('is_active', $entryA, 'each listing entry must carry its own is_active field');
+        $this->assertArrayHasKey('is_active', $entryB, 'each listing entry must carry its own is_active field');
+        $this->assertArrayHasKey('is_active', $entryC, 'each listing entry must carry its own is_active field');
+
+        $this->assertTrue($entryA['is_active'], 'agent-a was never deactivated');
+        $this->assertFalse($entryB['is_active'], 'agent-b was deactivated');
+        $this->assertTrue($entryC['is_active'], 'agent-c was never deactivated');
+    }
+
+    #[Test]
+    public function the_listing_reflects_the_current_status_never_a_stale_one(): void
+    {
+        $agentId = $this->createAgent('name: flip-flop-agent');
+        $this->createAgent('name: sibling-agent'); // sibling, so the agent under test is never the caller's last active one
+
+        $before = $this->actingAs($this->user)->getJson($this->agentsUrl());
+        $before->assertStatus(200);
+        $entryBefore = collect($before->json('data'))->firstWhere('id', $agentId);
+        $this->assertArrayHasKey('is_active', $entryBefore);
+        $this->assertTrue($entryBefore['is_active'], 'fixture sanity: the agent starts active');
+
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentId))->assertStatus(200);
+
+        $afterDeactivate = $this->actingAs($this->user)->getJson($this->agentsUrl());
+        $afterDeactivate->assertStatus(200);
+        $entryAfterDeactivate = collect($afterDeactivate->json('data'))->firstWhere('id', $agentId);
+        $this->assertArrayHasKey('is_active', $entryAfterDeactivate);
+        $this->assertFalse($entryAfterDeactivate['is_active'], 'a fresh listing must reflect the just-applied deactivation, never a stale cached true');
+        $this->assertNotSame($entryBefore['is_active'], $entryAfterDeactivate['is_active'], 'the read must be live: the second listing must differ from the first');
+
+        $this->actingAs($this->user)->postJson($this->activateUrl($agentId))->assertStatus(200);
+
+        $afterReactivate = $this->actingAs($this->user)->getJson($this->agentsUrl());
+        $afterReactivate->assertStatus(200);
+        $entryAfterReactivate = collect($afterReactivate->json('data'))->firstWhere('id', $agentId);
+        $this->assertArrayHasKey('is_active', $entryAfterReactivate);
+        $this->assertTrue($entryAfterReactivate['is_active'], 'a fresh listing must reflect the just-applied reactivation, never a stale cached false');
+    }
 }
