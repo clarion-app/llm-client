@@ -890,6 +890,7 @@ abstract class TestCase extends BaseTestCase
                 $table->string('linked_file_path', 1024)->nullable();
                 $table->string('linked_synced_file_hash', 64)->nullable();
                 $table->uuid('cloned_from_agent_id')->nullable();
+                $table->boolean('is_active')->default(true);
                 $table->timestamps();
                 $table->softDeletes();
 
