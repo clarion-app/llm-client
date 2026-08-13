@@ -546,13 +546,23 @@ class StoredAgentController extends Controller
      */
     private function agentResource(Agent $agent): array
     {
-        return [
+        $resource = [
             'id' => $agent->id,
             'name' => $agent->name,
             'current_version_number' => $agent->currentVersion?->version_number,
             'linked' => $agent->linked_repository_path !== null,
             'created_at' => $agent->created_at?->toIso8601String(),
         ];
+
+        if ($agent->cloned_from_agent_id !== null) {
+            $origin = $this->query->findAgentIncludingTrashed(Auth::id(), $agent->cloned_from_agent_id);
+            $resource['cloned_from'] = [
+                'id' => $agent->cloned_from_agent_id,
+                'name' => $origin?->name,
+            ];
+        }
+
+        return $resource;
     }
 
     /**
