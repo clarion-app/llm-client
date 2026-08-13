@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Models;
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Database\Factories\ConversationFactory;
@@ -13,7 +14,7 @@ class Conversation extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
-    protected $fillable = ['server_id', 'title', 'model', 'character', 'user_id', 'is_processing', 'channel', 'provider_override', 'ended_at'];
+    protected $fillable = ['server_id', 'title', 'model', 'character', 'user_id', 'is_processing', 'channel', 'provider_override', 'ended_at', 'agent_id', 'agent_version_id'];
 
     protected $casts = [
         'is_processing' => 'boolean',
@@ -57,6 +58,24 @@ class Conversation extends Model
     public function server()
     {
         return $this->belongsTo(Server::class, 'server_id');
+    }
+
+    public function agent(): BelongsTo
+    {
+        return $this->belongsTo(\ClarionApp\LlmClient\Models\Agent::class, 'agent_id');
+    }
+
+    /**
+     * The specific AgentVersion this conversation is bound to, if any — a
+     * direct, indexed lookup by the fixed agent_version_id column recorded
+     * at creation. This is the relation ConversationAgentDefinitionResolver
+     * actually uses; it must never be substituted with agent()->currentVersion,
+     * which would silently re-resolve to whatever version the agent has been
+     * edited to since, defeating the whole point of the binding (FR-003).
+     */
+    public function agentVersion(): BelongsTo
+    {
+        return $this->belongsTo(\ClarionApp\LlmClient\Models\AgentVersion::class, 'agent_version_id');
     }
 
     /**

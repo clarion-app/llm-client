@@ -161,10 +161,15 @@ abstract class TestCase extends BaseTestCase
                 $table->string('title')->nullable();
                 $table->string('model')->nullable();
                 $table->string('character')->nullable();
+                $table->string('channel')->nullable();
+                $table->uuid('agent_id')->nullable();
+                $table->uuid('agent_version_id')->nullable();
                 $table->string('provider_override')->nullable();
                 $table->boolean('is_processing')->default(false);
                 $table->timestamp('ended_at')->nullable();
                 $table->index('user_id');
+                $table->index('agent_id');
+                $table->index('agent_version_id');
             });
         }
 
