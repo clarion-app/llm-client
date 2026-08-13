@@ -4,10 +4,12 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
+use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\AgentService;
 use ClarionApp\LlmClient\Services\ConversationAgentDefinitionResolver;
@@ -15,6 +17,7 @@ use Dedoc\Scramble\Generator;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Mockery;
@@ -174,6 +177,21 @@ class AgentHandoffJourneyTest extends TestCase
         ]);
     }
 
+    /**
+     * Mirrors ConversationBindingSurvivesAgentEditJourneyTest::makeServer() —
+     * an OpenAI-provider fixture needed to drive start()'s own funnel
+     * (formatMessages() -> appendBoundInstructions() -> dispatchStreamRequest())
+     * end-to-end.
+     */
+    private function makeServer(): Server
+    {
+        return Server::create([
+            'name' => 'TestServer',
+            'server_url' => 'https://api.openai.com/v1/chat/completions',
+            'token' => 'test-token',
+        ]);
+    }
+
     // =================================================================
     // T013 (US1)
     // =================================================================
@@ -322,6 +340,82 @@ class AgentHandoffJourneyTest extends TestCase
             'Always respond in French.',
             $original->instructions,
             'forConversation(), on the same conversation, must still resolve agent A\'s ORIGINAL binding, provably unchanged by the handoff',
+        );
+    }
+
+    /**
+     * End-to-end companion to the_receiving_agents_instructions_govern_the_very_next_turn()
+     * above (T044/Polish, found while running the quickstart.md mutation
+     * checklist's Row 2): that test asserts only on
+     * ConversationAgentDefinitionResolver's own two methods directly, and
+     * never drives formatMessages() itself — so it stays green even if
+     * formatMessages()'s call site were reverted from effectiveDefinitionFor()
+     * back to forConversation(), since both resolver methods still exist and
+     * behave correctly in isolation. This test closes that gap by driving
+     * start() end-to-end (mirroring
+     * ConversationBindingSurvivesAgentEditJourneyTest::a_conversation_already_under_way_keeps_running_on_its_bound_versions_instructions_not_the_agents_current_ones())
+     * and inspecting the actual dispatched request's system content.
+     */
+    #[Test]
+    public function formatMessages_uses_the_receiving_agents_instructions_on_the_next_turn_end_to_end(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: Always respond in French.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: Always respond in English.");
+
+        $server = $this->makeServer();
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+        $conversation->update(['server_id' => $server->id, 'model' => 'gpt-4o']);
+
+        $result = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($result['success'] ?? false, 'fixture sanity: the handoff itself must succeed');
+
+        Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'user',
+            'user' => 'Tim',
+            'content' => 'What is the weather today?',
+            'responseTime' => 0,
+        ]);
+
+        Queue::fake();
+
+        $conversation = Conversation::find($conversation->id);
+        app(AgentLoopService::class)->start($conversation);
+
+        $capturedRequests = [];
+        Queue::pushed(SendHttpStreamRequest::class, function (SendHttpStreamRequest $job) use (&$capturedRequests) {
+            $reflector = new \ReflectionClass($job);
+            $requestProperty = $reflector->getProperty('request');
+            $requestProperty->setAccessible(true);
+            $capturedRequests[] = $requestProperty->getValue($job);
+
+            return true;
+        });
+
+        $this->assertNotEmpty($capturedRequests, 'start() must dispatch a SendHttpStreamRequest job');
+
+        $body = $capturedRequests[0]->body;
+        $messages = is_array($body->messages ?? null) ? $body->messages : [];
+
+        $systemContent = '';
+        foreach ($messages as $message) {
+            $role = is_array($message) ? ($message['role'] ?? null) : ($message->role ?? null);
+            if ($role === 'system') {
+                $content = is_array($message) ? ($message['content'] ?? '') : ($message->content ?? '');
+                $systemContent .= (string) $content;
+            }
+        }
+
+        $this->assertStringContainsString(
+            'Always respond in English.',
+            $systemContent,
+            'formatMessages() must use the RECEIVING agent (B)\'s instructions on the very next turn after a handoff',
+        );
+        $this->assertStringNotContainsString(
+            'Always respond in French.',
+            $systemContent,
+            'formatMessages() must never fall back to the ORIGINAL agent (A)\'s instructions once a handoff has occurred',
         );
     }
 
@@ -698,6 +792,110 @@ class AgentHandoffJourneyTest extends TestCase
             2,
             ConversationHandoff::where('conversation_id', $conversation->id)->count(),
             'no new ConversationHandoff row may be written by either loop-back attempt — the chain must stay at its pre-attempt length of 2',
+        );
+    }
+
+    // =================================================================
+    // Check-ordering (contracts §1's own explicit sequence: existence (3)
+    // and activation (4) must be checked BEFORE chain-membership (5) and
+    // chain-bound (6), so a nonexistent/deactivated target is refused
+    // with FR-010/FR-011's own specific reason, never a generic
+    // chain-shaped one that would misrepresent why the handoff actually
+    // failed. quickstart.md's own step 9/10 fixtures never combine "chain
+    // already at bound / target already in chain" with "target
+    // nonexistent/deactivated" — an empty chain means checks 5/6 never
+    // fire regardless of where they sit relative to checks 3/4, so those
+    // two steps' own named tests cannot observe a reordering of checks
+    // 3/4 vs 5/6 (found while running the quickstart.md T044 mutation
+    // checklist's Row 12 — this is a genuine gap the existing suite
+    // didn't cover, not merely a checklist-description inaccuracy).
+    // These two tests close it directly, by constructing a target that is
+    // BOTH chain-bound-triggering/chain-member AND nonexistent/deactivated,
+    // and asserting the SPECIFIC (existence/activation) reason wins.
+    // =================================================================
+
+    #[Test]
+    public function a_nonexistent_target_is_refused_by_name_even_when_the_chain_is_already_at_its_bound(): void
+    {
+        config(['llm-client.handoff.max_chain_length' => 2]);
+
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+        $agentC = app(AgentService::class)->create($this->user->id, "name: agent-c\ninstructions: I am agent C.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $first = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($first['success'] ?? false, 'fixture sanity: the first handoff (A -> B) must succeed');
+        $conversation = $conversation->fresh();
+
+        $second = $this->handoff($conversation, $agentC->id);
+        $this->assertTrue($second['success'] ?? false, 'fixture sanity: the second handoff (B -> C), reaching the configured bound of 2, must still succeed');
+        $conversation = $conversation->fresh();
+
+        // The chain is now exactly at its configured bound. Attempt a
+        // handoff to an agent id that does not exist at all. Per
+        // contracts §1's check ordering, existence (3) is checked BEFORE
+        // the chain-bound check (6) — the refusal must name the real
+        // problem ("not found"), never the chain-bound message, even
+        // though the chain-bound check WOULD also refuse this attempt if
+        // it ran first.
+        $result = $this->handoff($conversation, (string) Str::uuid());
+
+        $this->assertArrayHasKey('error', $result, 'fixture sanity: the attempt must still be refused one way or another');
+        $this->assertStringContainsStringIgnoringCase(
+            'not found',
+            $result['error'] ?? '',
+            'existence (check 3) must be evaluated before the chain-bound check (6) — a nonexistent target must be refused for THAT reason, never a generic "handoff limit" message that would misrepresent why the attempt actually failed',
+        );
+        $this->assertStringNotContainsStringIgnoringCase('handoff limit', $result['error'] ?? '');
+
+        $this->assertSame(
+            2,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no third row may be written either way',
+        );
+    }
+
+    #[Test]
+    public function a_deactivated_target_already_in_the_chain_is_refused_for_being_deactivated_not_for_looping(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $first = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($first['success'] ?? false, 'fixture sanity: the handoff (A -> B) must succeed');
+        $conversation = $conversation->fresh();
+
+        // agentA stays active so deactivating agentB never trips the
+        // last-active-agent guard (AgentService::deactivate()'s own rule,
+        // mirroring the other US5 tests in this file).
+        app(AgentService::class)->deactivate($agentB);
+        $this->assertFalse($agentB->fresh()->is_active, 'fixture sanity: agent B must actually be deactivated');
+
+        // Agent B is now BOTH already a member of the chain (it is the
+        // conversation's own current agent_id, per currentAgentIdentityFor())
+        // AND deactivated. Per contracts §1's check ordering, activation
+        // (4) is checked before chain-membership (5) — the refusal must
+        // name the real problem ("deactivated"), never the generic loop
+        // message, even though the cycle check WOULD also refuse this
+        // attempt if it ran first.
+        $result = $this->handoff($conversation, $agentB->id);
+
+        $this->assertArrayHasKey('error', $result, 'fixture sanity: the attempt must still be refused one way or another');
+        $this->assertStringContainsStringIgnoringCase(
+            'deactivated',
+            $result['error'] ?? '',
+            'activation (check 4) must be evaluated before the chain-membership check (5) — a deactivated target must be refused for THAT reason, never a generic "loop" message that would misrepresent why the attempt actually failed',
+        );
+        $this->assertStringNotContainsStringIgnoringCase('loop', $result['error'] ?? '');
+
+        $this->assertSame(
+            1,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no second row may be written either way',
         );
     }
 
