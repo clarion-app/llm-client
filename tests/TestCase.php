@@ -184,6 +184,8 @@ abstract class TestCase extends BaseTestCase
                 $table->unsignedInteger('responseTime')->nullable();
                 $table->json('tool_calls')->nullable();
                 $table->json('tool_data')->nullable();
+                $table->uuid('agent_id')->nullable();
+                $table->uuid('agent_version_id')->nullable();
                 $table->uuid('run_id')->nullable();
                 $table->uuid('parent_id')->nullable();
                 $table->unsignedInteger('sequence_number')->default(0);
@@ -283,6 +285,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineEvalReferenceSchema();
         $this->defineEvalPassRateSchema();
         $this->defineAgentSchema();
+        $this->defineConversationHandoffSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -918,6 +921,33 @@ abstract class TestCase extends BaseTestCase
 
                 $table->unique(['agent_id', 'version_number']);
                 $table->index('agent_id');
+            });
+        }
+    }
+
+    /**
+     * conversation_handoffs — one row per handoff event, recording that
+     * responsibility for a conversation passed from one agent to another
+     * (093-agent-handoff, data-model.md §1). Mirrors the migration's own
+     * column set exactly. Guarded by Schema::hasTable() like every
+     * existing block here, and called from defineDatabaseMigrations()
+     * directly, immediately after defineAgentSchema(), matching this
+     * package's own established Foundational-phase precedent.
+     */
+    protected function defineConversationHandoffSchema(): void
+    {
+        if (!Schema::hasTable('conversation_handoffs')) {
+            Schema::create('conversation_handoffs', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id');
+                $table->unsignedInteger('position');
+                $table->uuid('from_agent_id')->nullable();
+                $table->uuid('to_agent_id');
+                $table->uuid('to_agent_version_id');
+                $table->timestamp('created_at');
+                $table->timestamp('disclosed_at')->nullable();
+
+                $table->index('conversation_id');
             });
         }
     }

@@ -739,5 +739,12 @@ return [
     'agents' => [
         'versions_per_page' => (int) env('LLM_CLIENT_AGENT_VERSIONS_PER_PAGE', 25),
     ],
+
+    // Agent-to-Agent Handoff (093-agent-handoff) — the bound on how many
+    // times a single conversation's chain of handoffs may extend before a
+    // further handoff is refused (FR-008/SC-004).
+    'handoff' => [
+        'max_chain_length' => (int) env('LLM_CLIENT_HANDOFF_MAX_CHAIN_LENGTH', 5),
+    ],
 ];
 
