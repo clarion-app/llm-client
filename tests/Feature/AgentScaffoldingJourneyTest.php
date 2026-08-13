@@ -410,6 +410,33 @@ class AgentScaffoldingJourneyTest extends TestCase
         $this->assertSame($expected->content, file_get_contents($path));
     }
 
+    // ---------------------------------------------------------------
+    // Phase 6 (Polish) — quickstart.md step 2, closing a gap T038 found:
+    // AgentKindsCommandTest.php's two cases both explicitly rebind a
+    // hand-built AgentKindRegistry into the container (its own doc
+    // comment: "Rather than depending on the not-yet-built config-driven
+    // boot-time registration"), so no test previously proved `agent:kinds`
+    // reads from the *real*, config-driven LlmClientServiceProvider::
+    // registerAgentKinds() boot wiring — unlike `agent:create --kind=`,
+    // which the tests above already exercise end-to-end through the real
+    // container. This test calls `agent:kinds` with no container override
+    // at all, against this package's default `kinds.enabled` config.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function agent_kinds_lists_the_default_ready_made_kinds_via_the_real_boot_wiring(): void
+    {
+        $exitCode = Artisan::call('agent:kinds');
+
+        $this->assertSame(0, $exitCode);
+
+        $output = Artisan::output();
+        $this->assertStringContainsString('research', $output);
+        $this->assertStringContainsString(AgentKind::research()->getDescription(), $output);
+        $this->assertStringContainsString('coding', $output);
+        $this->assertStringContainsString(AgentKind::coding()->getDescription(), $output);
+    }
+
     #[Test]
     public function every_kind_combination_produces_a_valid_definition(): void
     {
