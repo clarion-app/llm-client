@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
+use ClarionApp\LlmClient\Exceptions\LastActiveAgentException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\ValueObjects\AgentChangeSource;
@@ -301,6 +302,59 @@ class AgentService
         $agent->linked_repository_path = null;
         $agent->linked_file_path = null;
         $agent->linked_synced_file_hash = null;
+        $agent->save();
+
+        return $agent->fresh();
+    }
+
+    /**
+     * Reactivate an agent (092-agent-activation, FR-002). A clean no-op —
+     * no write at all — when the agent is already active (FR-014). Never
+     * writes an AgentVersion row and never touches anything the agent has
+     * already produced (FR-003/FR-004), mirroring unlink()'s own direct
+     * property-assignment shape.
+     */
+    public function activate(Agent $agent): Agent
+    {
+        if ($agent->is_active === true) {
+            return $agent;
+        }
+
+        $agent->is_active = true;
+        $agent->save();
+
+        return $agent->fresh();
+    }
+
+    /**
+     * Deactivate an agent (092-agent-activation, FR-001/FR-003/FR-004/
+     * FR-013/FR-014, research.md D6). A clean no-op — no write at all, and
+     * no last-active-agent check performed — when the agent is already
+     * inactive (FR-014, checked first so an already-deactivated agent can
+     * never trigger a spurious warning). Otherwise, refuses before any
+     * write when deactivating this agent would leave the caller with no
+     * remaining active agents, unless $confirmed is true — the guard is
+     * scoped strictly to this agent's own owner (`user_id`), never
+     * installation-wide.
+     *
+     * @throws LastActiveAgentException
+     */
+    public function deactivate(Agent $agent, bool $confirmed = false): Agent
+    {
+        if ($agent->is_active === false) {
+            return $agent;
+        }
+
+        $hasOtherActive = Agent::where('user_id', $agent->user_id)
+            ->where('is_active', true)
+            ->where('id', '!=', $agent->id)
+            ->exists();
+
+        if (!$confirmed && !$hasOtherActive) {
+            throw new LastActiveAgentException($agent->id, $agent->name);
+        }
+
+        $agent->is_active = false;
         $agent->save();
 
         return $agent->fresh();

@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException;
 use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
+use ClarionApp\LlmClient\Exceptions\LastActiveAgentException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
@@ -419,6 +420,57 @@ class StoredAgentController extends Controller
     }
 
     /**
+     * POST /agents/{id}/activate (092-agent-activation, contracts §2,
+     * FR-002). Resolves via the *ordinary* AgentQuery::findAgent() — a
+     * soft-deleted agent is never a valid target (research.md D7). Always
+     * 200: activate() is idempotent, so there is no failure mode beyond
+     * "not found."
+     */
+    public function activate(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $agent = $this->service->activate($agent);
+
+        return response()->json($this->agentResource($agent), 200);
+    }
+
+    /**
+     * POST /agents/{id}/deactivate (092-agent-activation, contracts §1,
+     * FR-001/FR-013, research.md D6/D7). Resolves via the *ordinary*
+     * AgentQuery::findAgent() — a soft-deleted agent is never a valid
+     * target. Refuses with a 409 when deactivating would leave the caller
+     * with no remaining active agents and `confirm` was not passed;
+     * otherwise 200.
+     */
+    public function deactivate(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $confirmed = $request->boolean('confirm');
+
+        try {
+            $agent = $this->service->deactivate($agent, $confirmed);
+        } catch (LastActiveAgentException $e) {
+            return response()->json([
+                'error' => 'last_active_agent',
+                'code' => 'last_active_agent',
+                'message' => $e->getMessage(),
+            ], 409);
+        }
+
+        return response()->json($this->agentResource($agent), 200);
+    }
+
+    /**
      * The shape show()/link()/unlink()/syncFromFile() all share (contracts
      * §3): the current definition, plus `link`/`divergence` embedded only
      * when the agent is actually linked — never present-but-null
@@ -552,6 +604,7 @@ class StoredAgentController extends Controller
             'current_version_number' => $agent->currentVersion?->version_number,
             'linked' => $agent->linked_repository_path !== null,
             'created_at' => $agent->created_at?->toIso8601String(),
+            'is_active' => $agent->is_active,
         ];
 
         if ($agent->cloned_from_agent_id !== null) {

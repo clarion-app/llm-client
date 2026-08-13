@@ -159,6 +159,7 @@ class AgentActivationJourneyTest extends TestCase
     public function deactivation_touches_nothing_about_the_agents_definition_or_version_history(): void
     {
         $agentId = $this->createAgent('name: original-name');
+        $this->createAgent('name: sibling-agent'); // sibling, so the agent under test is never the caller's last active one (this test is about version history, not FR-013)
         $this->actingAs($this->user)->putJson($this->agentUrl($agentId), ['definition' => 'name: v2-name'])->assertStatus(200);
         $this->actingAs($this->user)->putJson($this->agentUrl($agentId), ['definition' => 'name: v3-name'])->assertStatus(200);
 
@@ -188,6 +189,7 @@ class AgentActivationJourneyTest extends TestCase
     public function deactivation_touches_nothing_the_agent_has_already_produced(): void
     {
         $agentId = $this->createAgent('name: chatty-agent');
+        $this->createAgent('name: sibling-agent'); // sibling, so the agent under test is never the caller's last active one (this test is about produced content, not FR-013)
         $server = $this->createServer();
 
         $conversation = $this->actingAs($this->user, 'api')->postJson($this->conversationUrl(), [

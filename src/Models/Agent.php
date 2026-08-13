@@ -24,6 +24,10 @@ class Agent extends Model
 
     protected $table = 'agents';
 
+    protected $casts = [
+        'is_active' => 'boolean',
+    ];
+
     protected $fillable = [
         'user_id',
         'name',

@@ -258,6 +258,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // contracts/agent-clone-api.md §1, Phase 3/US1).
     Route::post('agents/{id}/clone', [StoredAgentController::class, "clone"]);
 
+    // Activate/deactivate an agent (092-agent-activation,
+    // contracts/agent-activation-api.md §1/§2, Phase 3/US1).
+    Route::post('agents/{id}/activate', [StoredAgentController::class, "activate"]);
+    Route::post('agents/{id}/deactivate', [StoredAgentController::class, "deactivate"]);
+
     // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
     // contracts §4/§5). Named independently by two version ids, not nested
     // under a single agent (research.md D7) — no collision with the
