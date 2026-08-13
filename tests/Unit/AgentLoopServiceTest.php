@@ -41,11 +41,12 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        // buildToolsPayload returns 8 hardcoded meta-tools
-        // (3 operation + 4 memory + 1 declarative-memory proposal)
-        $this->assertCount(8, $tools);
+        // buildToolsPayload returns 9 hardcoded meta-tools
+        // (3 operation + 4 memory + 1 declarative-memory proposal + 1
+        // handoff, 093-agent-handoff)
+        $this->assertCount(9, $tools);
 
-        // Verify all 8 meta-tools are present
+        // Verify all 9 meta-tools are present
         $toolNames = collect($tools)->pluck('function.name')->toArray();
         $this->assertContains('list_applications', $toolNames);
         $this->assertContains('execute_operation', $toolNames);
@@ -55,6 +56,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertContains('memory_search', $toolNames);
         $this->assertContains('memory_delete', $toolNames);
         $this->assertContains('propose_declarative_memory', $toolNames);
+        $this->assertContains('handoff_to_agent', $toolNames);
 
         // Verify structure of each tool
         foreach ($tools as $tool) {
@@ -74,7 +76,8 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        $this->assertCount(8, $tools);
+        // 093-agent-handoff added a 9th meta-tool (handoff_to_agent).
+        $this->assertCount(9, $tools);
 
         // Verify list_applications has no parameters
         $listApps = collect($tools)->firstWhere('function.name', 'list_applications');

@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
@@ -1786,7 +1787,7 @@ class AgentLoopService
         // message inline in 'messages', so appending only after
         // formatForProvider() would silently drop the bound instructions
         // for those provider families (090-agent-version-binding, T027).
-        $definition = $this->agentDefinitionResolver->forConversation($conversation);
+        $definition = $this->agentDefinitionResolver->effectiveDefinitionFor($conversation);
         if ($definition !== null) {
             $messages = $this->appendBoundInstructions($messages, $definition->instructions);
         }
@@ -2063,6 +2064,23 @@ class AgentLoopService
                     ],
                 ],
             ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'handoff_to_agent',
+                    'description' => 'Hand this conversation off to a different agent that is better suited to continue it. The receiving agent takes over from this point forward, governed solely by its own permissions — the user is told plainly that the handoff happened. Use this when the current request would be better served by a different, specific agent you know the id of.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'agent_id' => [
+                                'type' => 'string',
+                                'description' => 'The id of the agent to hand this conversation off to.',
+                            ],
+                        ],
+                        'required' => ['agent_id'],
+                    ],
+                ],
+            ],
         ];
 
         if (empty($withheld)) {
@@ -2223,6 +2241,7 @@ class AgentLoopService
             'memory_search' => $this->handleMemorySearch($arguments, $conversation),
             'memory_delete' => $this->handleMemoryDelete($arguments, $conversation),
             'propose_declarative_memory' => $this->handleProposeDeclarativeMemory($arguments, $conversation),
+            'handoff_to_agent' => $this->handleHandoffToAgent($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -2490,7 +2509,7 @@ class AgentLoopService
         // installation-wide check alone would have allowed — it never
         // widens past it (090-agent-version-binding, T028, contracts §3).
         // No-op when the conversation is unbound.
-        $boundDefinition = $this->agentDefinitionResolver->forConversation($conversation);
+        $boundDefinition = $this->agentDefinitionResolver->effectiveDefinitionFor($conversation);
         if ($boundDefinition !== null && $validation['status'] !== ApiCallValidator::STATUS_REJECT) {
             if (!$boundDefinition->isOperationPermitted($operationId)) {
                 $validation = [
@@ -2903,6 +2922,48 @@ class AgentLoopService
             'type' => $type,
             'content' => $content,
             'existingId' => $existingId,
+        ]);
+    }
+
+    /**
+     * Hand this conversation off to a different agent (093-agent-handoff,
+     * contracts §1). This phase's own deliberately minimal body — checks 1,
+     * 3, and 7 only (agent_id presence, existence/ownership, and the write
+     * itself). Checks 2 (system-owned conversation guard), 4 (activation),
+     * 5 (chain membership/cycle), and 6 (chain bound) are added by later
+     * phases as new early-return checks inserted into this same method,
+     * never rewriting this phase's own checks.
+     */
+    private function handleHandoffToAgent(array $arguments, Conversation $conversation): string
+    {
+        $targetAgentId = $arguments['agent_id'] ?? null;
+        if (empty($targetAgentId)) {
+            return json_encode(['error' => 'agent_id is required']);
+        }
+
+        $target = app(AgentQuery::class)->findAgent($conversation->user_id, $targetAgentId);
+        if ($target === null) {
+            return json_encode(['error' => 'Agent not found or not available to hand off to.']);
+        }
+
+        $from = ConversationHandoff::where('conversation_id', $conversation->id)
+            ->orderByDesc('position')
+            ->value('to_agent_id') ?? $conversation->agent_id;
+        $position = 1 + ConversationHandoff::where('conversation_id', $conversation->id)->count();
+
+        ConversationHandoff::create([
+            'conversation_id' => $conversation->id,
+            'position' => $position,
+            'from_agent_id' => $from,
+            'to_agent_id' => $target->id,
+            'to_agent_version_id' => $target->current_version_id,
+            'created_at' => now(),
+        ]);
+
+        return json_encode([
+            'success' => true,
+            'handed_off_to' => $target->name,
+            'agent_id' => $target->id,
         ]);
     }
 

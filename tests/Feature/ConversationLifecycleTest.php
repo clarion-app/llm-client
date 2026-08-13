@@ -149,6 +149,23 @@ class ConversationLifecycleTest extends TestCase
             $table->timestamps();
             $table->softDeletes();
         });
+
+        // 093-agent-handoff: formatMessages() now calls
+        // effectiveDefinitionFor(), which queries conversation_handoffs on
+        // every AgentLoopService::run()/resumeSync() dispatch regardless of
+        // whether this test ever hands a conversation off.
+        Schema::create('conversation_handoffs', function (Blueprint $table) {
+            $table->uuid('id')->primary();
+            $table->uuid('conversation_id');
+            $table->unsignedInteger('position');
+            $table->uuid('from_agent_id')->nullable();
+            $table->uuid('to_agent_id');
+            $table->uuid('to_agent_version_id');
+            $table->timestamp('created_at');
+            $table->timestamp('disclosed_at')->nullable();
+
+            $table->index('conversation_id');
+        });
     }
 
     protected function setUp(): void

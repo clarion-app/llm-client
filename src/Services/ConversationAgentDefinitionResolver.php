@@ -4,7 +4,9 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
+use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinition;
 
 /**
@@ -36,6 +38,38 @@ class ConversationAgentDefinitionResolver
         }
 
         $version = $conversation->agentVersion;
+
+        if ($version === null) {
+            return null;
+        }
+
+        try {
+            return $this->parser->parse($version->raw_definition);
+        } catch (AgentDefinitionParseException | AgentDefinitionResolutionException) {
+            return null;
+        }
+    }
+
+    /**
+     * Resolves "the AgentDefinition currently governing this conversation" —
+     * the latest handoff's target if the conversation has ever been handed
+     * off (093-agent-handoff, data-model.md §3), otherwise falling back to
+     * forConversation()'s own original-binding resolution unchanged.
+     *
+     * Degrades to null on any resolution failure, identically to
+     * forConversation() — never throws.
+     */
+    public function effectiveDefinitionFor(Conversation $conversation): ?AgentDefinition
+    {
+        $latest = ConversationHandoff::where('conversation_id', $conversation->id)
+            ->orderByDesc('position')
+            ->first();
+
+        if ($latest === null) {
+            return $this->forConversation($conversation);
+        }
+
+        $version = AgentVersion::find($latest->to_agent_version_id);
 
         if ($version === null) {
             return null;
