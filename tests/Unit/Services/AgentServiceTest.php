@@ -797,9 +797,27 @@ YAML;
         $this->assertFalse($agent->is_active, 'fixture sanity: the agent must actually be deactivated first');
         $updatedAtBefore = $agent->fresh()->updated_at;
 
+        // updated_at alone is not a reliable no-write signal here: Laravel's
+        // default `timestamps()` columns carry only second-level precision,
+        // so a genuine write performed within the same wall-clock second as
+        // the prior write would leave updated_at byte-identical anyway,
+        // silently passing even if the FR-014 no-op guard were removed
+        // entirely. A query-log assertion closes that gap by proving no
+        // UPDATE statement was issued at all.
+        DB::enableQueryLog();
         $again = $this->service()->deactivate($agent, false);
+        $updateQueries = array_filter(
+            DB::getQueryLog(),
+            fn (array $q) => str_starts_with(strtolower($q['query']), 'update')
+        );
+        DB::disableQueryLog();
 
         $this->assertFalse($again->is_active);
+        $this->assertCount(
+            0,
+            $updateQueries,
+            'deactivating an already-deactivated agent must perform no write (FR-014) — no UPDATE query may be issued',
+        );
         $this->assertEquals(
             $updatedAtBefore,
             $again->fresh()->updated_at,
@@ -816,14 +834,58 @@ YAML;
         $this->assertTrue((bool) $agent->is_active, 'fixture sanity: a freshly created agent defaults to active');
         $updatedAtBefore = $agent->fresh()->updated_at;
 
+        // See the identical query-log rationale in
+        // deactivating_an_already_deactivated_agent_is_a_clean_no_op_no_write()
+        // above — updated_at's second-level precision alone cannot
+        // distinguish "no write" from "a write within the same second".
+        DB::enableQueryLog();
         $again = $this->service()->activate($agent);
+        $updateQueries = array_filter(
+            DB::getQueryLog(),
+            fn (array $q) => str_starts_with(strtolower($q['query']), 'update')
+        );
+        DB::disableQueryLog();
 
         $this->assertTrue($again->is_active);
+        $this->assertCount(
+            0,
+            $updateQueries,
+            'activating an already-active agent must perform no write (FR-014) — no UPDATE query may be issued',
+        );
         $this->assertEquals(
             $updatedAtBefore,
             $again->fresh()->updated_at,
             'activating an already-active agent must perform no write (FR-014) — updated_at must be byte-identical',
         );
+    }
+
+    #[Test]
+    public function deactivating_an_already_deactivated_agent_that_is_the_callers_only_agent_is_a_clean_no_op_and_never_throws(): void
+    {
+        // The real, observable purpose of FR-014's no-op guard being
+        // checked *before* the last-active-agent guard: without it, a
+        // second, idempotent deactivate() call on an agent that is both
+        // already inactive AND the caller's only agent would incorrectly
+        // fall through into the last-active-agent check and throw
+        // LastActiveAgentException on a call that changes nothing.
+        // (The sibling-agent fixture used by
+        // deactivating_an_already_deactivated_agent_is_a_clean_no_op_no_write()
+        // above cannot exercise this: with a still-active sibling present,
+        // $hasOtherActive is true either way, so removing the early-return
+        // guard produces no observable difference there — Eloquent's own
+        // dirty-tracking already skips the redundant UPDATE regardless of
+        // the guard's presence, which is what silently let that mutation
+        // through query-log/updated_at checks alone.)
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agent = $this->service()->create($user->id, $this->validYaml('agent-solo'));
+
+        $agent = $this->service()->deactivate($agent, true); // last active agent — requires confirm
+        $this->assertFalse($agent->is_active, 'fixture sanity: the agent must actually be deactivated first');
+
+        $again = $this->service()->deactivate($agent, false); // no confirm — must still be a clean no-op
+
+        $this->assertFalse($again->is_active);
     }
 
     #[Test]
@@ -881,6 +943,38 @@ YAML;
         } catch (LastActiveAgentException $e) {
             $this->assertSame($agentB->id, $e->agentId);
         }
+    }
+
+    #[Test]
+    public function the_last_active_agent_guard_never_counts_another_users_still_active_agent_as_this_users_own(): void
+    {
+        // The failure mode this guards against is the opposite direction of
+        // the_last_active_agent_guard_is_scoped_per_user_never_installation_wide()
+        // above: that test only ever checks a user's guard *after* every
+        // other agent in the installation has already been deactivated, so
+        // an unscoped query (dropping where('user_id', ...)) would happen to
+        // count zero other active agents anyway and produce an identical
+        // result — silently passing even with the scope removed. This test
+        // keeps userB's agent genuinely, currently active throughout, so a
+        // scope-dropping mutation is forced to visibly diverge: it would
+        // wrongly treat userB's own still-active agent as "another active
+        // agent of userA's," letting userA's last agent deactivate without
+        // ever throwing.
+        $this->seedOperationCatalog();
+        $userA = $this->user();
+        $userB = $this->user();
+        $agentA = $this->service()->create($userA->id, $this->validYaml('agent-a-only'));
+        $agentB = $this->service()->create($userB->id, $this->validYaml('agent-b-still-active'));
+
+        try {
+            $this->service()->deactivate($agentA, false);
+            $this->fail("Expected LastActiveAgentException: userA has no other active agent of their own, regardless of userB's still-active agent.");
+        } catch (LastActiveAgentException $e) {
+            $this->assertSame($agentA->id, $e->agentId);
+        }
+
+        $this->assertTrue(Agent::find($agentA->id)->is_active, 'no partial write: agentA must still be active after the refusal');
+        $this->assertTrue(Agent::find($agentB->id)->is_active, "agentB must be completely untouched by userA's own guard check");
     }
 
     #[Test]

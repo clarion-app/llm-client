@@ -342,6 +342,32 @@ class AgentActivationJourneyTest extends TestCase
     }
 
     #[Test]
+    public function the_last_active_agent_guard_never_counts_another_users_still_active_agent_as_this_users_own_over_http(): void
+    {
+        // Opposite direction of the_last_active_agent_guard_is_scoped_per_user_never_installation_wide_over_http()
+        // above: that test only exercises userB's guard after userA's agent
+        // has already been deactivated (via confirm), so an unscoped guard
+        // (dropping the user_id filter) would count zero other active
+        // agents installation-wide anyway and produce an identical 409 —
+        // silently passing even with the scope removed. Here userB's agent
+        // stays genuinely active throughout, forcing a scope-dropping
+        // mutation to visibly diverge: it would wrongly treat userB's
+        // still-active agent as "another active agent of userA's" and admit
+        // the deactivation (200) instead of refusing it (409).
+        $userB = User::factory()->create();
+        $agentAId = $this->createAgent('name: agent-a-only');
+        $this->createAgent('name: agent-b-still-active', $userB);
+
+        $response = $this->actingAs($this->user)->postJson($this->deactivateUrl($agentAId));
+        $response->assertStatus(409, "userA has no other active agent of their own, regardless of userB's still-active agent");
+        $this->assertSame('last_active_agent', $response->json('code'));
+
+        $showA = $this->actingAs($this->user)->getJson($this->agentUrl($agentAId));
+        $showA->assertStatus(200);
+        $this->assertTrue($showA->json('is_active'), 'no state change: agent-a-only must still be active after the refusal');
+    }
+
+    #[Test]
     public function ownership_isolation_holds_for_both_new_endpoints(): void
     {
         $userB = User::factory()->create();
