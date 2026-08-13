@@ -200,6 +200,14 @@ YAML;
     #[Test]
     public function a_misspelled_top_level_key_throws_unknown_key_naming_the_offending_key(): void
     {
+        // collect() (088-agent-definition-validator) always evaluates every
+        // one of the 11 steps, including the operation-catalog-dependent
+        // tools/safety steps, regardless of an earlier step's own outcome
+        // (FR-001) -- so the catalog is now reached even for a document
+        // whose only problem is an earlier, unrelated key, unlike 086's
+        // fail-fast parse() which never got this far for this document.
+        $this->seedOperationCatalog([]);
+
         $raw = <<<YAML
 name: ok
 namee: broken
@@ -217,6 +225,9 @@ YAML;
     #[Test]
     public function a_recognized_key_with_an_out_of_vocabulary_value_also_throws_unknown_key(): void
     {
+        // See the identical note in the sibling test just above.
+        $this->seedOperationCatalog([]);
+
         $raw = <<<YAML
 name: ok
 memory:

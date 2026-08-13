@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Models\LanguageModel;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinition;
+use ClarionApp\LlmClient\ValueObjects\AgentDefinitionCollectionResult;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionParseErrorKind;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionResolutionErrorKind;
 use ClarionApp\LlmClient\ValueObjects\MemoryKind;
@@ -33,14 +34,21 @@ use Symfony\Component\Yaml\Yaml;
  *   9. safety.confirmation_required -> EmptyOperationPattern (bare verbs exempt)
  *  10. safety.denylist -> EmptyOperationPattern (bare verbs exempt)
  *
- * Throws on the first problem found; never partially constructs an
- * AgentDefinition. Performs no writes of any kind.
+ * collect() is the sole implementation of the 11-step rule set, in
+ * collecting form: it never throws for a content-level problem, instead
+ * appending every one it finds (including every repeated occurrence within
+ * a single step) to a returned list and continuing through every remaining
+ * step regardless of what an earlier step found. parse() is a thin wrapper
+ * over collect() that throws the first collected problem, if any, else
+ * returns the collected definition — identical signature, exception types,
+ * and single-error behavior as before. Performs no writes of any kind.
  *
- * Scope note (Phase 3/US1): this parser populates AgentDefinition's own
- * fields only. It does not read config('llm-client.api_denylist') or
+ * Scope note: this parser populates AgentDefinition's own fields only. It
+ * does not read config('llm-client.api_denylist') or
  * config('llm-client.confirm_methods') — those installation-ceiling checks
  * live inside AgentDefinition::isOperationPermitted()/isConfirmationRequired()
- * themselves (Phase 4/US3's own scope, tasks.md Grounding note 3).
+ * themselves, and a document's own destructive-operation warning is
+ * computed by a separate service, AgentDefinitionValidator, not here.
  */
 final class AgentDefinitionParser
 {
@@ -57,30 +65,90 @@ final class AgentDefinitionParser
 
     public function parse(string $rawYaml): AgentDefinition
     {
-        $document = $this->parseYaml($rawYaml);
+        $result = $this->collect($rawYaml);
 
-        $formatVersion = $this->resolveFormatVersion($document);
+        if ($result->problems !== []) {
+            throw $result->problems[0];
+        }
 
-        $this->scanForUnknownKeys($document);
+        return $result->definition;
+    }
 
-        $name = $this->resolveName($document);
-        $instructions = $this->resolveInstructions($document);
-        $model = $this->resolveModel($document);
-        $capabilities = $this->resolveCapabilities($document);
-        $memory = $this->resolveMemory($document);
+    /**
+     * The sole implementation of the 11-step rule set (fixed check order
+     * above, unchanged), in collecting form: every problem a step finds is
+     * appended to the returned result's problems list instead of being
+     * thrown, and every step still runs regardless of whether an earlier
+     * one already found a problem — except the single YAML-structural
+     * precondition (step 0), which short-circuits with exactly one problem
+     * since there is no further content to check.
+     *
+     * Only AgentDefinitionParseException/AgentDefinitionResolutionException
+     * are ever caught here. Any other \Throwable (e.g. a genuine database
+     * failure resolving the model, or underlying the operation catalog)
+     * propagates uncaught — never appears in problems.
+     */
+    public function collect(string $rawYaml): AgentDefinitionCollectionResult
+    {
+        try {
+            $document = $this->parseYaml($rawYaml);
+        } catch (AgentDefinitionParseException $e) {
+            return new AgentDefinitionCollectionResult(
+                definition: $this->placeholderDefinition(),
+                problems: [$e],
+                catalog: [],
+            );
+        }
 
-        // Resolved once per parse() call and reused across every pattern
-        // check below (steps 8-10) — never re-fetched per pattern.
+        $problems = [];
+
+        try {
+            $formatVersion = $this->resolveFormatVersion($document);
+        } catch (AgentDefinitionParseException $e) {
+            $problems[] = $e;
+            $formatVersion = (string) config('llm-client.agent_definitions.current_format_version');
+        }
+
+        $this->scanForUnknownKeys($document, $problems);
+
+        try {
+            $name = $this->resolveName($document);
+        } catch (AgentDefinitionParseException $e) {
+            $problems[] = $e;
+            $name = '';
+        }
+
+        try {
+            $instructions = $this->resolveInstructions($document);
+        } catch (AgentDefinitionParseException $e) {
+            $problems[] = $e;
+            $instructions = '';
+        }
+
+        try {
+            $model = $this->resolveModel($document);
+        } catch (AgentDefinitionResolutionException $e) {
+            $problems[] = $e;
+            $model = null;
+        }
+
+        $capabilities = $this->resolveCapabilities($document, $problems);
+        $memory = $this->resolveMemory($document, $problems);
+
+        // Resolved once per collect() call and reused across every pattern
+        // check below (steps 8-10) — never re-fetched per pattern — and by
+        // AgentDefinitionValidator's own warning computation, which reuses
+        // this exact array rather than resolving its own.
         $catalog = $this->resolveCatalog();
 
-        [$toolsAllow, $toolsDeny] = $this->resolveTools($document, $catalog);
-        $safetyConfirmationRequired = $this->resolveSafetyList($document, 'confirmation_required', $catalog);
-        $safetyDenylist = $this->resolveSafetyList($document, 'denylist', $catalog);
+        [$toolsAllow, $toolsDeny] = $this->resolveTools($document, $catalog, $problems);
+        $safetyConfirmationRequired = $this->resolveSafetyList($document, 'confirmation_required', $catalog, $problems);
+        $safetyDenylist = $this->resolveSafetyList($document, 'denylist', $catalog, $problems);
 
         $version = $document['version'] ?? null;
         $version = $version !== null ? (string) $version : null;
 
-        return new AgentDefinition(
+        $definition = new AgentDefinition(
             formatVersion: $formatVersion,
             name: $name,
             version: $version,
@@ -93,12 +161,59 @@ final class AgentDefinitionParser
             safetyConfirmationRequired: $safetyConfirmationRequired,
             safetyDenylist: $safetyDenylist,
         );
+
+        return new AgentDefinitionCollectionResult(
+            definition: $definition,
+            problems: $problems,
+            catalog: $catalog,
+        );
     }
 
     /**
-     * Step 0: YAML parse. A thrown ParseException, or a result that is not
-     * a mapping (associative array), is MalformedYaml — a precondition of
-     * reading anything, not itself a numbered step in the check order.
+     * A harmless, fully-defaulted AgentDefinition used only when the
+     * document fails the YAML-structural precondition (step 0) — no
+     * further content could be checked, so every field is its own
+     * ordinary default rather than a value derived from the document.
+     */
+    private function placeholderDefinition(): AgentDefinition
+    {
+        return new AgentDefinition(
+            formatVersion: (string) config('llm-client.agent_definitions.current_format_version'),
+            name: '',
+            version: null,
+            instructions: '',
+            model: null,
+            memory: $this->defaultMemory(),
+            capabilities: ReducibleTool::cases(),
+            toolsAllow: ['*'],
+            toolsDeny: [],
+            safetyConfirmationRequired: [],
+            safetyDenylist: [],
+        );
+    }
+
+    /**
+     * @return array<string, bool>
+     */
+    private function defaultMemory(): array
+    {
+        return array_fill_keys(
+            array_map(static fn (MemoryKind $kind): string => $kind->value, MemoryKind::cases()),
+            true,
+        );
+    }
+
+    /**
+     * Step 0: YAML parse. A thrown ParseException, a genuinely non-mapping
+     * root (a bare scalar, or a non-empty list), is MalformedYaml — a
+     * precondition of reading anything, not itself a numbered step in the
+     * check order. An empty or whitespace-only document, and an explicit
+     * "{}"/"[]" (both parse to PHP's own empty array — indistinguishable
+     * from each other), are deliberately *not* MalformedYaml: they fall
+     * through as an empty mapping so the ordinary per-key checks run,
+     * where the next step's own MissingName naturally fires — a different,
+     * more specific kind for "there is nothing here" than for "this is
+     * broken."
      *
      * @return array<string, mixed>
      */
@@ -114,7 +229,22 @@ final class AgentDefinitionParser
             );
         }
 
-        if (!is_array($parsed) || array_is_list($parsed)) {
+        if ($parsed === null) {
+            return [];
+        }
+
+        if (!is_array($parsed)) {
+            throw new AgentDefinitionParseException(
+                AgentDefinitionParseErrorKind::MalformedYaml,
+                value: 'The document must be a YAML mapping.',
+            );
+        }
+
+        if ($parsed === []) {
+            return [];
+        }
+
+        if (array_is_list($parsed)) {
             throw new AgentDefinitionParseException(
                 AgentDefinitionParseErrorKind::MalformedYaml,
                 value: 'The document must be a YAML mapping.',
@@ -156,13 +286,17 @@ final class AgentDefinitionParser
      * defined by this schema. Key-name validity only — the memory value
      * shape check (enabled/disabled) is step 7's own concern.
      *
+     * Every bad key found across all four scans — not only the first — is
+     * appended to $problems; none of the loops below stop early.
+     *
      * @param array<string, mixed> $document
+     * @param list<AgentDefinitionParseException|AgentDefinitionResolutionException> $problems
      */
-    private function scanForUnknownKeys(array $document): void
+    private function scanForUnknownKeys(array $document, array &$problems): void
     {
         foreach (array_keys($document) as $key) {
             if (!is_string($key) || !in_array($key, self::TOP_LEVEL_KEYS, true)) {
-                throw new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: (string) $key);
+                $problems[] = new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: (string) $key);
             }
         }
 
@@ -171,7 +305,7 @@ final class AgentDefinitionParser
 
             foreach (array_keys($document['memory']) as $key) {
                 if (!is_string($key) || !in_array($key, $validMemoryKeys, true)) {
-                    throw new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: 'memory.' . (string) $key);
+                    $problems[] = new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: 'memory.' . (string) $key);
                 }
             }
         }
@@ -179,7 +313,7 @@ final class AgentDefinitionParser
         if (isset($document['tools']) && is_array($document['tools']) && !array_is_list($document['tools'])) {
             foreach (array_keys($document['tools']) as $key) {
                 if (!is_string($key) || !in_array($key, self::TOOLS_KEYS, true)) {
-                    throw new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: 'tools.' . (string) $key);
+                    $problems[] = new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: 'tools.' . (string) $key);
                 }
             }
         }
@@ -187,7 +321,7 @@ final class AgentDefinitionParser
         if (isset($document['safety']) && is_array($document['safety'])) {
             foreach (array_keys($document['safety']) as $key) {
                 if (!is_string($key) || !in_array($key, self::SAFETY_KEYS, true)) {
-                    throw new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: 'safety.' . (string) $key);
+                    $problems[] = new AgentDefinitionParseException(AgentDefinitionParseErrorKind::UnknownKey, key: 'safety.' . (string) $key);
                 }
             }
         }
@@ -266,10 +400,15 @@ final class AgentDefinitionParser
      * honored as zero capabilities — omission and explicit-empty are
      * deliberately not the same thing (research.md D7).
      *
+     * Every unrecognized entry — not only the first — is appended to
+     * $problems and omitted from the resolved list; the loop never stops
+     * early.
+     *
      * @param array<string, mixed> $document
+     * @param list<AgentDefinitionParseException|AgentDefinitionResolutionException> $problems
      * @return list<ReducibleTool>
      */
-    private function resolveCapabilities(array $document): array
+    private function resolveCapabilities(array $document, array &$problems): array
     {
         if (!array_key_exists('capabilities', $document)) {
             return ReducibleTool::cases();
@@ -284,7 +423,8 @@ final class AgentDefinitionParser
             $tool = ReducibleTool::tryFrom($entryString);
 
             if ($tool === null) {
-                throw new AgentDefinitionResolutionException(AgentDefinitionResolutionErrorKind::UnknownCapability, $entryString);
+                $problems[] = new AgentDefinitionResolutionException(AgentDefinitionResolutionErrorKind::UnknownCapability, $entryString);
+                continue;
             }
 
             $capabilities[] = $tool;
@@ -302,15 +442,16 @@ final class AgentDefinitionParser
      * this schema has no defined meaning for is the same failure mode one
      * level down as an unrecognized key name).
      *
+     * Every offending value — not only the first — is appended to
+     * $problems; the loop never stops early.
+     *
      * @param array<string, mixed> $document
+     * @param list<AgentDefinitionParseException|AgentDefinitionResolutionException> $problems
      * @return array<string, bool>
      */
-    private function resolveMemory(array $document): array
+    private function resolveMemory(array $document, array &$problems): array
     {
-        $memory = array_fill_keys(
-            array_map(static fn (MemoryKind $kind): string => $kind->value, MemoryKind::cases()),
-            true,
-        );
+        $memory = $this->defaultMemory();
 
         if (!array_key_exists('memory', $document)) {
             return $memory;
@@ -333,7 +474,7 @@ final class AgentDefinitionParser
             } elseif ($value === 'disabled') {
                 $memory[$kind->value] = false;
             } else {
-                throw new AgentDefinitionParseException(
+                $problems[] = new AgentDefinitionParseException(
                     AgentDefinitionParseErrorKind::UnknownKey,
                     key: 'memory.' . $kind->value,
                     value: $value,
@@ -352,11 +493,15 @@ final class AgentDefinitionParser
      * live catalog — the synthesized default ["*"] (only when tools/
      * tools.allow is omitted entirely) is exempt (research.md D8/D3/SC-002).
      *
+     * Every pattern that resolves empty — not only the first, across both
+     * allow and deny — is appended to $problems; neither loop stops early.
+     *
      * @param array<string, mixed> $document
      * @param list<array{operationId: string, method: string}> $catalog
+     * @param list<AgentDefinitionParseException|AgentDefinitionResolutionException> $problems
      * @return array{0: list<string>, 1: list<string>}
      */
-    private function resolveTools(array $document, array $catalog): array
+    private function resolveTools(array $document, array $catalog, array &$problems): array
     {
         $toolsAllow = ['*'];
         $toolsDeny = [];
@@ -383,12 +528,12 @@ final class AgentDefinitionParser
 
         if (!$allowIsDefault) {
             foreach ($toolsAllow as $pattern) {
-                $this->assertPatternResolves((string) $pattern, $catalog);
+                $this->collectPatternProblem((string) $pattern, $catalog, $problems);
             }
         }
 
         foreach ($toolsDeny as $pattern) {
-            $this->assertPatternResolves((string) $pattern, $catalog);
+            $this->collectPatternProblem((string) $pattern, $catalog, $problems);
         }
 
         return [array_map(static fn ($p): string => (string) $p, $toolsAllow), array_map(static fn ($p): string => (string) $p, $toolsDeny)];
@@ -400,11 +545,15 @@ final class AgentDefinitionParser
      * emptiness check (a verb always denotes "every operation with this
      * method," checked only against the fixed 5-verb set).
      *
+     * Every pattern that resolves empty — not only the first — is
+     * appended to $problems; the loop never stops early.
+     *
      * @param array<string, mixed> $document
      * @param list<array{operationId: string, method: string}> $catalog
+     * @param list<AgentDefinitionParseException|AgentDefinitionResolutionException> $problems
      * @return list<string>
      */
-    private function resolveSafetyList(array $document, string $key, array $catalog): array
+    private function resolveSafetyList(array $document, string $key, array $catalog, array &$problems): array
     {
         $safety = $document['safety'] ?? [];
         $safety = is_array($safety) ? $safety : [];
@@ -421,7 +570,7 @@ final class AgentDefinitionParser
                 continue;
             }
 
-            $this->assertPatternResolves($patternString, $catalog);
+            $this->collectPatternProblem($patternString, $catalog, $problems);
         }
 
         return $resolved;
@@ -429,11 +578,12 @@ final class AgentDefinitionParser
 
     /**
      * @param list<array{operationId: string, method: string}> $catalog
+     * @param list<AgentDefinitionParseException|AgentDefinitionResolutionException> $problems
      */
-    private function assertPatternResolves(string $pattern, array $catalog): void
+    private function collectPatternProblem(string $pattern, array $catalog, array &$problems): void
     {
         if (OperationGroupPattern::resolve([$pattern], $catalog) === []) {
-            throw new AgentDefinitionResolutionException(AgentDefinitionResolutionErrorKind::EmptyOperationPattern, $pattern);
+            $problems[] = new AgentDefinitionResolutionException(AgentDefinitionResolutionErrorKind::EmptyOperationPattern, $pattern);
         }
     }
 

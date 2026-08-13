@@ -145,6 +145,15 @@ YAML;
     #[Test]
     public function create_with_unresolvable_content_throws_and_writes_no_row_at_all(): void
     {
+        // collect() (088-agent-definition-validator) always evaluates every
+        // one of the 11 steps, including the operation-catalog-dependent
+        // tools/safety steps, regardless of an earlier step's own outcome
+        // (FR-001) -- so the catalog is now reached even for a document
+        // whose only problem is unresolvableYaml()'s unrelated capability,
+        // unlike 086's fail-fast parse() which never got this far for this
+        // document.
+        $this->seedOperationCatalog();
+
         $user = $this->user();
 
         try {

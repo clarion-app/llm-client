@@ -39,6 +39,15 @@ class AgentDefinitionUnknownNameJourneyTest extends TestCase
     #[Test]
     public function an_unrecognized_capability_throws_unknown_capability_naming_it(): void
     {
+        // collect() (088-agent-definition-validator) always evaluates every
+        // one of the 11 steps, including the operation-catalog-dependent
+        // tools/safety steps, regardless of an earlier step's own outcome
+        // (FR-001) -- so the catalog is now reached even for a document
+        // whose only problem is the unrelated capability below, unlike
+        // 086's fail-fast parse() which never got this far for this
+        // document.
+        $this->seedOperationCatalog([]);
+
         $raw = <<<YAML
 name: broken-agent
 capabilities: [web_browsing]
