@@ -4,12 +4,19 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
+use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\AgentLoopStreamHandler;
+use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\Services\AgentLoopService;
 use Dedoc\Scramble\Generator;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
@@ -40,6 +47,22 @@ class AgentActivationJourneyTest extends TestCase
 
         $this->user = User::factory()->create();
         $this->seedOperationCatalog();
+
+        // Required by AgentLoopService::run()'s condensation check
+        // (CondensationSummaryStore::inCooldown()) — this file's own US2
+        // section is the first in this file to drive run() directly,
+        // mirroring the identical hasTable()-guarded pattern already
+        // established by ConversationBindingSurvivesQueueContinuationTest.php
+        // and other sibling *JourneyTest.php files in this suite.
+        if (!Schema::hasTable('condensation_states')) {
+            Schema::create('condensation_states', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id')->unique();
+                $table->unsignedInteger('consecutive_failures')->default(0);
+                $table->timestamp('cooldown_until')->nullable();
+                $table->timestamps();
+            });
+        }
     }
 
     protected function tearDown(): void
@@ -149,6 +172,28 @@ class AgentActivationJourneyTest extends TestCase
             'server_url' => 'https://api.openai.com/v1/chat/completions',
             'token' => 'test-token',
         ]);
+    }
+
+    /**
+     * Mirrors InFlightWorkCompletesJourneyTest.php's own fakeProvider()
+     * helper verbatim (same mocked LlmProvider/ProviderRegistry shape) —
+     * needed here so US2's "a conversation already in progress finishes
+     * normally" case (quickstart step 5) can drive a real
+     * AgentLoopService::run() call without an outbound HTTP request.
+     */
+    private function fakeProvider(): void
+    {
+        $provider = Mockery::mock(LlmProvider::class);
+        $provider->shouldReceive('chat')->andReturn([
+            'choices' => [['message' => ['content' => 'A whole answer, start to finish.']]],
+            'usage' => ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 15],
+        ]);
+        $provider->shouldReceive('countTokens')->andReturnUsing(fn ($t) => (int) ceil(strlen((string) $t) / 4));
+
+        $registry = Mockery::mock(ProviderRegistry::class);
+        $registry->shouldReceive('resolve')->andReturn($provider);
+        $registry->shouldReceive('resolveByType')->andReturn($provider);
+        $this->app->instance(ProviderRegistry::class, $registry);
     }
 
     // =================================================================
@@ -323,5 +368,184 @@ class AgentActivationJourneyTest extends TestCase
 
         $activateResponse = $this->actingAs($this->user)->postJson($this->activateUrl($agentId));
         $activateResponse->assertStatus(404);
+    }
+
+    // =================================================================
+    // T017 — US2 (quickstart steps 1, 2, 5, 6, 7)
+    // =================================================================
+
+    #[Test]
+    public function a_deactivated_agent_refuses_a_new_conversation_with_a_clear_explanation(): void
+    {
+        $agentId = $this->createAgent('name: refused-agent');
+        $this->createAgent('name: sibling-agent'); // sibling, so the agent under test is never the caller's last active one
+        $server = $this->createServer();
+
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentId))->assertStatus(200);
+
+        $countBefore = Conversation::count();
+
+        $response = $this->actingAs($this->user, 'api')->postJson($this->conversationUrl(), [
+            'agent_id' => $agentId,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ]);
+
+        $response->assertStatus(409);
+        $this->assertSame('agent_deactivated', $response->json('code'));
+        $this->assertStringContainsString('refused-agent', (string) $response->json('message'), 'the refusal must name the agent');
+
+        $this->assertSame($countBefore, Conversation::count(), 'no Conversation row may be created when admission is refused');
+    }
+
+    #[Test]
+    public function a_reactivated_agent_accepts_new_conversations_again_exactly_as_before(): void
+    {
+        $agentId = $this->createAgent('name: reactivated-agent');
+        $this->createAgent('name: sibling-agent');
+        $server = $this->createServer();
+
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentId))->assertStatus(200);
+        $this->actingAs($this->user)->postJson($this->activateUrl($agentId))->assertStatus(200);
+
+        $response = $this->actingAs($this->user, 'api')->postJson($this->conversationUrl(), [
+            'agent_id' => $agentId,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ]);
+
+        $response->assertStatus(201);
+        $this->assertSame($agentId, $response->json('agent_id'));
+        $this->assertNotNull($response->json('agent_version_id'));
+        $this->assertNotNull(Conversation::find($response->json('id')), 'a Conversation row must exist once admission is restored');
+    }
+
+    #[Test]
+    public function a_conversation_already_in_progress_when_its_agent_is_deactivated_finishes_normally_undisturbed(): void
+    {
+        $agentId = $this->createAgent('name: mid-conversation-agent');
+        $this->createAgent('name: sibling-agent');
+        $server = $this->createServer();
+
+        $conversation = $this->actingAs($this->user, 'api')->postJson($this->conversationUrl(), [
+            'agent_id' => $agentId,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ])->assertStatus(201);
+        $conversationModel = Conversation::find($conversation->json('id'));
+
+        // The greeting message store() itself creates (L118-124) — the
+        // baseline this test's own delta is measured against, so a
+        // pre-existing assistant row is never mistaken for run()'s output.
+        $assistantCountBefore = Message::where('conversation_id', $conversationModel->id)->where('role', 'assistant')->count();
+
+        // The agent is deactivated mid-conversation.
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentId))->assertStatus(200);
+
+        $this->fakeProvider();
+
+        $result = app(AgentLoopService::class)->run($conversationModel, 'A question after my agent was deactivated.');
+
+        $this->assertSame('completed', $result['status'], 'a conversation already in progress must finish normally, undisturbed by a mid-conversation deactivation');
+        $this->assertSame(
+            $assistantCountBefore + 1,
+            Message::where('conversation_id', $conversationModel->id)->where('role', 'assistant')->count(),
+            'an assistant Message must be written exactly as it would without the deactivation'
+        );
+
+        $conversationModel->refresh();
+        $this->assertFalse((bool) $conversationModel->is_processing);
+    }
+
+    #[Test]
+    public function work_already_queued_on_a_now_deactivated_agents_behalf_resolves_predictably(): void
+    {
+        $agentId = $this->createAgent('name: queued-work-agent');
+        $this->createAgent('name: sibling-agent');
+        $server = $this->createServer();
+
+        $conversation = $this->actingAs($this->user, 'api')->postJson($this->conversationUrl(), [
+            'agent_id' => $agentId,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ])->assertStatus(201);
+        $conversationModel = Conversation::find($conversation->json('id'));
+
+        // Deactivate the agent before the queue-boundary continuation
+        // (AgentLoopStreamHandler::finish()) ever runs, mirroring
+        // InFlightWorkCompletesJourneyTest.php's own "cross the gate mid-flight"
+        // shape for a different gate.
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentId))->assertStatus(200);
+
+        $handler = new AgentLoopStreamHandler();
+        $handler->reply = 'A reply produced after my agent was deactivated.';
+        $handler->message = Message::create([
+            'conversation_id' => $conversationModel->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+        ]);
+
+        $data = json_encode([
+            'conversation_id' => $conversationModel->id,
+            'iteration' => 1,
+        ]);
+
+        // Invoked directly against a fixture SSE payload, exactly as the
+        // real http-queue job would call it once dequeued.
+        $handler->finish($data, 1);
+
+        $handler->message->refresh();
+        $this->assertSame(
+            'A reply produced after my agent was deactivated.',
+            $handler->message->content,
+            'the queued turn must reach an ordinary terminal state, not hang or silently drop'
+        );
+
+        $conversationModel->refresh();
+        $this->assertFalse((bool) $conversationModel->is_processing);
+
+        // Code-inspection assertion (research.md D3): the queue-boundary
+        // continuation point must gain no new is_active/Agent check of its
+        // own — the guarantee is structural absence, not a new check.
+        $handlerSource = file_get_contents(
+            (new \ReflectionClass(AgentLoopStreamHandler::class))->getFileName()
+        );
+        $this->assertStringNotContainsString(
+            'is_active',
+            $handlerSource,
+            'AgentLoopStreamHandler must never gain its own is_active check (research.md D3) — the queue path re-checks nothing about admission'
+        );
+
+        $streamRequestSource = file_get_contents(
+            (new \ReflectionClass(SendHttpStreamRequest::class))->getFileName()
+        );
+        $this->assertStringNotContainsString(
+            'is_active',
+            $streamRequestSource,
+            'SendHttpStreamRequest is a generic, cross-package job and must never gain an llm-client-specific is_active check'
+        );
+    }
+
+    #[Test]
+    public function deactivation_takes_effect_immediately_with_no_window(): void
+    {
+        $agentId = $this->createAgent('name: immediate-effect-agent');
+        $this->createAgent('name: sibling-agent');
+        $server = $this->createServer();
+
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentId))->assertStatus(200);
+
+        // Immediately, same test, no delay: the very first post-deactivation
+        // attempt must already be refused.
+        $response = $this->actingAs($this->user, 'api')->postJson($this->conversationUrl(), [
+            'agent_id' => $agentId,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ]);
+
+        $response->assertStatus(409);
+        $this->assertSame('agent_deactivated', $response->json('code'));
     }
 }
