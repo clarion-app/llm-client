@@ -591,6 +591,18 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\GitDefinitionFileReader::class)
             );
         });
+
+        // AgentVersionResolver holds only the already-singleton
+        // AgentDefinitionParser — safe as singleton() for the identical
+        // reason as every other binding above (087-agent-model-versioning,
+        // Phase 6/Polish). Not yet called from any conversation-start path
+        // (research.md D12) — registered here so it is ready to consume
+        // for roadmap item 4.2.1.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentVersionResolver::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\AgentVersionResolver(
+                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class)
+            );
+        });
     }
 
     /**
