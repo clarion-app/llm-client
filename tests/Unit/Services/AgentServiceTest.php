@@ -643,6 +643,26 @@ YAML;
     }
 
     #[Test]
+    public function cloning_under_a_name_only_used_by_a_different_users_own_agent_succeeds_the_collision_check_is_per_owner_not_global(): void
+    {
+        // Added during the T025 mutation-testing pass (091-agent-clone-fork,
+        // quickstart.md row 10): dropping the user_id scope from clone()'s
+        // name-collision check went undetected by every other named test in
+        // this file, since none of them exercises two distinct users' own
+        // agents sharing a name. This test closes that gap directly.
+        $this->seedOperationCatalog();
+        $userA = $this->user();
+        $userB = $this->user();
+        $this->service()->create($userA->id, $this->validYaml('shared-name'));
+        $sourceForB = $this->service()->create($userB->id, $this->validYaml('agent-owned-by-b'));
+
+        $clone = $this->service()->clone($sourceForB, $userB->id, 'shared-name');
+
+        $this->assertSame('shared-name', $clone->name, 'a name already used by a *different* user\'s own agent must never collide for this user');
+        $this->assertSame($userB->id, $clone->user_id);
+    }
+
+    #[Test]
     public function a_name_freed_by_retiring_an_agent_is_immediately_reusable_by_a_clone(): void
     {
         $this->seedOperationCatalog();
