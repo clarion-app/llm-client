@@ -123,6 +123,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
+                \ClarionApp\LlmClient\Commands\AgentCreateCommand::class,
             ]);
         }
 
@@ -611,6 +612,23 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new \ClarionApp\LlmClient\Services\AgentDefinitionValidator(
                 $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class)
             );
+        });
+
+        // AgentDefinitionScaffolder holds only the already-singleton
+        // AgentDefinitionParser/AgentDefinitionValidator -- safe as
+        // singleton() for the identical reason as every other binding above
+        // (089-agent-scaffolding-cli).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentDefinitionScaffolder::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\AgentDefinitionScaffolder(
+                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class),
+                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionValidator::class)
+            );
+        });
+
+        // AgentDefinitionScaffoldWriter is stateless and filesystem-only --
+        // holds no collaborators at all (089-agent-scaffolding-cli).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentDefinitionScaffoldWriter::class, function () {
+            return new \ClarionApp\LlmClient\Services\AgentDefinitionScaffoldWriter();
         });
     }
 
