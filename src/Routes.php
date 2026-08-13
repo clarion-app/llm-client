@@ -36,6 +36,7 @@ use ClarionApp\LlmClient\Controllers\EvalReferenceController;
 use ClarionApp\LlmClient\Controllers\EvalRunComparisonController;
 use ClarionApp\LlmClient\Controllers\EvalDashboardController;
 use ClarionApp\LlmClient\Controllers\StoredAgentController;
+use ClarionApp\LlmClient\Controllers\AgentVersionComparisonController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -252,6 +253,13 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::delete('agents/{id}/link', [StoredAgentController::class, "unlink"]);
     Route::get('agents/{id}/divergence', [StoredAgentController::class, "divergence"]);
     Route::post('agents/{id}/sync-from-file', [StoredAgentController::class, "syncFromFile"]);
+
+    // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
+    // contracts §4/§5). Named independently by two version ids, not nested
+    // under a single agent (research.md D7) — no collision with the
+    // `agents/{id}/...` routes above (see contracts §5's own segment-count
+    // argument).
+    Route::get('agents/versions/compare', [AgentVersionComparisonController::class, "compare"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
