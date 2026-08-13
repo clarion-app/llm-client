@@ -424,4 +424,123 @@ class AgentHandoffJourneyTest extends TestCase
         $this->assertSame($serverIdBefore, $conversation->server_id, 'a handoff must never change conversation.server_id');
         $this->assertSame($providerOverrideBefore, $conversation->provider_override, 'a handoff must never change conversation.provider_override');
     }
+
+    // =================================================================
+    // US5 (T029, quickstart steps 9, 10, 11) — sequenced after T013/T014,
+    // same file.
+    //
+    // handleHandoffToAgent()'s current (Phase 3, T017) body implements
+    // only contracts §1 checks 1, 3, and 7 — check 2 (system-owned
+    // conversation) and check 4 (is_active) do not exist yet; both are
+    // Phase 5's own scope (T030).
+    //
+    // Note on "already covered": T013's own
+    // a_nonexistent_or_not_owned_target_agent_is_refused() (above) already
+    // exercises "target agent id does not exist at all" via check 3
+    // (AgentQuery::findAgent(), already ownership-scoped by
+    // conversation.user_id) — that exact scenario is NOT duplicated here.
+    // Only the cross-user-owned variant below is a genuinely new fixture
+    // (a real agent that exists but belongs to someone else), and per
+    // findAgent()'s own established "doesn't exist and isn't yours are
+    // indistinguishable" contract it is expected to already PASS under
+    // the current Phase 3 code — it is added here as an explicit FR-011
+    // regression lock, not as a red case.
+    // =================================================================
+
+    #[Test]
+    public function a_handoff_to_a_deactivated_agent_fails_gracefully_and_the_original_agent_continues_undisturbed(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+
+        // agentA stays active, so deactivating agentB never trips
+        // AgentService::deactivate()'s own last-active-agent guard — the
+        // production deactivation path, mirroring
+        // AgentActivationJourneyTest's own precedent.
+        app(AgentService::class)->deactivate($agentB);
+        $this->assertFalse($agentB->fresh()->is_active, 'fixture sanity: agent B must actually be deactivated');
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $result = $this->handoff($conversation, $agentB->id);
+
+        $this->assertArrayHasKey('error', $result, 'a handoff to a deactivated agent must be refused, not silently succeed');
+        $this->assertStringContainsString(
+            $agentB->name,
+            $result['error'] ?? '',
+            'the refusal must name the deactivated agent',
+        );
+        $this->assertStringContainsStringIgnoringCase(
+            'deactivated',
+            $result['error'] ?? '',
+            'the refusal must explain why: the target agent is deactivated',
+        );
+
+        $this->assertSame(
+            0,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no ConversationHandoff row may be written when the target is deactivated',
+        );
+
+        $effective = app(ConversationAgentDefinitionResolver::class)->effectiveDefinitionFor($conversation->fresh());
+        $this->assertNotNull($effective);
+        $this->assertSame(
+            'I am agent A.',
+            $effective->instructions,
+            'the original agent (A) must continue governing the conversation, completely undisturbed by the refused handoff attempt',
+        );
+    }
+
+    #[Test]
+    public function a_handoff_to_a_real_agent_owned_by_a_different_user_fails_identically_to_a_nonexistent_target(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $otherUser = User::factory()->create();
+        $otherUsersAgent = app(AgentService::class)->create($otherUser->id, "name: someone-elses-agent\ninstructions: Not yours.");
+
+        $nonexistentResult = $this->handoff($conversation, (string) Str::uuid());
+        $crossUserResult = $this->handoff($conversation, $otherUsersAgent->id);
+
+        $this->assertArrayHasKey('error', $crossUserResult);
+        $this->assertSame(
+            $nonexistentResult['error'] ?? null,
+            $crossUserResult['error'] ?? null,
+            'a real agent owned by a different user must be refused with the IDENTICAL message as a nonexistent agent id — never a distinguishing detail that would leak the other agent\'s existence (FR-011)',
+        );
+
+        $this->assertSame(
+            0,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no ConversationHandoff row may be written for a not-owned target',
+        );
+    }
+
+    #[Test]
+    public function a_handoff_attempted_on_a_system_owned_conversation_fails_cleanly_instead_of_throwing(): void
+    {
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+
+        $conversation = Conversation::create([
+            'user_id' => null,
+            'title' => 'system-owned-conversation',
+            'character' => 'Clarion',
+            'model' => 'test-model',
+        ]);
+
+        $result = $this->handoff($conversation, $agentB->id);
+
+        $this->assertArrayHasKey(
+            'error',
+            $result,
+            'a handoff attempted on a system-owned (user_id === null) conversation must return a clean error JSON string, never throw a TypeError from AgentQuery::findAgent()\'s non-nullable string $callerUserId parameter',
+        );
+
+        $this->assertSame(
+            0,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no ConversationHandoff row may be written for a system-owned conversation',
+        );
+    }
 }
