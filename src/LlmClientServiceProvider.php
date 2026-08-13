@@ -603,6 +603,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class)
             );
         });
+
+        // AgentDefinitionValidator holds only the already-singleton
+        // AgentDefinitionParser -- safe as singleton() for the identical
+        // reason as every other binding above (088-agent-definition-validator).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentDefinitionValidator::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\AgentDefinitionValidator(
+                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class)
+            );
+        });
     }
 
     /**

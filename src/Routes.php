@@ -228,6 +228,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // `agents` (plural) route group, deliberately distinct from the
     // pre-existing singular `Route::post('agent', AgentController::class)`
     // above (087-agent-model-versioning, Phase 3/US1).
+    // On-demand check, before saving (088-agent-definition-validator,
+    // contracts/agent-definition-validator-api.md §1) -- stateless, no
+    // agent id, always 200. Placed before `agents`/`store` for readability
+    // (no route-ordering ambiguity either way).
+    Route::post('agents/check', [StoredAgentController::class, "check"]);
+
     Route::post('agents', [StoredAgentController::class, "store"]);
     Route::put('agents/{id}', [StoredAgentController::class, "update"]);
 

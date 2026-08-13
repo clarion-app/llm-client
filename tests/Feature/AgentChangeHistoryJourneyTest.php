@@ -161,7 +161,8 @@ YAML,
         ]);
 
         $response->assertStatus(422);
-        $this->assertSame('UnknownCapability', $response->json('kind'));
+        $this->assertFalse($response->json('valid'));
+        $this->assertSame('UnknownCapability', $response->json('problems.0.kind'));
 
         $this->assertSame(
             $versionCountBefore,

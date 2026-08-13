@@ -9,11 +9,14 @@ use ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
+use ClarionApp\LlmClient\Services\AgentDefinitionValidator;
 use ClarionApp\LlmClient\Services\AgentDivergenceChecker;
 use ClarionApp\LlmClient\Services\AgentQuery;
 use ClarionApp\LlmClient\Services\AgentService;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionParseErrorKind;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionResolutionErrorKind;
+use ClarionApp\LlmClient\ValueObjects\AgentDefinitionValidationResult;
+use ClarionApp\LlmClient\ValueObjects\AgentDefinitionWarning;
 use ClarionApp\LlmClient\ValueObjects\FileDivergenceReport;
 use Auth;
 use Illuminate\Http\JsonResponse;
@@ -38,12 +41,50 @@ class StoredAgentController extends Controller
         private readonly AgentService $service,
         private readonly AgentQuery $query,
         private readonly AgentDefinitionParser $parser,
+        private readonly AgentDefinitionValidator $validator,
         private readonly AgentDivergenceChecker $divergenceChecker,
     ) {}
 
     /**
+     * POST /agents/check (088-agent-definition-validator, contracts §1,
+     * FR-005/FR-006). A stateless, pure check of content against live
+     * installation state — no agent id, no save. Always 200: a completed
+     * check that finds problems is itself a successful check (research.md
+     * D6/D8). The only failure mode is an uncaught exception (a genuine
+     * live-state read failure) surfacing as an ordinary 500 — never
+     * converted into a 200 body describing it as a "problem".
+     *
+     * 'definition' uses `present|nullable|string` here rather than
+     * store()/update()'s `required|string` — an empty-string definition is
+     * a genuine, checkable document (it reports MissingName, research.md
+     * D5) and must reach AgentDefinitionValidator::check() rather than
+     * being rejected by Laravel's own `required` rule before ever getting
+     * there. `nullable` is needed alongside it because the framework's own
+     * global ConvertEmptyStringsToNull middleware turns an empty (or,
+     * after TrimStrings, whitespace-only) string body value into `null`
+     * before validation ever runs — `(string) null === ''` below restores
+     * the same empty-document meaning the raw HTTP body actually carried.
+     */
+    public function check(Request $request): JsonResponse
+    {
+        $request->validate([
+            'definition' => 'present|nullable|string',
+        ]);
+
+        $result = $this->validator->check((string) $request->input('definition'));
+
+        return response()->json($this->checkResultResource($result), 200);
+    }
+
+    /**
      * POST /agents (contracts §1, FR-001/SC-001). Creates a new agent
      * that already has exactly one version the moment it is created.
+     *
+     * 088-agent-definition-validator: checks the definition via
+     * AgentDefinitionValidator::check() *before* ever calling
+     * AgentService::create() (research.md D8) — on any blocking problem,
+     * returns the byte-identical body POST /agents/check would return for
+     * the same content, and AgentService is never invoked.
      */
     public function store(Request $request): JsonResponse
     {
@@ -51,19 +92,29 @@ class StoredAgentController extends Controller
             'definition' => 'required|string',
         ]);
 
-        try {
-            $agent = $this->service->create(Auth::id(), $request->input('definition'));
-        } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
-            return $this->definitionErrorResponse($e);
+        $rawYaml = $request->input('definition');
+        $result = $this->validator->check($rawYaml);
+
+        if (!$result->valid) {
+            return response()->json($this->checkResultResource($result), 422);
         }
 
-        return response()->json($this->agentResource($agent), 201);
+        $agent = $this->service->create(Auth::id(), $rawYaml);
+
+        return response()->json([
+            ...$this->agentResource($agent),
+            'warnings' => $this->warningsResource($result->warnings),
+        ], 201);
     }
 
     /**
      * PUT /agents/{id} (contracts §4, FR-002/SC-002). Every definition
      * change through this path produces a new, distinct, attributed
      * version, never altering a prior one.
+     *
+     * 088-agent-definition-validator: identical pre-save check treatment
+     * as store() (research.md D8) — checked first, AgentService::update()
+     * never called on a blocking problem.
      */
     public function update(Request $request, string $id): JsonResponse
     {
@@ -77,13 +128,19 @@ class StoredAgentController extends Controller
             'definition' => 'required|string',
         ]);
 
-        try {
-            $agent = $this->service->update($agent, Auth::id(), $request->input('definition'));
-        } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
-            return $this->definitionErrorResponse($e);
+        $rawYaml = $request->input('definition');
+        $result = $this->validator->check($rawYaml);
+
+        if (!$result->valid) {
+            return response()->json($this->checkResultResource($result), 422);
         }
 
-        return response()->json($this->agentResource($agent), 200);
+        $agent = $this->service->update($agent, Auth::id(), $rawYaml);
+
+        return response()->json([
+            ...$this->agentResource($agent),
+            'warnings' => $this->warningsResource($result->warnings),
+        ], 200);
     }
 
     /**
@@ -379,6 +436,48 @@ class StoredAgentController extends Controller
             'error' => 'file_unreadable',
             'message' => $e->getMessage(),
         ], 422);
+    }
+
+    /**
+     * The `{valid, problems, warnings}` shape (088-agent-definition-validator,
+     * contracts §1/§2/§3) shared verbatim by check()'s own 200 body and by
+     * store()/update()'s 422 body — the single serialization point behind
+     * FR-006's "same terms" guarantee (research.md D8/D9). `category` is
+     * derived from the problem's own PHP class, never a separately-tracked
+     * field that could drift from it.
+     */
+    private function checkResultResource(AgentDefinitionValidationResult $result): array
+    {
+        return [
+            'valid' => $result->valid,
+            'problems' => array_map(fn (AgentDefinitionParseException|AgentDefinitionResolutionException $e): array => [
+                'category' => $e instanceof AgentDefinitionParseException ? 'structural' : 'semantic',
+                'kind' => $e->kind->name,
+                'key' => $e instanceof AgentDefinitionParseException ? $e->key : null,
+                'value' => $e->value,
+                'message' => $e->getMessage(),
+            ], $result->problems),
+            'warnings' => $this->warningsResource($result->warnings),
+        ];
+    }
+
+    /**
+     * The per-warning shape checkResultResource() and every successful
+     * save/read response embed (088-agent-definition-validator, contracts
+     * §1). Kept separate from checkResultResource() so a success body can
+     * add `warnings` alongside agentResource()'s own fields without
+     * building a full {valid, problems, warnings} envelope around it.
+     *
+     * @param list<AgentDefinitionWarning> $warnings
+     */
+    private function warningsResource(array $warnings): array
+    {
+        return array_map(fn (AgentDefinitionWarning $w): array => [
+            'kind' => $w->kind->name,
+            'operation_id' => $w->operationId,
+            'method' => $w->method,
+            'message' => $w->message,
+        ], $warnings);
     }
 
     /**
