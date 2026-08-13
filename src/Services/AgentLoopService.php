@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
+use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\Message;
@@ -826,6 +827,15 @@ class AgentLoopService
                         $degradationBlock = $decision->toDisclosureArray();
                     }
 
+                    // A handoff, if any is still undisclosed, is announced
+                    // here — after the degradation block so it prepends
+                    // last, landing first in the final string (093-agent-
+                    // handoff, US2, contracts §2's own ordering).
+                    $handoffDisclosure = $this->composeHandoffDisclosure($conversation);
+                    if ($handoffDisclosure !== null) {
+                        $content = $handoffDisclosure.' '.$content;
+                    }
+
                     $assistantMessage = Message::create([
                         'conversation_id' => $conversation->id,
                         'content' => $content,
@@ -1418,6 +1428,16 @@ class AgentLoopService
                         $content = $disclosure.' '.$content;
                     }
                     $degradationBlock = $decision->toDisclosureArray();
+                }
+
+                // A handoff, if any is still undisclosed, is announced
+                // here — after the degradation block so it prepends last,
+                // landing first in the final string (093-agent-handoff,
+                // US2, contracts §2's own ordering; mirrors run()'s own
+                // wiring verbatim).
+                $handoffDisclosure = $this->composeHandoffDisclosure($conversation);
+                if ($handoffDisclosure !== null) {
+                    $content = $handoffDisclosure.' '.$content;
                 }
 
                 $assistantMessage = Message::create([
@@ -2965,6 +2985,50 @@ class AgentLoopService
             'handed_off_to' => $target->name,
             'agent_id' => $target->id,
         ]);
+    }
+
+    /**
+     * Compose the user-facing disclosure sentence for any undisclosed
+     * handoff(s) on this conversation, and mark them disclosed in the same
+     * call (093-agent-handoff, US2, contracts §2, research.md D6). Returns
+     * null when there is nothing to disclose — the ordinary case for a
+     * conversation that has never been handed off, or whose most recent
+     * handoff has already been disclosed.
+     *
+     * Resolves the receiving agent via Agent::withTrashed()->find() plus
+     * the null-safe ?-> operator — never an unguarded Agent::find()->name
+     * — because the receiving agent may have been soft-deleted between the
+     * handoff succeeding and this disclosure firing on a later turn,
+     * and an unguarded ->name access on a null lookup would throw and
+     * crash the entire turn's response, not just the disclosure.
+     * withTrashed() still surfaces a since-retired agent's real name
+     * (FR-005 — a past handoff must remain plainly visible even after the
+     * named agent is later retired; mirrors §3's own read-endpoint
+     * behavior for the same case), so the generic "a retired agent"
+     * fallback only fires when the row is genuinely unresolvable (no
+     * matching Agent row at all, trashed or not), never merely because
+     * the agent has since been deactivated or soft-deleted.
+     */
+    public function composeHandoffDisclosure(Conversation $conversation): ?string
+    {
+        $undisclosed = ConversationHandoff::where('conversation_id', $conversation->id)
+            ->whereNull('disclosed_at')
+            ->orderBy('position')
+            ->get();
+
+        if ($undisclosed->isEmpty()) {
+            return null;
+        }
+
+        $latest = $undisclosed->last();
+        $name = Agent::withTrashed()->find($latest->to_agent_id)?->name ?? 'a retired agent';
+        $sentence = "This conversation has been handed off to \"{$name}\".";
+
+        ConversationHandoff::where('conversation_id', $conversation->id)
+            ->whereNull('disclosed_at')
+            ->update(['disclosed_at' => now()]);
+
+        return $sentence;
     }
 
     /**

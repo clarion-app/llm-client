@@ -315,6 +315,15 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             $degradationBlock = $degradationDecision->toDisclosureArray();
         }
 
+        // A handoff, if any is still undisclosed, is announced here —
+        // after the degradation block so it prepends last, landing first
+        // in the final string (093-agent-handoff, US2, contracts §2's own
+        // ordering; mirrors run()'s/resumeSync()'s own wiring verbatim).
+        $handoffDisclosure = app(AgentLoopService::class)->composeHandoffDisclosure($conversation);
+        if ($handoffDisclosure !== null) {
+            $this->reply = $handoffDisclosure.' '.$this->reply;
+        }
+
         $this->message->content = $this->reply;
         $this->message->responseTime = $seconds;
         if ($degradationBlock !== null) {

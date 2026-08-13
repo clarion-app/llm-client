@@ -623,20 +623,59 @@ class AgentHandoffDisclosureJourneyTest extends TestCase
             $result['status'],
             'the turn must complete normally even though the receiving agent has since been soft-deleted',
         );
+        // withTrashed() still surfaces a soft-deleted agent's real name
+        // (FR-005 — a past handoff remains plainly visible even after the
+        // named agent is later retired; mirrors §3's own read-endpoint
+        // behavior) — a soft-deleted agent is retired, not gone, so the
+        // disclosure must still name it, never mask it behind the generic
+        // fallback.
         $this->assertStringContainsString(
-            'a retired agent',
+            'agent-b',
             $result['content'],
-            'composeHandoffDisclosure() must fall back to a generic name rather than crashing when the receiving agent is gone',
+            'composeHandoffDisclosure() must still name a soft-deleted (merely retired) receiving agent via withTrashed(), not mask it',
         );
 
         $message = Message::find($result['message_id']);
         $this->assertNotNull($message);
-        $this->assertStringContainsString('a retired agent', $message->content);
+        $this->assertStringContainsString('agent-b', $message->content);
 
         $row = ConversationHandoff::where('conversation_id', $conversation->id)->first();
         $this->assertNotNull(
             $row->disclosed_at,
             'the handoff row must still be marked disclosed even when the receiving agent has been soft-deleted',
+        );
+    }
+
+    #[Test]
+    public function disclosure_composition_falls_back_to_a_generic_name_only_when_the_receiving_agent_is_genuinely_unresolvable(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        // A handoff row naming an agent id that never existed at all (not
+        // even soft-deleted) — the one case withTrashed()->find() still
+        // cannot resolve, and composeHandoffDisclosure()'s own generic
+        // fallback exists specifically to survive without crashing.
+        ConversationHandoff::create([
+            'conversation_id' => $conversation->id,
+            'position' => 1,
+            'from_agent_id' => $agentA->id,
+            'to_agent_id' => (string) \Illuminate\Support\Str::uuid(),
+            'to_agent_version_id' => (string) \Illuminate\Support\Str::uuid(),
+            'created_at' => now(),
+        ]);
+
+        $service = $this->serviceWithScriptedProvider([
+            $this->plainReply('Here is your answer.'),
+        ]);
+
+        $result = $service->run($conversation->fresh(), 'Please help.');
+
+        $this->assertSame('completed', $result['status']);
+        $this->assertStringContainsString(
+            'a retired agent',
+            $result['content'],
+            'composeHandoffDisclosure() must fall back to a generic name when no Agent row exists at all, trashed or not',
         );
     }
 
