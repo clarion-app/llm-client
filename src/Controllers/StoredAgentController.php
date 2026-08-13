@@ -374,12 +374,20 @@ class StoredAgentController extends Controller
      * when the agent is actually linked — never present-but-null
      * (contracts §3's own "omit the whole block when the concept doesn't
      * apply" convention).
+     *
+     * 088-agent-definition-validator (research.md D10): also surfaces the
+     * current version's own `warnings` via AgentDefinitionValidator::check()
+     * — this one shared helper is used by show()/link()/unlink()/
+     * syncFromFile(), so this single addition surfaces warnings on all
+     * four. Deliberately not added to agentResource() (used by restore()),
+     * which stays unchanged per research.md D11.
      */
     private function agentDetailResource(Agent $agent): array
     {
         $resource = [
             ...$this->agentResource($agent),
             'definition' => $this->parser->parse($agent->currentVersion->raw_definition),
+            'warnings' => $this->warningsResource($this->validator->check($agent->currentVersion->raw_definition)->warnings),
         ];
 
         if ($agent->linked_repository_path !== null) {

@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
 use ClarionApp\LlmClient\Services\AgentDefinitionValidator;
+use ClarionApp\LlmClient\ValueObjects\AgentDefinitionWarningKind;
 use Dedoc\Scramble\Generator;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Schema;
@@ -202,6 +203,197 @@ YAML;
         $this->expectException(QueryException::class);
 
         (new AgentDefinitionValidator(new AgentDefinitionParser()))->check($raw);
+    }
+
+    // -----------------------------------------------------------------
+    // Warning computation (088-agent-definition-validator, Phase 5/US3,
+    // research.md D2). check()->warnings still stubs [] until T029 lands
+    // the real computation -- every assertion below is expected to be
+    // genuinely RED until then.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_delete_operation_permitted_via_tools_allow_with_no_covering_confirmation_produces_exactly_one_warning(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        $raw = <<<YAML
+name: risky-agent
+tools:
+  allow:
+    - contacts.destroy
+YAML;
+
+        $result = (new AgentDefinitionValidator(new AgentDefinitionParser()))->check($raw);
+
+        $this->assertCount(1, $result->warnings);
+        $this->assertSame(AgentDefinitionWarningKind::DestructiveOperationWithoutConfirmation, $result->warnings[0]->kind);
+        $this->assertSame('contacts.destroy', $result->warnings[0]->operationId);
+        $this->assertSame('DELETE', $result->warnings[0]->method);
+    }
+
+    #[Test]
+    public function the_identical_document_with_a_covering_confirmation_required_entry_produces_no_warning(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        $raw = <<<YAML
+name: risky-agent
+tools:
+  allow:
+    - contacts.destroy
+safety:
+  confirmation_required:
+    - contacts.destroy
+YAML;
+
+        $result = (new AgentDefinitionValidator(new AgentDefinitionParser()))->check($raw);
+
+        $this->assertSame([], $result->warnings);
+    }
+
+    #[Test]
+    public function the_identical_document_with_the_operation_also_denied_produces_no_warning(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        // Denied-and-thus-not-actually-permitted is not a warning
+        // candidate at all (research.md D2's "permitted-and-not-denied"
+        // condition) -- an author who both allows and denies the same
+        // operation has, in effect, not granted it.
+        $raw = <<<YAML
+name: risky-agent
+tools:
+  allow:
+    - contacts.destroy
+  deny:
+    - contacts.destroy
+YAML;
+
+        $result = (new AgentDefinitionValidator(new AgentDefinitionParser()))->check($raw);
+
+        $this->assertSame([], $result->warnings);
+    }
+
+    #[Test]
+    public function the_warning_reads_the_documents_own_confirmation_list_directly_never_via_the_ceiling_unioned_isConfirmationRequired(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+        $this->app['config']->set('llm-client.confirm_methods', ['DELETE']);
+
+        $raw = <<<YAML
+name: ceiling-agent
+tools:
+  allow:
+    - contacts.destroy
+YAML;
+
+        $definition = (new AgentDefinitionParser())->parse($raw);
+
+        // The installation's own confirm_methods ceiling already makes
+        // isConfirmationRequired() return true for this operation,
+        // regardless of the document's own (empty) safety.confirmation_
+        // required list -- exactly the trap research.md D2 warns about.
+        // If the warning computation read isConfirmationRequired()
+        // instead of the document's own safetyConfirmationRequired list
+        // directly, this fact alone would make the warning permanently
+        // unreachable on this (the default) installation config.
+        $this->assertTrue($definition->isConfirmationRequired('contacts.destroy'));
+
+        $result = (new AgentDefinitionValidator(new AgentDefinitionParser()))->check($raw);
+
+        $this->assertCount(1, $result->warnings);
+        $this->assertSame(AgentDefinitionWarningKind::DestructiveOperationWithoutConfirmation, $result->warnings[0]->kind);
+        $this->assertSame('contacts.destroy', $result->warnings[0]->operationId);
+        $this->assertSame('DELETE', $result->warnings[0]->method);
+    }
+
+    #[Test]
+    public function one_catalog_snapshot_covers_the_whole_check_call_including_the_warning_computation(): void
+    {
+        $operations = [
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact'],
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+            'weather.get_forecast' => ['path' => '/api/weather', 'method' => 'get', 'summary' => 'Get forecast'],
+        ];
+
+        $paths = [];
+        foreach ($operations as $operationId => $entry) {
+            $paths[$entry['path']][$entry['method']] = [
+                'operationId' => $operationId,
+                'summary' => $entry['summary'],
+            ];
+        }
+        $doc = ['paths' => $paths];
+
+        $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
+        $prop->setAccessible(true);
+        $prop->setValue(null, $doc);
+
+        // A hard call-count expectation: getOperations() must be called
+        // exactly once for the *whole* check() call -- never once inside
+        // collect()'s own pattern steps and again for the warning
+        // computation (research.md D7).
+        $generator = Mockery::mock(Generator::class);
+        $generator->shouldReceive('__invoke')->once()->andReturn($doc);
+        $this->app->instance(Generator::class, $generator);
+
+        $raw = <<<YAML
+name: catalog-agent
+tools:
+  allow:
+    - contacts.*
+  deny:
+    - weather.get_forecast
+safety:
+  confirmation_required:
+    - contacts.store
+  denylist:
+    - weather.get_forecast
+YAML;
+
+        $result = (new AgentDefinitionValidator(new AgentDefinitionParser()))->check($raw);
+
+        $this->assertSame([], $result->problems);
+        $this->assertCount(1, $result->warnings);
+        $this->assertSame('contacts.destroy', $result->warnings[0]->operationId);
+    }
+
+    #[Test]
+    public function warnings_are_computed_regardless_of_whether_problems_is_empty(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        // Combines a blocking problem (an unrecognized capability) with
+        // the destructive-without-confirmation warning shape -- US3 AC3:
+        // computing the warning must never be short-circuited by an
+        // already-present blocking problem.
+        $raw = <<<YAML
+name: risky-and-broken-agent
+capabilities:
+  - not_a_real_capability
+tools:
+  allow:
+    - contacts.destroy
+YAML;
+
+        $result = (new AgentDefinitionValidator(new AgentDefinitionParser()))->check($raw);
+
+        $this->assertFalse($result->valid);
+        $this->assertCount(1, $result->problems);
+        $this->assertCount(1, $result->warnings);
+        $this->assertSame(AgentDefinitionWarningKind::DestructiveOperationWithoutConfirmation, $result->warnings[0]->kind);
+        $this->assertSame('contacts.destroy', $result->warnings[0]->operationId);
     }
 
     /**
