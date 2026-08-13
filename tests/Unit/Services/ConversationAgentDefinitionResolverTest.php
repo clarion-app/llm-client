@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Tests\Unit\Services;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\LanguageModel;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
@@ -44,6 +45,7 @@ class ConversationAgentDefinitionResolverTest extends TestCase
         $this->clearOperationCatalog();
         Mockery::close();
 
+        DB::table('conversation_handoffs')->delete();
         DB::table('conversations')->delete();
         DB::table('agent_versions')->delete();
         DB::table('agents')->delete();
@@ -244,6 +246,186 @@ class ConversationAgentDefinitionResolverTest extends TestCase
             $versionId,
             $conversation->fresh()->agent_version_id,
             'a resolution failure must never retroactively change agent_version_id',
+        );
+    }
+
+    // =================================================================
+    // effectiveDefinitionFor() — 093-agent-handoff
+    //
+    // Written before effectiveDefinitionFor() exists — every test in this
+    // section is expected to fail with a "Call to undefined method
+    // ConversationAgentDefinitionResolver::effectiveDefinitionFor()" error
+    // until T015 adds it. forConversation() itself (tested above) is never
+    // modified by this feature — data-model.md §3.
+    // =================================================================
+
+    #[Test]
+    public function effective_definition_for_matches_for_conversation_when_there_is_no_handoff(): void
+    {
+        $agent = app(AgentService::class)->create(
+            $this->user->id,
+            "name: weather-agent\ninstructions: Always respond in English.",
+        );
+
+        $conversation = Conversation::factory()->create([
+            'user_id' => $this->user->id,
+            'agent_id' => $agent->id,
+            'agent_version_id' => $agent->current_version_id,
+        ]);
+
+        $resolver = $this->resolver();
+
+        $effective = $resolver->effectiveDefinitionFor($conversation);
+        $original = $resolver->forConversation($conversation);
+
+        $this->assertInstanceOf(AgentDefinition::class, $effective);
+        $this->assertInstanceOf(AgentDefinition::class, $original);
+        $this->assertSame(
+            $original->instructions,
+            $effective->instructions,
+            'with no handoff rows, effectiveDefinitionFor() must return byte-identical instructions to forConversation()',
+        );
+        $this->assertSame(
+            $original->toolsAllow,
+            $effective->toolsAllow,
+            'with no handoff rows, effectiveDefinitionFor() must return byte-identical permitted operations to forConversation()',
+        );
+        $this->assertSame($original->name, $effective->name);
+    }
+
+    #[Test]
+    public function effective_definition_for_resolves_the_handoffs_target_while_for_conversation_still_resolves_the_original(): void
+    {
+        $agentA = app(AgentService::class)->create(
+            $this->user->id,
+            "name: agent-a\ninstructions: Always respond in English.",
+        );
+        $agentB = app(AgentService::class)->create(
+            $this->user->id,
+            "name: agent-b\ninstructions: Always respond in French.",
+        );
+
+        $conversation = Conversation::factory()->create([
+            'user_id' => $this->user->id,
+            'agent_id' => $agentA->id,
+            'agent_version_id' => $agentA->current_version_id,
+        ]);
+
+        ConversationHandoff::create([
+            'conversation_id' => $conversation->id,
+            'position' => 1,
+            'from_agent_id' => $agentA->id,
+            'to_agent_id' => $agentB->id,
+            'to_agent_version_id' => $agentB->current_version_id,
+            'created_at' => now(),
+        ]);
+
+        $resolver = $this->resolver();
+
+        $effective = $resolver->effectiveDefinitionFor($conversation);
+        $original = $resolver->forConversation($conversation);
+
+        $this->assertInstanceOf(AgentDefinition::class, $effective);
+        $this->assertSame(
+            'Always respond in French.',
+            $effective->instructions,
+            'effectiveDefinitionFor() must resolve the handoff row\'s to_agent_version_id (agent B), not the conversation\'s original binding',
+        );
+
+        $this->assertInstanceOf(AgentDefinition::class, $original);
+        $this->assertSame(
+            'Always respond in English.',
+            $original->instructions,
+            'forConversation(), called on the very same conversation object, must still resolve the ORIGINAL binding (agent A), provably unchanged',
+        );
+    }
+
+    #[Test]
+    public function effective_definition_for_resolves_the_latest_of_multiple_handoffs(): void
+    {
+        $agentA = app(AgentService::class)->create(
+            $this->user->id,
+            "name: agent-a\ninstructions: I am agent A.",
+        );
+        $agentB = app(AgentService::class)->create(
+            $this->user->id,
+            "name: agent-b\ninstructions: I am agent B.",
+        );
+        $agentC = app(AgentService::class)->create(
+            $this->user->id,
+            "name: agent-c\ninstructions: I am agent C.",
+        );
+
+        $conversation = Conversation::factory()->create([
+            'user_id' => $this->user->id,
+            'agent_id' => $agentA->id,
+            'agent_version_id' => $agentA->current_version_id,
+        ]);
+
+        ConversationHandoff::create([
+            'conversation_id' => $conversation->id,
+            'position' => 1,
+            'from_agent_id' => $agentA->id,
+            'to_agent_id' => $agentB->id,
+            'to_agent_version_id' => $agentB->current_version_id,
+            'created_at' => now(),
+        ]);
+        ConversationHandoff::create([
+            'conversation_id' => $conversation->id,
+            'position' => 2,
+            'from_agent_id' => $agentB->id,
+            'to_agent_id' => $agentC->id,
+            'to_agent_version_id' => $agentC->current_version_id,
+            'created_at' => now(),
+        ]);
+
+        $definition = $this->resolver()->effectiveDefinitionFor($conversation);
+
+        $this->assertInstanceOf(AgentDefinition::class, $definition);
+        $this->assertSame(
+            'I am agent C.',
+            $definition->instructions,
+            'effectiveDefinitionFor() must resolve the LATEST (highest position) handoff row, not an earlier one',
+        );
+    }
+
+    #[Test]
+    public function effective_definition_for_degrades_to_null_when_the_handoffs_target_version_no_longer_resolves(): void
+    {
+        $agentA = app(AgentService::class)->create(
+            $this->user->id,
+            "name: agent-a\ninstructions: I am agent A.",
+        );
+        $agentB = app(AgentService::class)->create(
+            $this->user->id,
+            "name: agent-b\ninstructions: I am agent B.",
+        );
+        $targetVersionId = $agentB->current_version_id;
+
+        $conversation = Conversation::factory()->create([
+            'user_id' => $this->user->id,
+            'agent_id' => $agentA->id,
+            'agent_version_id' => $agentA->current_version_id,
+        ]);
+
+        ConversationHandoff::create([
+            'conversation_id' => $conversation->id,
+            'position' => 1,
+            'from_agent_id' => $agentA->id,
+            'to_agent_id' => $agentB->id,
+            'to_agent_version_id' => $targetVersionId,
+            'created_at' => now(),
+        ]);
+
+        // Simulate a since-deleted/unresolvable target version — the same
+        // defensive scenario forConversation() itself already degrades on.
+        DB::table('agent_versions')->where('id', $targetVersionId)->delete();
+
+        $definition = $this->resolver()->effectiveDefinitionFor($conversation->fresh());
+
+        $this->assertNull(
+            $definition,
+            'a since-deleted/unresolvable handoff target version must degrade to null, matching forConversation()\'s own degrade-on-failure posture, never throwing',
         );
     }
 }
