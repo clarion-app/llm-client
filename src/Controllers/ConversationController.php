@@ -88,6 +88,13 @@ class ConversationController extends Controller
                     'code' => 'agent_not_found',
                 ], 404);
             }
+            if ($agent->is_active === false) {
+                return response()->json([
+                    'error' => 'agent_deactivated',
+                    'code' => 'agent_deactivated',
+                    'message' => "The agent \"{$agent->name}\" is deactivated and is not accepting new conversations. Reactivate it to resume.",
+                ], 409);
+            }
             $validatedData['agent_id'] = $agent->id;
             $validatedData['agent_version_id'] = $agent->current_version_id;
         }
