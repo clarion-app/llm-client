@@ -3,14 +3,17 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentVersion;
+use Illuminate\Contracts\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Collection;
 
 /**
  * Ownership-scoped reads for `agents`/`agent_versions` (contracts §12).
  *
- * Skeleton for Phase 3/US1 — only findAgent() is needed here, used by
+ * findAgent() is Phase 3/US1's own surface, used by
  * StoredAgentController::update() to resolve the target agent before
- * handing it to AgentService::update(). versionsForAgent()/findVersion()
- * are added in Phase 4/US2.
+ * handing it to AgentService::update(). listForUser()/versionsForAgent()/
+ * findVersion() are Phase 4/US2's own addition (contracts §2/§5/§6).
  */
 class AgentQuery
 {
@@ -25,6 +28,55 @@ class AgentQuery
     {
         return Agent::where('id', $agentId)
             ->where('user_id', $callerUserId)
+            ->first();
+    }
+
+    /**
+     * Every agent the caller owns (contracts §2) — unpaginated, per
+     * contracts §2's own "scale/scope expects a small per-user count" note.
+     *
+     * @return Collection<int, Agent>
+     */
+    public function listForUser(string $callerUserId): Collection
+    {
+        return Agent::where('user_id', $callerUserId)->get();
+    }
+
+    /**
+     * Every version of an agent, in order, paginated (contracts §5). Null
+     * uniformly when the agent itself doesn't exist or isn't the caller's
+     * own (research.md D5) — the same "not found" signal findAgent() gives,
+     * so the controller never has to special-case which.
+     */
+    public function versionsForAgent(string $callerUserId, string $agentId, int $page = 1): ?LengthAwarePaginator
+    {
+        if ($this->findAgent($callerUserId, $agentId) === null) {
+            return null;
+        }
+
+        return AgentVersion::where('agent_id', $agentId)
+            ->orderBy('version_number')
+            ->paginate(
+                config('llm-client.agents.versions_per_page', 25),
+                ['*'],
+                'page',
+                $page,
+            );
+    }
+
+    /**
+     * A single version, scoped by both the parent agent's ownership and
+     * the version's own agent_id — a version belonging to a different
+     * agent is indistinguishable from a nonexistent one (contracts §6).
+     */
+    public function findVersion(string $callerUserId, string $agentId, string $versionId): ?AgentVersion
+    {
+        if ($this->findAgent($callerUserId, $agentId) === null) {
+            return null;
+        }
+
+        return AgentVersion::where('id', $versionId)
+            ->where('agent_id', $agentId)
             ->first();
     }
 }

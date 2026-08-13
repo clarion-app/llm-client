@@ -13,9 +13,9 @@ use Illuminate\Support\Facades\DB;
  * DB::transaction() + MAX(version_number) + 1 pattern verbatim
  * (research.md D1/D4).
  *
- * create()/update() are this file's Phase 3/US1 surface — restore()/
- * link()/syncFromFile()/unlink() are User Story 2/3's own scope, added
- * later.
+ * create()/update() are Phase 3/US1's own surface. restore() is Phase
+ * 4/US2's own addition — link()/syncFromFile()/unlink() remain User Story
+ * 3's own scope, added later.
  *
  * Every method that writes an AgentVersion calls
  * AgentDefinitionParser::parse() first, before any write, and propagates
@@ -93,6 +93,48 @@ class AgentService
                 'content_hash' => hash('sha256', $rawYaml),
                 'source' => AgentChangeSource::ProductEdit->value,
                 'changed_by_user_id' => $userId,
+            ]);
+
+            $agent->current_version_id = $version->id;
+            $agent->name = $definition->name;
+            $agent->save();
+
+            return $agent->fresh();
+        });
+    }
+
+    /**
+     * Restore an agent to an earlier version: re-validates the target's
+     * raw_definition against *current* installation state before writing
+     * anything (research.md D7 — a version that could no longer resolve
+     * must never become current), then inserts one new agent_versions row
+     * whose content is byte-identical to the target's (source =
+     * restoration, restored_from_version_id = $target->id) and repoints
+     * current_version_id/name at it, in one transaction (FR-006/FR-007).
+     *
+     * Deliberately never special-cases restoring to the agent's own
+     * already-current version — there is no early-return no-op branch, so
+     * restoring to the current version still produces a new, distinct
+     * version (spec Edge Cases; contracts §7; mutation-checklist row 10).
+     *
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException
+     */
+    public function restore(Agent $agent, string $userId, AgentVersion $target): Agent
+    {
+        $definition = $this->parser->parse($target->raw_definition);
+
+        return DB::transaction(function () use ($agent, $userId, $target, $definition) {
+            $nextVersionNumber = (int) AgentVersion::where('agent_id', $agent->id)->max('version_number') + 1;
+
+            $version = AgentVersion::create([
+                'agent_id' => $agent->id,
+                'version_number' => $nextVersionNumber,
+                'raw_definition' => $target->raw_definition,
+                'content_hash' => $target->content_hash,
+                'source' => AgentChangeSource::Restoration->value,
+                'changed_by_user_id' => $userId,
+                'restored_from_version_id' => $target->id,
             ]);
 
             $agent->current_version_id = $version->id;

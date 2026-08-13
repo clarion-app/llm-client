@@ -230,6 +230,14 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // above (087-agent-model-versioning, Phase 3/US1).
     Route::post('agents', [StoredAgentController::class, "store"]);
     Route::put('agents/{id}', [StoredAgentController::class, "update"]);
+
+    // Agent version history — list/read/restore (contracts/agent-versioning-api.md
+    // §2/§3/§5/§6/§7, 087-agent-model-versioning, Phase 4/US2).
+    Route::get('agents', [StoredAgentController::class, "index"]);
+    Route::get('agents/{id}', [StoredAgentController::class, "show"]);
+    Route::get('agents/{id}/versions', [StoredAgentController::class, "versions"]);
+    Route::get('agents/{id}/versions/{versionId}', [StoredAgentController::class, "versionDetail"]);
+    Route::post('agents/{id}/versions/{versionId}/restore', [StoredAgentController::class, "restore"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
