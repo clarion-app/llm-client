@@ -722,6 +722,14 @@ return [
         // this falls back to context_window.injected_section_reserve at
         // resolution time — never copied into a second hardcoded number.
         'instructions_max_tokens' => env('LLM_CLIENT_AGENT_DEFINITIONS_INSTRUCTIONS_MAX_TOKENS', null),
+
+        // Ready-made agent kinds (089-agent-scaffolding-cli) — which
+        // built-in AgentKind starting shapes `agent:create --kind=` and
+        // `agent:kinds` may offer. Mirrors 'presets' => ['enabled' => [...]]'s
+        // own shape exactly, above.
+        'kinds' => [
+            'enabled' => ['research', 'coding'],
+        ],
     ],
 
     // Agent Version History (087-agent-model-versioning) — bounds for

@@ -124,6 +124,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentCreateCommand::class,
+                \ClarionApp\LlmClient\Commands\AgentKindsCommand::class,
             ]);
         }
 
@@ -195,6 +196,9 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         // Register built-in structured output presets
         $this->registerPresets();
+
+        // Register built-in ready-made agent kinds (089-agent-scaffolding-cli)
+        $this->registerAgentKinds();
     }
 
     public function register(): void
@@ -630,6 +634,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Services\AgentDefinitionScaffoldWriter::class, function () {
             return new \ClarionApp\LlmClient\Services\AgentDefinitionScaffoldWriter();
         });
+
+        // AgentKindRegistry holds only in-memory, boot-time-registered
+        // AgentKind value objects -- safe as singleton() for the identical
+        // reason as StructuredOutputPresetRegistry above
+        // (089-agent-scaffolding-cli).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentKindRegistry::class, function () {
+            return new \ClarionApp\LlmClient\Services\AgentKindRegistry();
+        });
     }
 
     /**
@@ -695,6 +707,27 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         foreach ($presetClasses as $name => $class) {
             if (in_array($name, $enabled)) {
                 $registry->register(new $class());
+            }
+        }
+    }
+
+    /**
+     * Register built-in ready-made agent kinds with the registry
+     * (089-agent-scaffolding-cli, contracts §5).
+     */
+    protected function registerAgentKinds(): void
+    {
+        $registry = $this->app->make(\ClarionApp\LlmClient\Services\AgentKindRegistry::class);
+        $enabled = config('llm-client.agent_definitions.kinds.enabled', ['research', 'coding']);
+
+        $kinds = [
+            'research' => fn () => \ClarionApp\LlmClient\ValueObjects\AgentKind::research(),
+            'coding' => fn () => \ClarionApp\LlmClient\ValueObjects\AgentKind::coding(),
+        ];
+
+        foreach ($kinds as $slug => $factory) {
+            if (in_array($slug, $enabled, true)) {
+                $registry->register($factory());
             }
         }
     }
