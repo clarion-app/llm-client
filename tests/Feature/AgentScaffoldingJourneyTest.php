@@ -4,7 +4,9 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
+use ClarionApp\LlmClient\Services\AgentDefinitionScaffolder;
 use ClarionApp\LlmClient\Services\AgentDefinitionValidator;
+use ClarionApp\LlmClient\ValueObjects\AgentKind;
 use Dedoc\Scramble\Generator;
 use Illuminate\Support\Facades\Artisan;
 use Mockery;
@@ -308,6 +310,122 @@ class AgentScaffoldingJourneyTest extends TestCase
 
         $this->assertTrue($result->valid);
         $this->assertSame([], $result->problems);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 5 (US2) — a chosen kind shapes the generated definition
+    // (T029). Written before `agent:create` gains a --kind option and
+    // before any kind is registered — every case below is expected to
+    // fail until Phase 5's own Implementation tasks (T030-T034) land.
+    // That is the intended RED state, not a mistake.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function choosing_the_research_kind_reflects_that_kinds_own_shape(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        $exitCode = Artisan::call('agent:create', [
+            'name' => 'research-bot',
+            '--kind' => 'research',
+            '--path' => $dir,
+        ]);
+
+        $this->assertSame(0, $exitCode);
+
+        $path = $dir.'/research-bot.yaml';
+        $this->assertFileExists($path);
+        $content = file_get_contents($path);
+        $parsed = Yaml::parse($content);
+
+        $overrides = AgentKind::research()->getOverrides();
+        $this->assertSame($overrides['instructions'], $parsed['instructions']);
+        $this->assertSame($overrides['capabilities'], $parsed['capabilities']);
+        $this->assertSame($overrides['memory'], $parsed['memory']);
+
+        $generic = $this->app->make(AgentDefinitionScaffolder::class)->generate('research-bot', null);
+        $genericParsed = Yaml::parse($generic->content);
+
+        $this->assertSame($genericParsed['format_version'], $parsed['format_version']);
+        $this->assertSame($genericParsed['model'], $parsed['model']);
+        $this->assertSame($genericParsed['tools']['allow'], $parsed['tools']['allow']);
+        $this->assertSame($genericParsed['tools']['deny'], $parsed['tools']['deny']);
+        $this->assertSame($genericParsed['safety']['confirmation_required'], $parsed['safety']['confirmation_required']);
+        $this->assertSame($genericParsed['safety']['denylist'], $parsed['safety']['denylist']);
+    }
+
+    #[Test]
+    public function choosing_the_coding_kind_reflects_that_kinds_own_shape(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        $exitCode = Artisan::call('agent:create', [
+            'name' => 'coding-bot',
+            '--kind' => 'coding',
+            '--path' => $dir,
+        ]);
+
+        $this->assertSame(0, $exitCode);
+
+        $path = $dir.'/coding-bot.yaml';
+        $this->assertFileExists($path);
+        $content = file_get_contents($path);
+        $parsed = Yaml::parse($content);
+
+        $overrides = AgentKind::coding()->getOverrides();
+        $this->assertSame($overrides['instructions'], $parsed['instructions']);
+        $this->assertSame($overrides['capabilities'], $parsed['capabilities']);
+        $this->assertSame($overrides['memory'], $parsed['memory']);
+
+        $generic = $this->app->make(AgentDefinitionScaffolder::class)->generate('coding-bot', null);
+        $genericParsed = Yaml::parse($generic->content);
+
+        $this->assertSame($genericParsed['format_version'], $parsed['format_version']);
+        $this->assertSame($genericParsed['model'], $parsed['model']);
+        $this->assertSame($genericParsed['tools']['allow'], $parsed['tools']['allow']);
+        $this->assertSame($genericParsed['tools']['deny'], $parsed['tools']['deny']);
+        $this->assertSame($genericParsed['safety']['confirmation_required'], $parsed['safety']['confirmation_required']);
+        $this->assertSame($genericParsed['safety']['denylist'], $parsed['safety']['denylist']);
+    }
+
+    #[Test]
+    public function omitting_a_kind_produces_the_generic_scaffold(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        $expected = $this->app->make(AgentDefinitionScaffolder::class)->generate('x', null);
+
+        $exitCode = Artisan::call('agent:create', [
+            'name' => 'x',
+            '--path' => $dir,
+        ]);
+
+        $this->assertSame(0, $exitCode);
+
+        $path = $dir.'/x.yaml';
+        $this->assertFileExists($path);
+        $this->assertSame($expected->content, file_get_contents($path));
+    }
+
+    #[Test]
+    public function every_kind_combination_produces_a_valid_definition(): void
+    {
+        $this->seedOperationCatalog([]);
+
+        $scaffolder = $this->app->make(AgentDefinitionScaffolder::class);
+        $validator = $this->app->make(AgentDefinitionValidator::class);
+
+        foreach ([null, AgentKind::research(), AgentKind::coding()] as $kind) {
+            $scaffold = $scaffolder->generate('kind-combo-agent', $kind);
+            $result = $validator->check($scaffold->content);
+
+            $label = $kind?->getSlug() ?? 'null (no kind)';
+            $this->assertTrue($result->valid, "Expected a valid definition for kind: {$label}");
+            $this->assertSame([], $result->problems, "Expected no problems for kind: {$label}");
+        }
     }
 
     // ---------------------------------------------------------------

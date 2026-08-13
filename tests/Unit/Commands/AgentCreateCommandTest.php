@@ -183,6 +183,44 @@ class AgentCreateCommandTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // 5. An unavailable --kind fails clearly, naming it, before anything
+    //    else runs — no file is written (Phase 5/US2, T028, Edge Case,
+    //    FR-013, quickstart step 8, contract §1 row 1,
+    //    mutation-checklist row 5).
+    //
+    //    Written before AgentCreateCommand gains a --kind option — this
+    //    case is expected to fail (unrecognized "--kind" option error)
+    //    until Phase 5's own Implementation tasks (T034) land. That is
+    //    the intended RED state, not a mistake.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function an_unavailable_kind_is_refused_before_anything_else_runs(): void
+    {
+        $this->seedOperationCatalog([]);
+        $dir = $this->makeTempDir();
+
+        $exitCode = Artisan::call('agent:create', [
+            'name' => 'x',
+            '--kind' => 'devops',
+            '--path' => $dir,
+        ]);
+
+        $this->assertSame(1, $exitCode);
+
+        $output = Artisan::output();
+        $this->assertStringContainsString('devops', $output);
+        $this->assertStringContainsString('research', $output);
+        $this->assertStringContainsString('coding', $output);
+
+        $this->assertSame(
+            [],
+            $this->directoryEntries($dir),
+            'No file of any kind may be written when the requested kind is unavailable — the kind must be resolved, and generation refused, before any name validation or filesystem interaction.'
+        );
+    }
+
+    // ---------------------------------------------------------------
     // Operation catalog fixture (copied verbatim from
     // AgentDefinitionMinimalJourneyTest.php's own established pattern)
     // ---------------------------------------------------------------
