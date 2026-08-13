@@ -610,4 +610,81 @@ class AgentActivationJourneyTest extends TestCase
         $this->assertArrayHasKey('is_active', $entryAfterReactivate);
         $this->assertTrue($entryAfterReactivate['is_active'], 'a fresh listing must reflect the just-applied reactivation, never a stale cached false');
     }
+
+    // =================================================================
+    // T025 — US4 (quickstart step 16, research.md D4 — structural only)
+    // =================================================================
+
+    #[Test]
+    public function the_admission_gate_is_keyed_on_the_target_agents_identity_not_the_callers(): void
+    {
+        // No agent-to-agent delegation mechanism exists anywhere in this
+        // codebase (research.md D4 — re-confirmed via a repo-wide grep for
+        // delegat/handoff/sub-?agent immediately before writing this test;
+        // roadmap item 4.2.4 remains unbuilt). This test therefore proves
+        // the one structural property this feature *can* honestly
+        // establish in delegation's absence: ConversationController::store()'s
+        // admission check is keyed on the target agent's own identity/state
+        // (Agent.is_active, resolved via the ownership-scoped findAgent()),
+        // never on any notion of "who" or "what" is making the request — so
+        // a future 4.2.4 that happened to route through this same,
+        // unmodified POST /conversation path would inherit the refusal
+        // automatically, with zero new code.
+        $agentId = $this->createAgent('name: helper-agent');
+        $this->createAgent('name: sibling-agent'); // sibling, so the agent under test is never the caller's last active one
+        $userB = User::factory()->create();
+        $server = $this->createServer();
+
+        $this->actingAs($this->user)->postJson($this->deactivateUrl($agentId))->assertStatus(200);
+
+        // The owning caller ("User A") is refused via the deactivated-agent
+        // branch — a 409, never a 201, never an unhandled exception.
+        $ownerAttempt = $this->actingAs($this->user, 'api')->postJson($this->conversationUrl(), [
+            'agent_id' => $agentId,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ]);
+        $ownerAttempt->assertStatus(409);
+        $this->assertSame('agent_deactivated', $ownerAttempt->json('code'));
+
+        // A completely unrelated caller ("User B," standing in for what a
+        // future delegating agent's request would look like) is refused via
+        // the pre-existing ownership check instead — a 404, never a 201,
+        // never an unhandled exception. The refusal path has no
+        // special-cased "is this a delegating agent vs. a person" branch:
+        // both callers are refused, each via whichever pre-existing check
+        // their own relationship to the agent already triggers.
+        $strangerAttempt = $this->actingAs($userB, 'api')->postJson($this->conversationUrl(), [
+            'agent_id' => $agentId,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ]);
+        $strangerAttempt->assertStatus(404);
+
+        // No caller, regardless of identity, was ever admitted to the
+        // deactivated agent.
+        $this->assertSame(0, Conversation::where('agent_id', $agentId)->count(), 'no caller may ever be admitted to a deactivated agent, regardless of identity');
+
+        // Code-inspection assertion: store()'s method body contains no
+        // conditional branching on any caller-type/caller-role/delegation
+        // concept — confirming the Phase 4 check is unconditionally
+        // agent-identity-keyed, not caller-identity-keyed.
+        $controllerSource = file_get_contents(
+            (new \ReflectionClass(\ClarionApp\LlmClient\Controllers\ConversationController::class))->getFileName()
+        );
+        $reflectionMethod = (new \ReflectionClass(\ClarionApp\LlmClient\Controllers\ConversationController::class))->getMethod('store');
+        $storeSource = implode('', array_slice(
+            explode("\n", $controllerSource),
+            $reflectionMethod->getStartLine() - 1,
+            $reflectionMethod->getEndLine() - $reflectionMethod->getStartLine() + 1
+        ));
+
+        foreach (['delegat', 'handoff', 'hand-off', 'caller_type', 'callerType', 'sub_agent', 'subAgent'] as $forbiddenToken) {
+            $this->assertStringNotContainsStringIgnoringCase(
+                $forbiddenToken,
+                $storeSource,
+                "store() must contain no caller-type/delegation concept ({$forbiddenToken}) — the admission check must stay unconditionally agent-identity-keyed"
+            );
+        }
+    }
 }
