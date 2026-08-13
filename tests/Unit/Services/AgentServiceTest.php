@@ -5,16 +5,23 @@ namespace ClarionApp\LlmClient\Tests\Unit\Services;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
+use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
+use ClarionApp\LlmClient\Models\LanguageModel;
+use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
 use ClarionApp\LlmClient\Services\AgentService;
 use ClarionApp\LlmClient\Services\GitDefinitionFileReader;
 use ClarionApp\LlmClient\ValueObjects\AgentChangeSource;
+use ClarionApp\LlmClient\ValueObjects\AgentDefinitionResolutionErrorKind;
+use ClarionApp\LlmClient\ValueObjects\MemoryKind;
 use Dedoc\Scramble\Generator;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
+use Symfony\Component\Process\Process;
 use Tests\TestCase;
 
 /**
@@ -29,6 +36,9 @@ use Tests\TestCase;
  */
 class AgentServiceTest extends TestCase
 {
+    /** @var string[] */
+    private array $tempRepoPaths = [];
+
     protected function tearDown(): void
     {
         $this->clearOperationCatalog();
@@ -36,7 +46,13 @@ class AgentServiceTest extends TestCase
 
         DB::table('agent_versions')->delete();
         DB::table('agents')->delete();
+        DB::table('llm_memory_entries')->delete();
         DB::table('users')->delete();
+
+        foreach ($this->tempRepoPaths as $path) {
+            $this->removeDirectory($path);
+        }
+        $this->tempRepoPaths = [];
 
         parent::tearDown();
     }
@@ -108,6 +124,59 @@ YAML;
         $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
         $prop->setAccessible(true);
         $prop->setValue(null, null);
+    }
+
+    /**
+     * A real, throwaway git repository under a tmp directory — the same
+     * fixture convention GitDefinitionFileReaderTest.php establishes (091,
+     * tasks.md T011's own corrected guidance): never a mock of
+     * GitDefinitionFileReader.
+     */
+    private function createGitRepo(): string
+    {
+        $repoPath = sys_get_temp_dir().'/agent_service_clone_test_'.uniqid('', true);
+        mkdir($repoPath, 0777, true);
+        $this->tempRepoPaths[] = $repoPath;
+
+        $this->runGit(['init'], $repoPath);
+        $this->runGit(['config', 'user.name', 'Test Author'], $repoPath);
+        $this->runGit(['config', 'user.email', 'test-author@example.test'], $repoPath);
+        $this->runGit(['config', 'commit.gpgsign', 'false'], $repoPath);
+
+        return $repoPath;
+    }
+
+    private function runGit(array $args, string $cwd): void
+    {
+        (new Process(array_merge(['git'], $args), $cwd))->mustRun();
+    }
+
+    private function writeFile(string $repoPath, string $relPath, string $content): void
+    {
+        file_put_contents($repoPath.'/'.$relPath, $content);
+    }
+
+    private function commitAll(string $repoPath, string $message): void
+    {
+        $this->runGit(['add', '.'], $repoPath);
+        $this->runGit(['commit', '-m', $message], $repoPath);
+    }
+
+    private function removeDirectory(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        foreach (new \FilesystemIterator($path) as $item) {
+            if ($item->isDir()) {
+                $this->removeDirectory($item->getPathname());
+            } else {
+                @unlink($item->getPathname());
+            }
+        }
+
+        @rmdir($path);
     }
 
     // ---------------------------------------------------------------
@@ -422,5 +491,230 @@ YAML;
             $agent->currentVersion->version_number,
             'the next version_number must be MAX(version_number) + 1 (2) over the surviving rows — the deleted version 2 row no longer exists to collide with',
         );
+    }
+
+    // ---------------------------------------------------------------
+    // clone() — US1 (AC1-AC4, FR-002/FR-003/FR-004/FR-005/FR-006,
+    // contracts §1's internal service surface, research.md D1/D2/D2a)
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function clone_carries_instructions_permitted_operations_and_settings_under_a_new_name(): void
+    {
+        $this->seedOperationCatalog(['contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact']]);
+        $user = $this->user();
+        $source = $this->service()->create(
+            $user->id,
+            "name: weather-agent\ninstructions: Always be polite.\ntools:\n  allow: [contacts.*]",
+        );
+
+        $clone = $this->service()->clone($source, $user->id, 'weather-agent-copy');
+
+        $this->assertInstanceOf(Agent::class, $clone);
+        $this->assertNotSame($source->id, $clone->id);
+        $this->assertSame('weather-agent-copy', $clone->name, 'the clone must carry the new name, not the source\'s');
+        $this->assertSame($user->id, $clone->user_id);
+
+        $definition = (new AgentDefinitionParser())->parse($clone->currentVersion->raw_definition);
+        $this->assertSame('Always be polite.', $definition->instructions, 'instructions must match the source at the moment of copying');
+        $this->assertSame(['contacts.*'], $definition->toolsAllow, 'permitted operations must match the source at the moment of copying');
+    }
+
+    #[Test]
+    public function clones_own_version_history_starts_fresh_never_referencing_the_sources_chain(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $source = $this->service()->create($user->id, $this->validYaml('weather-agent'));
+        $source = $this->service()->update($source, $user->id, $this->validYaml('weather-agent'));
+        $source = $this->service()->update($source, $user->id, $this->validYaml('weather-agent'));
+        $this->assertSame(3, DB::table('agent_versions')->where('agent_id', $source->id)->count(), 'fixture sanity: the source must have 3 versions before cloning');
+
+        $clone = $this->service()->clone($source, $user->id, 'weather-agent-copy');
+
+        $this->assertSame(
+            1,
+            DB::table('agent_versions')->where('agent_id', $clone->id)->count(),
+            'the clone must start with exactly one version, never inheriting the source\'s history',
+        );
+
+        $version = AgentVersion::find($clone->current_version_id);
+        $this->assertNotNull($version);
+        $this->assertSame(1, $version->version_number);
+        $this->assertSame(AgentChangeSource::Created->value, $version->source);
+        $this->assertNull($version->restored_from_version_id, 'a clone\'s first version must never reference any of the source\'s version ids');
+    }
+
+    #[Test]
+    public function editing_the_original_after_cloning_never_affects_the_clone(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $source = $this->service()->create($user->id, "name: weather-agent\ninstructions: Original instructions.");
+        $clone = $this->service()->clone($source, $user->id, 'weather-agent-copy');
+
+        $this->service()->update($source->fresh(), $user->id, "name: weather-agent\ninstructions: Completely different now.");
+
+        $cloneReread = Agent::find($clone->id);
+        $definition = (new AgentDefinitionParser())->parse($cloneReread->currentVersion->raw_definition);
+        $this->assertSame('Original instructions.', $definition->instructions, 'editing the source after cloning must never affect the already-made clone');
+    }
+
+    #[Test]
+    public function editing_the_clone_after_cloning_never_affects_the_original(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $source = $this->service()->create($user->id, "name: weather-agent\ninstructions: Original instructions.");
+        $clone = $this->service()->clone($source, $user->id, 'weather-agent-copy');
+
+        $this->service()->update($clone->fresh(), $user->id, "name: weather-agent-copy\ninstructions: Completely different now.");
+
+        $sourceReread = Agent::find($source->id);
+        $definition = (new AgentDefinitionParser())->parse($sourceReread->currentVersion->raw_definition);
+        $this->assertSame('Original instructions.', $definition->instructions, 'editing the clone must never affect the original it was cloned from');
+    }
+
+    #[Test]
+    public function a_clone_is_never_linked_to_the_sources_git_file_even_when_the_source_is_linked(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $repoPath = $this->createGitRepo();
+        $this->writeFile($repoPath, 'agent.yaml', "name: linked-agent\n");
+        $this->commitAll($repoPath, 'Initial commit');
+
+        $source = $this->service()->create($user->id, $this->validYaml('linked-agent'));
+        $source = $this->service()->link($source, $user->id, $repoPath, 'agent.yaml');
+        $this->assertNotNull($source->linked_repository_path, 'fixture sanity: the source must actually be linked before cloning');
+
+        $clone = $this->service()->clone($source, $user->id, 'linked-agent-copy');
+
+        $this->assertNull($clone->linked_repository_path, 'a clone must never inherit the source\'s link');
+        $this->assertNull($clone->linked_file_path);
+        $this->assertNull($clone->linked_synced_file_hash);
+    }
+
+    // ---------------------------------------------------------------
+    // clone() — US3 (AC1-AC4, FR-010/FR-011/FR-012/FR-013/FR-014,
+    // contracts §1's internal service surface, research.md D3/D5/D6/D9/D10)
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function cloning_a_retired_soft_deleted_source_produces_a_fully_active_non_trashed_clone(): void
+    {
+        $this->seedOperationCatalog(['contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact']]);
+        $user = $this->user();
+        $source = $this->service()->create(
+            $user->id,
+            "name: weather-agent\ninstructions: Last known state.\ntools:\n  allow: [contacts.*]",
+        );
+        $source->delete();
+        $this->assertNotNull($source->fresh()->deleted_at, 'fixture sanity: the source must actually be soft-deleted before cloning');
+
+        $clone = $this->service()->clone(Agent::withTrashed()->find($source->id), $user->id, 'copy-of-retired');
+
+        $this->assertNull($clone->deleted_at, 'a clone of a retired agent must itself be fully active, not trashed');
+        $definition = (new AgentDefinitionParser())->parse($clone->currentVersion->raw_definition);
+        $this->assertSame('Last known state.', $definition->instructions, 'the clone must match the retired source\'s last state before retirement');
+        $this->assertSame(['contacts.*'], $definition->toolsAllow);
+    }
+
+    #[Test]
+    public function cloning_under_a_name_that_collides_with_the_destination_owners_own_agent_throws_and_writes_no_row(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agentA = $this->service()->create($user->id, $this->validYaml('agent-a'));
+        $this->service()->create($user->id, $this->validYaml('agent-b'));
+
+        $agentsBefore = DB::table('agents')->count();
+        $versionsBefore = DB::table('agent_versions')->count();
+
+        try {
+            $this->service()->clone($agentA, $user->id, 'agent-b');
+            $this->fail('Expected AgentNameAlreadyInUseException for a colliding name.');
+        } catch (AgentNameAlreadyInUseException $e) {
+            $this->assertSame('agent-b', $e->name);
+        }
+
+        $this->assertSame($agentsBefore, DB::table('agents')->count(), 'a rejected clone() must write no agent row');
+        $this->assertSame($versionsBefore, DB::table('agent_versions')->count(), 'a rejected clone() must write no version row');
+    }
+
+    #[Test]
+    public function a_name_freed_by_retiring_an_agent_is_immediately_reusable_by_a_clone(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agentA = $this->service()->create($user->id, $this->validYaml('agent-a'));
+        $agentA->delete();
+        $other = $this->service()->create($user->id, $this->validYaml('agent-b'));
+
+        $clone = $this->service()->clone($other, $user->id, 'agent-a');
+
+        $this->assertSame('agent-a', $clone->name, 'a name freed by soft-deleting an agent must be immediately reusable by a clone');
+    }
+
+    #[Test]
+    public function clones_memory_kind_settings_are_plain_carried_settings_never_touching_any_memoryentry_row(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $source = $this->service()->create($user->id, "name: weather-agent\nmemory:\n  scratch: disabled");
+
+        DB::table('llm_memory_entries')->insert([
+            'id' => (string) Str::uuid(),
+            'scope' => 'long_term',
+            'agent_id' => $source->id,
+            'user_id' => $user->id,
+            'key' => 'some-key',
+            'content' => 'some remembered content',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        $memoryCountBefore = DB::table('llm_memory_entries')->count();
+
+        $clone = $this->service()->clone($source, $user->id, 'weather-agent-copy');
+
+        $this->assertSame(
+            $memoryCountBefore,
+            DB::table('llm_memory_entries')->count(),
+            'clone() must never write (or read from) any MemoryEntry row',
+        );
+        $definition = (new AgentDefinitionParser())->parse($clone->currentVersion->raw_definition);
+        $this->assertFalse($definition->memoryEnabled(MemoryKind::Scratch), 'a clone\'s memory-kind settings are plain carried settings, matching the source exactly');
+    }
+
+    #[Test]
+    public function the_sources_own_current_definition_failing_to_re_resolve_is_refused_cleanly_with_no_partial_write(): void
+    {
+        $this->seedOperationCatalog();
+        $server = Server::forceCreate(['id' => (string) Str::uuid(), 'name' => 'Primary']);
+        $model = LanguageModel::create(['id' => (string) Str::uuid(), 'name' => 'clone-model', 'server_id' => $server->id]);
+
+        $user = $this->user();
+        $source = $this->service()->create($user->id, "name: weather-agent\nmodel: clone-model");
+
+        // The source's own current definition no longer resolves against
+        // live installation state — the model it names has since been
+        // deleted. clone() re-validates the rewritten document via
+        // AgentDefinitionParser::parse() (not a string-replace-only copy),
+        // so this must be caught here too, exactly as restore()'s own
+        // analogous test above expects.
+        $model->delete();
+
+        $agentsBefore = DB::table('agents')->count();
+        $versionsBefore = DB::table('agent_versions')->count();
+
+        try {
+            $this->service()->clone($source, $user->id, 'weather-agent-copy');
+            $this->fail('Expected AgentDefinitionResolutionException for a since-deleted model.');
+        } catch (AgentDefinitionResolutionException $e) {
+            $this->assertSame(AgentDefinitionResolutionErrorKind::UnknownModel, $e->kind);
+        }
+
+        $this->assertSame($agentsBefore, DB::table('agents')->count(), 'a rejected clone() must write no agent row');
+        $this->assertSame($versionsBefore, DB::table('agent_versions')->count(), 'a rejected clone() must write no version row');
     }
 }
