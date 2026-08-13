@@ -2,10 +2,12 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\ValueObjects\AgentChangeSource;
 use Illuminate\Support\Facades\DB;
+use Symfony\Component\Yaml\Yaml;
 
 /**
  * The sole write path for `agents`/`agent_versions` (contracts §12) —
@@ -59,6 +61,71 @@ class AgentService
                 'content_hash' => hash('sha256', $rawYaml),
                 'source' => AgentChangeSource::Created->value,
                 'changed_by_user_id' => $userId,
+            ]);
+
+            $agent->current_version_id = $version->id;
+            $agent->save();
+
+            return $agent->fresh();
+        });
+    }
+
+    /**
+     * Clone an agent into a complete, independent copy under a new name,
+     * optionally for a different owner (091-agent-clone-fork, contracts §1,
+     * research.md D1/D2/D2a/D6). Rewrites only the `name:` key of the
+     * source's current raw YAML document (Yaml::parse()/Yaml::dump() —
+     * research.md D10, no existing serializer to reuse), then re-validates
+     * the rewritten document with a single AgentDefinitionParser::parse()
+     * call — the source's *current* definition is re-checked against live
+     * installation state as a side effect, but only one parse() call is
+     * ever made (on the rewritten document), never two.
+     *
+     * A per-owner name collision is refused *before* any row is written
+     * (FR-014) — `Agent`'s default query excludes trashed rows, so a name
+     * freed by soft-deleting an agent is immediately reusable (research.md
+     * D6).
+     *
+     * Inserts exactly one new Agent row (`cloned_from_agent_id` = the
+     * source's id; `current_version_id` starts null) and exactly one new
+     * AgentVersion (`version_number = 1`, `source = Created`) in one
+     * transaction — the identical two-row shape create() already produces.
+     * Deliberately does not set `linked_repository_path`/`linked_file_path`/
+     * `linked_synced_file_hash` — a clone is never linked to the source's
+     * git file, even when the source itself is (research.md D2a).
+     *
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException
+     * @throws \ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException
+     * @throws AgentNameAlreadyInUseException
+     */
+    public function clone(Agent $source, string $newOwnerUserId, string $newName): Agent
+    {
+        $document = Yaml::parse($source->currentVersion->raw_definition);
+        $document = is_array($document) ? $document : [];
+        $document['name'] = $newName;
+        $rawYaml = Yaml::dump($document, 4, 2);
+
+        $this->parser->parse($rawYaml);
+
+        if (Agent::where('user_id', $newOwnerUserId)->where('name', $newName)->exists()) {
+            throw new AgentNameAlreadyInUseException($newName);
+        }
+
+        return DB::transaction(function () use ($newOwnerUserId, $newName, $rawYaml, $source) {
+            $agent = Agent::create([
+                'user_id' => $newOwnerUserId,
+                'name' => $newName,
+                'current_version_id' => null,
+                'cloned_from_agent_id' => $source->id,
+            ]);
+
+            $version = AgentVersion::create([
+                'agent_id' => $agent->id,
+                'version_number' => 1,
+                'raw_definition' => $rawYaml,
+                'content_hash' => hash('sha256', $rawYaml),
+                'source' => AgentChangeSource::Created->value,
+                'changed_by_user_id' => $newOwnerUserId,
             ]);
 
             $agent->current_version_id = $version->id;

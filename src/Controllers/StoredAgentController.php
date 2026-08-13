@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException;
+use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
@@ -382,6 +383,39 @@ class StoredAgentController extends Controller
         }
 
         return response()->json($this->agentResource($agent), 200);
+    }
+
+    /**
+     * POST /agents/{id}/clone (091-agent-clone-fork, contracts §1,
+     * FR-002/FR-013/FR-014). Resolves the source via
+     * AgentQuery::findAgentIncludingTrashed() — a retired source is found,
+     * not 404'd (FR-013). A colliding destination name is refused with a
+     * 409, distinct from the 422 definition-error shape.
+     */
+    public function clone(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgentIncludingTrashed(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $request->validate([
+            'name' => 'required|string',
+        ]);
+
+        try {
+            $clone = $this->service->clone($agent, Auth::id(), $request->input('name'));
+        } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
+            return $this->definitionErrorResponse($e);
+        } catch (AgentNameAlreadyInUseException $e) {
+            return response()->json([
+                'error' => 'agent_name_already_in_use',
+                'message' => $e->getMessage(),
+            ], 409);
+        }
+
+        return response()->json($this->agentResource($clone), 201);
     }
 
     /**

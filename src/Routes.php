@@ -254,6 +254,10 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agents/{id}/divergence', [StoredAgentController::class, "divergence"]);
     Route::post('agents/{id}/sync-from-file', [StoredAgentController::class, "syncFromFile"]);
 
+    // Clone an agent into a complete, independent copy (091-agent-clone-fork,
+    // contracts/agent-clone-api.md §1, Phase 3/US1).
+    Route::post('agents/{id}/clone', [StoredAgentController::class, "clone"]);
+
     // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
     // contracts §4/§5). Named independently by two version ids, not nested
     // under a single agent (research.md D7) — no collision with the
