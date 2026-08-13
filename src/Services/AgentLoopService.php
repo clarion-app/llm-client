@@ -2974,6 +2974,20 @@ class AgentLoopService
             return json_encode(['error' => "The agent \"{$target->name}\" is deactivated and cannot receive a handoff."]);
         }
 
+        $chainMembers = ConversationHandoff::where('conversation_id', $conversation->id)
+            ->pluck('to_agent_id')
+            ->push($conversation->agent_id)
+            ->filter()
+            ->all();
+        if (in_array($target->id, $chainMembers, true)) {
+            return json_encode(['error' => "This conversation has already been handled by \"{$target->name}\" — handing off to it again would create a loop."]);
+        }
+
+        $chainLength = ConversationHandoff::where('conversation_id', $conversation->id)->count();
+        if ($chainLength >= config('llm-client.handoff.max_chain_length', 5)) {
+            return json_encode(['error' => "This conversation has reached its handoff limit ({$chainLength}) and cannot be handed off again."]);
+        }
+
         $from = ConversationHandoff::where('conversation_id', $conversation->id)
             ->orderByDesc('position')
             ->value('to_agent_id') ?? $conversation->agent_id;
