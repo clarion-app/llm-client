@@ -543,4 +543,161 @@ class AgentHandoffJourneyTest extends TestCase
             'no ConversationHandoff row may be written for a system-owned conversation',
         );
     }
+
+    // =================================================================
+    // US4 (quickstart steps 7, 8) — sequenced after T013/T014/T029, same
+    // file.
+    //
+    // handleHandoffToAgent()'s current (Phase 5, T030) body implements
+    // only contracts §1 checks 1, 2, 3, 4, and 7 — check 5 (chain
+    // membership / cycle prevention) and check 6 (chain-length bound) do
+    // not exist yet; both are Phase 6's own scope (T034). Every test
+    // below is expected to FAIL against the current code: the loop-back
+    // handoffs (checks 5) and the beyond-bound handoff (check 6) all
+    // currently SUCCEED (writing a row and returning {"success": true})
+    // when they should be refused.
+    // =================================================================
+
+    #[Test]
+    public function a_handoff_chain_is_refused_once_it_reaches_the_configured_max_length(): void
+    {
+        config(['llm-client.handoff.max_chain_length' => 2]);
+
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+        $agentC = app(AgentService::class)->create($this->user->id, "name: agent-c\ninstructions: I am agent C.");
+        $agentD = app(AgentService::class)->create($this->user->id, "name: agent-d\ninstructions: I am agent D.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $first = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($first['success'] ?? false, 'fixture sanity: the first handoff (A -> B) must succeed');
+
+        $conversation = $conversation->fresh();
+        $second = $this->handoff($conversation, $agentC->id);
+        $this->assertTrue($second['success'] ?? false, 'fixture sanity: the second handoff (B -> C), reaching the configured max_chain_length of 2, must still succeed — only the NEXT one is refused');
+
+        $this->assertSame(
+            2,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'fixture sanity: the chain must be exactly at the configured bound (2) before the third attempt',
+        );
+
+        $conversation = $conversation->fresh();
+        $third = $this->handoff($conversation, $agentD->id);
+
+        $this->assertArrayHasKey(
+            'error',
+            $third,
+            'a handoff attempted once the chain has already reached max_chain_length must be refused, not silently succeed',
+        );
+        $this->assertStringContainsStringIgnoringCase(
+            'handoff limit',
+            $third['error'] ?? '',
+            'the refusal must explain why: the conversation has reached its handoff limit',
+        );
+
+        $this->assertSame(
+            2,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no third ConversationHandoff row may be written once the chain has reached its configured bound',
+        );
+    }
+
+    #[Test]
+    public function a_handoff_cannot_loop_back_to_the_conversations_original_agent(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $first = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($first['success'] ?? false, 'fixture sanity: the first handoff (A -> B) must succeed');
+
+        $conversation = $conversation->fresh();
+        $result = $this->handoff($conversation, $agentA->id);
+
+        $this->assertArrayHasKey(
+            'error',
+            $result,
+            'a handoff back to the conversation\'s ORIGINAL binding agent must be refused as a loop, not silently succeed',
+        );
+        $this->assertStringContainsString(
+            $agentA->name,
+            $result['error'] ?? '',
+            'the refusal must name the already-visited agent (A)',
+        );
+        $this->assertStringContainsStringIgnoringCase(
+            'loop',
+            $result['error'] ?? '',
+            'the refusal must explain why: handing off again would create a loop',
+        );
+
+        $this->assertSame(
+            1,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no new ConversationHandoff row may be written when the target would create a loop — the chain must stay at its pre-attempt length of 1',
+        );
+    }
+
+    #[Test]
+    public function a_handoff_cannot_loop_back_to_any_agent_already_in_a_longer_chain(): void
+    {
+        $agentA = app(AgentService::class)->create($this->user->id, "name: agent-a\ninstructions: I am agent A.");
+        $agentB = app(AgentService::class)->create($this->user->id, "name: agent-b\ninstructions: I am agent B.");
+        $agentC = app(AgentService::class)->create($this->user->id, "name: agent-c\ninstructions: I am agent C.");
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        $first = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($first['success'] ?? false, 'fixture sanity: the first handoff (A -> B) must succeed');
+
+        $conversation = $conversation->fresh();
+        $second = $this->handoff($conversation, $agentC->id);
+        $this->assertTrue($second['success'] ?? false, 'fixture sanity: the second handoff (B -> C) must succeed');
+
+        $this->assertSame(
+            2,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'fixture sanity: the chain must be A -> B -> C (two rows) before the loop-back attempt',
+        );
+
+        $conversation = $conversation->fresh();
+
+        // Attempt to hand off back to B — a MIDDLE link, not the original
+        // (A) — proving membership is checked against the whole chain, not
+        // just its first link.
+        $backToB = $this->handoff($conversation, $agentB->id);
+
+        $this->assertArrayHasKey(
+            'error',
+            $backToB,
+            'a handoff back to ANY agent already in the chain (not just the original) must be refused as a loop',
+        );
+        $this->assertStringContainsString(
+            $agentB->name,
+            $backToB['error'] ?? '',
+            'the refusal must name the already-visited agent (B)',
+        );
+        $this->assertStringContainsStringIgnoringCase('loop', $backToB['error'] ?? '');
+
+        // Attempt to hand off back to A — the ORIGINAL agent, further back
+        // in the chain — refused identically.
+        $backToA = $this->handoff($conversation, $agentA->id);
+
+        $this->assertArrayHasKey(
+            'error',
+            $backToA,
+            'a handoff back to the original agent (A), still further back in a longer chain, must also be refused as a loop',
+        );
+        $this->assertStringContainsString($agentA->name, $backToA['error'] ?? '');
+        $this->assertStringContainsStringIgnoringCase('loop', $backToA['error'] ?? '');
+
+        $this->assertSame(
+            2,
+            ConversationHandoff::where('conversation_id', $conversation->id)->count(),
+            'no new ConversationHandoff row may be written by either loop-back attempt — the chain must stay at its pre-attempt length of 2',
+        );
+    }
 }
