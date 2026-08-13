@@ -215,6 +215,57 @@ YAML;
         }
     }
 
+    /**
+     * Mutation-checklist row 8, T034 addendum (found during Phase 6's final
+     * non-vacuousness pass): the test above alone cannot fully prove parse()
+     * delegates to collect() rather than reimplementing its own throw-on-
+     * first logic, because AgentDefinitionParser is a deliberately stateless
+     * singleton (LlmClientServiceProvider's own comment) -- across two
+     * independent top-level calls, even a correct implementation constructs
+     * two distinct-but-equal exception instances, so assertSame() across
+     * two separate calls can never distinguish "delegates to one collect()
+     * call" from "reimplements independently." What genuinely distinguishes
+     * them, observable from outside, is whether a *single* parse() call
+     * re-derives the result more than once -- re-reading live state (the
+     * operation catalog, in this document's case) redundantly. This is the
+     * same call-count technique the_operation_catalog_is_resolved_exactly_once_per_collect_call()
+     * above already establishes for collect() itself, applied one layer up:
+     * a single parse() call, for a document whose only problem is in a
+     * pattern-based step (steps 8-10, guaranteeing resolveCatalog() is
+     * actually reached), must read the operation catalog exactly once --
+     * never twice, which any reimplementation redundantly re-deriving the
+     * result (whether by calling collect() a second time or duplicating its
+     * step logic inline) would do.
+     */
+    #[Test]
+    public function parse_reads_the_operation_catalog_exactly_once_never_redundantly_re_deriving_its_result(): void
+    {
+        $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
+        $prop->setAccessible(true);
+        $prop->setValue(null, ['paths' => []]);
+
+        $generator = Mockery::mock(Generator::class);
+        $generator->shouldReceive('__invoke')->once()->andReturn(['paths' => []]);
+        $this->app->instance(Generator::class, $generator);
+
+        $raw = <<<YAML
+name: broken-agent
+tools:
+  allow:
+    - nonexistent.operation
+YAML;
+
+        try {
+            (new AgentDefinitionParser())->parse($raw);
+            $this->fail('Expected parse() to throw for an empty-resolving tools.allow pattern.');
+        } catch (AgentDefinitionResolutionException $e) {
+            $this->assertSame(AgentDefinitionResolutionErrorKind::EmptyOperationPattern, $e->kind);
+        }
+
+        // Mockery::close() in tearDown() enforces the ->once() expectation
+        // above -- a redundant second read would fail the test there.
+    }
+
     #[Test]
     public function empty_whitespace_and_empty_mapping_documents_report_missing_name_not_malformed_yaml(): void
     {
