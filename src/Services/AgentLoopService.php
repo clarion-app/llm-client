@@ -67,6 +67,7 @@ class AgentLoopService
     private ?AutoMemoryRetriever $autoMemoryRetriever;
     private ?MetricsRecorder $metricsRecorder;
     private ?RunTraceRecorder $runTraceRecorder;
+    private ConversationAgentDefinitionResolver $agentDefinitionResolver;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -86,7 +87,8 @@ class AgentLoopService
         ?PreferenceInjector $preferenceInjector = null,
         ?AutoMemoryRetriever $autoMemoryRetriever = null,
         ?MetricsRecorder $metricsRecorder = null,
-        ?RunTraceRecorder $runTraceRecorder = null
+        ?RunTraceRecorder $runTraceRecorder = null,
+        ?ConversationAgentDefinitionResolver $agentDefinitionResolver = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -106,6 +108,7 @@ class AgentLoopService
         $this->autoMemoryRetriever = $autoMemoryRetriever;
         $this->metricsRecorder = $metricsRecorder;
         $this->runTraceRecorder = $runTraceRecorder;
+        $this->agentDefinitionResolver = $agentDefinitionResolver ?? new ConversationAgentDefinitionResolver(new AgentDefinitionParser());
     }
 
     /**
@@ -1775,8 +1778,49 @@ class AgentLoopService
      */
     private function formatMessages(Conversation $conversation, array $messages): array
     {
+        // A bound conversation's instructions are appended onto the raw
+        // messages array's own system-role entry BEFORE provider
+        // formatting — never only onto the post-formatting $formatted['system']
+        // result. MessageFormatter's OpenAI/LlamaCpp pass-through branch
+        // always returns an empty 'system' string and keeps the system
+        // message inline in 'messages', so appending only after
+        // formatForProvider() would silently drop the bound instructions
+        // for those provider families (090-agent-version-binding, T027).
+        $definition = $this->agentDefinitionResolver->forConversation($conversation);
+        if ($definition !== null) {
+            $messages = $this->appendBoundInstructions($messages, $definition->instructions);
+        }
+
         $providerType = $conversation->effectiveProviderType;
         return $this->messageFormatter->formatForProvider($messages, $providerType);
+    }
+
+    /**
+     * Appends a bound agent version's instructions onto the first
+     * system-role entry in $messages, or prepends a new one if none exists
+     * (matching buildMessagesPayload()'s own convention of always placing
+     * its system entry first when present). No-op when $instructions is
+     * effectively absent from the caller's perspective — callers only
+     * invoke this when a bound AgentDefinition was actually resolved.
+     */
+    private function appendBoundInstructions(array $messages, string $instructions): array
+    {
+        foreach ($messages as $index => $message) {
+            $role = is_array($message) ? ($message['role'] ?? null) : ($message->role ?? null);
+            if ($role === 'system') {
+                if (is_array($message)) {
+                    $messages[$index]['content'] = ($message['content'] ?? '') . "\n\n" . $instructions;
+                } else {
+                    $messages[$index]->content = ($message->content ?? '') . "\n\n" . $instructions;
+                }
+
+                return $messages;
+            }
+        }
+
+        array_unshift($messages, ['role' => 'system', 'content' => $instructions]);
+
+        return $messages;
     }
 
     /**
@@ -2441,6 +2485,22 @@ class AgentLoopService
 
         // Check confirmation/rejection
         $validation = ApiCallValidator::validate($operationId, $method, $pathTemplate);
+
+        // A bound agent version's own tools.deny/safety.* narrows what the
+        // installation-wide check alone would have allowed — it never
+        // widens past it (090-agent-version-binding, T028, contracts §3).
+        // No-op when the conversation is unbound.
+        $boundDefinition = $this->agentDefinitionResolver->forConversation($conversation);
+        if ($boundDefinition !== null && $validation['status'] !== ApiCallValidator::STATUS_REJECT) {
+            if (!$boundDefinition->isOperationPermitted($operationId)) {
+                $validation = [
+                    'status' => ApiCallValidator::STATUS_REJECT,
+                    'reason' => 'Operation not permitted by the agent version this conversation is bound to.',
+                ];
+            } elseif ($boundDefinition->isConfirmationRequired($operationId) && $validation['status'] !== ApiCallValidator::STATUS_CONFIRM) {
+                $validation['status'] = ApiCallValidator::STATUS_CONFIRM;
+            }
+        }
 
         if ($validation['status'] === 'reject') {
             return json_encode(['error' => $validation['reason'] ?? 'Operation rejected']);
