@@ -628,6 +628,7 @@ class StoredAgentController extends Controller
             'name' => $agent->name,
             'current_version_number' => $agent->currentVersion?->version_number,
             'linked' => $agent->linked_repository_path !== null,
+            'is_active' => $agent->is_active,
         ];
     }
 
