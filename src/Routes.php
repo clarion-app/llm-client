@@ -35,6 +35,7 @@ use ClarionApp\LlmClient\Controllers\EvalJudgmentController;
 use ClarionApp\LlmClient\Controllers\EvalReferenceController;
 use ClarionApp\LlmClient\Controllers\EvalRunComparisonController;
 use ClarionApp\LlmClient\Controllers\EvalDashboardController;
+use ClarionApp\LlmClient\Controllers\StoredAgentController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -222,6 +223,13 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Case detail composition — given/expected_behavior/produced_response/
     // judgment reasoning (contracts/eval-dashboard-api.md §2)
     Route::get('eval-runs/{runId}/cases/{caseResultId}/detail', [EvalDashboardController::class, "caseDetail"]);
+
+    // Agent version history (contracts/agent-versioning-api.md §1/§4) — the
+    // `agents` (plural) route group, deliberately distinct from the
+    // pre-existing singular `Route::post('agent', AgentController::class)`
+    // above (087-agent-model-versioning, Phase 3/US1).
+    Route::post('agents', [StoredAgentController::class, "store"]);
+    Route::put('agents/{id}', [StoredAgentController::class, "update"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
