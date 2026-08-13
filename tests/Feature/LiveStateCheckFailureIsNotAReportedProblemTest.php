@@ -4,6 +4,8 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
+use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use Dedoc\Scramble\Generator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -72,6 +74,54 @@ YAML;
         // exists to preserve.
         $this->assertNull($response->json('valid'));
         $this->assertNull($response->json('problems'));
+    }
+
+    /**
+     * Same fixture as above, but asserting on the propagated exception's
+     * own concrete type rather than only the HTTP status. A bare
+     * assertStatus(500) cannot distinguish "propagated uncaught, as
+     * research.md D6 designs it" from "got caught into `problems` by a
+     * widened catch, then blew up three layers downstream for an
+     * unrelated typing reason" -- both produce an ordinary 500 (tasks.md
+     * Progress Log Phase 6, mutation-checklist row 7's documented
+     * Feature-level test-precision gap: this suite's original single
+     * test gave zero real signal against the specific mutation that
+     * widens collect()'s catch scope, because
+     * StoredAgentController::checkResultResource()'s typed closure
+     * parameter throws its own unrelated TypeError on the leaked
+     * QueryException -- also a 500, and also not an
+     * AgentDefinitionParseException/AgentDefinitionResolutionException,
+     * so a "not one of the two domain types" assertion alone is
+     * insufficient too). Asserting the caught throwable IS specifically
+     * the underlying QueryException (not merely "isn't a domain
+     * exception") is what actually distinguishes the two: under the row
+     * 7 mutation the caught throwable is a TypeError instead, so this
+     * assertion goes red exactly when it should.
+     */
+    #[Test]
+    public function the_propagated_failure_is_the_underlying_database_exception_itself(): void
+    {
+        Schema::drop('language_models');
+
+        $raw = <<<YAML
+name: broken-agent
+model: some-model
+YAML;
+
+        $this->withoutExceptionHandling();
+
+        $caught = null;
+
+        try {
+            $this->actingAs($this->user)
+                ->postJson($this->checkUrl(), ['definition' => $raw]);
+        } catch (\Throwable $e) {
+            $caught = $e;
+        }
+
+        $this->assertInstanceOf(\Illuminate\Database\QueryException::class, $caught);
+        $this->assertNotInstanceOf(AgentDefinitionParseException::class, $caught);
+        $this->assertNotInstanceOf(AgentDefinitionResolutionException::class, $caught);
     }
 
     /**

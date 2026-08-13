@@ -85,6 +85,31 @@ class EmptyVsMalformedDefinitionTest extends TestCase
     }
 
     /**
+     * FR-006's "same terms" guarantee applies to a save *attempt*, not
+     * only to the dedicated check endpoint (research.md D8/D9) -- an
+     * empty-string or whitespace-only `definition` posted directly to
+     * `POST /agents`/`PUT /agents/{id}` must report the identical
+     * {valid, problems, warnings} 422 shape `POST /agents/check` reports
+     * for the same content (MissingName), not Laravel's differently-
+     * shaped default `required`-rule validation-error body. store()/
+     * update() use the same `present|nullable|string` rule as check()
+     * for exactly this reason.
+     */
+    #[Test]
+    public function an_empty_or_whitespace_only_definition_posted_directly_to_store_reports_missing_name_not_a_generic_validation_error(): void
+    {
+        foreach (['', "   \n"] as $raw) {
+            $response = $this->actingAs($this->user)
+                ->postJson('/api/clarion-app/llm-client/agents', ['definition' => $raw]);
+
+            $response->assertStatus(422, 'input: ' . var_export($raw, true));
+            $response->assertJson(['valid' => false], 'input: ' . var_export($raw, true));
+            $this->assertCount(1, $response->json('problems'), 'input: ' . var_export($raw, true));
+            $this->assertSame('MissingName', $response->json('problems.0.kind'), 'input: ' . var_export($raw, true));
+        }
+    }
+
+    /**
      * Seeds both of ApiManager's live-catalog seams -- see
      * AgentDefinitionFullJourneyTest/AgentDefinitionSafetyCeilingJourneyTest
      * for the established convention this mirrors exactly.

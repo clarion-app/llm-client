@@ -85,14 +85,25 @@ class StoredAgentController extends Controller
      * AgentService::create() (research.md D8) — on any blocking problem,
      * returns the byte-identical body POST /agents/check would return for
      * the same content, and AgentService is never invoked.
+     *
+     * `present|nullable|string` (not `required|string`) for the identical
+     * reason check()'s own docblock explains: an empty-string or
+     * whitespace-only body value is a genuine, checkable document (it
+     * reports MissingName, research.md D5) that must reach
+     * AgentDefinitionValidator::check() and produce the same
+     * {valid, problems, warnings} 422 shape check() would report for the
+     * same content (FR-006's "same terms" guarantee) — not Laravel's own,
+     * differently-shaped `required` validation-error body, which the
+     * global ConvertEmptyStringsToNull middleware would otherwise trigger
+     * for an empty/whitespace-only definition.
      */
     public function store(Request $request): JsonResponse
     {
         $request->validate([
-            'definition' => 'required|string',
+            'definition' => 'present|nullable|string',
         ]);
 
-        $rawYaml = $request->input('definition');
+        $rawYaml = (string) $request->input('definition');
         $result = $this->validator->check($rawYaml);
 
         if (!$result->valid) {
@@ -114,7 +125,12 @@ class StoredAgentController extends Controller
      *
      * 088-agent-definition-validator: identical pre-save check treatment
      * as store() (research.md D8) — checked first, AgentService::update()
-     * never called on a blocking problem.
+     * never called on a blocking problem. Uses the identical
+     * `present|nullable|string` rule as store() for the identical reason
+     * (see store()'s own docblock) — an empty/whitespace-only definition
+     * must reach the validator and report MissingName in the standard
+     * {valid, problems, warnings} shape, not Laravel's own differently-
+     * shaped `required` validation error.
      */
     public function update(Request $request, string $id): JsonResponse
     {
@@ -125,10 +141,10 @@ class StoredAgentController extends Controller
         }
 
         $request->validate([
-            'definition' => 'required|string',
+            'definition' => 'present|nullable|string',
         ]);
 
-        $rawYaml = $request->input('definition');
+        $rawYaml = (string) $request->input('definition');
         $result = $this->validator->check($rawYaml);
 
         if (!$result->valid) {
