@@ -889,11 +889,13 @@ abstract class TestCase extends BaseTestCase
                 $table->string('linked_repository_path', 1024)->nullable();
                 $table->string('linked_file_path', 1024)->nullable();
                 $table->string('linked_synced_file_hash', 64)->nullable();
+                $table->uuid('cloned_from_agent_id')->nullable();
                 $table->timestamps();
                 $table->softDeletes();
 
                 $table->index('user_id');
                 $table->index('current_version_id');
+                $table->index('cloned_from_agent_id');
             });
         }
 

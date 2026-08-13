@@ -32,6 +32,29 @@ class AgentQuery
     }
 
     /**
+     * The trash-inclusive counterpart to findAgent() (091, research.md D5)
+     * — finds an agent by id regardless of whether it has been retired
+     * (soft-deleted), still scoped by caller ownership.
+     *
+     * Two call sites: clone()'s own source resolution (Phase 3, FR-013 —
+     * a retired source is found, not 404'd), and cloned_from display
+     * (Phase 4, FR-008 — a since-removed origin still resolves for
+     * display). findAgent() itself is deliberately left untouched — every
+     * other existing action keeps excluding trashed agents exactly as
+     * before.
+     *
+     * @return Agent|null Null uniformly for "doesn't exist" and "belongs
+     *   to someone else," identical to findAgent()'s own contract.
+     */
+    public function findAgentIncludingTrashed(string $callerUserId, string $agentId): ?Agent
+    {
+        return Agent::withTrashed()
+            ->where('id', $agentId)
+            ->where('user_id', $callerUserId)
+            ->first();
+    }
+
+    /**
      * Every agent the caller owns (contracts §2) — unpaginated, per
      * contracts §2's own "scale/scope expects a small per-user count" note.
      *

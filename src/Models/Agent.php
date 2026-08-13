@@ -31,6 +31,7 @@ class Agent extends Model
         'linked_repository_path',
         'linked_file_path',
         'linked_synced_file_hash',
+        'cloned_from_agent_id',
     ];
 
     /** The version currently in effect for this agent. */
@@ -46,5 +47,19 @@ class Agent extends Model
     public function versions(): HasMany
     {
         return $this->hasMany(AgentVersion::class, 'agent_id')->orderBy('version_number');
+    }
+
+    /**
+     * The agent this one was cloned from, if any (091, data-model.md §1).
+     *
+     * A plain belongsTo with no withTrashed() baked in — a since-removed
+     * origin will not resolve through this relation. Display code that
+     * needs a since-removed origin to still resolve uses
+     * AgentQuery::findAgentIncludingTrashed() instead, never this relation
+     * directly.
+     */
+    public function clonedFrom(): BelongsTo
+    {
+        return $this->belongsTo(Agent::class, 'cloned_from_agent_id');
     }
 }
