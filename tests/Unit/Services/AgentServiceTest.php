@@ -6,6 +6,7 @@ use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
+use ClarionApp\LlmClient\Exceptions\LastActiveAgentException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Models\LanguageModel;
@@ -736,5 +737,162 @@ YAML;
 
         $this->assertSame($agentsBefore, DB::table('agents')->count(), 'a rejected clone() must write no agent row');
         $this->assertSame($versionsBefore, DB::table('agent_versions')->count(), 'a rejected clone() must write no version row');
+    }
+
+    // ---------------------------------------------------------------
+    // activate()/deactivate() — US1 (092-agent-activation, FR-001/FR-002/
+    // FR-003/FR-004/FR-013/FR-014, research.md D1/D6, data-model.md §1/§3)
+    //
+    // Written first, confirmed RED: AgentService has no activate()/
+    // deactivate() methods yet — Phase 3's own implementation (T011) comes
+    // after these tests.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function deactivating_an_active_agent_flips_is_active_to_false_and_touches_nothing_else(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agent = $this->service()->create($user->id, $this->validYaml('agent-a'));
+        // A sibling active agent, so agent-a is never the caller's last
+        // active one — this test is about the plain toggle, not FR-013.
+        $this->service()->create($user->id, $this->validYaml('agent-b'));
+        $currentVersionIdBefore = $agent->current_version_id;
+        $versionCountBefore = AgentVersion::where('agent_id', $agent->id)->count();
+
+        $deactivated = $this->service()->deactivate($agent, false);
+
+        $this->assertFalse($deactivated->is_active, 'deactivate() must flip is_active to false');
+        $this->assertSame($currentVersionIdBefore, $deactivated->current_version_id, 'deactivate() must never repoint current_version_id');
+        $this->assertSame(
+            $versionCountBefore,
+            AgentVersion::where('agent_id', $agent->id)->count(),
+            'deactivate() must never write an AgentVersion row (FR-003)',
+        );
+    }
+
+    #[Test]
+    public function reactivating_a_deactivated_agent_flips_is_active_back_to_true(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agent = $this->service()->create($user->id, $this->validYaml('agent-a'));
+        $this->service()->create($user->id, $this->validYaml('agent-b'));
+        $agent = $this->service()->deactivate($agent, false);
+        $this->assertFalse($agent->is_active, 'fixture sanity: the agent must actually be deactivated first');
+
+        $reactivated = $this->service()->activate($agent);
+
+        $this->assertTrue($reactivated->is_active, 'activate() must flip is_active back to true');
+    }
+
+    #[Test]
+    public function deactivating_an_already_deactivated_agent_is_a_clean_no_op_no_write(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agent = $this->service()->create($user->id, $this->validYaml('agent-a'));
+        $this->service()->create($user->id, $this->validYaml('agent-b'));
+        $agent = $this->service()->deactivate($agent, false);
+        $this->assertFalse($agent->is_active, 'fixture sanity: the agent must actually be deactivated first');
+        $updatedAtBefore = $agent->fresh()->updated_at;
+
+        $again = $this->service()->deactivate($agent, false);
+
+        $this->assertFalse($again->is_active);
+        $this->assertEquals(
+            $updatedAtBefore,
+            $again->fresh()->updated_at,
+            'deactivating an already-deactivated agent must perform no write (FR-014) — updated_at must be byte-identical',
+        );
+    }
+
+    #[Test]
+    public function activating_an_already_active_agent_is_a_clean_no_op_no_write(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agent = $this->service()->create($user->id, $this->validYaml('agent-a'));
+        $this->assertTrue((bool) $agent->is_active, 'fixture sanity: a freshly created agent defaults to active');
+        $updatedAtBefore = $agent->fresh()->updated_at;
+
+        $again = $this->service()->activate($agent);
+
+        $this->assertTrue($again->is_active);
+        $this->assertEquals(
+            $updatedAtBefore,
+            $again->fresh()->updated_at,
+            'activating an already-active agent must perform no write (FR-014) — updated_at must be byte-identical',
+        );
+    }
+
+    #[Test]
+    public function deactivating_the_callers_last_remaining_active_agent_without_confirm_throws_and_writes_nothing(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agent = $this->service()->create($user->id, $this->validYaml('only-agent'));
+
+        try {
+            $this->service()->deactivate($agent, false);
+            $this->fail('Expected LastActiveAgentException when deactivating the caller\'s only active agent without confirm.');
+        } catch (LastActiveAgentException $e) {
+            $this->assertSame($agent->id, $e->agentId);
+            $this->assertSame('only-agent', $e->agentName);
+        }
+
+        $this->assertTrue(
+            Agent::find($agent->id)->is_active,
+            'no partial write: the agent must still be active after the refusal (FR-013)',
+        );
+    }
+
+    #[Test]
+    public function deactivating_the_last_active_agent_succeeds_when_confirmed_is_true(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $agent = $this->service()->create($user->id, $this->validYaml('only-agent'));
+
+        $deactivated = $this->service()->deactivate($agent, true);
+
+        $this->assertFalse($deactivated->is_active, 'confirm: true must let the person deliberately proceed anyway (research.md D6)');
+    }
+
+    #[Test]
+    public function the_last_active_agent_guard_is_scoped_per_user_never_installation_wide(): void
+    {
+        $this->seedOperationCatalog();
+        $userA = $this->user();
+        $userB = $this->user();
+        $agentA = $this->service()->create($userA->id, $this->validYaml('agent-a-only'));
+        $agentB = $this->service()->create($userB->id, $this->validYaml('agent-b-only'));
+
+        $this->service()->deactivate($agentA, true);
+
+        $this->assertTrue(
+            Agent::find($agentB->id)->is_active,
+            "user A deactivating their own last active agent must never affect user B's completely separate agent",
+        );
+
+        try {
+            $this->service()->deactivate($agentB->fresh(), false);
+            $this->fail("Expected LastActiveAgentException for user B's own last active agent — the guard must count only user B's own agents, not the whole installation.");
+        } catch (LastActiveAgentException $e) {
+            $this->assertSame($agentB->id, $e->agentId);
+        }
+    }
+
+    #[Test]
+    public function deactivating_an_agent_that_is_not_the_callers_last_active_one_without_confirm_succeeds_directly(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+        $first = $this->service()->create($user->id, $this->validYaml('agent-a'));
+        $this->service()->create($user->id, $this->validYaml('agent-b'));
+
+        $deactivated = $this->service()->deactivate($first, false);
+
+        $this->assertFalse($deactivated->is_active, 'a non-last active agent must deactivate directly, with no exception');
     }
 }
