@@ -105,6 +105,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agent-runs/{runId}/delegations', [DelegationController::class, "forRun"]);
     Route::get('delegations/{id}', [DelegationController::class, "show"]);
     Route::get('agent-runs/{runId}/cost-with-delegations', [DelegationController::class, "cost"]);
+    // Result aggregation read endpoint (099 US3)
+    Route::get('agent-runs/{runId}/combined-results', [DelegationController::class, "combinedResults"]);
 
     // Model price configuration endpoints (073 US1) — operator-only
     Route::get('model-prices', [ModelPriceController::class, "index"]);

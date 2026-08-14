@@ -784,4 +784,194 @@ class DelegationQueryControllerTest extends TestCase
         $this->assertSame('no_output', $row['result_reason']);
         $this->assertNull($row['result_output']);
     }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 5 (US3), tasks.md T032 --
+    // GET /agent-runs/{runId}/combined-results (contracts/
+    // result-aggregation-api.md §2, data-model.md §4/§6). Sequenced after
+    // T015/T025 (this file's own two prior 099 extensions) -- not [P].
+    // Built directly against hand-built Delegation rows, mirroring this
+    // file's own established "shape/ownership scenarios build their
+    // fixtures directly" precedent (no agent-loop scaffolding needed,
+    // research.md D5).
+    //
+    // Written before DelegationController::combinedResults() and its
+    // route exist -- every request below hits Laravel's own "route not
+    // found" 404 (a different body/shape from what the eventual
+    // controller returns for a 200, a 200 null, or its own uniform
+    // not-found response), matching this file's own class docblock
+    // precedent for its Phase 4-era endpoints -- so every assertion below
+    // is expected to FAIL red, non-vacuously.
+    //
+    // Per ResultAggregationServiceTest's own T030 docblock: each
+    // `contributors` entry may carry an additional `output` field beyond
+    // the five checked here (helper_agent_id/helper_agent_name are
+    // checked via assertArrayHasKey rather than an exact key-set match on
+    // each entry) -- needed so AgentLoopService::buildCombinedHelperResultsSection()
+    // can attribute a combined_output entry back to its specific
+    // contributor(s) without a second, redundant Delegation query. The
+    // *top-level* response shape (run_id/contributors/combined_output/
+    // conflicts/truncated) is still asserted exactly, per contracts §2.
+    // =================================================================
+
+    private function combinedResultsUrl(string $runId): string
+    {
+        return "/api/clarion-app/llm-client/agent-runs/{$runId}/combined-results";
+    }
+
+    #[Test]
+    public function combined_results_returns_404_for_a_nonexistent_run(): void
+    {
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson($this->combinedResultsUrl((string) Str::uuid()));
+
+        $response->assertStatus(404)->assertJsonStructure(['error', 'code']);
+    }
+
+    #[Test]
+    public function combined_results_returns_404_for_a_foreign_owned_run(): void
+    {
+        $runId = $this->makeRun($this->otherUser);
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson($this->combinedResultsUrl($runId));
+
+        $response->assertStatus(404)->assertJsonStructure(['error', 'code']);
+    }
+
+    #[Test]
+    public function combined_results_returns_200_null_for_an_owned_run_with_zero_delegations(): void
+    {
+        $runId = $this->makeRun($this->user);
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson($this->combinedResultsUrl($runId));
+
+        $response->assertStatus(200);
+        // assertContent('null'), not assertNull($response->json()):
+        // TestResponse::json() calls decodeResponseJson(), which treats a
+        // fully-decoded-to-null body as an invalid response and fails with
+        // "Invalid JSON was returned from the route." before ever
+        // returning -- true for every response whose entire JSON payload
+        // is the literal top-level `null`, regardless of what the
+        // controller returns. Same fix as this repo's own
+        // EvalReferenceController::current()/RegressionReportJourneyTest.php
+        // precedent for the identical "a real, valid 200 null body" case.
+        $response->assertContent('null');
+    }
+
+    #[Test]
+    public function combined_results_returns_200_null_for_an_owned_run_with_exactly_one_qualifying_delegation(): void
+    {
+        $runId = $this->makeRun($this->user);
+        $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Done.',
+            'result_output' => json_encode(['a' => 1]),
+            'result_undone' => '',
+        ]);
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson($this->combinedResultsUrl($runId));
+
+        $response->assertStatus(200);
+        $response->assertContent('null');
+    }
+
+    #[Test]
+    public function combined_results_returns_the_full_shape_for_two_delegations_to_different_helpers(): void
+    {
+        $runId = $this->makeRun($this->user);
+
+        $extractor = $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Extracted the line items.',
+            'result_output' => json_encode(['line_items' => ['Widget A', 'Widget B']]),
+            'result_undone' => '',
+        ]);
+        $normalizer = $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Normalized the currency.',
+            'result_output' => json_encode(['currency' => 'USD']),
+            'result_undone' => '',
+        ]);
+
+        $extractorName = Agent::find($extractor->helper_agent_id)->name;
+        $normalizerName = Agent::find($normalizer->helper_agent_id)->name;
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson($this->combinedResultsUrl($runId));
+
+        $response->assertStatus(200)->assertJsonStructure([
+            'run_id', 'contributors', 'combined_output', 'conflicts', 'truncated',
+        ]);
+
+        $body = $response->json();
+        $this->assertSame(
+            ['run_id', 'contributors', 'combined_output', 'conflicts', 'truncated'],
+            array_keys($body),
+            'the top-level response shape must be exactly contracts/result-aggregation-api.md §2\'s five keys',
+        );
+        $this->assertSame($runId, $body['run_id']);
+        $this->assertCount(2, $body['contributors']);
+        $this->assertSame([], $body['conflicts']);
+        $this->assertFalse($body['truncated']);
+        $this->assertSame(
+            ['line_items' => ['Widget A', 'Widget B'], 'currency' => 'USD'],
+            $body['combined_output'],
+        );
+
+        $byDelegationId = collect($body['contributors'])->keyBy('delegation_id');
+        $this->assertArrayHasKey($extractor->id, $byDelegationId);
+        $this->assertArrayHasKey($normalizer->id, $byDelegationId);
+
+        $extractorRow = $byDelegationId[$extractor->id];
+        $this->assertArrayHasKey('helper_agent_id', $extractorRow);
+        $this->assertArrayHasKey('helper_agent_name', $extractorRow);
+        $this->assertSame($extractor->helper_agent_id, $extractorRow['helper_agent_id']);
+        $this->assertSame($extractorName, $extractorRow['helper_agent_name']);
+
+        $normalizerRow = $byDelegationId[$normalizer->id];
+        $this->assertSame($normalizer->helper_agent_id, $normalizerRow['helper_agent_id']);
+        $this->assertSame($normalizerName, $normalizerRow['helper_agent_name']);
+    }
+
+    #[Test]
+    public function combined_results_provenance_is_unchanged_when_refetched_after_the_run_has_fully_ended(): void
+    {
+        // makeRun() both opens AND closes the run (RunEndState::Completed)
+        // before this test ever calls the endpoint -- there is no live
+        // conversation in progress at any point below, matching the
+        // "later reviewer of the interaction record" framing (research.md
+        // D5/D8) directly, not merely simulating it after the fact.
+        $runId = $this->makeRun($this->user);
+
+        $extractor = $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Extracted the line items.',
+            'result_output' => json_encode(['line_items' => ['Widget A']]),
+            'result_undone' => '',
+        ]);
+        $normalizer = $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Normalized the currency.',
+            'result_output' => json_encode(['currency' => 'USD']),
+            'result_undone' => '',
+        ]);
+
+        $first = $this->actingAs($this->user, 'api')->getJson($this->combinedResultsUrl($runId));
+        $first->assertStatus(200);
+
+        $second = $this->actingAs($this->user, 'api')->getJson($this->combinedResultsUrl($runId));
+        $second->assertStatus(200);
+
+        $this->assertSame(
+            $first->json(),
+            $second->json(),
+            'a later reviewer re-fetching the same run\'s combined results after it has fully ended must see byte-identical provenance -- no live conversation required',
+        );
+
+        $contributorIds = array_column($first->json()['contributors'], 'delegation_id');
+        $this->assertEqualsCanonicalizing([$extractor->id, $normalizer->id], $contributorIds);
+    }
 }

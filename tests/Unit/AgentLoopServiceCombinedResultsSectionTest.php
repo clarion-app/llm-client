@@ -1,0 +1,176 @@
+<?php
+
+namespace ClarionApp\LlmClient\Tests\Unit;
+
+use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\McpToolExecutor;
+use ClarionApp\LlmClient\Services\McpToolRegistry;
+use ClarionApp\LlmClient\Services\OperationCache;
+use ClarionApp\LlmClient\Services\ResultAggregationService;
+use Mockery;
+use PHPUnit\Framework\Attributes\Test;
+use Tests\TestCase;
+
+/**
+ * 099-result-aggregation, Phase 5 (US3), tasks.md T031.
+ *
+ * Unit tests for the new
+ * `AgentLoopService::buildCombinedHelperResultsSection(?string $runId): ?string`
+ * (data-model.md §5, contracts/result-aggregation-meta-tool.md §3) --
+ * mirrors `buildKnownHelpersSection()`'s own established shape, and
+ * exercises it exactly the way `AgentLoopServiceTest::invokeBuildKnownOperationsSection()`
+ * exercises its own sibling section builder: directly, via reflection,
+ * since these builders are not part of the class's public surface.
+ * `ResultAggregationService` is bound into the container as a full
+ * Mockery double -- no real Delegation/Agent fixtures, no LLM call,
+ * matching research.md D5's "fully testable... independent of any LLM
+ * call" claim for the combination machinery this method only renders,
+ * never computes.
+ *
+ * Design note (see `ResultAggregationServiceTest`'s own T030 docblock for
+ * the full rationale): each mocked `contributors` entry below carries an
+ * `output` field beyond the six data-model.md §4 names, since
+ * contracts §3's own literal example attributes each `combined_output`
+ * entry to the specific helper name(s) that produced it -- data neither
+ * `combined_output` (a flat map) nor a bare `contributors` entry (without
+ * `output`) can reconstruct on its own.
+ *
+ * Written before `buildCombinedHelperResultsSection()` exists at all --
+ * every assertion below is expected to FAIL red (method does not exist on
+ * `AgentLoopService`).
+ */
+class AgentLoopServiceCombinedResultsSectionTest extends TestCase
+{
+    protected function tearDown(): void
+    {
+        Mockery::close();
+
+        parent::tearDown();
+    }
+
+    private function service(): AgentLoopService
+    {
+        return new AgentLoopService(
+            app(McpToolRegistry::class),
+            app(McpToolExecutor::class),
+            app(OperationCache::class),
+        );
+    }
+
+    /**
+     * Invokes the (expected-private) buildCombinedHelperResultsSection()
+     * via reflection -- AgentLoopServiceTest's own established
+     * invokeBuildKnownOperationsSection() precedent for a system-prompt
+     * section builder that is not part of the class's public surface.
+     * setAccessible(true) also tolerates the method turning out public.
+     */
+    private function invoke(AgentLoopService $service, ?string $runId): ?string
+    {
+        $reflection = new \ReflectionClass($service);
+        $method = $reflection->getMethod('buildCombinedHelperResultsSection');
+        $method->setAccessible(true);
+
+        return $method->invoke($service, $runId);
+    }
+
+    private function mockCombineForRun(?array $return, ?string $expectedRunId = null): void
+    {
+        $mock = Mockery::mock(ResultAggregationService::class);
+        $expectation = $mock->shouldReceive('combineForRun')->once();
+        if ($expectedRunId !== null) {
+            $expectation->with($expectedRunId);
+        }
+        $expectation->andReturn($return);
+        $this->app->instance(ResultAggregationService::class, $mock);
+    }
+
+    // =================================================================
+    // null when combineForRun() returns null
+    // =================================================================
+
+    #[Test]
+    public function returns_null_when_combine_for_run_returns_null(): void
+    {
+        $runId = 'run-with-fewer-than-two-delegations';
+        $this->mockCombineForRun(null, $runId);
+
+        $this->assertNull($this->invoke($this->service(), $runId));
+    }
+
+    #[Test]
+    public function passes_the_run_id_through_to_combine_for_run_unchanged(): void
+    {
+        $runId = 'exact-run-id-1234';
+        $this->mockCombineForRun(null, $runId);
+
+        // Mockery's own with()/once() expectations set up in
+        // mockCombineForRun() are the assertion here -- Mockery::close()
+        // in tearDown() verifies the run id actually reached the service
+        // call unchanged, not merely that *some* string was passed.
+        $this->invoke($this->service(), $runId);
+        $this->assertTrue(true);
+    }
+
+    // =================================================================
+    // Non-null combined view -> rendered "## Combined Helper Results"
+    // section with per-key provenance (contracts §3)
+    // =================================================================
+
+    #[Test]
+    public function renders_the_combined_helper_results_section_with_provenance_when_combine_for_run_is_non_null(): void
+    {
+        $runId = 'run-with-two-delegations';
+
+        $this->mockCombineForRun([
+            'contributors' => [
+                [
+                    'delegation_id' => 'delegation-extractor',
+                    'helper_agent_id' => 'agent-extractor',
+                    'helper_agent_name' => 'Invoice Line-Item Extractor',
+                    'status' => 'success',
+                    'summary' => 'Extracted all five line items from the invoice.',
+                    'undone' => '',
+                    'output' => ['line_items' => ['Widget A', 'Widget B'], 'currency' => 'USD'],
+                ],
+                [
+                    'delegation_id' => 'delegation-normalizer',
+                    'helper_agent_id' => 'agent-normalizer',
+                    'helper_agent_name' => 'Currency Normalizer',
+                    'status' => 'success',
+                    'summary' => 'Normalized all currency fields to USD.',
+                    'undone' => '',
+                    'output' => ['currency' => 'USD'],
+                ],
+            ],
+            'combined_output' => [
+                'line_items' => ['Widget A', 'Widget B'],
+                'currency' => 'USD',
+            ],
+            'conflicts' => [],
+            'truncated' => false,
+        ], $runId);
+
+        $section = $this->invoke($this->service(), $runId);
+
+        $this->assertNotNull($section);
+        $this->assertStringContainsString('## Combined Helper Results', $section);
+        $this->assertStringContainsString('line_items', $section);
+        $this->assertStringContainsString(
+            '(from "Invoice Line-Item Extractor")',
+            $section,
+            'a key produced by exactly one contributor must name that one contributor',
+        );
+        $this->assertStringContainsString('currency', $section);
+        $this->assertStringContainsString(
+            '(from "Invoice Line-Item Extractor", "Currency Normalizer")',
+            $section,
+            'a key produced identically by two contributors must name both, in contributor order',
+        );
+        $this->assertStringNotContainsString(
+            'Conflicting',
+            $section,
+            'no conflicts block belongs in the Phase 5 baseline case -- conflicts is empty (Phase 6 adds the conflicting case)',
+        );
+    }
+
+}

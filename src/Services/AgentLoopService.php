@@ -303,7 +303,7 @@ class AgentLoopService
 
         $tools = $this->buildToolsPayload($decision->withheldTools);
         $formattedTools = $this->formatTools($conversation, $tools);
-        $rawMessages = $this->buildMessagesPayload($conversation);
+        $rawMessages = $this->buildMessagesPayload($conversation, $runId);
 
         // Measure context window trim timing for retroactive action recording.
         $reshapeTuple = null;
@@ -442,7 +442,7 @@ class AgentLoopService
 
         $tools = $this->buildToolsPayload($decision->withheldTools);
         $formattedTools = $this->formatTools($conversation, $tools);
-        $rawMessages = $this->buildMessagesPayload($conversation);
+        $rawMessages = $this->buildMessagesPayload($conversation, $runId);
 
         // Measure context window trim timing for retroactive action recording.
         $reshapeTuple = null;
@@ -830,7 +830,7 @@ class AgentLoopService
                     );
                 }
 
-                $rawMessages = $this->buildMessagesPayload($conversation);
+                $rawMessages = $this->buildMessagesPayload($conversation, $runId);
 
                 // Site 3: ContextReshape around applyContextWindowTrim in run().
                 $activeActionId = null;
@@ -1508,7 +1508,7 @@ class AgentLoopService
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
         for (; $iteration <= $maxIterations; $iteration++) {
-            $rawMessages = $this->buildMessagesPayload($conversation);
+            $rawMessages = $this->buildMessagesPayload($conversation, $runId);
 
             // Site 7: ContextReshape around applyContextWindowTrim in resumeSync().
             $reshapeActionId = null;
@@ -2888,6 +2888,63 @@ class AgentLoopService
     }
 
     /**
+     * Builds a "Combined Helper Results" section for the system prompt
+     * (099-result-aggregation, contracts/result-aggregation-meta-tool.md
+     * §3, data-model.md §5) -- mirrors buildKnownHelpersSection()'s exact
+     * "query fresh per call, append only when non-empty" shape. Returns
+     * null when no run id is available, or ResultAggregationService::
+     * combineForRun() itself returns null (fewer than two delegations on
+     * this run have reported a structured result). Recomputed fresh on
+     * every call -- never cached -- so a delegation completed mid-turn is
+     * reflected on the very next call within the same run.
+     */
+    private function buildCombinedHelperResultsSection(?string $runId): ?string
+    {
+        if ($runId === null) {
+            return null;
+        }
+
+        $combined = app(ResultAggregationService::class)->combineForRun($runId);
+
+        if ($combined === null) {
+            return null;
+        }
+
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '## Combined Helper Results';
+        $lines[] = '';
+        $lines[] = 'The following facts were produced by your helpers this turn:';
+
+        foreach ($combined['combined_output'] as $key => $value) {
+            $contributorNames = [];
+            foreach ($combined['contributors'] as $contributor) {
+                if (is_array($contributor['output'] ?? null) && array_key_exists($key, $contributor['output'])) {
+                    $contributorNames[] = $contributor['helper_agent_name'] ?? 'a retired agent';
+                }
+            }
+
+            $quotedNames = implode(', ', array_map(fn ($name) => "\"{$name}\"", $contributorNames));
+            $lines[] = "- {$key}: ".json_encode($value)." (from {$quotedNames})";
+        }
+
+        if (!empty($combined['conflicts'])) {
+            $lines[] = '';
+            $lines[] = '⚠ Conflicting values — not resolved automatically:';
+
+            foreach ($combined['conflicts'] as $conflict) {
+                $valueParts = array_map(
+                    fn ($entry) => json_encode($entry['value'])." (from \"{$entry['helper_agent_name']}\")",
+                    $conflict['values'],
+                );
+                $lines[] = "- {$conflict['key']}: ".implode(' vs ', $valueParts);
+            }
+        }
+
+        return implode(PHP_EOL, $lines);
+    }
+
+    /**
      * Build the auto-retrieved memory section for injection into the system prompt.
      * Uses AutoMemoryRetriever when available, falls back to PreferenceInjector.
      *
@@ -2988,7 +3045,7 @@ class AgentLoopService
         return $payload;
     }
 
-    public function buildMessagesPayload(Conversation $conversation): array
+    public function buildMessagesPayload(Conversation $conversation, ?string $runId = null): array
     {
         $payload = [];
 
@@ -3014,6 +3071,20 @@ class AgentLoopService
         $knownHelpersSection = $this->buildKnownHelpersSection($conversation);
         if ($knownHelpersSection !== null) {
             $systemPrompt .= $knownHelpersSection;
+        }
+
+        // Append "Combined Helper Results" section when the current run
+        // has two or more delegations reporting a structured result
+        // (099-result-aggregation, research.md D5). $runId is the caller's
+        // own already-in-scope run id (run()/resumeSync()/the streaming
+        // dispatch path) -- not read from the ambient Context 'run_id'
+        // slot, since that slot is not reliably cleared between calls in
+        // every caller (e.g. metrics-only reconstruction callers) and
+        // reading it here would risk attributing one call's combined
+        // section to a stale, unrelated run.
+        $combinedHelperResultsSection = $this->buildCombinedHelperResultsSection($runId);
+        if ($combinedHelperResultsSection !== null) {
+            $systemPrompt .= $combinedHelperResultsSection;
         }
 
         if (!empty($systemPrompt)) {

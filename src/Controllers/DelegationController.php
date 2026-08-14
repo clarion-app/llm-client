@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Services\DelegationQuery;
+use ClarionApp\LlmClient\Services\ResultAggregationService;
 use ClarionApp\LlmClient\Support\Decimal;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -100,6 +101,44 @@ class DelegationController extends Controller
             ],
             'delegation_count' => $delegated['delegation_count'],
         ]);
+    }
+
+    /**
+     * GET /agent-runs/{runId}/combined-results -- the read-only, always-
+     * current combined view over every delegation on this run that has
+     * reported a structured result (099-result-aggregation, US3,
+     * contracts/result-aggregation-api.md §2, research.md D5/D8).
+     * Ownership resolved via the same DelegationQuery::delegationsForRun()
+     * (-> RunTraceQuery::findRun()) pattern forRun()/cost() already use.
+     * 404 for a run that doesn't exist or isn't the caller's; 200 null for
+     * an owned run with fewer than two qualifying delegations; the
+     * combined view otherwise, with run_id added (combineForRun() itself
+     * doesn't include it).
+     */
+    public function combinedResults(Request $request, string $runId)
+    {
+        $callerUserId = Auth::user()->id;
+
+        $delegations = $this->delegationQuery->delegationsForRun($callerUserId, $runId);
+        if ($delegations === null) {
+            return $this->notFoundResponse('Run not found', 'run_not_found');
+        }
+
+        $combined = app(ResultAggregationService::class)->combineForRun($runId);
+
+        if ($combined === null) {
+            // response()->json(null) cannot express a literal JSON `null`
+            // body -- Symfony's JsonResponse substitutes an empty
+            // ArrayObject for a null $data argument, which would encode as
+            // `{}`/`[]` instead (EvalReferenceController::current()'s own
+            // established precedent for this exact quirk). "Fewer than two
+            // qualifying delegations" is a real, valid state (contracts
+            // §2), not an error, so the body must be the literal JSON null
+            // a caller can distinguish from an empty object/array.
+            return response('null', 200, ['Content-Type' => 'application/json']);
+        }
+
+        return response()->json(array_merge(['run_id' => $runId], $combined));
     }
 
     /**
