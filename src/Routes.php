@@ -296,6 +296,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // 4/US3, contracts/subagent-model-api.md §3, FR-007). Owner-only.
     Route::get('agents/{id}/helpers/hierarchy', [AgentHelperController::class, "hierarchy"]);
 
+    // Remove a previously assigned helper (097-subagent-model, Phase 5/US4,
+    // contracts/subagent-model-api.md §4). Owner-only for the parent side;
+    // idempotent — always 204 whether an active assignment existed or not.
+    Route::delete('agents/{id}/helpers/{helperAgentId}', [AgentHelperController::class, "remove"]);
+
     // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
     // contracts §4/§5). Named independently by two version ids, not nested
     // under a single agent (research.md D7) — no collision with the

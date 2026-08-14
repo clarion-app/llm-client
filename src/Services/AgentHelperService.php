@@ -114,4 +114,41 @@ class AgentHelperService
 
         return $assignment;
     }
+
+    /**
+     * Removes a previously assigned helper from a parent agent the caller
+     * owns (097-subagent-model, Phase 5/US4, data-model.md §3). Same
+     * ownership resolution as assign() for the parent side — but, unlike
+     * assign(), the helper side does not need to still be owned by the
+     * caller, or even still exist, for a removal to succeed (removing an
+     * assignment to a since-retired or -removed helper must always be
+     * possible).
+     *
+     * Idempotent: soft-deletes the active (non-trashed) row for the pair if
+     * one exists and returns true; returns false, never throws, when no
+     * active row exists for the pair — mirrors AgentShareService::revoke()'s
+     * exact idempotency posture.
+     *
+     * @throws \RuntimeException when the caller does not own the parent agent.
+     */
+    public function remove(string $callerUserId, string $parentAgentId, string $helperAgentId): bool
+    {
+        $parent = $this->query->findAgent($callerUserId, $parentAgentId);
+
+        if ($parent === null) {
+            throw new \RuntimeException('Agent not found or not owned by the caller.');
+        }
+
+        $assignment = AgentHelperAssignment::where('parent_agent_id', $parentAgentId)
+            ->where('helper_agent_id', $helperAgentId)
+            ->first();
+
+        if ($assignment === null) {
+            return false;
+        }
+
+        $assignment->delete();
+
+        return true;
+    }
 }

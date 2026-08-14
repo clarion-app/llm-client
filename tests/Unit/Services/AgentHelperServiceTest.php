@@ -288,4 +288,79 @@ YAML;
             'helper_agent_id' => $helper->id,
         ]);
     }
+
+    // ---------------------------------------------------------------
+    // remove() -- T053 (US4, data-model.md §1 state-transition table)
+    //
+    // Mirrors AgentShareService::revoke()'s exact idempotency idiom: finds
+    // the active (non-trashed) row directly, returns false (never throws)
+    // if none exists, otherwise soft-deletes it and returns true.
+    //
+    // Written first, confirmed RED: AgentHelperService::remove() does not
+    // exist yet.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function remove_soft_deletes_an_active_row_and_returns_true(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'remove-parent', '"*"');
+        $helper = $this->agent($owner, 'remove-helper', 'contacts.*');
+
+        $this->service()->assign($owner->id, $parent->id, $helper->id);
+
+        $result = $this->service()->remove($owner->id, $parent->id, $helper->id);
+
+        $this->assertTrue($result);
+        $row = AgentHelperAssignment::withTrashed()
+            ->where('parent_agent_id', $parent->id)
+            ->where('helper_agent_id', $helper->id)
+            ->first();
+        $this->assertNotNull($row);
+        $this->assertNotNull($row->deleted_at, 'remove() must soft-delete the row, not hard-delete it');
+    }
+
+    #[Test]
+    public function remove_returns_false_and_never_throws_when_no_active_row_exists_for_the_pair(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'remove-noop-parent', '"*"');
+        $helper = $this->agent($owner, 'remove-noop-helper', 'contacts.*');
+
+        // Deliberately never assigned -- no active row for this pair.
+        $result = $this->service()->remove($owner->id, $parent->id, $helper->id);
+
+        $this->assertFalse($result, 'removing a pair with no active assignment must be a false, idempotent no-op, never an exception');
+    }
+
+    #[Test]
+    public function assign_after_remove_restores_the_same_row_rather_than_inserting_a_duplicate(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'reassign-parent', '"*"');
+        $helper = $this->agent($owner, 'reassign-helper', 'contacts.*');
+
+        $original = $this->service()->assign($owner->id, $parent->id, $helper->id);
+        $originalId = $original->id;
+        $originalCreatedAt = $original->created_at;
+
+        $this->service()->remove($owner->id, $parent->id, $helper->id);
+
+        $restored = $this->service()->assign($owner->id, $parent->id, $helper->id);
+
+        $this->assertSame($originalId, $restored->id, 're-assignment must restore the SAME row, not insert a new one');
+        $this->assertEquals($originalCreatedAt, $restored->created_at, 'created_at must be unchanged across remove()+re-assign()');
+        $this->assertNull($restored->deleted_at, 'deleted_at must be cleared on restore');
+        $this->assertSame(
+            1,
+            AgentHelperAssignment::withTrashed()
+                ->where('parent_agent_id', $parent->id)
+                ->where('helper_agent_id', $helper->id)
+                ->count(),
+            'exactly one lifetime row must exist for this pair, never a duplicate',
+        );
+    }
 }

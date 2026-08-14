@@ -570,4 +570,126 @@ YAML;
         $this->assertSame(2, $cEntry['depth']);
         $this->assertSame([$agentA->id, $agentB->id, $agentC->id], $cEntry['path']);
     }
+
+    // ---------------------------------------------------------------
+    // T054 -- US4 (retirement/removal handling, data-model.md §1
+    // state-transition table, research.md D4)
+    //
+    // Written first, confirmed RED: the deactivated/gone cases exercise
+    // Phase 3's plain, non-trash-inclusive helpersFor() lookup (fixed in
+    // T056); the DELETE-related assertions exercise a route that does not
+    // exist yet at all (added in T058), so they 404 via Laravel's own
+    // route-not-found handling.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function us4_ac1_a_deactivated_helper_still_appears_marked_deactivated(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->makeAgent($owner, 'us4-parent-deactivate', '"*"');
+        $helper = $this->makeAgent($owner, 'us4-helper-deactivate', 'contacts.*');
+
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($parent->id), [
+            'helper_agent_id' => $helper->id,
+        ])->assertStatus(201);
+
+        $this->actingAs($owner, 'api')->postJson($this->agentUrl($helper->id).'/deactivate')->assertStatus(200);
+
+        $list = $this->actingAs($owner, 'api')->getJson($this->helpersUrl($parent->id));
+        $list->assertStatus(200);
+
+        $row = collect($list->json('data'))->firstWhere('helper_agent_id', $helper->id);
+        $this->assertNotNull($row, 'a deactivated helper\'s row must still appear');
+        $this->assertSame('deactivated', $row['helper_status']);
+    }
+
+    #[Test]
+    public function us4_ac1_a_soft_deleted_helper_still_appears_marked_gone(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->makeAgent($owner, 'us4-parent-gone', '"*"');
+        $helperTwo = $this->makeAgent($owner, 'us4-helper-gone', 'contacts.*');
+
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($parent->id), [
+            'helper_agent_id' => $helperTwo->id,
+        ])->assertStatus(201);
+
+        // No HTTP hard-delete endpoint exists for agents (only
+        // activate/deactivate, confirmed via `grep -n "Route::delete"
+        // src/Routes.php` and StoredAgentController -- no destroy()
+        // method), so soft-deleted directly at the model layer, mirroring
+        // Agent's own SoftDeletes trait.
+        $helperTwo->delete();
+
+        $list = $this->actingAs($owner, 'api')->getJson($this->helpersUrl($parent->id));
+        $list->assertStatus(200);
+
+        $row = collect($list->json('data'))->firstWhere('helper_agent_id', $helperTwo->id);
+        $this->assertNotNull($row, 'a soft-deleted helper\'s row must still appear, distinct from the deactivated case');
+        $this->assertSame('gone', $row['helper_status']);
+    }
+
+    #[Test]
+    public function us4_ac2_delete_removes_the_assignment_entirely_while_both_agents_still_resolve(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->makeAgent($owner, 'us4-parent-delete', '"*"');
+        $helper = $this->makeAgent($owner, 'us4-helper-delete', 'contacts.*');
+
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($parent->id), [
+            'helper_agent_id' => $helper->id,
+        ])->assertStatus(201);
+
+        $deleteResponse = $this->actingAs($owner, 'api')->deleteJson($this->helpersUrl($parent->id).'/'.$helper->id);
+        $deleteResponse->assertStatus(204);
+
+        $list = $this->actingAs($owner, 'api')->getJson($this->helpersUrl($parent->id));
+        $list->assertStatus(200);
+        $this->assertNotContains(
+            $helper->id,
+            collect($list->json('data'))->pluck('helper_agent_id')->all(),
+            'a removed assignment must not appear at all -- contrast with the deactivated/gone cases above, where the row stayed and was merely marked',
+        );
+
+        $this->actingAs($owner, 'api')->getJson($this->agentUrl($parent->id))->assertStatus(200);
+        $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id))->assertStatus(200);
+    }
+
+    #[Test]
+    public function us4_reassignment_after_removal_restores_the_same_row_not_a_duplicate(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->makeAgent($owner, 'us4-reassign-a', '"*"');
+        $agentB = $this->makeAgent($owner, 'us4-reassign-b', 'contacts.*');
+
+        $firstAssign = $this->actingAs($owner, 'api')->postJson($this->helpersUrl($agentA->id), [
+            'helper_agent_id' => $agentB->id,
+        ]);
+        $firstAssign->assertStatus(201);
+
+        $originalCreatedAt = DB::table('agent_helper_assignments')
+            ->where('parent_agent_id', $agentA->id)
+            ->where('helper_agent_id', $agentB->id)
+            ->value('created_at');
+
+        $this->actingAs($owner, 'api')->deleteJson($this->helpersUrl($agentA->id).'/'.$agentB->id)->assertStatus(204);
+
+        $secondAssign = $this->actingAs($owner, 'api')->postJson($this->helpersUrl($agentA->id), [
+            'helper_agent_id' => $agentB->id,
+        ]);
+        $secondAssign->assertStatus(200);
+
+        $rows = DB::table('agent_helper_assignments')
+            ->where('parent_agent_id', $agentA->id)
+            ->where('helper_agent_id', $agentB->id)
+            ->get();
+
+        $this->assertCount(1, $rows, 'exactly one row must exist for (A, B) across the whole sequence, never a duplicate');
+        $this->assertEquals($originalCreatedAt, $rows->first()->created_at, 'created_at must be unchanged across remove()+re-assign()');
+        $this->assertNull($rows->first()->deleted_at, 'deleted_at must be null again after restore');
+    }
 }

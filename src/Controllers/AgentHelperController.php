@@ -140,6 +140,29 @@ class AgentHelperController extends Controller
         return response()->json($result);
     }
 
+    /**
+     * DELETE /agents/{id}/helpers/{helperAgentId} (contracts §4,
+     * 097-subagent-model Phase 5/US4). Owner-only for the parent side —
+     * `404` identically to assign()/helpers()/hierarchy() when the caller
+     * doesn't own {id}. Always `204` beyond that, whether an active
+     * assignment existed for this pair and was removed, or none existed at
+     * all (idempotent no-op) — mirrors
+     * AgentShareController::unshare()'s exact posture. The helper agent
+     * itself no longer existing/being owned by the caller is deliberately
+     * not a 404 here (contracts §4) — a removal must still succeed even for
+     * a since-removed helper.
+     */
+    public function remove(Request $request, string $id, string $helperAgentId): JsonResponse
+    {
+        if ($this->agentQuery->findAgent(Auth::id(), $id) === null) {
+            return $this->notFoundResponse();
+        }
+
+        $this->service->remove(Auth::id(), $id, $helperAgentId);
+
+        return response()->json(null, 204);
+    }
+
     private function rowResource(object $row): array
     {
         return [

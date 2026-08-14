@@ -536,4 +536,68 @@ YAML;
             'depth 3 exceeds the configured max_depth of 2 -- must be flagged as exceeding it',
         );
     }
+
+    // ---------------------------------------------------------------
+    // helpersFor() -- trash-inclusive resolution -- T052 (US4)
+    //
+    // Phase 3's helpersFor() (AgentHelperQuery.php's own docblock) resolves
+    // each row's helper via the plain, non-trash-inclusive `helper()`
+    // relation -- a known, disclosed, temporary limitation this phase
+    // (T056) fixes. The *deactivated* case below is included for
+    // completeness under this heading, but is NOT expected to newly fail:
+    // a deactivated agent (is_active = false) is never soft-deleted, so
+    // the plain `helper()` relation already resolves it fine, and T016
+    // already proved helper_status: 'deactivated' renders correctly for
+    // it. The *soft-deleted* ("gone") case is the genuinely new one: a
+    // trashed related model is excluded by Eloquent's own SoftDeletes
+    // global scope on a plain (non-withTrashed()) relation query, so the
+    // row is currently OMITTED from the result entirely -- not merely
+    // mislabeled -- until helpersFor() is fixed to resolve via a
+    // trash-inclusive lookup.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function helpers_for_still_includes_a_deactivated_helpers_row_marked_deactivated(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'retire-parent-deactivated', '"*"');
+        $helper = $this->agent($owner, 'retire-helper-deactivated', 'contacts.*');
+
+        $helper->is_active = false;
+        $helper->save();
+
+        $this->assign($parent, $helper, $owner);
+
+        $result = $this->query()->helpersFor($owner->id, $parent->id);
+        $row = $result->firstWhere('helper_agent_id', $helper->id);
+
+        $this->assertNotNull($row, 'a deactivated helper\'s row must still appear');
+        $this->assertSame('deactivated', $row->helper_status);
+    }
+
+    #[Test]
+    public function helpers_for_still_includes_a_soft_deleted_helpers_row_marked_gone(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'retire-parent-gone', '"*"');
+        $helper = $this->agent($owner, 'retire-helper-gone', 'contacts.*');
+
+        $this->assign($parent, $helper, $owner);
+
+        $helper->delete();
+        $this->assertNotNull(Agent::withTrashed()->find($helper->id)->deleted_at, 'fixture sanity: the helper agent must actually be soft-deleted');
+
+        $result = $this->query()->helpersFor($owner->id, $parent->id);
+        $row = $result->firstWhere('helper_agent_id', $helper->id);
+
+        $this->assertNotNull(
+            $row,
+            'a soft-deleted helper\'s row must still appear -- against Phase 3\'s plain, non-trash-inclusive helper() '
+            .'lookup this currently fails because the row is OMITTED entirely (Eloquent\'s SoftDeletes global scope '
+            .'excludes the trashed related model from a plain relation query), not merely mislabeled',
+        );
+        $this->assertSame('gone', $row->helper_status ?? null);
+    }
 }

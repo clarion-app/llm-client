@@ -73,10 +73,13 @@ class AgentHelperQuery
      * (data-model.md §4). Null uniformly for "doesn't exist"/"not yours,"
      * matching findAgent()'s own contract.
      *
-     * A soft-deleted helper's row is, for now, defensively omitted from
-     * the result rather than resolved via a trash-inclusive lookup — a
-     * known, disclosed, temporary limitation fixed in a later phase (US4),
-     * not something this method attempts to handle yet.
+     * Each row's helper is resolved via a trash-inclusive lookup
+     * (Agent::withTrashed()->find(), mirroring
+     * AgentQuery::findAgentIncludingTrashed()'s own precedent) rather than
+     * the plain `helper()` relation, so a row is never omitted merely
+     * because its helper has since been soft-deleted (097-subagent-model
+     * Phase 5/US4, fixing Phase 3's own disclosed, temporary limitation) —
+     * the row is annotated `helper_status: 'gone'` instead.
      *
      * One shared $catalog is resolved once per call and reused across
      * every row — never re-resolved inside the loop.
@@ -93,13 +96,15 @@ class AgentHelperQuery
 
         $catalog = $this->catalog();
 
-        $assignments = AgentHelperAssignment::where('parent_agent_id', $parentAgentId)
-            ->with('helper')
-            ->get();
+        $assignments = AgentHelperAssignment::where('parent_agent_id', $parentAgentId)->get();
 
         return $assignments
-            ->filter(fn (AgentHelperAssignment $assignment): bool => $assignment->helper !== null)
-            ->map(fn (AgentHelperAssignment $assignment) => $this->annotateRow($assignment, $assignment->helper, $parent, $catalog))
+            ->map(fn (AgentHelperAssignment $assignment) => $this->annotateRow(
+                $assignment,
+                Agent::withTrashed()->find($assignment->helper_agent_id),
+                $parent,
+                $catalog,
+            ))
             ->values();
     }
 
@@ -345,8 +350,32 @@ class AgentHelperQuery
         return $this->annotateRow($assignment, $helper, $parent, $this->catalog());
     }
 
-    private function annotateRow(AgentHelperAssignment $assignment, Agent $helper, Agent $parent, array $catalog): object
+    /**
+     * $helper is nullable to cover the trash-inclusive lookup in
+     * helpersFor() still coming back empty (the helper agent id no longer
+     * resolves at all, even including trashed rows) — treated identically
+     * to a resolved-but-soft-deleted helper: 'gone', never omitted or
+     * thrown for.
+     */
+    private function annotateRow(AgentHelperAssignment $assignment, ?Agent $helper, Agent $parent, array $catalog): object
     {
+        if ($helper === null || $helper->trashed()) {
+            $name = $helper->name ?? null;
+
+            return (object) [
+                'id' => $assignment->id,
+                'parent_agent_id' => $assignment->parent_agent_id,
+                'helper_agent_id' => $assignment->helper_agent_id,
+                'helper_name' => $name,
+                'helper_purpose' => null,
+                'helper_status' => 'gone',
+                'within_bounds' => false,
+                'effective_operation_count' => 0,
+                'created_at' => $assignment->created_at,
+                'updated_at' => $assignment->updated_at,
+            ];
+        }
+
         [$name, $purpose] = $this->helperNameAndPurpose($helper);
 
         return (object) [
