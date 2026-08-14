@@ -1052,6 +1052,17 @@ abstract class TestCase extends BaseTestCase
                 $table->index('helper_run_id');
             });
         }
+
+        if (!Schema::hasColumn('agent_delegations', 'result_status')) {
+            Schema::table('agent_delegations', function (Blueprint $table) {
+                $table->enum('result_status', ['success', 'partial', 'failure'])->nullable();
+                $table->string('result_reason', 32)->nullable();
+                $table->text('result_summary')->nullable();
+                $table->longText('result_output')->nullable();
+                $table->text('result_undone')->nullable();
+                $table->boolean('result_truncated')->default(false);
+            });
+        }
     }
 
     /**

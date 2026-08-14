@@ -227,6 +227,48 @@ class ContentSanitizerTest extends TestCase
         $this->assertLessThanOrEqual(50, strlen($result));
     }
 
+    // ========== truncate() with an optional per-call cap override (T009, 099-result-aggregation) ==========
+
+    /** @test */
+    public function cap_override_smaller_than_default_truncates_at_the_override(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.action_content_cap_bytes', 16384);
+        $sanitizer = $this->makeSanitizer();
+
+        $content = str_repeat('x', 200);
+        $result = $sanitizer->truncate($content, 50);
+
+        $this->assertStringEndsWith("\n\n[TRUNCATED: original content exceeded cap]", $result);
+        $this->assertLessThanOrEqual(50, strlen($result));
+    }
+
+    /** @test */
+    public function cap_override_larger_than_content_length_leaves_it_untouched(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.action_content_cap_bytes', 10);
+        $sanitizer = $this->makeSanitizer();
+
+        $content = str_repeat('x', 50);
+        $result = $sanitizer->truncate($content, 1000);
+
+        $this->assertEquals($content, $result);
+    }
+
+    /** @test */
+    public function omitting_cap_override_is_byte_identical_to_default_behavior(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.action_content_cap_bytes', 100);
+        $sanitizer = $this->makeSanitizer();
+
+        $content = str_repeat('x', 200);
+        $withoutOverride = $sanitizer->truncate($content);
+        $withNullOverride = $sanitizer->truncate($content, null);
+
+        $this->assertSame($withoutOverride, $withNullOverride);
+        $this->assertStringEndsWith("\n\n[TRUNCATED: original content exceeded cap]", $withoutOverride);
+        $this->assertLessThanOrEqual(100, strlen($withoutOverride));
+    }
+
     // ========== No-op on clean content ==========
 
     /** @test */

@@ -29,6 +29,12 @@ class Delegation extends Model
         'outcome_summary',
         'started_at',
         'completed_at',
+        'result_status',
+        'result_reason',
+        'result_summary',
+        'result_output',
+        'result_undone',
+        'result_truncated',
     ];
 
     protected $casts = [
@@ -36,6 +42,7 @@ class Delegation extends Model
         'status' => 'string',
         'started_at' => 'datetime',
         'completed_at' => 'datetime',
+        'result_truncated' => 'boolean',
     ];
 
     protected static function booted(): void

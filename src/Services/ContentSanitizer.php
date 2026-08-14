@@ -55,20 +55,26 @@ class ContentSanitizer
     }
 
     /**
-     * Truncate content to the configured byte cap.
+     * Truncate content to the configured byte cap, or to $capBytes when
+     * given (099-result-aggregation) — a per-call override used by callers
+     * with their own independently-configured bound (e.g. delegation result
+     * caps) distinct from run_trace.action_content_cap_bytes. Omitting
+     * $capBytes (the default, null) preserves this method's original
+     * behavior exactly for every existing caller.
      * Appends a truncation marker if content was truncated.
      * Returns the truncated string.
      */
-    public function truncate(string $content): string
+    public function truncate(string $content, ?int $capBytes = null): string
     {
+        $cap = $capBytes ?? $this->cap;
         $byteLength = strlen($content);
 
-        if ($byteLength <= $this->cap) {
+        if ($byteLength <= $cap) {
             return $content;
         }
 
         $markerBytes = strlen(self::TRUNCATION_MARKER);
-        $availableBytes = max(0, $this->cap - $markerBytes);
+        $availableBytes = max(0, $cap - $markerBytes);
 
         // Truncate at byte boundary to avoid splitting multi-byte characters.
         $truncated = mb_strcut($content, 0, $availableBytes, 'UTF-8');

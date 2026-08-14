@@ -766,6 +766,14 @@ return [
         'max_iterations' => (int) env('LLM_CLIENT_DELEGATION_MAX_ITERATIONS', 10),
         'max_seconds' => (int) env('LLM_CLIENT_DELEGATION_MAX_SECONDS', 120),
         'max_chain_depth' => (int) env('LLM_CLIENT_DELEGATION_MAX_CHAIN_DEPTH', 5),
+        // 099-result-aggregation: schema-retry ceiling for the mandatory
+        // delegation_result shape (research.md D1), and the two independent
+        // size bounds a returned result and a combined view are held to
+        // (research.md D4) — the parent's own working context is shared with
+        // everything else injected there (context_window.injected_section_reserve).
+        'max_result_schema_retries' => (int) env('LLM_CLIENT_DELEGATION_MAX_RESULT_SCHEMA_RETRIES', 2),
+        'result_output_cap_bytes' => (int) env('LLM_CLIENT_DELEGATION_RESULT_OUTPUT_CAP_BYTES', 8192),
+        'combined_output_cap_bytes' => (int) env('LLM_CLIENT_DELEGATION_COMBINED_OUTPUT_CAP_BYTES', 16384),
     ],
 ];
 

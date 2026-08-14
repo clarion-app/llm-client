@@ -50,6 +50,7 @@ use ClarionApp\LlmClient\Listeners\PersistFeedbackSignal;
 use ClarionApp\LlmClient\Presets\DecisionPreset;
 use ClarionApp\LlmClient\Presets\SummaryPreset;
 use ClarionApp\LlmClient\Presets\ExtractionPreset;
+use ClarionApp\LlmClient\Presets\DelegationResultPreset;
 use GuzzleHttp\Client;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Scheduling\Schedule;
@@ -698,6 +699,13 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
     protected function registerPresets(): void
     {
         $registry = $this->app->make(StructuredOutputPresetRegistry::class);
+
+        // 099-result-aggregation: the delegation_result shape is mandatory
+        // delegation infrastructure, never a caller-choosable preset —
+        // registered unconditionally, outside the presets.enabled-gated
+        // loop below (research.md D1).
+        $registry->register(new DelegationResultPreset());
+
         $enabled = config('llm-client.presets.enabled', ['decision', 'summary', 'extraction']);
 
         $presetClasses = [
