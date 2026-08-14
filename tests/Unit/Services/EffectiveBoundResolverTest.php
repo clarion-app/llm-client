@@ -385,6 +385,7 @@ YAML;
         $this->seedDelegationRow([
             'parent_conversation_id' => $this->conversation($owner)->id,
             'parent_agent_id' => $looseParent->id,
+            'helper_agent_id' => $helper->id,
             'helper_conversation_id' => $helperConversation->id,
             'owner_user_id' => $owner->id,
         ]);
