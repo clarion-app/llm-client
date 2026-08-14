@@ -9,13 +9,23 @@ use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\OperationsSearchService;
 use ClarionApp\LlmClient\Services\OperationCache;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
+use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Services\AgentDefinitionParser;
+use ClarionApp\LlmClient\Services\AgentService;
+use ClarionApp\LlmClient\Services\GitDefinitionFileReader;
+use ClarionApp\Backend\ApiManager;
+use ClarionApp\Backend\Models\User;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use Dedoc\Scramble\Generator;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
 use Mockery;
 
 use PHPUnit\Framework\Attributes\Test;
@@ -282,6 +292,132 @@ class AgentLoopServiceTest extends TestCase
 
         $message->refresh();
         $this->assertNull($message->tool_data['pending_confirmation']);
+    }
+
+    /**
+     * Reconciliation finding (100-subagent-tool-restrictions): resume()
+     * (and its synchronous sibling resumeSync()) execute an approved,
+     * previously-paused confirmation directly via executeApiCall() —
+     * they never route through handleExecuteOperation(), the one place
+     * EffectiveBoundResolver's ancestor-chain re-check (FR-004/FR-005/
+     * FR-006) was wired in Phase 4. A confirmation can sit pending for
+     * up to confirmation_timeout (default 300s); if an ancestor's
+     * permitted operations no longer include the pending operation by
+     * the time it is approved, the pre-fix code would still execute it
+     * with zero live re-validation — exactly the "no path exists by
+     * which delegating work escalates authority" guarantee this feature
+     * exists for, just reached through the confirmation-resume path
+     * instead of a fresh tool call. Reachable in the shipped app: a
+     * helper's own ephemeral conversation is owned by the same real user
+     * as the parent (DelegationService::delegate() sets user_id to the
+     * owner), its id is exposed via DelegationController's own
+     * delegation-row responses, and ConversationController::confirmApiCall()
+     * places no restriction on which of the caller's own conversations a
+     * pending confirmation is resumed on.
+     */
+    #[Test]
+    public function resume_reapplies_the_live_ancestor_chain_bound_and_blocks_a_confirmed_call_the_ancestor_no_longer_permits()
+    {
+        Queue::fake();
+
+        $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
+        $prop->setAccessible(true);
+        $prop->setValue(null, ['paths' => [
+            '/api/allowed' => ['get' => ['operationId' => 'allowed.operation', 'summary' => 'Allowed']],
+            '/api/pending' => ['delete' => ['operationId' => 'pending.operation', 'summary' => 'Pending']],
+        ]]);
+        $generator = Mockery::mock(Generator::class);
+        $generator->shouldReceive('__invoke')->andReturn(['paths' => [
+            '/api/allowed' => ['get' => ['operationId' => 'allowed.operation', 'summary' => 'Allowed']],
+            '/api/pending' => ['delete' => ['operationId' => 'pending.operation', 'summary' => 'Pending']],
+        ]]);
+        $this->app->instance(Generator::class, $generator);
+
+        $owner = User::factory()->create();
+        $agentService = new AgentService(new AgentDefinitionParser(), new GitDefinitionFileReader());
+
+        // The ancestor (parent) does NOT currently permit pending.operation
+        // — whether because it was narrowed after the confirmation was
+        // first requested, or simply because it never did, the live check
+        // must catch it either way.
+        $parent = $agentService->create($owner->id, "name: recon-resume-parent\ninstructions: hi\ntools:\n  allow:\n    - allowed.operation\n");
+        $helper = $agentService->create($owner->id, "name: recon-resume-helper\ninstructions: hi\ntools:\n  allow:\n    - allowed.operation\n    - pending.operation\n");
+
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $parent->id,
+            'helper_agent_id' => $helper->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $parentConversation = Conversation::factory()->create(['user_id' => $owner->id, 'server_id' => $server->id]);
+        $helperConversation = Conversation::factory()->create(['user_id' => $owner->id, 'server_id' => $server->id, 'is_processing' => true]);
+
+        Delegation::create([
+            'id' => (string) Str::uuid(),
+            'parent_conversation_id' => $parentConversation->id,
+            'parent_agent_id' => $parent->id,
+            'helper_agent_id' => $helper->id,
+            'helper_conversation_id' => $helperConversation->id,
+            'owner_user_id' => $owner->id,
+            'task' => 'Attempt the pending operation.',
+            'depth' => 1,
+            'status' => 'in_progress',
+            'started_at' => now(),
+        ]);
+
+        $message = Message::create([
+            'conversation_id' => $helperConversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+            'tool_data' => [
+                'tool_calls' => [
+                    [
+                        'id' => 'call_pending',
+                        'type' => 'function',
+                        'function' => [
+                            'name' => 'execute_operation',
+                            'arguments' => '{"operationId":"pending.operation","parameters":{}}',
+                        ],
+                    ],
+                ],
+                'tool_results' => null,
+                'iteration' => 1,
+                'pending_confirmation' => [
+                    'operationId' => 'pending.operation',
+                    'tool_name' => 'execute_operation',
+                    'method' => 'DELETE',
+                    'path' => '/api/pending',
+                    'arguments' => [],
+                    'conversation_history_snapshot' => [],
+                    'expires_at' => now()->addMinutes(5)->toIso8601String(),
+                ],
+            ],
+        ]);
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        // The whole point of this test: if the ancestor-chain re-check is
+        // ever removed from resume(), execution would reach this mock —
+        // making it fail loudly rather than silently passing.
+        $executorMock->shouldNotReceive('executeHttpCall');
+
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
+        $service->resume($helperConversation, $message, true);
+
+        $message->refresh();
+        $resultContent = json_decode($message->tool_data['tool_results'][0]['content'] ?? 'null', true);
+
+        $this->assertIsArray($resultContent);
+        $this->assertArrayHasKey('error', $resultContent);
+        $this->assertStringContainsString(
+            'Operation not permitted: ancestor agent',
+            $resultContent['error'],
+            'resume() must re-check the live ancestor-chain bound before executing an approved confirmation, not just trust the bound that held when confirmation was first requested',
+        );
+        $this->assertStringContainsString('pending.operation', $resultContent['error']);
     }
 
     #[Test]

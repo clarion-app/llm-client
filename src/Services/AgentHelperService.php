@@ -76,9 +76,20 @@ class AgentHelperService
         $catalog = $this->helperQuery->catalog();
 
         if (!$this->helperQuery->isWithinParentBounds($helper, $parent, $catalog)) {
+            // Reconciliation fix (100-subagent-tool-restrictions): the
+            // excess reported here must be diffed against the parent's
+            // *recursive* structural bound (structuralEffectiveBound()),
+            // the same bound isWithinParentBounds() above already checks
+            // against -- not the parent's own raw permittedOperationIds().
+            // Diffing against the raw set under-reports (often to an empty
+            // array) whenever the parent is itself narrowed by one of its
+            // own active parents, e.g. a 3-level chain (quickstart.md
+            // scenario 2), silently violating FR-002/SC-001/SC-007's
+            // "names the exact excess tool(s)" guarantee even though the
+            // refusal itself still correctly fires.
             $excess = array_values(array_diff(
                 $this->helperQuery->permittedOperationIds($helper, $catalog),
-                $this->helperQuery->permittedOperationIds($parent, $catalog),
+                $this->helperQuery->structuralEffectiveBound($parent, $catalog),
             ));
 
             throw new HelperExceedsParentPermissionsException($parentAgentId, $helperAgentId, $excess);

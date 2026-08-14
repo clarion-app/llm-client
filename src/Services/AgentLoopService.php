@@ -414,14 +414,33 @@ class AgentLoopService
                     ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
                 ];
             } else {
-                // Execute the confirmed API operation
-                $resultContent = $this->executeApiCall(
-                    $pending['operationId'],
-                    $pending['method'],
-                    $pending['path'],
-                    $pending['arguments'] ?? [],
-                    $conversation
-                );
+                // Re-check the ancestor-chain bound at the moment of
+                // execution (100-subagent-tool-restrictions, FR-004/
+                // FR-005/FR-006) rather than trusting the bound that held
+                // when the confirmation was first requested: a
+                // confirmation can sit pending for up to
+                // confirmation_timeout (default 300s), during which a
+                // parent's permissions may have been narrowed. Unlike
+                // handleExecuteOperation(), this method never routes
+                // through it at all when resuming, so without this check
+                // an already-approved, now-out-of-bounds helper call
+                // would execute with zero live re-validation.
+                $chain = $this->effectiveBoundResolver->check($conversation, $pending['operationId']);
+
+                if (!$chain['allowed']) {
+                    $resultContent = json_encode([
+                        'error' => "Operation not permitted: ancestor agent \"{$chain['blocking_agent_name']}\" ({$chain['levels_up']} level(s) up in this delegation chain) does not permit \"{$pending['operationId']}\".",
+                    ]);
+                } else {
+                    // Execute the confirmed API operation
+                    $resultContent = $this->executeApiCall(
+                        $pending['operationId'],
+                        $pending['method'],
+                        $pending['path'],
+                        $pending['arguments'] ?? [],
+                        $conversation
+                    );
+                }
 
                 $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
                 $toolData['tool_results'] = [
@@ -1440,13 +1459,28 @@ class AgentLoopService
 
         if ($approved) {
             try {
-                $resultContent = $this->executeApiCall(
-                    $pending['operationId'],
-                    $pending['method'],
-                    $pending['path'],
-                    $pending['arguments'] ?? [],
-                    $conversation
-                );
+                // See resume()'s identical re-check, immediately above the
+                // same relative point in that sibling method
+                // (100-subagent-tool-restrictions, FR-004/FR-005/FR-006):
+                // resumeSync() also never routes through
+                // handleExecuteOperation() when resuming, so the ancestor-
+                // chain bound must be re-verified here rather than trusted
+                // from when the confirmation was first requested.
+                $chain = $this->effectiveBoundResolver->check($conversation, $pending['operationId']);
+
+                if (!$chain['allowed']) {
+                    $resultContent = json_encode([
+                        'error' => "Operation not permitted: ancestor agent \"{$chain['blocking_agent_name']}\" ({$chain['levels_up']} level(s) up in this delegation chain) does not permit \"{$pending['operationId']}\".",
+                    ]);
+                } else {
+                    $resultContent = $this->executeApiCall(
+                        $pending['operationId'],
+                        $pending['method'],
+                        $pending['path'],
+                        $pending['arguments'] ?? [],
+                        $conversation
+                    );
+                }
 
                 // Record the confirmed operation's outcome (fire-and-forget).
                 $this->recordToolMetric(

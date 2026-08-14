@@ -256,6 +256,54 @@ YAML;
     }
 
     #[Test]
+    public function assign_reports_the_excess_against_the_parents_recursive_structural_bound_not_its_raw_permitted_set(): void
+    {
+        // 100-subagent-tool-restrictions reconciliation finding: assign()'s
+        // isWithinParentBounds() check (used to decide *whether* to throw)
+        // was upgraded to the recursive structuralEffectiveBound() in
+        // Phase 3, but the $excess computation below it was not -- it
+        // still diffed the helper's own permitted set against the
+        // parent's raw permittedOperationIds(), not its recursive bound.
+        // In a 3-level chain this produces a wrong (often empty)
+        // excess_operation_ids, violating FR-002/SC-001/SC-007's "names
+        // the exact excess tool(s)" -- quickstart.md scenario 2 names the
+        // expected value explicitly (`excess_operation_ids: ["Y"]`) for
+        // exactly this shape, but no test drove it through assign()
+        // itself (only through isWithinParentBounds()/
+        // effectiveOperationIds() directly, T008).
+        $owner = $this->user();
+        $this->seedOperationCatalog([
+            'x.operation' => ['path' => '/api/x', 'method' => 'get', 'summary' => 'X'],
+            'y.operation' => ['path' => '/api/y', 'method' => 'get', 'summary' => 'Y'],
+        ]);
+        $agentA = $this->agentService()->create($owner->id, "name: recon-a\ninstructions: hi\ntools:\n  allow:\n    - x.operation\n");
+        $agentB = $this->agentService()->create($owner->id, "name: recon-b\ninstructions: hi\ntools:\n  allow:\n    - x.operation\n    - y.operation\n");
+        $agentC = $this->agentService()->create($owner->id, "name: recon-c\ninstructions: hi\ntools:\n  allow:\n    - x.operation\n    - y.operation\n");
+
+        // A permits {X} only; B permits {X,Y} and is assigned as A's helper
+        // -- so B's own *recursive* bound (B ∩ A) is only {X}, even though
+        // B's raw permitted set is {X,Y}.
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $agentA->id,
+            'helper_agent_id' => $agentB->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        try {
+            $this->service()->assign($owner->id, $agentB->id, $agentC->id);
+            $this->fail('C (permits {X,Y}) exceeds B\'s recursive bound ({X}, narrowed by A) -- assign() must refuse');
+        } catch (HelperExceedsParentPermissionsException $e) {
+            $this->assertSame(
+                ['y.operation'],
+                array_values($e->excessOperationIds),
+                'the excess must name Y (the operation exceeding B\'s recursive bound), not be empty just because C ⊆ B\'s own raw set',
+            );
+        }
+
+        $this->assertSame(0, AgentHelperAssignment::where('parent_agent_id', $agentB->id)->where('helper_agent_id', $agentC->id)->count());
+    }
+
+    #[Test]
     public function assign_succeeds_when_the_helpers_operations_are_a_strict_subset_of_the_parents(): void
     {
         $owner = $this->user();
