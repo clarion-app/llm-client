@@ -66,4 +66,27 @@ class Agent extends Model
     {
         return $this->belongsTo(Agent::class, 'cloned_from_agent_id');
     }
+
+    /**
+     * AgentHelperAssignment rows where this agent is the parent
+     * (097-subagent-model, data-model.md §2). Purely for eager-load
+     * convenience — never required for correctness, since AgentHelperQuery
+     * is the actual read path.
+     */
+    public function helperAssignments(): HasMany
+    {
+        return $this->hasMany(AgentHelperAssignment::class, 'parent_agent_id');
+    }
+
+    /**
+     * AgentHelperAssignment rows where this agent is the helper
+     * (097-subagent-model, data-model.md §2) — i.e. every parent this
+     * agent currently helps. Purely for eager-load convenience — never
+     * required for correctness, since AgentHelperQuery is the actual read
+     * path.
+     */
+    public function parentAssignments(): HasMany
+    {
+        return $this->hasMany(AgentHelperAssignment::class, 'helper_agent_id');
+    }
 }

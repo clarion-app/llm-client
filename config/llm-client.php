@@ -746,5 +746,14 @@ return [
     'handoff' => [
         'max_chain_length' => (int) env('LLM_CLIENT_HANDOFF_MAX_CHAIN_LENGTH', 5),
     ],
+
+    // Sub-Agent Model (097-subagent-model) — the technical safety bound on
+    // how many levels deep a chain of helper assignments may nest before a
+    // further assignment is refused (research.md D5). Not a business
+    // limit — spec.md's own Assumptions impose none — purely to keep
+    // cycle-detection and hierarchy-display traversal bounded.
+    'helpers' => [
+        'max_depth' => (int) env('LLM_CLIENT_HELPERS_MAX_DEPTH', 10),
+    ],
 ];
 

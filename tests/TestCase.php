@@ -287,6 +287,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineAgentSchema();
         $this->defineConversationHandoffSchema();
         $this->defineAgentShareGrantSchema();
+        $this->defineAgentHelperAssignmentSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -979,6 +980,35 @@ abstract class TestCase extends BaseTestCase
                 $table->index('agent_id');
                 $table->index('owner_user_id');
                 $table->index('recipient_user_id');
+            });
+        }
+    }
+
+    /**
+     * agent_helper_assignments — one lifetime row per ordered
+     * (parent_agent_id, helper_agent_id) pair, recording that a parent
+     * agent has a helper agent assigned to it (097-subagent-model,
+     * data-model.md §1). Mirrors the migration's own column set exactly.
+     * Guarded by Schema::hasTable() like every existing block here, and
+     * called from defineDatabaseMigrations() directly, immediately after
+     * defineAgentShareGrantSchema(), matching this package's own
+     * established Foundational-phase precedent.
+     */
+    protected function defineAgentHelperAssignmentSchema(): void
+    {
+        if (!Schema::hasTable('agent_helper_assignments')) {
+            Schema::create('agent_helper_assignments', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('parent_agent_id');
+                $table->uuid('helper_agent_id');
+                $table->uuid('owner_user_id');
+                $table->timestamps();
+                $table->timestamp('deleted_at')->nullable();
+
+                $table->unique(['parent_agent_id', 'helper_agent_id']);
+                $table->index('parent_agent_id');
+                $table->index('helper_agent_id');
+                $table->index('owner_user_id');
             });
         }
     }
