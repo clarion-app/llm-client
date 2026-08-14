@@ -600,4 +600,48 @@ YAML;
         );
         $this->assertSame('gone', $row->helper_status ?? null);
     }
+
+    /**
+     * Phase 6 (Polish, tasks.md T064) mutation-checklist row 5 coverage gap:
+     * mutating helpersFor() to resolve the helper via a *plain* (non-
+     * trash-inclusive) Agent::find() instead of Agent::withTrashed()->find()
+     * stayed unexpectedly GREEN against the test immediately above, because
+     * annotateRow()'s own null-branch already renders 'gone' for a null
+     * $helper just as it does for a resolved-but-trashed one -- Eloquent's
+     * SoftDeletes global scope makes a plain find() return null for a
+     * trashed row, which annotateRow() already handles gracefully rather
+     * than omitting or crashing. That null-handling is not itself the
+     * trash-inclusive lookup's actual job, though: the genuine difference
+     * a trash-inclusive lookup provides is that $helper is a real (if
+     * trashed) Agent instance, so its own `name` is still readable --
+     * a plain find() loses that to null instead. This test asserts the
+     * gone row's helper_name is still the agent's own name, not null,
+     * closing the gap the row-5 mutation would otherwise pass right
+     * through.
+     */
+    #[Test]
+    public function helpers_for_preserves_a_soft_deleted_helpers_own_name_via_the_trash_inclusive_lookup(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'retire-parent-gone-name', '"*"');
+        $helper = $this->agent($owner, 'retire-helper-gone-name', 'contacts.*');
+
+        $this->assign($parent, $helper, $owner);
+
+        $helper->delete();
+
+        $result = $this->query()->helpersFor($owner->id, $parent->id);
+        $row = $result->firstWhere('helper_agent_id', $helper->id);
+
+        $this->assertNotNull($row);
+        $this->assertSame('gone', $row->helper_status);
+        $this->assertSame(
+            'retire-helper-gone-name',
+            $row->helper_name,
+            'a trash-inclusive lookup must still resolve the gone helper\'s own name -- a plain, non-trash-inclusive '
+            .'lookup would lose it to null instead, even though annotateRow()\'s own defensive null-handling means '
+            .'the row itself would still appear correctly marked "gone" either way',
+        );
+    }
 }
