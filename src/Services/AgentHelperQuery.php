@@ -104,6 +104,229 @@ class AgentHelperQuery
     }
 
     /**
+     * Whether assigning the candidate helper under the given would-be
+     * parent would close a cycle, direct or transitive (research.md D2) —
+     * a DFS walking outward from the candidate helper along its own active
+     * "parent of" edges (every agent the candidate helper is itself,
+     * transitively, currently a parent to), until either the would-be
+     * parent is found (a cycle would form) or the reachable set is
+     * exhausted. Guarded by a visited-set so a pre-existing cycle in the
+     * data — which the real API must never allow once this check is wired
+     * into AgentHelperService::assign(), but which the traversal itself
+     * must still defend against regardless — cannot cause infinite
+     * recursion.
+     *
+     * @return list<string>|null the ordered cycle path, starting at the
+     *   candidate helper and ending at the would-be parent, or null if no
+     *   cycle would form.
+     */
+    public function wouldCreateCycle(string $parentAgentId, string $helperAgentId): ?array
+    {
+        $path = [];
+        $visited = [];
+
+        if ($this->dfsForTarget($helperAgentId, $parentAgentId, $path, $visited)) {
+            return $path;
+        }
+
+        return null;
+    }
+
+    /**
+     * How many levels below its root ancestor the candidate helper would
+     * land if assigned under the given would-be parent (research.md D5) —
+     * the would-be parent's own depth (0 for a root, i.e. an agent that is
+     * not itself currently anyone's active helper) plus one. The candidate
+     * helper's own id plays no part in the arithmetic (only where it would
+     * be attached matters), but is kept in the signature to mirror
+     * wouldCreateCycle()'s own (parentAgentId, helperAgentId) argument
+     * order.
+     */
+    public function computeDepth(string $parentAgentId, string $helperAgentId): int
+    {
+        return $this->depthOf($parentAgentId, []) + 1;
+    }
+
+    /**
+     * The full descendant graph beneath a given agent the caller owns
+     * (FR-007, data-model.md §4) — a flattened, depth-first list of every
+     * currently-active helper reachable through any number of hops, not
+     * only the immediate ones helpersFor() returns. Reuses the same
+     * active-edge adjacency lookup wouldCreateCycle()'s own traversal is
+     * built on, and the identical cycle-guard posture (a would-be revisit
+     * of an agent already on the current path is skipped rather than
+     * looped forever). Bounded by config('llm-client.helpers.max_depth')
+     * (research.md D5) — a defensive cap on traversal size/response
+     * latency, never a promise that deeper structure could exist
+     * (assign()'s own depth check already prevents that).
+     *
+     * Null uniformly for "doesn't exist"/"not yours," matching
+     * helpersFor()'s own contract.
+     *
+     * @return array{data: list<array{agent_id: string, name: string, depth: int, path: list<string>, helper_status: string, within_bounds: bool, effective_operation_count: int}>, truncated: bool}|null
+     */
+    public function hierarchyFor(string $callerUserId, string $rootAgentId): ?array
+    {
+        $root = $this->query->findAgent($callerUserId, $rootAgentId);
+
+        if ($root === null) {
+            return null;
+        }
+
+        $catalog = $this->catalog();
+        $maxDepth = (int) config('llm-client.helpers.max_depth', 10);
+
+        $entries = [];
+        $truncated = false;
+
+        $this->walkHierarchy($root, [$root->id], $maxDepth, $catalog, $entries, $truncated);
+
+        return [
+            'data' => $entries,
+            'truncated' => $truncated,
+        ];
+    }
+
+    /**
+     * @param list<string> $path the chain of agent ids from the root down
+     *   to (and including) $parent.
+     * @param list<array{operationId: string, method: string}> $catalog
+     * @param list<array{agent_id: string, name: string, depth: int, path: list<string>, helper_status: string, within_bounds: bool, effective_operation_count: int}> $entries
+     */
+    private function walkHierarchy(Agent $parent, array $path, int $maxDepth, array $catalog, array &$entries, bool &$truncated): void
+    {
+        $depth = count($path);
+
+        $assignments = AgentHelperAssignment::where('parent_agent_id', $parent->id)
+            ->with('helper')
+            ->get();
+
+        foreach ($assignments as $assignment) {
+            $helper = $assignment->helper;
+
+            if ($helper === null || in_array($assignment->helper_agent_id, $path, true)) {
+                // A trash-inclusive resolution belongs to US4/Phase 5
+                // (matching helpersFor()'s own disclosed, temporary
+                // limitation); a would-be revisit of an agent already on
+                // this path is a pre-existing cycle in the data the
+                // traversal defends against rather than looping forever,
+                // exactly like wouldCreateCycle()'s own visited-set guard.
+                continue;
+            }
+
+            if ($depth > $maxDepth) {
+                $truncated = true;
+
+                continue;
+            }
+
+            $childPath = [...$path, $helper->id];
+
+            $entries[] = [
+                'agent_id' => $helper->id,
+                'name' => $helper->name,
+                'depth' => $depth,
+                'path' => $childPath,
+                'helper_status' => $helper->is_active ? 'active' : 'deactivated',
+                'within_bounds' => $this->isWithinParentBounds($helper, $parent, $catalog),
+                'effective_operation_count' => count($this->effectiveOperationIds($helper, $parent, $catalog)),
+            ];
+
+            $this->walkHierarchy($helper, $childPath, $maxDepth, $catalog, $entries, $truncated);
+        }
+    }
+
+    /**
+     * DFS from $currentAgentId outward along active "parent of" edges
+     * (every agent $currentAgentId is itself currently a parent to),
+     * looking for $targetAgentId. Shared, by-reference $visited across the
+     * whole traversal is correct (not merely convenient) here: whether
+     * $targetAgentId is reachable beneath a given node is a property of
+     * that node alone, independent of which path led to it, so a node
+     * already fully explored never needs re-exploring.
+     *
+     * @param list<string> $path
+     * @param array<string, bool> $visited
+     */
+    private function dfsForTarget(string $currentAgentId, string $targetAgentId, array &$path, array &$visited): bool
+    {
+        if (isset($visited[$currentAgentId])) {
+            return false;
+        }
+
+        $visited[$currentAgentId] = true;
+        $path[] = $currentAgentId;
+
+        if ($currentAgentId === $targetAgentId) {
+            return true;
+        }
+
+        foreach ($this->activeHelperIdsOf($currentAgentId) as $childAgentId) {
+            if ($this->dfsForTarget($childAgentId, $targetAgentId, $path, $visited)) {
+                return true;
+            }
+        }
+
+        array_pop($path);
+
+        return false;
+    }
+
+    /**
+     * How deep $agentId itself already sits below its own root ancestor
+     * (0 for a root). Unlike dfsForTarget()'s shared visited-set, $visited
+     * is intentionally passed *by value* here: depth is the max over
+     * every valid path from a root, so a node reachable via more than one
+     * parent (research.md D1) must remain visitable again on a sibling
+     * branch — only revisiting a node already on the *current* path (a
+     * pre-existing cycle) must be guarded against.
+     *
+     * @param array<string, bool> $visited
+     */
+    private function depthOf(string $agentId, array $visited): int
+    {
+        if (isset($visited[$agentId])) {
+            return 0;
+        }
+
+        $visited[$agentId] = true;
+
+        $parentIds = $this->activeParentIdsOf($agentId);
+
+        if ($parentIds === []) {
+            return 0;
+        }
+
+        $maxParentDepth = 0;
+
+        foreach ($parentIds as $parentId) {
+            $maxParentDepth = max($maxParentDepth, $this->depthOf($parentId, $visited));
+        }
+
+        return $maxParentDepth + 1;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function activeHelperIdsOf(string $parentAgentId): array
+    {
+        return AgentHelperAssignment::where('parent_agent_id', $parentAgentId)
+            ->pluck('helper_agent_id')
+            ->all();
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function activeParentIdsOf(string $helperAgentId): array
+    {
+        return AgentHelperAssignment::where('helper_agent_id', $helperAgentId)
+            ->pluck('parent_agent_id')
+            ->all();
+    }
+
+    /**
      * The identical per-row annotation helpersFor() produces, for exactly
      * one already-known assignment — used by AgentHelperController::assign()
      * to render its own 201/200 response without re-listing and searching

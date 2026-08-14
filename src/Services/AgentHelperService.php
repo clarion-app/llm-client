@@ -2,6 +2,8 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Exceptions\HelperAssignmentCycleException;
+use ClarionApp\LlmClient\Exceptions\HelperDepthLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\HelperExceedsParentPermissionsException;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 
@@ -22,9 +24,12 @@ use ClarionApp\LlmClient\Models\AgentHelperAssignment;
  * read-time within_bounds/effective_operation_count annotation are
  * provably the same rule.
  *
- * Cycle and depth-limit checks are deliberately not wired in here yet
- * (097-subagent-model Phase 4/US3) — assign() currently only enforces
- * self-assignment and the subset-of-parent constraint (US1/US2).
+ * Cycle prevention (research.md D2) and the depth-limit bound (research.md
+ * D5) are enforced here too (097-subagent-model Phase 4/US3), after the
+ * self-assignment/subset-of-parent checks and before the upsert
+ * (data-model.md §3's ordered validation list) — both reuse
+ * AgentHelperQuery's own wouldCreateCycle()/computeDepth() traversal
+ * rather than re-implementing graph-walking here.
  */
 class AgentHelperService
 {
@@ -43,6 +48,10 @@ class AgentHelperService
      *   the candidate helper, or when parentAgentId === helperAgentId.
      * @throws HelperExceedsParentPermissionsException when the candidate
      *   helper's own permitted operations exceed the parent's.
+     * @throws HelperAssignmentCycleException when the assignment would
+     *   close a cycle, direct or transitive.
+     * @throws HelperDepthLimitExceededException when the assignment would
+     *   nest the helper deeper than config('llm-client.helpers.max_depth').
      */
     public function assign(string $callerUserId, string $parentAgentId, string $helperAgentId): AgentHelperAssignment
     {
@@ -71,6 +80,19 @@ class AgentHelperService
             ));
 
             throw new HelperExceedsParentPermissionsException($parentAgentId, $helperAgentId, $excess);
+        }
+
+        $cyclePath = $this->helperQuery->wouldCreateCycle($parentAgentId, $helperAgentId);
+
+        if ($cyclePath !== null) {
+            throw new HelperAssignmentCycleException($parentAgentId, $helperAgentId, $cyclePath);
+        }
+
+        $maxDepth = (int) config('llm-client.helpers.max_depth', 10);
+        $computedDepth = $this->helperQuery->computeDepth($parentAgentId, $helperAgentId);
+
+        if ($computedDepth > $maxDepth) {
+            throw new HelperDepthLimitExceededException($parentAgentId, $helperAgentId, $computedDepth, $maxDepth);
         }
 
         $assignment = AgentHelperAssignment::withTrashed()->firstOrNew([

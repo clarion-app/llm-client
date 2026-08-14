@@ -4,6 +4,8 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use Auth;
+use ClarionApp\LlmClient\Exceptions\HelperAssignmentCycleException;
+use ClarionApp\LlmClient\Exceptions\HelperDepthLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\HelperExceedsParentPermissionsException;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Services\AgentHelperQuery;
@@ -27,11 +29,12 @@ use Illuminate\Http\Request;
  * to manage its helpers.
  *
  * Unlike AgentShareController::validationFailedResponse()'s single
- * catch-all 422 shape, assign() here renders distinct 422 bodies per
- * rejection reason — a plain \RuntimeException (self-assignment) and
- * HelperExceedsParentPermissionsException (exceeds-parent-permissions) in
- * this phase; HelperAssignmentCycleException/HelperDepthLimitExceededException
- * are added in Phase 4/US3, not yet caught here.
+ * catch-all 422 shape, assign() here renders four distinct 422 bodies per
+ * rejection reason: a plain \RuntimeException (self-assignment),
+ * HelperExceedsParentPermissionsException (exceeds-parent-permissions),
+ * HelperAssignmentCycleException (cycle-detected, 097-subagent-model Phase
+ * 4/US3), and HelperDepthLimitExceededException (depth-limit-exceeded,
+ * same phase).
  */
 class AgentHelperController extends Controller
 {
@@ -76,6 +79,19 @@ class AgentHelperController extends Controller
                 'message' => $e->getMessage(),
                 'excess_operation_ids' => $e->excessOperationIds,
             ], 422);
+        } catch (HelperAssignmentCycleException $e) {
+            return response()->json([
+                'error' => 'cycle_detected',
+                'message' => $e->getMessage(),
+                'cycle_path' => $e->cyclePath,
+            ], 422);
+        } catch (HelperDepthLimitExceededException $e) {
+            return response()->json([
+                'error' => 'depth_limit_exceeded',
+                'message' => $e->getMessage(),
+                'computed_depth' => $e->computedDepth,
+                'max_depth' => $e->maxDepth,
+            ], 422);
         } catch (\RuntimeException $e) {
             return response()->json([
                 'error' => 'self_assignment',
@@ -105,6 +121,23 @@ class AgentHelperController extends Controller
         return response()->json([
             'data' => $rows->map(fn (object $row) => $this->rowResource($row))->all(),
         ]);
+    }
+
+    /**
+     * GET /agents/{id}/helpers/hierarchy (contracts §3, FR-007). Owner-only,
+     * `404` identically to assign()/helpers() for a non-owner caller. The
+     * full descendant graph beneath the given agent, flattened depth-first
+     * — not only its immediate helpers.
+     */
+    public function hierarchy(Request $request, string $id): JsonResponse
+    {
+        $result = $this->query->hierarchyFor(Auth::id(), $id);
+
+        if ($result === null) {
+            return $this->notFoundResponse();
+        }
+
+        return response()->json($result);
     }
 
     private function rowResource(object $row): array

@@ -37,10 +37,30 @@ use Tests\TestCase;
  * deliberately not covering a soft-deleted helper here, that is Phase
  * 5/US4's own addition).
  *
- * wouldCreateCycle()/hierarchyFor() are deliberately not covered here
- * (Phase 4/US3, per the Ordering grounding note).
+ * T036 (US3, appended below) covers the not-yet-built wouldCreateCycle():
+ * a fresh, disjoint pair is null (no cycle); a direct 2-cycle and a 3-hop
+ * transitive chain both return a non-null cycle path (the 3-hop case
+ * specifically proving the DFS walks beyond the direct case, naming all
+ * three agents in chain order); and a defensive case seeding a
+ * pre-existing cycle directly at the model layer (bypassing
+ * AgentHelperService::assign()'s own validation, which does not exist
+ * yet) proves the traversal's visited-set terminates rather than looping
+ * forever, even confronted with fixture data that should never occur
+ * through the real API.
  *
- * Written first, confirmed RED: AgentHelperQuery does not exist yet.
+ * T037 (US3, appended below) covers the not-yet-built depth-computation
+ * primitive (research.md D5) via config('llm-client.helpers.max_depth'):
+ * an assignment landing within the configured bound and one landing
+ * beyond it both compute the correct depth (the caller -- assign(),
+ * tested at the HTTP level in T039 -- is the one that turns "exceeds" into
+ * a refusal; this file only proves the number itself is right).
+ *
+ * hierarchyFor() is deliberately not covered here (Phase 4/US3's own HTTP
+ * scenario, T040, in AgentHelperAssignmentJourneyTest.php instead).
+ *
+ * Written first, confirmed RED: AgentHelperQuery does not exist yet
+ * (T015/T016), and wouldCreateCycle()/computeDepth() do not exist yet
+ * either (T036/T037).
  */
 class AgentHelperQueryTest extends TestCase
 {
@@ -345,6 +365,175 @@ YAML;
             2,
             $exceedingRow->effective_operation_count,
             'the intersection with the parent (2), never the helper\'s own full 3-operation set',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // wouldCreateCycle() — T036 (US3)
+    //
+    // Every assignment below is seeded directly at the model layer
+    // (AgentHelperService::assign() does not yet exist / does not yet
+    // enforce this rule) so each fixture graph can be built exactly as
+    // described regardless of what a future assign() would itself refuse.
+    //
+    // Written first, confirmed RED: wouldCreateCycle() doesn't exist yet.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_fresh_disjoint_pair_returns_null_no_cycle(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->agent($owner, 'cycle-fresh-a', '"*"');
+        $agentB = $this->agent($owner, 'cycle-fresh-b', '"*"');
+
+        $result = $this->query()->wouldCreateCycle($agentA->id, $agentB->id);
+
+        $this->assertNull($result, 'two agents with no existing relationship at all must never be flagged as a cycle');
+    }
+
+    #[Test]
+    public function a_direct_two_cycle_returns_a_non_null_path_naming_both(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->agent($owner, 'cycle-direct-a', '"*"');
+        $agentB = $this->agent($owner, 'cycle-direct-b', '"*"');
+
+        // A is already a helper of B (existing edge: parent=B, helper=A).
+        $this->assign($agentB, $agentA, $owner);
+
+        // Checking whether B could now be assigned as A's own helper
+        // (parent=A, helper=B) -- this would close the loop A -> B -> A.
+        $result = $this->query()->wouldCreateCycle($agentA->id, $agentB->id);
+
+        $this->assertNotNull($result, 'assigning B as A\'s helper would close a direct 2-cycle with the existing A-helper-of-B edge');
+        $this->assertEqualsCanonicalizing(
+            [$agentA->id, $agentB->id],
+            $result,
+            'the cycle path must name both agents involved',
+        );
+    }
+
+    #[Test]
+    public function a_three_hop_chain_returns_a_non_null_path_naming_all_three_in_order(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->agent($owner, 'cycle-chain-a', '"*"');
+        $agentB = $this->agent($owner, 'cycle-chain-b', '"*"');
+        $agentC = $this->agent($owner, 'cycle-chain-c', '"*"');
+
+        // A -> B -> C: A is parent of B, B is parent of C.
+        $this->assign($agentA, $agentB, $owner);
+        $this->assign($agentB, $agentC, $owner);
+
+        // Checking whether A could now be assigned as C's own helper
+        // (parent=C, helper=A) -- this would close the loop
+        // A -> B -> C -> A, a genuinely transitive cycle the direct-case
+        // check above cannot exercise.
+        $result = $this->query()->wouldCreateCycle($agentC->id, $agentA->id);
+
+        $this->assertNotNull($result, 'assigning A as C\'s helper would close a transitive, 3-hop cycle');
+        $this->assertSame(
+            [$agentA->id, $agentB->id, $agentC->id],
+            $result,
+            'the cycle path must name all three agents in chain order (A, B, C), not merely contain them',
+        );
+    }
+
+    #[Test]
+    public function a_pre_existing_cycle_in_the_fixture_data_does_not_cause_infinite_recursion(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->agent($owner, 'cycle-guard-a', '"*"');
+        $agentB = $this->agent($owner, 'cycle-guard-b', '"*"');
+        $agentC = $this->agent($owner, 'cycle-guard-c', '"*"');
+
+        // Seed a pre-existing 2-cycle directly at the model layer,
+        // bypassing AgentHelperService::assign()'s own validation entirely
+        // -- something the real API must never allow once T044 wires the
+        // cycle check in, but the traversal itself must defend against
+        // regardless, via a visited-set, rather than looping forever or
+        // overflowing the stack if such data somehow existed anyway.
+        $this->assign($agentA, $agentB, $owner);
+        $this->assign($agentB, $agentA, $owner);
+
+        // C is entirely unrelated to the A<->B cycle -- checking whether A
+        // could be assigned as C's own helper must terminate and correctly
+        // report no cycle, since C never appears in A's reachable
+        // descendant set no matter how many times the traversal revisits
+        // A/B.
+        $result = $this->query()->wouldCreateCycle($agentC->id, $agentA->id);
+
+        $this->assertNull($result, 'C is unrelated to the pre-existing A<->B cycle; the traversal must still terminate and find no cycle');
+    }
+
+    // ---------------------------------------------------------------
+    // Depth-computation primitive — T037 (US3)
+    //
+    // Design note: no method name for this primitive is fixed by
+    // data-model.md/research.md D5 (both describe only its behavior, not
+    // its signature) -- computeDepth(parentAgentId, helperAgentId): int is
+    // chosen here as the smallest primitive that answers "how deep would
+    // the candidate helper land if assigned under this parent," mirroring
+    // wouldCreateCycle()'s own (parentAgentId, helperAgentId) argument
+    // order. Whether a value exceeds config('llm-client.helpers.max_depth')
+    // is a comparison the caller makes (AgentHelperService::assign(), at
+    // the HTTP level in T039) -- this primitive only computes the number.
+    //
+    // Written first, confirmed RED: computeDepth() doesn't exist yet.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function an_assignment_landing_within_the_configured_max_depth_computes_the_correct_depth(): void
+    {
+        config(['llm-client.helpers.max_depth' => 2]);
+
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->agent($owner, 'depth-within-a', '"*"'); // root
+        $agentB = $this->agent($owner, 'depth-within-b', '"*"'); // depth 1
+        $agentD = $this->agent($owner, 'depth-within-d', '"*"'); // candidate
+
+        $this->assign($agentA, $agentB, $owner);
+
+        // D assigned under B (itself at depth 1) would land at depth 2.
+        $depth = $this->query()->computeDepth($agentB->id, $agentD->id);
+
+        $this->assertSame(2, $depth, 'D assigned under B lands at depth 2');
+        $this->assertLessThanOrEqual(
+            config('llm-client.helpers.max_depth'),
+            $depth,
+            'depth 2 is within the configured max_depth of 2 -- must not be flagged as exceeding it',
+        );
+    }
+
+    #[Test]
+    public function an_assignment_landing_beyond_the_configured_max_depth_computes_the_correct_depth(): void
+    {
+        config(['llm-client.helpers.max_depth' => 2]);
+
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->agent($owner, 'depth-beyond-a', '"*"'); // root
+        $agentB = $this->agent($owner, 'depth-beyond-b', '"*"'); // depth 1
+        $agentC = $this->agent($owner, 'depth-beyond-c', '"*"'); // depth 2
+        $agentD = $this->agent($owner, 'depth-beyond-d', '"*"'); // candidate
+
+        $this->assign($agentA, $agentB, $owner);
+        $this->assign($agentB, $agentC, $owner);
+
+        // D assigned under C (itself at depth 2) would land at depth 3,
+        // beyond the configured max_depth of 2.
+        $depth = $this->query()->computeDepth($agentC->id, $agentD->id);
+
+        $this->assertSame(3, $depth, 'D assigned under C lands at depth 3');
+        $this->assertGreaterThan(
+            config('llm-client.helpers.max_depth'),
+            $depth,
+            'depth 3 exceeds the configured max_depth of 2 -- must be flagged as exceeding it',
         );
     }
 }
