@@ -36,6 +36,21 @@ class Message extends Model
 
     protected static function booted(): void
     {
+        // EloquentMultiChainBridge's own `creating` listener (registered in
+        // this class's boot(), which runs before booted()) stamps `id` with
+        // a random Str::uuid() (v4) — fine for uniqueness, but it makes
+        // `id`'s sort order unrelated to creation order. Several call sites
+        // in this package (e.g. SubagentToolRestrictionRuntimeJourneyTest's
+        // toolCallMessages()) order a conversation's messages by `id` to
+        // recover the order they were written in, mirroring the same
+        // ordered-UUID precedent already established by
+        // EvalJudgmentOverride/EvalReferenceDesignation in this codebase.
+        // Registered here (booted(), not boot()) so it runs after — and
+        // overwrites — the trait's own random assignment.
+        static::creating(function ($model) {
+            $model->id = (string) \Illuminate\Support\Str::orderedUuid();
+        });
+
         static::creating(function ($model) {
             if ($model->run_id === null) {
                 $model->run_id = Context::get('run_id');

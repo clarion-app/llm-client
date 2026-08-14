@@ -71,6 +71,7 @@ class AgentLoopService
     private ?MetricsRecorder $metricsRecorder;
     private ?RunTraceRecorder $runTraceRecorder;
     private ConversationAgentDefinitionResolver $agentDefinitionResolver;
+    private EffectiveBoundResolver $effectiveBoundResolver;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -91,7 +92,8 @@ class AgentLoopService
         ?AutoMemoryRetriever $autoMemoryRetriever = null,
         ?MetricsRecorder $metricsRecorder = null,
         ?RunTraceRecorder $runTraceRecorder = null,
-        ?ConversationAgentDefinitionResolver $agentDefinitionResolver = null
+        ?ConversationAgentDefinitionResolver $agentDefinitionResolver = null,
+        ?EffectiveBoundResolver $effectiveBoundResolver = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -112,6 +114,7 @@ class AgentLoopService
         $this->metricsRecorder = $metricsRecorder;
         $this->runTraceRecorder = $runTraceRecorder;
         $this->agentDefinitionResolver = $agentDefinitionResolver ?? new ConversationAgentDefinitionResolver(new AgentDefinitionParser());
+        $this->effectiveBoundResolver = $effectiveBoundResolver ?? new EffectiveBoundResolver(new AgentHelperQuery(new AgentQuery(new AgentDefinitionParser()), new AgentDefinitionParser()));
     }
 
     /**
@@ -2735,6 +2738,23 @@ class AgentLoopService
                 ];
             } elseif ($boundDefinition->isConfirmationRequired($operationId) && $validation['status'] !== ApiCallValidator::STATUS_CONFIRM) {
                 $validation['status'] = ApiCallValidator::STATUS_CONFIRM;
+            }
+        }
+
+        // A helper's own attempt is also bound by the CURRENT permissions
+        // of every ancestor in the specific delegation chain that routed
+        // the work to it — checked live, on every attempt, not only at
+        // assignment time (100-subagent-tool-restrictions, FR-004/FR-005/
+        // FR-006). Never overwrites an installation-denylist rejection
+        // already found upstream; a chain-derived rejection does override
+        // a prior `confirm` status (reject wins).
+        if ($validation['status'] !== ApiCallValidator::STATUS_REJECT) {
+            $chain = $this->effectiveBoundResolver->check($conversation, $operationId);
+            if (!$chain['allowed']) {
+                $validation = [
+                    'status' => ApiCallValidator::STATUS_REJECT,
+                    'reason' => "Operation not permitted: ancestor agent \"{$chain['blocking_agent_name']}\" ({$chain['levels_up']} level(s) up in this delegation chain) does not permit \"{$operationId}\".",
+                ];
             }
         }
 
