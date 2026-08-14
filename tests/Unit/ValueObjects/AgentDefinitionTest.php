@@ -170,6 +170,89 @@ class AgentDefinitionTest extends TestCase
         $this->assertFalse($definition->isConfirmationRequired('contacts.store'));
     }
 
+    // =================================================================
+    // permittedOperationIds() (095-agent-summary-cards, T005, US1,
+    // data-model.md §5, research.md D4). Unlike isOperationPermitted(),
+    // the catalog is caller-supplied rather than resolved internally
+    // (resolveCatalog()) — every test below builds its own $catalog
+    // array from the exact same $operations map it hands to
+    // seedOperationCatalog(), so ApiManager::getOperationDetails()
+    // (consulted internally by the reused isDeniedByInstallation()) and
+    // the passed-in $catalog always describe the identical operation
+    // set.
+    // =================================================================
+
+    #[Test]
+    public function permitted_operation_ids_returns_exactly_the_tools_allow_matched_subset(): void
+    {
+        $operations = [
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact'],
+            'contacts.index' => ['path' => '/api/contacts', 'method' => 'get', 'summary' => 'List contacts'],
+            'weather.get_forecast' => ['path' => '/api/weather', 'method' => 'get', 'summary' => 'Get forecast'],
+        ];
+        $this->seedOperationCatalog($operations);
+
+        $definition = $this->makeDefinition(toolsAllow: ['contacts.*'], toolsDeny: []);
+
+        $result = $definition->permittedOperationIds($this->buildCatalog($operations));
+
+        $this->assertEqualsCanonicalizing(['contacts.store', 'contacts.index'], $result, 'only the contacts.* subset, never weather.get_forecast');
+    }
+
+    #[Test]
+    public function permitted_operation_ids_excludes_a_pattern_present_in_both_allow_and_deny_deny_wins(): void
+    {
+        $operations = [
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact'],
+            'contacts.index' => ['path' => '/api/contacts', 'method' => 'get', 'summary' => 'List contacts'],
+        ];
+        $this->seedOperationCatalog($operations);
+
+        $definition = $this->makeDefinition(toolsAllow: ['contacts.*'], toolsDeny: ['contacts.store']);
+
+        $result = $definition->permittedOperationIds($this->buildCatalog($operations));
+
+        $this->assertNotContains('contacts.store', $result, 'deny must win over allow for this one operation');
+        $this->assertContains('contacts.index', $result, 'the sibling operation, never denied, must still be permitted');
+    }
+
+    #[Test]
+    public function permitted_operation_ids_excludes_an_installation_denylisted_operation_even_when_allowed_and_not_denied(): void
+    {
+        $operations = [
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact'],
+            'internal.hidden' => ['path' => '/api/internal/hidden', 'method' => 'get', 'summary' => 'An installation-restricted operation'],
+        ];
+        $this->seedOperationCatalog($operations);
+        $this->app['config']->set('llm-client.api_denylist', ['/api/internal/*']);
+
+        // Present in toolsAllow and absent from toolsDeny at the
+        // definition level -- only the installation's own ceiling stands
+        // between this operation and permission.
+        $definition = $this->makeDefinition(toolsAllow: ['*'], toolsDeny: []);
+
+        $result = $definition->permittedOperationIds($this->buildCatalog($operations));
+
+        $this->assertNotContains('internal.hidden', $result, 'the installation denylist ceiling must exclude this operation regardless of the definition\'s own allow list');
+        $this->assertContains('contacts.store', $result, 'an operation the installation does not restrict must still be permitted');
+    }
+
+    #[Test]
+    public function permitted_operation_ids_returns_an_empty_list_when_tools_allow_matches_no_catalog_operation(): void
+    {
+        $operations = [
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact'],
+            'weather.get_forecast' => ['path' => '/api/weather', 'method' => 'get', 'summary' => 'Get forecast'],
+        ];
+        $this->seedOperationCatalog($operations);
+
+        $definition = $this->makeDefinition(toolsAllow: ['nonexistent_group.*'], toolsDeny: []);
+
+        $result = $definition->permittedOperationIds($this->buildCatalog($operations));
+
+        $this->assertSame([], $result);
+    }
+
     /**
      * @param array<string, bool>|null $memory
      * @param list<ReducibleTool> $capabilities
@@ -242,5 +325,25 @@ class AgentDefinitionTest extends TestCase
         $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
         $prop->setAccessible(true);
         $prop->setValue(null, null);
+    }
+
+    /**
+     * Builds the [{operationId, method}, ...] shape permittedOperationIds()
+     * expects as its own $catalog argument -- the exact same shape
+     * resolveCatalog() builds internally, but hand-built here from the
+     * identical $operations map already handed to seedOperationCatalog()
+     * so the two never describe a different operation set.
+     *
+     * @param array<string, array{path: string, method: string, summary: string}> $operations
+     * @return list<array{operationId: string, method: string}>
+     */
+    private function buildCatalog(array $operations): array
+    {
+        $catalog = [];
+        foreach ($operations as $operationId => $entry) {
+            $catalog[] = ['operationId' => $operationId, 'method' => $entry['method']];
+        }
+
+        return $catalog;
     }
 }

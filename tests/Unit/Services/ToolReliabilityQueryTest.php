@@ -387,4 +387,115 @@ class ToolReliabilityQueryTest extends TestCase
         $agentARow = collect($breakdown)->firstWhere('agent_id', 'agent-a');
         $this->assertSame(3, $agentARow['invocation_count'], "the caller's own contribution only, never the stranger's 50 folded in");
     }
+
+    // === 095-agent-summary-cards (T006, US2): agentSummary()/agentList() ===
+    //
+    // Neither method exists yet -- both fail with an undefined-method error
+    // until data-model.md §6/research.md D2's implementation adds them.
+    // Both are cross-tool (no $toolName at all, unlike every method above)
+    // aggregates over a raw [$from, $to] range, mirroring
+    // CostRollupQuery::agentTotal()/agentList()'s own shape exactly.
+
+    #[Test]
+    public function agent_list_sums_across_every_tool_name_for_a_given_agent(): void
+    {
+        $caller = (string) Str::uuid();
+        $agentId = 'agent-multi-tool';
+
+        $this->seedSummary(['tool_name' => 'search_documents', 'agent_id' => $agentId, 'user_id' => $caller, 'invocation_count' => 10, 'success_count' => 9, 'failure_count' => 1, 'failure_timeout_count' => 1]);
+        $this->seedSummary(['tool_name' => 'send_email', 'agent_id' => $agentId, 'user_id' => $caller, 'invocation_count' => 5, 'success_count' => 5]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->agentList($this->today(), $this->today(), $caller, true);
+
+        $row = collect($result)->firstWhere('agent_id', $agentId);
+        $this->assertNotNull($row, 'the agent must appear in the list, summed across every tool_name it used');
+        $this->assertSame(15, $row['invocation_count'], 'invocation_count must be the sum across both tool_name rows, not just one');
+        $this->assertSame(14, $row['success_count']);
+        $this->assertSame(1, $row['failure_count']);
+    }
+
+    #[Test]
+    public function agent_list_computes_low_sample_and_no_activity_identically_to_shapes_own_formula(): void
+    {
+        $caller = (string) Str::uuid();
+
+        // Below ToolReliabilitySummary::LOW_SAMPLE_THRESHOLD (10).
+        $this->seedSummary(['tool_name' => 'search_documents', 'agent_id' => 'agent-low-sample', 'user_id' => $caller, 'invocation_count' => 9, 'success_count' => 9]);
+        // At the threshold, clears it.
+        $this->seedSummary(['tool_name' => 'search_documents', 'agent_id' => 'agent-cleared', 'user_id' => $caller, 'invocation_count' => 10, 'success_count' => 10]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->agentList($this->today(), $this->today(), $caller, true);
+
+        $lowSampleRow = collect($result)->firstWhere('agent_id', 'agent-low-sample');
+        $clearedRow = collect($result)->firstWhere('agent_id', 'agent-cleared');
+
+        $this->assertNotNull($lowSampleRow);
+        $this->assertNotNull($clearedRow);
+        $this->assertTrue($lowSampleRow['low_sample'], '9 summed invocations is below the fixed threshold of 10, identical to shape()\'s own formula');
+        $this->assertFalse($lowSampleRow['no_activity']);
+        $this->assertFalse($clearedRow['low_sample'], '10 summed invocations clears the threshold, identical to shape()\'s own formula');
+    }
+
+    #[Test]
+    public function agent_list_non_operator_scoping_restricts_to_the_callers_own_rows(): void
+    {
+        $owner = (string) Str::uuid();
+        $stranger = (string) Str::uuid();
+        $agentId = 'agent-shared-by-two-users';
+
+        $this->seedSummary(['tool_name' => 'search_documents', 'agent_id' => $agentId, 'user_id' => $owner, 'invocation_count' => 3, 'success_count' => 3]);
+        $this->seedSummary(['tool_name' => 'search_documents', 'agent_id' => $agentId, 'user_id' => $stranger, 'invocation_count' => 50, 'success_count' => 0, 'failure_count' => 50, 'failure_other_count' => 50]);
+
+        $query = new ToolReliabilityQuery();
+
+        $asOwner = $query->agentList($this->today(), $this->today(), $owner, false);
+        $ownerRow = collect($asOwner)->firstWhere('agent_id', $agentId);
+        $this->assertNotNull($ownerRow, 'a non-operator scoping mismatch must never throw or omit the caller\'s own row');
+        $this->assertSame(3, $ownerRow['invocation_count'], "only the caller's own rows, never the stranger's");
+        $this->assertSame(0, $ownerRow['failure_count']);
+
+        $asOperator = $query->agentList($this->today(), $this->today(), $owner, true);
+        $operatorRow = collect($asOperator)->firstWhere('agent_id', $agentId);
+        $this->assertSame(53, $operatorRow['invocation_count'], 'an operator sees the full cross-user total');
+    }
+
+    #[Test]
+    public function agent_list_omits_an_agent_with_zero_rows_in_range_rather_than_a_zero_value_row(): void
+    {
+        $caller = (string) Str::uuid();
+        $this->seedSummary(['tool_name' => 'search_documents', 'agent_id' => 'agent-active', 'user_id' => $caller, 'invocation_count' => 5, 'success_count' => 5]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->agentList($this->today(), $this->today(), $caller, true);
+
+        $agentIds = array_column($result, 'agent_id');
+        $this->assertContains('agent-active', $agentIds);
+        $this->assertNotContains('agent-never-used-at-all', $agentIds, 'an agent with zero rows in range must be absent, never a zero-value row -- AgentSummaryQuery supplies the default shape for an absent key, not this method');
+    }
+
+    #[Test]
+    public function agent_summary_sums_across_every_tool_name_for_the_given_agent_and_reports_no_activity_when_unmatched(): void
+    {
+        $caller = (string) Str::uuid();
+        $agentId = 'agent-cross-tool';
+
+        $this->seedSummary(['tool_name' => 'search_documents', 'agent_id' => $agentId, 'user_id' => $caller, 'invocation_count' => 6, 'success_count' => 6]);
+        $this->seedSummary(['tool_name' => 'send_email', 'agent_id' => $agentId, 'user_id' => $caller, 'invocation_count' => 4, 'success_count' => 3, 'failure_count' => 1, 'failure_other_count' => 1]);
+
+        $query = new ToolReliabilityQuery();
+        $result = $query->agentSummary($agentId, $this->today(), $this->today(), $caller, true);
+
+        $this->assertSame($agentId, $result['agent_id']);
+        $this->assertSame(10, $result['invocation_count'], 'agentSummary() must sum across every tool_name for this agent, not just one');
+        $this->assertSame(9, $result['success_count']);
+        $this->assertSame(1, $result['failure_count']);
+        $this->assertFalse($result['no_activity']);
+        $this->assertFalse($result['low_sample']);
+
+        $unmatched = $query->agentSummary('agent-never-used', $this->today(), $this->today(), $caller, true);
+        $this->assertSame(0, $unmatched['invocation_count']);
+        $this->assertTrue($unmatched['no_activity'], 'an unmatched agent must report the no_activity shape, never null or an exception');
+    }
 }

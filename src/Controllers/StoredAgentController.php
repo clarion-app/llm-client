@@ -15,6 +15,7 @@ use ClarionApp\LlmClient\Services\AgentDefinitionValidator;
 use ClarionApp\LlmClient\Services\AgentDivergenceChecker;
 use ClarionApp\LlmClient\Services\AgentQuery;
 use ClarionApp\LlmClient\Services\AgentService;
+use ClarionApp\LlmClient\Services\AgentSummaryQuery;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionParseErrorKind;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionResolutionErrorKind;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionValidationResult;
@@ -45,6 +46,7 @@ class StoredAgentController extends Controller
         private readonly AgentDefinitionParser $parser,
         private readonly AgentDefinitionValidator $validator,
         private readonly AgentDivergenceChecker $divergenceChecker,
+        private readonly AgentSummaryQuery $summaryQuery,
     ) {}
 
     /**
@@ -190,7 +192,9 @@ class StoredAgentController extends Controller
 
         $result = $this->query->searchForUser(Auth::id(), $request->input('q'), $page, $perPage);
 
-        $data = array_map(fn (Agent $agent) => $this->agentSearchEntryResource($agent), $result['data']);
+        $summaries = $this->summaryQuery->summariesFor($result['data'], Auth::id());
+
+        $data = array_map(fn (Agent $agent) => $this->agentSearchEntryResource($agent, $summaries[$agent->id]), $result['data']);
 
         return response()->json([
             ...$this->envelope($data, $result['total'], $page, $perPage),
@@ -765,10 +769,14 @@ class StoredAgentController extends Controller
 
     /**
      * The shape search()'s `data` entries use (094-agent-search-listing,
-     * data-model.md §5, contracts/agent-search-api.md §1). `can_use` is
-     * always `true` today (research.md D6, FR-003).
+     * data-model.md §5, contracts/agent-search-api.md §1, extended by
+     * 095-agent-summary-cards, data-model.md §8, contracts/
+     * agent-summary-cards-api.md §1). `can_use` is always `true` today
+     * (research.md D6, FR-003). `$summary` is the per-agent shape
+     * AgentSummaryQuery::summariesFor() produces, keyed by this same
+     * agent's id at the call site.
      */
-    private function agentSearchEntryResource(Agent $agent): array
+    private function agentSearchEntryResource(Agent $agent, array $summary): array
     {
         return [
             'id' => $agent->id,
@@ -776,6 +784,11 @@ class StoredAgentController extends Controller
             'is_active' => $agent->is_active,
             'can_use' => true,
             'current_version_number' => $agent->currentVersion?->version_number,
+            'purpose' => $summary['purpose'],
+            'capabilities' => $summary['capabilities'],
+            'operation_count' => $summary['operation_count'],
+            'memory_enabled' => $summary['memory_enabled'],
+            'usage' => $summary['usage'],
         ];
     }
 }

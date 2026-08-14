@@ -115,6 +115,50 @@ class ToolReliabilityQuery
         return array_values($rows);
     }
 
+    /**
+     * Single agent, cross-tool, lifetime-range aggregate (095-agent-summary-
+     * cards, data-model.md §6, research.md D2). Unlike toolSummary(), there
+     * is no $toolName predicate at all — every tool_reliability_summaries
+     * row for this agent, across every tool it used, is summed together.
+     * Returns the zero-value/no_activity shape (never null) when the agent
+     * has no in-range, in-scope activity at all.
+     */
+    public function agentSummary(string $agentId, string $from, string $to, ?string $callerId, bool $isOperator): array
+    {
+        $query = $this->periodQuery($from, $to)->where('agent_id', $agentId);
+
+        if (!$isOperator) {
+            $query->where('user_id', $callerId);
+        }
+
+        $row = $query->selectRaw($this->aggregateSelect())->first();
+
+        return $this->shapeAgent($agentId, $row);
+    }
+
+    /**
+     * One entry per agent with any in-range, in-scope activity, summed
+     * across every tool_name (095-agent-summary-cards, data-model.md §6,
+     * research.md D2/D6) — mirroring CostRollupQuery::agentList()'s own
+     * grouped shape. An agent with zero rows in range is simply absent,
+     * never a zero-value row; AgentSummaryQuery supplies the default shape
+     * for an absent key, not this method.
+     */
+    public function agentList(string $from, string $to, ?string $callerId, bool $isOperator): array
+    {
+        $query = $this->periodQuery($from, $to);
+
+        if (!$isOperator) {
+            $query->where('user_id', $callerId);
+        }
+
+        $rows = $query->selectRaw('agent_id, '.$this->aggregateSelect())
+            ->groupBy('agent_id')
+            ->get();
+
+        return $rows->map(fn ($row) => $this->shapeAgent($row->agent_id, $row))->all();
+    }
+
     private function distinctAgentIds(string $toolName, string $from, string $to, ?string $userIdFilter): array
     {
         $query = $this->periodQuery($from, $to)->where('tool_name', $toolName);
@@ -183,6 +227,27 @@ class ToolReliabilityQuery
                 'other' => (int) ($row->failure_other_count ?? 0),
                 'uncategorized' => (int) ($row->failure_uncategorized_count ?? 0),
             ],
+            'low_sample' => $invocationCount < ToolReliabilitySummary::LOW_SAMPLE_THRESHOLD,
+            'no_activity' => $invocationCount === 0,
+        ];
+    }
+
+    /**
+     * The cross-tool sibling of shape() (095-agent-summary-cards, data-
+     * model.md §6) — no `period`/`tool_name`/`failure_breakdown` keys,
+     * since this aggregate has no tool or period dimension by construction.
+     * low_sample/no_activity use shape()'s identical post-summation
+     * formula.
+     */
+    private function shapeAgent(string $agentId, ?object $row): array
+    {
+        $invocationCount = (int) ($row->invocation_count ?? 0);
+
+        return [
+            'agent_id' => $agentId,
+            'invocation_count' => $invocationCount,
+            'success_count' => (int) ($row->success_count ?? 0),
+            'failure_count' => (int) ($row->failure_count ?? 0),
             'low_sample' => $invocationCount < ToolReliabilitySummary::LOW_SAMPLE_THRESHOLD,
             'no_activity' => $invocationCount === 0,
         ];

@@ -84,6 +84,34 @@ final class AgentDefinition
     }
 
     /**
+     * The exact set of catalog operations this definition currently
+     * permits — deny wins over allow, unioned with the installation
+     * denylist ceiling, identical policy to isOperationPermitted() but
+     * computed for the whole catalog at once instead of one operationId at
+     * a time (095-agent-summary-cards, data-model.md §5, research.md D4).
+     *
+     * $catalog is caller-supplied rather than resolved internally
+     * (resolveCatalog()) so a list render resolves it once and reuses the
+     * same array across every agent's own call, instead of each agent
+     * re-resolving it independently.
+     *
+     * @param list<array{operationId: string, method: string}> $catalog
+     * @return list<string>
+     */
+    public function permittedOperationIds(array $catalog): array
+    {
+        $permitted = array_diff(
+            OperationGroupPattern::resolve($this->toolsAllow, $catalog),
+            OperationGroupPattern::resolve($this->toolsDeny, $catalog),
+        );
+
+        return array_values(array_filter(
+            $permitted,
+            fn (string $operationId): bool => !$this->isDeniedByInstallation($operationId),
+        ));
+    }
+
+    /**
      * Unions the definition's own safetyConfirmationRequired with the
      * installation's own config('llm-client.confirm_methods') ceiling
      * (086-agent-yaml-schema Phase 4/US3) — an operation whose HTTP method
