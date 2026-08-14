@@ -277,4 +277,81 @@ class AgentQueryTest extends TestCase
         $this->assertNull($accessible);
         $this->assertNull($editable);
     }
+
+    // ---------------------------------------------------------------
+    // searchForUser() extension (096-agent-sharing, Phase 3/US1,
+    // tasks.md T020, data-model.md §3) — a caller's result set must
+    // include both agents they own and agents actively shared with them;
+    // pagination/total_unfiltered counts must include both; a revoked
+    // grant's agent must be excluded.
+    //
+    // Written first, confirmed RED: searchForUser()'s base query is still
+    // ownership-only, so a shared (not owned) agent is absent from every
+    // assertion below.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function search_for_user_includes_both_owned_and_actively_shared_agents(): void
+    {
+        $this->seedOperationCatalog();
+        $owner = $this->user();
+        $recipient = $this->user();
+        $ownedAgent = $this->service()->create($recipient->id, 'name: recipients-own-agent');
+        $sharedAgent = $this->service()->create($owner->id, 'name: shared-with-recipient');
+        $this->grant($sharedAgent->id, $owner->id, $recipient->id, 'use');
+
+        $result = $this->query()->searchForUser($recipient->id, null, 1, 20);
+
+        $ids = collect($result['data'])->pluck('id')->all();
+        $this->assertContains($ownedAgent->id, $ids, "the caller's own agent must still be included");
+        $this->assertContains($sharedAgent->id, $ids, 'an actively shared agent must now be included');
+    }
+
+    #[Test]
+    public function search_for_user_pagination_and_total_unfiltered_counts_include_shared_agents(): void
+    {
+        $this->seedOperationCatalog();
+        $owner = $this->user();
+        $recipient = $this->user();
+        $this->service()->create($recipient->id, 'name: recipients-own-agent-2');
+        $sharedAgent = $this->service()->create($owner->id, 'name: shared-with-recipient-2');
+        $this->grant($sharedAgent->id, $owner->id, $recipient->id, 'use');
+
+        $result = $this->query()->searchForUser($recipient->id, null, 1, 20);
+
+        $this->assertSame(2, $result['total_unfiltered'], 'total_unfiltered must count both owned and shared agents');
+        $this->assertSame(2, $result['total']);
+        $this->assertCount(2, $result['data']);
+    }
+
+    #[Test]
+    public function search_for_user_excludes_a_revoked_grants_agent(): void
+    {
+        // Deliberately paired with an *active* shared agent in the same
+        // fixture (not just an owned one): a revoked grant's exclusion
+        // would otherwise hold trivially even under today's still-
+        // ownership-only searchForUser(), since neither shared agent
+        // would appear yet either way — that would make this assertion
+        // vacuous rather than a genuine pre-implementation failure.
+        // Requiring the active one to be present is what forces this test
+        // red before T028 lands.
+        $this->seedOperationCatalog();
+        $owner = $this->user();
+        $recipient = $this->user();
+        $ownedAgent = $this->service()->create($recipient->id, 'name: recipients-own-agent-3');
+        $activeSharedAgent = $this->service()->create($owner->id, 'name: active-share-agent');
+        $this->grant($activeSharedAgent->id, $owner->id, $recipient->id, 'use');
+        $revokedAgent = $this->service()->create($owner->id, 'name: revoked-share-agent');
+        $revokedGrant = $this->grant($revokedAgent->id, $owner->id, $recipient->id, 'use');
+        $revokedGrant->delete();
+        $this->assertNotNull($revokedGrant->fresh()->deleted_at, 'fixture sanity: the grant must actually be soft-deleted');
+
+        $result = $this->query()->searchForUser($recipient->id, null, 1, 20);
+
+        $ids = collect($result['data'])->pluck('id')->all();
+        $this->assertContains($ownedAgent->id, $ids);
+        $this->assertContains($activeSharedAgent->id, $ids, 'an actively shared agent must still be included alongside the excluded revoked one');
+        $this->assertNotContains($revokedAgent->id, $ids, "a revoked grant's agent must not be included");
+        $this->assertSame(2, $result['total_unfiltered']);
+    }
 }

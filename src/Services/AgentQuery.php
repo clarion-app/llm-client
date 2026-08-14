@@ -170,6 +170,11 @@ class AgentQuery
      * query over name/instructions, paginated (094-agent-search-listing,
      * data-model.md §4).
      *
+     * Extended by 096-agent-sharing (data-model.md §3) to also include
+     * every agent actively (non-revoked) shared with the caller, alongside
+     * the agents they own outright — the one query behind GET
+     * /agents/search, so this is where FR-003/FR-004 are made real.
+     *
      * @return array{
      *   data: list<Agent>,   // already sliced to the requested page
      *   total: int,          // count after filtering by $query
@@ -183,6 +188,7 @@ class AgentQuery
         int $perPage,
     ): array {
         $agents = Agent::where('user_id', $callerUserId)
+            ->orWhereIn('id', $this->activeGrantAgentIds($callerUserId))
             ->with('currentVersion')
             ->orderBy('name')
             ->get();

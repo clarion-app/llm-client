@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException;
 use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
 use ClarionApp\LlmClient\Exceptions\LastActiveAgentException;
 use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentShareGrant;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
 use ClarionApp\LlmClient\Services\AgentDefinitionValidator;
@@ -22,6 +23,7 @@ use ClarionApp\LlmClient\ValueObjects\AgentDefinitionValidationResult;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinitionWarning;
 use ClarionApp\LlmClient\ValueObjects\FileDivergenceReport;
 use Auth;
+use ClarionApp\Backend\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -193,8 +195,14 @@ class StoredAgentController extends Controller
         $result = $this->query->searchForUser(Auth::id(), $request->input('q'), $page, $perPage);
 
         $summaries = $this->summaryQuery->summariesFor($result['data'], Auth::id());
+        $grants = $this->grantsForAgents(Auth::id(), $result['data']);
 
-        $data = array_map(fn (Agent $agent) => $this->agentSearchEntryResource($agent, $summaries[$agent->id]), $result['data']);
+        $data = array_map(fn (Agent $agent) => $this->agentSearchEntryResource(
+            $agent,
+            $summaries[$agent->id],
+            $grants[$agent->id] ?? null,
+            Auth::id(),
+        ), $result['data']);
 
         return response()->json([
             ...$this->envelope($data, $result['total'], $page, $perPage),
@@ -771,18 +779,33 @@ class StoredAgentController extends Controller
      * The shape search()'s `data` entries use (094-agent-search-listing,
      * data-model.md §5, contracts/agent-search-api.md §1, extended by
      * 095-agent-summary-cards, data-model.md §8, contracts/
-     * agent-summary-cards-api.md §1). `can_use` is always `true` today
-     * (research.md D6, FR-003). `$summary` is the per-agent shape
-     * AgentSummaryQuery::summariesFor() produces, keyed by this same
-     * agent's id at the call site.
+     * agent-summary-cards-api.md §1, and by 096-agent-sharing, data-model.md
+     * §9). `$summary` is the per-agent shape AgentSummaryQuery::summariesFor()
+     * produces, keyed by this same agent's id at the call site. `$grant` is
+     * the active grant backing this entry for a shared (not owned) agent —
+     * null for an agent the caller owns outright, since an owner never has
+     * a grant on their own agent.
+     *
+     * `can_use` is now genuinely conditional (research.md D6): true for the
+     * owner or a use_and_edit grant, false for a use-only grant. Its
+     * meaning is "may edit this agent's definition," not "may converse with
+     * it" — every entry in this response is conversation-eligible for the
+     * viewing caller regardless of permission.
      */
-    private function agentSearchEntryResource(Agent $agent, array $summary): array
+    private function agentSearchEntryResource(Agent $agent, array $summary, ?AgentShareGrant $grant, string $callerUserId): array
     {
+        $isShared = $agent->user_id !== $callerUserId;
+
         return [
             'id' => $agent->id,
             'name' => $agent->name,
             'is_active' => $agent->is_active,
-            'can_use' => true,
+            'can_use' => $agent->user_id === $callerUserId || $grant?->permission === 'use_and_edit',
+            'is_shared' => $isShared,
+            'shared_by' => $isShared
+                ? ['id' => $agent->user_id, 'name' => User::find($agent->user_id)?->name]
+                : null,
+            'permission' => $agent->user_id === $callerUserId ? 'owner' : $grant?->permission,
             'current_version_number' => $agent->currentVersion?->version_number,
             'purpose' => $summary['purpose'],
             'capabilities' => $summary['capabilities'],
@@ -790,5 +813,32 @@ class StoredAgentController extends Controller
             'memory_enabled' => $summary['memory_enabled'],
             'usage' => $summary['usage'],
         ];
+    }
+
+    /**
+     * The active grants backing search()'s current-page result set,
+     * keyed by agent_id — resolved in a single query for every shared
+     * (not owned) agent among $agents, rather than one query per row
+     * (096-agent-sharing, data-model.md §9).
+     *
+     * @param list<Agent> $agents
+     * @return array<string, AgentShareGrant>
+     */
+    private function grantsForAgents(string $callerUserId, array $agents): array
+    {
+        $sharedAgentIds = array_values(array_map(
+            fn (Agent $agent) => $agent->id,
+            array_filter($agents, fn (Agent $agent) => $agent->user_id !== $callerUserId),
+        ));
+
+        if ($sharedAgentIds === []) {
+            return [];
+        }
+
+        return AgentShareGrant::where('recipient_user_id', $callerUserId)
+            ->whereIn('agent_id', $sharedAgentIds)
+            ->get()
+            ->keyBy('agent_id')
+            ->all();
     }
 }

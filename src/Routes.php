@@ -37,6 +37,7 @@ use ClarionApp\LlmClient\Controllers\EvalRunComparisonController;
 use ClarionApp\LlmClient\Controllers\EvalDashboardController;
 use ClarionApp\LlmClient\Controllers\StoredAgentController;
 use ClarionApp\LlmClient\Controllers\AgentVersionComparisonController;
+use ClarionApp\LlmClient\Controllers\AgentShareController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -269,6 +270,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // contracts/agent-activation-api.md §1/§2, Phase 3/US1).
     Route::post('agents/{id}/activate', [StoredAgentController::class, "activate"]);
     Route::post('agents/{id}/deactivate', [StoredAgentController::class, "deactivate"]);
+
+    // Share an agent with another installation user, and list who currently
+    // has access (096-agent-sharing, contracts/agent-sharing-api.md §1/§2,
+    // Phase 3/US1). Both owner-only.
+    Route::post('agents/{id}/shares', [AgentShareController::class, "share"]);
+    Route::get('agents/{id}/shares', [AgentShareController::class, "shares"]);
 
     // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
     // contracts §4/§5). Named independently by two version ids, not nested
