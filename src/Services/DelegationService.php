@@ -15,17 +15,16 @@ use Illuminate\Support\Str;
 
 /**
  * The single write path for a delegated task hand-off (data-model.md §5,
- * research.md D1/D6/D7/D8). Mirrors AgentHelperService's role as the
- * sole owner of its own table.
+ * research.md D1/D3/D4/D5/D6/D7/D8). Mirrors AgentHelperService's role as
+ * the sole owner of its own table.
  *
- * This phase deliberately ships without bounding (D3), depth-limit
- * enforcement (D4), or failure-catching (D5) -- those are additive changes
- * layered on top of this same sequence later. depth is computed and stored
- * here (cheap, needed for the row's own completeness) but not yet refused
- * on; a bare try/finally restores the ambient run id around the nested
- * run() call, but nothing here catches an exception the nested call
- * throws -- it is expected to propagate to the parent's own top-level
- * handler.
+ * Bounding (D3) caps the nested run() call's own iterations/deadline;
+ * depth (D4) is computed, stored, and refused on before the nested call is
+ * ever made; a try/catch/finally wraps the nested run() call itself -- the
+ * catch (D5) maps any thrown exception to a terminal 'failed' Delegation
+ * and a structured failure result instead of letting it propagate to the
+ * parent's own loop, while the finally block unconditionally restores the
+ * ambient run id (D6) regardless of which of try/catch ran.
  */
 class DelegationService
 {
@@ -147,6 +146,25 @@ class DelegationService
 
         try {
             $rawResult = $this->agentLoopService->run($helperConversation, $composedMessage, $delegationOptions);
+        } catch (\Throwable $e) {
+            // D5: a thrown exception from the nested run() call must never
+            // propagate to the parent's own loop -- caught here and mapped
+            // to a terminal 'failed' Delegation, matching the ordinary
+            // ceiling/completion outcomes' own shape (FR-008/FR-012).
+            $failureReason = Str::limit($e->getMessage(), 500);
+
+            $delegation->status = 'failed';
+            $delegation->completed_at = now();
+            $delegation->outcome_summary = $failureReason;
+            $delegation->save();
+
+            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason);
+
+            return [
+                'status' => 'failed',
+                'helper' => $helperAgent->name,
+                'error' => $failureReason,
+            ];
         } finally {
             if ($enclosingRunId !== null) {
                 Context::add('run_id', $enclosingRunId);
