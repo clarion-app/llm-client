@@ -589,4 +589,233 @@ YAML;
             'the second call, requested only after P was narrowed to exclude A, must be blocked — the very next action is bound by the new, tighter permissions (Edge Case 1, quickstart.md scenario 4)',
         );
     }
+
+    // =================================================================
+    // T029 (US4, 100-subagent-tool-restrictions) — quickstart.md
+    // Scenario 6: installation-wide denial/confirmation rules apply to a
+    // helper's own delegated attempt exactly as they would to a
+    // directly-acting conversation (FR-009/FR-010, SC-006). Proof-only
+    // per research.md D5 — AgentDefinition::isOperationPermitted()/
+    // ::isConfirmationRequired() already union the installation ceiling
+    // into every definition either the direct or the delegated path
+    // reads, so no production code change is expected to make these
+    // pass; they are expected to already be GREEN today.
+    // =================================================================
+
+    #[Test]
+    public function an_installation_denylisted_operation_is_rejected_identically_for_a_direct_attempt_and_a_delegated_helpers_nested_attempt(): void
+    {
+        config(['llm-client.api_denylist' => ['/api/scenario6-denylisted']]);
+
+        $this->seedOperationCatalog([
+            'scenario6.denylisted' => ['path' => '/api/scenario6-denylisted', 'method' => 'get', 'summary' => 'Denylisted op'],
+        ]);
+
+        $parent = $this->makeAgentPermitting('scenario6-parent-denylist', ['scenario6.denylisted']);
+        $helper = $this->makeAgentPermitting('scenario6-helper-denylist', ['scenario6.denylisted']);
+        $this->assignHelper($parent->id, $helper->id);
+
+        Context::add('eval_run_simulating_tools', true);
+
+        // Direct attempt: a conversation bound directly to P, no
+        // delegation involved at all — the baseline scenario 6 compares
+        // the delegated attempt against.
+        $directConversation = $this->makeConversation($parent);
+        $directResult = json_decode(
+            app(AgentLoopService::class)->executeMetaTool(
+                'execute_operation',
+                ['operationId' => 'scenario6.denylisted', 'parameters' => []],
+                $directConversation,
+            ),
+            true,
+        );
+
+        $this->assertSame(
+            'Path is denylisted: /api/scenario6-denylisted',
+            $directResult['error'] ?? null,
+            'fixture sanity: a direct attempt at a denylisted path must be rejected (086-agent-yaml-schema, unchanged) — establishes the baseline this test compares the delegated attempt against',
+        );
+
+        // Delegated attempt: the byte-identical operation, attempted by
+        // H acting on delegated work from P.
+        $parentConversation = $this->makeConversation($parent);
+        $delegatedService = $this->serviceWithScriptedProvider([
+            $this->toolCallReply([$this->toolCall('execute_operation', ['operationId' => 'scenario6.denylisted', 'parameters' => []], 'call_denylist')]),
+            $this->plainReply('Attempt finished.'),
+        ]);
+        $delegatedResult = $this->delegationServiceWith($delegatedService)->delegate(
+            $parentConversation->fresh(),
+            $helper->id,
+            'Attempt the denylisted operation.',
+            null,
+        );
+
+        $delegation = Delegation::find($delegatedResult['delegation_id']);
+        $this->assertNotNull($delegation, 'fixture sanity: the delegation must have written a Delegation row');
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+
+        $toolMessage = $this->toolCallMessages($helperConversation)->first();
+        $this->assertNotNull($toolMessage, 'fixture sanity: H must have actually attempted the denylisted operation');
+        $delegatedToolResult = $this->firstToolResultContent($toolMessage);
+
+        $this->assertSame(
+            $directResult['error'] ?? null,
+            $delegatedToolResult['error'] ?? null,
+            'the installation denylist must reject a helper\'s own delegated attempt with the byte-identical message it would give a directly-acting conversation (US4, FR-009, SC-006)',
+        );
+    }
+
+    #[Test]
+    public function an_installation_confirm_method_operation_pauses_identically_for_a_direct_attempt_and_a_delegated_helpers_nested_attempt(): void
+    {
+        config(['llm-client.confirm_methods' => ['DELETE']]);
+
+        $this->seedOperationCatalog([
+            'scenario6.confirm' => ['path' => '/api/scenario6-confirm', 'method' => 'delete', 'summary' => 'Confirm-required op'],
+        ]);
+
+        $parent = $this->makeAgentPermitting('scenario6-parent-confirm', ['scenario6.confirm']);
+        $helper = $this->makeAgentPermitting('scenario6-helper-confirm', ['scenario6.confirm']);
+        $this->assignHelper($parent->id, $helper->id);
+
+        Context::add('eval_run_simulating_tools', true);
+
+        // Direct attempt — the baseline scenario 6 compares against.
+        $directConversation = $this->makeConversation($parent);
+        $directResult = json_decode(
+            app(AgentLoopService::class)->executeMetaTool(
+                'execute_operation',
+                ['operationId' => 'scenario6.confirm', 'parameters' => []],
+                $directConversation,
+            ),
+            true,
+        );
+
+        $this->assertTrue(
+            $directResult['__requires_confirmation'] ?? false,
+            'fixture sanity: a direct attempt at a confirm-method operation must pause for confirmation (086-agent-yaml-schema, unchanged) — establishes the baseline this test compares the delegated attempt against',
+        );
+        $this->assertSame('scenario6.confirm', $directResult['operationId'] ?? null);
+        $this->assertSame('DELETE', $directResult['method'] ?? null);
+        $this->assertSame('/api/scenario6-confirm', $directResult['path'] ?? null);
+
+        // Delegated attempt: the byte-identical operation, attempted
+        // from H's own nested run.
+        $parentConversation = $this->makeConversation($parent);
+        $delegatedService = $this->serviceWithScriptedProvider([
+            $this->toolCallReply([$this->toolCall('execute_operation', ['operationId' => 'scenario6.confirm', 'parameters' => []], 'call_confirm')]),
+        ]);
+        $delegatedResult = $this->delegationServiceWith($delegatedService)->delegate(
+            $parentConversation->fresh(),
+            $helper->id,
+            'Attempt the confirm-method operation.',
+            null,
+        );
+
+        $delegation = Delegation::find($delegatedResult['delegation_id']);
+        $this->assertNotNull($delegation, 'fixture sanity: the delegation must have written a Delegation row');
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+
+        $pausedMessage = $this->toolCallMessages($helperConversation)->first();
+        $this->assertNotNull($pausedMessage, 'fixture sanity: H must have actually attempted the confirm-method operation');
+        $pendingConfirmation = $pausedMessage->tool_data['pending_confirmation'] ?? null;
+        $this->assertNotNull(
+            $pendingConfirmation,
+            'H\'s own nested run must have paused for confirmation exactly as the direct attempt did — never silently auto-approved by the parent (D5)',
+        );
+
+        $this->assertSame(
+            $directResult['operationId'] ?? null,
+            $pendingConfirmation['operationId'] ?? null,
+            'the confirmation pause must name the byte-identical operationId a direct attempt would (US4, FR-010, SC-006)',
+        );
+        $this->assertSame($directResult['method'] ?? null, $pendingConfirmation['method'] ?? null);
+        $this->assertSame($directResult['path'] ?? null, $pendingConfirmation['path'] ?? null);
+    }
+
+    // =================================================================
+    // T029 (US4, 100-subagent-tool-restrictions) — quickstart.md
+    // Scenario 7: a helper's confirmation-required action is never
+    // silently approved by the parent, and is diagnosable as such (D5).
+    // Drives T028's unit-level mapping through the real, unmocked
+    // execution path end-to-end — DelegationService::delegate() (real)
+    // -> AgentLoopService::run() (real, scripted provider only) ->
+    // handleExecuteOperation()'s existing STATUS_CONFIRM pause (real,
+    // unchanged) -> delegate()'s not-yet-built confirmation_required
+    // branch (Phase 6 Implementation, T030, not yet done).
+    //
+    // Written before that branch exists — expected to FAIL on the
+    // result_reason assertion (still 'no_output' from the generic
+    // fallback), not on the earlier structural assertions, which already
+    // hold today.
+    // =================================================================
+
+    #[Test]
+    public function a_delegated_tasks_only_viable_next_operation_requiring_confirmation_is_never_executed_and_fails_the_delegation_as_confirmation_required(): void
+    {
+        config(['llm-client.confirm_methods' => ['DELETE']]);
+
+        $this->seedOperationCatalog([
+            'scenario7.confirm' => ['path' => '/api/scenario7-confirm', 'method' => 'delete', 'summary' => 'Confirm-required op'],
+        ]);
+
+        $parent = $this->makeAgentPermitting('scenario7-parent', ['scenario7.confirm']);
+        $helper = $this->makeAgentPermitting('scenario7-helper', ['scenario7.confirm']);
+        $this->assignHelper($parent->id, $helper->id);
+
+        $parentConversation = $this->makeConversation($parent);
+
+        Context::add('eval_run_simulating_tools', true);
+
+        // The task's only viable next operation requires confirmation —
+        // the nested run() call pauses on its very first tool call, so
+        // exactly one scripted response is ever consumed.
+        $service = $this->serviceWithScriptedProvider([
+            $this->toolCallReply([$this->toolCall('execute_operation', ['operationId' => 'scenario7.confirm', 'parameters' => []], 'call_scenario7')]),
+        ]);
+
+        $result = $this->delegationServiceWith($service)->delegate(
+            $parentConversation->fresh(),
+            $helper->id,
+            'Delete the thing — the only viable next step requires confirmation.',
+            null,
+        );
+
+        $this->assertSame('failure', $result['status'] ?? null);
+        $this->assertSame(
+            'confirmation_required',
+            $result['reason'] ?? null,
+            'a helper blocked on confirmation must be diagnosable as such, not indistinguishable from producing nothing at all (D5, contracts §4)',
+        );
+        $this->assertArrayHasKey('output', $result);
+        $this->assertNull($result['output'], 'the operation requiring confirmation was never executed, so no output can exist');
+
+        $delegation = Delegation::find($result['delegation_id']);
+        $this->assertNotNull($delegation, 'fixture sanity: the delegation must have written a Delegation row');
+        $this->assertSame('failed', $delegation->status);
+        $this->assertSame('confirmation_required', $delegation->result_reason);
+        $this->assertSame('failure', $delegation->result_status);
+        $this->assertNull($delegation->result_output);
+
+        // No side effect: the confirm-gated operation itself was paused
+        // before ever reaching executeApiCall() (contracts §3's
+        // existing, unchanged STATUS_CONFIRM handling in
+        // handleExecuteOperation() — the '__requires_confirmation'
+        // marker is returned in place of dispatching the call at all).
+        // Proven here by the helper conversation's own paused assistant
+        // message still carrying pending_confirmation with no
+        // tool_results ever recorded for this call.
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+        $pausedMessage = $this->toolCallMessages($helperConversation)->first();
+        $this->assertNotNull($pausedMessage);
+        $this->assertNotNull(
+            $pausedMessage->tool_data['pending_confirmation'] ?? null,
+            'fixture sanity: H\'s attempt must genuinely have paused for confirmation, never executed',
+        );
+        $this->assertArrayHasKey('tool_results', $pausedMessage->tool_data ?? []);
+        $this->assertNull(
+            $pausedMessage->tool_data['tool_results'],
+            'the confirm-gated call must never have produced a tool result — it was never executed',
+        );
+    }
 }

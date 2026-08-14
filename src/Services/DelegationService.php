@@ -375,16 +375,57 @@ class DelegationService
             );
         }
 
+        // 100-subagent-tool-restrictions (US4, research.md D5, contracts
+        // §4): a 'confirmation_required' return from the nested run() call
+        // means the helper's own only viable next operation required
+        // explicit confirmation -- something no one is present to answer
+        // inside a delegated run. This must be diagnosable as its own
+        // distinct result_reason, not folded into the generic 'no_output'
+        // fallback below (which would make it indistinguishable from a
+        // provider reply with no choices at all). The operation was never
+        // executed on this path, so result_output stays null exactly like
+        // every other failure branch (FR-007).
+        if (($rawResult['status'] ?? null) === 'confirmation_required') {
+            $resultSummary = 'This action requires your explicit confirmation and could not be completed automatically.';
+            $resultUndone = 'Everything -- the task could not be completed.';
+
+            $delegation->status = 'failed';
+            $delegation->completed_at = now();
+            $delegation->outcome_summary = $resultSummary;
+            $delegation->result_status = 'failure';
+            $delegation->result_reason = 'confirmation_required';
+            $delegation->result_output = null;
+            $delegation->result_summary = $resultSummary;
+            $delegation->result_undone = $resultUndone;
+            $delegation->result_truncated = false;
+            $delegation->save();
+
+            $sixFieldResult = [
+                'status' => 'failure',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => 'confirmation_required',
+            ];
+
+            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $resultSummary, json_encode($sixFieldResult));
+
+            return array_merge(
+                ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
+                $sixFieldResult,
+            );
+        }
+
         // Neither completed nor a recognized ceiling: every other shape
         // run() can return without throwing -- 'No response from LLM' (a
-        // provider reply with no choices), a 'confirmation_required' pause
-        // no one can ever answer inside a delegated run, an
-        // 'agent_access_revoked' stop -- is a non-completion, and must
-        // reach the parent as one. Reporting it as 'completed' would hand
-        // the parent a failure message dressed as a result and leave the
-        // Delegation row permanently in_progress, contradicting both
-        // FR-008/SC-004 and data-model.md §1's own "updated once to a
-        // terminal state after it returns (or throws)".
+        // provider reply with no choices), an 'agent_access_revoked' stop
+        // -- is a non-completion, and must reach the parent as one.
+        // Reporting it as 'completed' would hand the parent a failure
+        // message dressed as a result and leave the Delegation row
+        // permanently in_progress, contradicting both FR-008/SC-004 and
+        // data-model.md §1's own "updated once to a terminal state after
+        // it returns (or throws)".
         $failureReason = Str::limit(
             (string) ($content !== '' ? $content : 'The helper\'s run ended without producing a result.'),
             500,

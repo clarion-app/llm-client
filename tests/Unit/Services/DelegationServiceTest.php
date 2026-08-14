@@ -826,4 +826,80 @@ class DelegationServiceTest extends TestCase
         $this->assertSame('failed', $row->status);
         $this->assertSame($shortMessage, $row->outcome_summary);
     }
+
+    // =================================================================
+    // T028 (US4, 100-subagent-tool-restrictions) -- the not-yet-built
+    // 'confirmation_required' branch in delegate()'s fallback mapping
+    // (research.md D5, contracts §4).
+    //
+    // Written before DelegationService::delegate() distinguishes a
+    // 'confirmation_required' return from the nested run() call from any
+    // other non-completing, non-ceiling return. Today it falls straight
+    // into the generic "neither completed nor a recognized ceiling"
+    // fallback (L378-419) and is reported as result_reason: 'no_output',
+    // indistinguishable from a provider reply with no choices at all or
+    // any other non-completion. This case is expected to FAIL for that
+    // reason -- reason mismatch ('no_output' instead of
+    // 'confirmation_required'), not an uncaught error.
+    // =================================================================
+
+    #[Test]
+    public function delegate_maps_a_confirmation_required_return_to_a_failed_delegation_with_its_own_distinct_result_reason(): void
+    {
+        $parent = $this->makeAgent('parent-agent-confirmation-required');
+        $helper = $this->makeAgent('helper-agent-confirmation-required');
+        app(AgentHelperService::class)->assign($this->user->id, $parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        // Mirrors the exhaustion tests above (T037/US4's own established
+        // mock-the-nested-run()-return pattern): the exact shape
+        // AgentLoopService::run() itself already returns on a
+        // STATUS_CONFIRM validation result (AgentLoopService.php
+        // L1200-1205), never fabricated.
+        $mockAgentLoopService = Mockery::mock(AgentLoopService::class);
+        $mockAgentLoopService->shouldReceive('run')
+            ->once()
+            ->andReturn([
+                'status' => 'confirmation_required',
+                'content' => '',
+                'message_id' => null,
+                'confirmation' => [
+                    'confirmation_type' => 'api_call',
+                    'operationId' => 'delete.thing',
+                    'method' => 'DELETE',
+                    'path' => '/api/thing',
+                    'arguments' => [],
+                    'expires_at' => now()->addMinutes(5)->toIso8601String(),
+                ],
+            ]);
+        $this->app->instance(AgentLoopService::class, $mockAgentLoopService);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Delete the thing.', null);
+
+        $this->assertSame(
+            'failure',
+            $result['status'] ?? null,
+            'a confirmation_required return from the nested run() call must still map to the failure-shaped delegation_result (contracts §4) -- the helper\'s action was never approved, never executed',
+        );
+        $this->assertSame($helper->name, $result['helper'] ?? null);
+        $this->assertSame(
+            'confirmation_required',
+            $result['reason'] ?? null,
+            'the returned six-field shape\'s reason must be the new, distinct confirmation_required value -- not the generic no_output every other non-completing, non-ceiling return currently falls into (contracts §4)',
+        );
+        $this->assertArrayHasKey('output', $result);
+        $this->assertNull($result['output'], 'a confirmation_required delegation never carries output -- the operation was never executed');
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row, 'a failed-on-confirmation delegation must still write a Delegation row (FR-012)');
+        $this->assertSame('failed', $row->status);
+        $this->assertSame(
+            'confirmation_required',
+            $row->result_reason,
+            'the Delegation row itself must record confirmation_required, not the generic no_output the pre-existing fallback would otherwise write',
+        );
+        $this->assertSame('failure', $row->result_status);
+        $this->assertNull($row->result_output);
+    }
 }
