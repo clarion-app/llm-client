@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Tests\Unit\Services;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Services\AgentService;
@@ -50,6 +51,7 @@ class EffectiveBoundResolverTest extends TestCase
         Mockery::close();
 
         DB::table('agent_delegations')->delete();
+        DB::table('agent_helper_assignments')->delete();
         DB::table('conversations')->delete();
         DB::table('agent_versions')->delete();
         DB::table('agents')->delete();
@@ -331,5 +333,70 @@ YAML;
             $result['allowed'],
             'a defensive revisit guard must terminate the walk cleanly (mutation-testing checklist row 2\'s sibling for the runtime side) — every distinct ancestor actually reachable in this cycle (both of which permit x.operation) has already been checked once by the time a revisit is detected',
         );
+    }
+
+    // ---------------------------------------------------------------
+    // check() — a helper assigned to TWO different parents is bounded
+    // only by the specific chain that delegated the task, not by a
+    // combined/union view of every parent it is structurally assigned
+    // to (100-subagent-tool-restrictions, Phase 7/US5, tasks.md T034,
+    // spec.md Edge Case 2, mutation-testing checklist row 6).
+    //
+    // agent_helper_assignments (the full structural graph, Phase 3's own
+    // concern) and agent_delegations (the actual chain a piece of work
+    // was routed through, this class's own concern) must never be
+    // conflated: a helper can be structurally assigned to a parent that
+    // never delegated anything to it for this particular attempt, and
+    // that parent's own (possibly tighter) bound must have no bearing on
+    // this check.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_helper_assigned_to_two_different_parents_is_bounded_only_by_the_parent_that_actually_delegated_this_task(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+
+        $tightParent = $this->agentPermitting($owner, 'ebr-two-parents-tight', ['x.operation']);
+        $looseParent = $this->agentPermitting($owner, 'ebr-two-parents-loose', ['x.operation', 'y.operation']);
+        $helper = $this->agentPermitting($owner, 'ebr-two-parents-helper', ['x.operation', 'y.operation']);
+
+        // Structural assignment (agent_helper_assignments) to BOTH
+        // parents -- the full structural graph a mutation reading the
+        // wrong table (row 6) would consult instead of the actual
+        // delegation chain.
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $tightParent->id,
+            'helper_agent_id' => $helper->id,
+            'owner_user_id' => $owner->id,
+        ]);
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $looseParent->id,
+            'helper_agent_id' => $helper->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        $helperConversation = $this->conversation($owner);
+
+        // The ACTUAL delegation chain (agent_delegations) routes this
+        // specific piece of work through the LOOSE parent only -- the
+        // tight parent never delegated anything here, despite the
+        // structural assignment above.
+        $this->seedDelegationRow([
+            'parent_conversation_id' => $this->conversation($owner)->id,
+            'parent_agent_id' => $looseParent->id,
+            'helper_conversation_id' => $helperConversation->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        $result = $this->resolver()->check($helperConversation, 'y.operation');
+
+        $this->assertTrue(
+            $result['allowed'],
+            'the tight parent (which does not permit y.operation) is structurally assigned to this helper too, but never delegated this specific task -- agent_delegations (the actual chain), not agent_helper_assignments (the full structural graph), must govern this attempt (Edge Case 2)',
+        );
+        $this->assertNull($result['blocking_agent_id']);
+        $this->assertNull($result['blocking_agent_name']);
+        $this->assertNull($result['levels_up']);
     }
 }

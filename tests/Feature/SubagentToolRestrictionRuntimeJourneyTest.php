@@ -818,4 +818,121 @@ YAML;
             'the confirm-gated call must never have produced a tool result — it was never executed',
         );
     }
+
+    // =================================================================
+    // T033 (US5, 100-subagent-tool-restrictions) — quickstart.md
+    // Scenario 5: a 3-level delegation chain (A -> B -> C) is bounded by
+    // the TOP-level agent, not merely the immediate parent. Proof-only —
+    // EffectiveBoundResolver (built generically in Phase 4) already walks
+    // the full agent_delegations chain; no production code changes in
+    // this phase. This one test exercises mutation-testing checklist
+    // rows 5, 7, and 9 (EffectiveBoundResolver::check() always-allow,
+    // chain-derived reject downgraded to confirm, and depth off-by-one,
+    // respectively).
+    //
+    // Sequenced per tasks.md T033's own note: A initially permits
+    // {X, Y} — broad enough for both structural assignments below to
+    // succeed under Phase 3's own recursive
+    // guardAgainstExceedingActiveParents() check — B (assigned to A)
+    // permits {X, Y}, C (assigned to B) permits {X, Y}. Only AFTER both
+    // assignments succeed is A narrowed down to {X} only, isolating the
+    // RUNTIME check under test (EffectiveBoundResolver, walking the
+    // actual agent_delegations chain) from Phase 3's structural check (a
+    // different, already-covered mechanism — see T035's own dedicated
+    // case). Neither B's nor C's own definition is ever edited.
+    //
+    // A single shared, container-bound AgentLoopService double scripts
+    // every level's own turn, in the exact order the chain's own
+    // recursive chat() calls occur — DelegationDepthLimitTest.php's own
+    // established convention for a multi-level LIVE delegation chain,
+    // since delegate_to_helper's own handler resolves both
+    // DelegationService and AgentLoopService from the container.
+    // =================================================================
+
+    #[Test]
+    public function a_three_level_delegation_chain_is_blocked_by_the_top_level_agent_even_though_the_immediate_ancestor_still_permits_it(): void
+    {
+        $this->seedOperationCatalog([
+            'x.operation' => ['path' => '/api/x', 'method' => 'get', 'summary' => 'X operation'],
+            'y.operation' => ['path' => '/api/y', 'method' => 'get', 'summary' => 'Y operation'],
+        ]);
+
+        $agentA = $this->makeAgentPermitting('scenario5-agent-a', ['x.operation', 'y.operation']);
+        $helperB = $this->makeAgentPermitting('scenario5-helper-b', ['x.operation', 'y.operation']);
+        $this->assignHelper($agentA->id, $helperB->id);
+
+        $helperC = $this->makeAgentPermitting('scenario5-helper-c', ['x.operation', 'y.operation']);
+        $this->assignHelper($helperB->id, $helperC->id);
+
+        // Narrow A to {X} only -- AFTER both structural assignments above
+        // already succeeded, so the structural check (Phase 3) never gets
+        // a chance to refuse anything here; only the runtime chain check
+        // (this test's own subject) is under test from this point on.
+        $this->narrowAgentTo($agentA, 'scenario5-agent-a', ['x.operation']);
+
+        $conversationA = $this->makeConversation($agentA);
+
+        Context::add('eval_run_simulating_tools', true);
+
+        $service = $this->serviceWithScriptedProvider([
+            // A's own turn: delegate to B (depth 1).
+            $this->toolCallReply([
+                $this->toolCall('delegate_to_helper', [
+                    'helper_agent_id' => $helperB->id,
+                    'task' => 'Handle the first hop of this chain.',
+                    'context' => null,
+                ], 'call_scenario5_a_to_b'),
+            ]),
+            // B's own nested turn: delegate to C (depth 2).
+            $this->toolCallReply([
+                $this->toolCall('delegate_to_helper', [
+                    'helper_agent_id' => $helperC->id,
+                    'task' => 'Handle the second hop of this chain.',
+                    'context' => null,
+                ], 'call_scenario5_b_to_c'),
+            ]),
+            // C's own nested turn: attempt operation Y -- permitted by
+            // both B's own bound and C's own bound, but not by A, two
+            // levels further up this specific delegation chain.
+            $this->toolCallReply([
+                $this->toolCall('execute_operation', ['operationId' => 'y.operation', 'parameters' => []], 'call_scenario5_c_op_y'),
+            ]),
+            // C's own finishing reply, after its blocked attempt.
+            $this->plainReply('C acknowledges the blocked attempt.'),
+            // B's own finishing reply.
+            $this->plainReply("B's final answer, relying on C's own outcome."),
+            // A's own finishing reply.
+            $this->plainReply("A's final answer, relying on B's own outcome."),
+        ]);
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $result = $service->run($conversationA->fresh(), 'Please handle this chained task, which requires operation Y.');
+        $this->assertSame('completed', $result['status'], 'the top-level turn itself must complete normally regardless of what happened several levels down');
+
+        $delegationAB = Delegation::where('parent_conversation_id', $conversationA->id)->first();
+        $this->assertNotNull($delegationAB, 'fixture sanity: the first hop (A to B) must have succeeded');
+        $this->assertSame('completed', $delegationAB->status);
+
+        $delegationBC = Delegation::where('parent_conversation_id', $delegationAB->helper_conversation_id)->first();
+        $this->assertNotNull($delegationBC, 'fixture sanity: the second hop (B to C) must have succeeded -- the structural assignment of C under B was made while A still permitted {X, Y}, so it was never itself refused');
+        $this->assertSame('completed', $delegationBC->status);
+
+        $helperCConversation = Conversation::find($delegationBC->helper_conversation_id);
+        $this->assertNotNull($helperCConversation);
+
+        $cToolMessage = $this->toolCallMessages($helperCConversation)->first();
+        $this->assertNotNull($cToolMessage, 'fixture sanity: C must actually have attempted execute_operation(y.operation)');
+        $cToolResult = $this->firstToolResultContent($cToolMessage);
+
+        $this->assertArrayHasKey(
+            'error',
+            (array) $cToolResult,
+            'C\'s attempt at Y must be blocked -- Y is outside A\'s current bound, two levels up this specific delegation chain',
+        );
+        $this->assertSame(
+            'Operation not permitted: ancestor agent "scenario5-agent-a" (2 level(s) up in this delegation chain) does not permit "y.operation".',
+            $cToolResult['error'] ?? null,
+            'the rejection must name A specifically, at exactly 2 levels up (contracts §3) -- even though both B\'s own bound and C\'s own bound still include Y, since neither of their own definitions was ever edited',
+        );
+    }
 }

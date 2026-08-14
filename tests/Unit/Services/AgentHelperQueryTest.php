@@ -482,6 +482,57 @@ YAML;
     }
 
     // ---------------------------------------------------------------
+    // structuralEffectiveBound() cascades through a THIRD level of
+    // recursion — T035 (100-subagent-tool-restrictions, Phase 7/US5,
+    // tasks.md T035, spec.md Edge Case 3, FR-013).
+    //
+    // T007's own 3-level case (above) already proved a 2-hop cascade:
+    // root A narrows middle B. T008's own case already proved a helper's
+    // row reflects its immediate parent's own reduction one level up.
+    // This case goes one level further: an intermediate agent that is
+    // itself already a helper (B, itself narrowed by root A) acts as a
+    // PARENT to its own helper C, which in turn has its own helper D --
+    // proving the reduction cascades all the way to D, three levels
+    // beneath the root, without any manual step and without any
+    // depth-specific ceiling in structuralEffectiveBound()'s existing
+    // recursion (already built in Phase 3/T011 -- no new production
+    // code this phase).
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function structural_effective_bound_cascades_through_a_third_level_when_an_intermediate_helper_is_itself_narrowed_by_its_own_parent(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+
+        $agentA = $this->agentPermitting($owner, 't035-root-a', ['x.operation']);
+        $agentB = $this->agentPermitting($owner, 't035-middle-b', ['x.operation', 'y.operation']);
+        $agentC = $this->agentPermitting($owner, 't035-middle-c', ['x.operation', 'y.operation']);
+        $agentD = $this->agentPermitting($owner, 't035-leaf-d', ['x.operation', 'y.operation']);
+
+        $this->assign($agentA, $agentB, $owner); // B is A's helper -- narrowed to {X} by A
+        $this->assign($agentB, $agentC, $owner); // C is B's helper -- C's own relationship to B never changes
+        $this->assign($agentC, $agentD, $owner); // D is C's helper, a third level down from root A
+        $catalog = $this->buildCatalog();
+
+        $this->assertSame(
+            ['x.operation'],
+            $this->query()->structuralEffectiveBound($agentD, $catalog),
+            'D, three levels beneath root A, must still reflect A\'s own narrowing all the way down -- the cascade holds through a third level of recursion, not just the two already covered by T007/T008',
+        );
+
+        $this->assertFalse(
+            $this->query()->isWithinParentBounds($agentD, $agentC, $catalog),
+            'D is within C\'s own raw {X, Y}, but C\'s recursive bound (itself narrowed all the way from A, through B) is only {X} -- D exceeds it even though its own direct relationship to C never changed',
+        );
+        $this->assertSame(
+            ['x.operation'],
+            $this->sortedIds($this->query()->effectiveOperationIds($agentD, $agentC, $catalog)),
+            'effectiveOperationIds() for D against C must reflect the fully cascaded bound, not C\'s own raw {X, Y}',
+        );
+    }
+
+    // ---------------------------------------------------------------
     // FR-007/FR-008 composition with the recursive structural bound —
     // T025 (100-subagent-tool-restrictions, Phase 5/US3, tasks.md T025,
     // spec.md's "narrow a helper to just what its job needs" framing).
