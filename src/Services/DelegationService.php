@@ -72,9 +72,16 @@ class DelegationService
             ];
         }
 
-        // D4: depth, computed and stored -- not yet enforced.
+        // D4: depth, computed and enforced.
         $enclosingDelegation = Delegation::where('helper_conversation_id', $parentConversation->id)->latest()->first();
         $depth = $enclosingDelegation !== null ? $enclosingDelegation->depth + 1 : 1;
+
+        if ($depth > config('llm-client.delegation.max_chain_depth', 5)) {
+            return [
+                'error' => 'delegation_depth_exceeded',
+                'message' => 'This delegation chain has reached its maximum depth and cannot delegate any further.',
+            ];
+        }
 
         // D1: a brand-new, isolated ephemeral conversation for this one
         // delegation -- the exact server/model resolution recipe
@@ -130,8 +137,16 @@ class DelegationService
         // Context slot with no awareness of nesting.
         $enclosingRunId = Context::get('run_id');
 
+        // D3: the delegation-specific bounds -- an $options override on the
+        // nested run() call only, never mutating the shared config the
+        // parent's own outer loop reads.
+        $delegationOptions = [
+            'max_iterations' => config('llm-client.delegation.max_iterations', 10),
+            'deadline_at' => now()->addSeconds(config('llm-client.delegation.max_seconds', 120)),
+        ];
+
         try {
-            $rawResult = $this->agentLoopService->run($helperConversation, $composedMessage);
+            $rawResult = $this->agentLoopService->run($helperConversation, $composedMessage, $delegationOptions);
         } finally {
             if ($enclosingRunId !== null) {
                 Context::add('run_id', $enclosingRunId);
@@ -151,11 +166,65 @@ class DelegationService
         $content = $rawResult['content'] ?? '';
         $delegation->helper_run_id = $helperRunId;
 
+        // D3: a ceiling-reached return from the nested run() maps to a
+        // terminal 'exhausted' Delegation.status -- distinct from a
+        // genuine failure (Phase 6), never Failure on the trace row.
+        $exhaustionReasons = [
+            'max_iterations' => 'iteration_limit',
+            'time_ceiling_reached' => 'time_limit',
+        ];
+        $code = $rawResult['code'] ?? null;
+
         if (($rawResult['status'] ?? null) === 'completed') {
             $delegation->status = 'completed';
             $delegation->completed_at = now();
+            $delegation->outcome_summary = Str::limit((string) $content, 500);
+            $delegation->save();
+
+            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Success);
+
+            return [
+                'status' => 'completed',
+                'helper' => $helperAgent->name,
+                'result' => $content,
+            ];
         }
 
+        if ($code !== null && array_key_exists($code, $exhaustionReasons)) {
+            $incompleteBecause = $exhaustionReasons[$code];
+
+            // The helper's own last assistant content, if any, else empty
+            // (contracts/delegation-protocol-meta-tool.md) -- every prior
+            // iteration's assistant/tool messages are already persisted on
+            // the helper's own conversation by the time run() returns.
+            $partialResult = (string) ($helperConversation->messages()
+                ->where('role', 'assistant')
+                ->orderByDesc('created_at')
+                ->value('content') ?? '');
+
+            $delegation->status = 'exhausted';
+            $delegation->completed_at = now();
+            $delegation->outcome_summary = Str::limit($partialResult, 500);
+            $delegation->save();
+
+            $this->runTraceRecorder->closeAction(
+                $actionId,
+                ActionOutcome::Unfinished,
+                null,
+                "Delegation exhausted its {$incompleteBecause} before the helper could finish.",
+            );
+
+            return [
+                'status' => 'exhausted',
+                'helper' => $helperAgent->name,
+                'partial_result' => $partialResult,
+                'incomplete_because' => $incompleteBecause,
+            ];
+        }
+
+        // Neither completed nor a recognized ceiling -- left in_progress,
+        // a known, disclosed limitation until Phase 6 (US5) adds failure
+        // catching around the nested run() call.
         $delegation->outcome_summary = Str::limit((string) $content, 500);
         $delegation->save();
 

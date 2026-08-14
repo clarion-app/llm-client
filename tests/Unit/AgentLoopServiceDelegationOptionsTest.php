@@ -230,7 +230,8 @@ class AgentLoopServiceDelegationOptionsTest extends TestCase
         $this->assertSame('error', $result['status'] ?? null);
         $this->assertSame('Maximum iterations reached', $result['content'] ?? null);
         $this->assertSame('max_iterations', $result['code'] ?? null);
-        $this->assertNull($result['message_id'] ?? 'unset');
+        $this->assertArrayHasKey('message_id', $result);
+        $this->assertNull($result['message_id']);
 
         $run = DB::table('agent_runs')->where('conversation_id', $conversation->id)->first();
         $this->assertNotNull($run, 'fixture sanity: the run trace must have opened a row');
@@ -278,7 +279,8 @@ class AgentLoopServiceDelegationOptionsTest extends TestCase
         $this->assertSame('error', $result['status'] ?? null);
         $this->assertSame('Delegation time bound reached', $result['content'] ?? null);
         $this->assertSame('time_ceiling_reached', $result['code'] ?? null);
-        $this->assertNull($result['message_id'] ?? 'unset', 'mirrors the max-iterations close-out shape exactly -- message_id is always null');
+        $this->assertArrayHasKey('message_id', $result);
+        $this->assertNull($result['message_id'], 'mirrors the max-iterations close-out shape exactly -- message_id is always null');
 
         $run = DB::table('agent_runs')->where('conversation_id', $conversation->id)->first();
         $this->assertNotNull($run, 'fixture sanity: the run trace must have opened a row before the deadline check ever runs');

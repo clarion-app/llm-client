@@ -769,7 +769,8 @@ class AgentLoopService
             );
         }
 
-        $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
+        $maxIterations = $options['max_iterations'] ?? config('llm-client.agent_loop.max_iterations', 20);
+        $deadlineAt = $options['deadline_at'] ?? null;
         $tools = $this->buildToolsPayload($decision->withheldTools);
         $formattedTools = $this->formatTools($conversation, $tools);
 
@@ -787,6 +788,35 @@ class AgentLoopService
 
         try {
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
+                // Delegation time bound (research.md D3): checked before any
+                // per-iteration work for this iteration begins, mirroring the
+                // max-iterations-exceeded close-out shape below exactly, but
+                // with its own distinct end_reason/code.
+                if ($deadlineAt !== null && now()->greaterThanOrEqualTo($deadlineAt)) {
+                    $conversation->update(['is_processing' => false]);
+
+                    if ($this->runTraceRecorder !== null && $runId !== null) {
+                        if ($currentStepId !== null) {
+                            $this->runTraceRecorder->closeStep(
+                                $currentStepId,
+                                RunEndState::StoppedEarly,
+                            );
+                        }
+                        $this->runTraceRecorder->closeRun(
+                            $runId,
+                            RunEndState::StoppedEarly,
+                            'Delegation time bound reached',
+                        );
+                    }
+
+                    return [
+                        'status' => 'error',
+                        'content' => 'Delegation time bound reached',
+                        'message_id' => null,
+                        'code' => 'time_ceiling_reached',
+                    ];
+                }
+
                 // Generate attempt group ID for this turn (shared across LLM calls, retries, and tool calls)
                 $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
 
