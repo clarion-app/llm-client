@@ -24,7 +24,18 @@ class ConversationController extends Controller
     {
         $userId = Auth::id();
         $searchTerm = $request->query('search');
-        $query = Conversation::ownedByRealUser()->where('user_id', $userId);
+        // Exclude a delegation's own ephemeral helper conversations
+        // (098-delegation-protocol, research.md D10). channel is a
+        // nullable column with no DB-level default -- an ordinary
+        // conversation's own row may genuinely have a null channel, and
+        // SQL's `<> 'agent-delegation'` is UNKNOWN (not true) against
+        // null, so it must be paired with an explicit whereNull() or
+        // every channel-less conversation would silently vanish from the
+        // list.
+        $query = Conversation::ownedByRealUser()->where('user_id', $userId)
+            ->where(function ($q) {
+                $q->whereNull('channel')->orWhere('channel', '<>', 'agent-delegation');
+            });
 
         if(strlen($searchTerm))
         {

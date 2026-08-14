@@ -41,12 +41,12 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        // buildToolsPayload returns 9 hardcoded meta-tools
+        // buildToolsPayload returns 10 hardcoded meta-tools
         // (3 operation + 4 memory + 1 declarative-memory proposal + 1
-        // handoff, 093-agent-handoff)
-        $this->assertCount(9, $tools);
+        // handoff, 093-agent-handoff + 1 delegation, 098-delegation-protocol)
+        $this->assertCount(10, $tools);
 
-        // Verify all 9 meta-tools are present
+        // Verify all 10 meta-tools are present
         $toolNames = collect($tools)->pluck('function.name')->toArray();
         $this->assertContains('list_applications', $toolNames);
         $this->assertContains('execute_operation', $toolNames);
@@ -57,6 +57,7 @@ class AgentLoopServiceTest extends TestCase
         $this->assertContains('memory_delete', $toolNames);
         $this->assertContains('propose_declarative_memory', $toolNames);
         $this->assertContains('handoff_to_agent', $toolNames);
+        $this->assertContains('delegate_to_helper', $toolNames);
 
         // Verify structure of each tool
         foreach ($tools as $tool) {
@@ -76,8 +77,9 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache());
         $tools = $service->buildToolsPayload();
 
-        // 093-agent-handoff added a 9th meta-tool (handoff_to_agent).
-        $this->assertCount(9, $tools);
+        // 093-agent-handoff added a 9th meta-tool (handoff_to_agent);
+        // 098-delegation-protocol added a 10th (delegate_to_helper).
+        $this->assertCount(10, $tools);
 
         // Verify list_applications has no parameters
         $listApps = collect($tools)->firstWhere('function.name', 'list_applications');

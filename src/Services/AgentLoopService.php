@@ -10,6 +10,7 @@ use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
+use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
@@ -957,6 +958,16 @@ class AgentLoopService
                     $handoffDisclosure = $this->composeHandoffDisclosure($conversation);
                     if ($handoffDisclosure !== null) {
                         $content = $handoffDisclosure.' '.$content;
+                    }
+
+                    // A delegation, if any happened during this run, is
+                    // announced last of all three prepends -- landing
+                    // first in the final string (098-delegation-protocol,
+                    // research.md D7), completing the degradation, then
+                    // handoff, then delegation stacking order.
+                    $delegationDisclosure = $this->composeDelegationDisclosure($runId);
+                    if ($delegationDisclosure !== null) {
+                        $content = $delegationDisclosure.' '.$content;
                     }
 
                     $assistantMessage = Message::create([
@@ -2231,6 +2242,31 @@ class AgentLoopService
                     ],
                 ],
             ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'delegate_to_helper',
+                    'description' => 'Hand a self-contained piece of work to one of your assigned helpers. State exactly what is needed and what context applies — the helper sees only what you state here, nothing else from this conversation. Waits for the helper\'s outcome (success, partial result, or failure) before returning. Use this for a bounded task a narrower, specialized helper is better suited to carry out on your behalf, not to hand off the whole conversation (use handoff_to_agent for that).',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'helper_agent_id' => [
+                                'type' => 'string',
+                                'description' => 'The id of one of your own assigned helpers (see the Known Helpers section, if present). Delegating to any other agent is refused.',
+                            ],
+                            'task' => [
+                                'type' => 'string',
+                                'description' => 'What is needed — the self-contained statement of work for the helper to carry out.',
+                            ],
+                            'context' => [
+                                'type' => 'string',
+                                'description' => 'Optional. The specific context the helper needs to carry out the task. Only what you include here is visible to the helper — nothing else from this conversation crosses the boundary.',
+                            ],
+                        ],
+                        'required' => ['helper_agent_id', 'task'],
+                    ],
+                ],
+            ],
         ];
 
         if (empty($withheld)) {
@@ -2392,6 +2428,7 @@ class AgentLoopService
             'memory_delete' => $this->handleMemoryDelete($arguments, $conversation),
             'propose_declarative_memory' => $this->handleProposeDeclarativeMemory($arguments, $conversation),
             'handoff_to_agent' => $this->handleHandoffToAgent($arguments, $conversation),
+            'delegate_to_helper' => $this->handleDelegateToHelper($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -2783,6 +2820,44 @@ class AgentLoopService
     }
 
     /**
+     * Builds a "Known Helpers" section for the system prompt
+     * (098-delegation-protocol, contracts/delegation-protocol-meta-tool.md)
+     * -- mirrors buildKnownOperationsSection()'s exact shape. Returns null
+     * when the conversation has no bound agent, or that agent has no
+     * active assigned helpers.
+     */
+    private function buildKnownHelpersSection(Conversation $conversation): ?string
+    {
+        if ($conversation->agent_id === null || $conversation->user_id === null) {
+            return null;
+        }
+
+        $helpers = app(AgentHelperQuery::class)->helpersFor((string) $conversation->user_id, $conversation->agent_id);
+
+        if ($helpers === null) {
+            return null;
+        }
+
+        $active = $helpers->filter(fn ($row) => $row->helper_status === 'active');
+
+        if ($active->isEmpty()) {
+            return null;
+        }
+
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '## Known Helpers';
+        $lines[] = '';
+
+        foreach ($active as $row) {
+            $lines[] = "**{$row->helper_agent_id}** — {$row->helper_name}";
+            $lines[] = "  - Purpose: {$row->helper_purpose}";
+        }
+
+        return implode(PHP_EOL, $lines);
+    }
+
+    /**
      * Build the auto-retrieved memory section for injection into the system prompt.
      * Uses AutoMemoryRetriever when available, falls back to PreferenceInjector.
      *
@@ -2902,6 +2977,13 @@ class AgentLoopService
         $knownOpsSection = $this->buildKnownOperationsSection($conversation);
         if ($knownOpsSection !== null) {
             $systemPrompt .= $knownOpsSection;
+        }
+
+        // Append "Known Helpers" section when the bound agent has at
+        // least one active assigned helper (098-delegation-protocol).
+        $knownHelpersSection = $this->buildKnownHelpersSection($conversation);
+        if ($knownHelpersSection !== null) {
+            $systemPrompt .= $knownHelpersSection;
         }
 
         if (!empty($systemPrompt)) {
@@ -3140,6 +3222,34 @@ class AgentLoopService
     }
 
     /**
+     * Hand a self-contained task to one of this conversation's own
+     * assigned helpers (098-delegation-protocol, contracts/
+     * delegation-protocol-meta-tool.md). Presence-checks
+     * `helper_agent_id`/`task` (mirrors handleHandoffToAgent()'s own
+     * `agent_id` presence check above) and delegates the real work to
+     * DelegationService::delegate() -- eligibility, isolation, and the
+     * nested run() call all live there.
+     */
+    private function handleDelegateToHelper(array $arguments, Conversation $conversation): string
+    {
+        $helperAgentId = $arguments['helper_agent_id'] ?? null;
+        if (empty($helperAgentId)) {
+            return json_encode(['error' => 'helper_agent_id is required']);
+        }
+
+        $task = $arguments['task'] ?? null;
+        if (empty($task)) {
+            return json_encode(['error' => 'task is required']);
+        }
+
+        $context = $arguments['context'] ?? null;
+
+        $result = app(DelegationService::class)->delegate($conversation, $helperAgentId, $task, $context);
+
+        return json_encode($result);
+    }
+
+    /**
      * Compose the user-facing disclosure sentence for any undisclosed
      * handoff(s) on this conversation, and mark them disclosed in the same
      * call (093-agent-handoff, US2, contracts §2, research.md D6). Returns
@@ -3181,6 +3291,38 @@ class AgentLoopService
             ->update(['disclosed_at' => now()]);
 
         return $sentence;
+    }
+
+    /**
+     * Compose the user-facing disclosure sentence for every delegation
+     * made during this run (098-delegation-protocol, research.md D7).
+     * Scoped by run, not by an ever-disclosed flag -- unlike handoff's
+     * "only the most recent redirect matters" semantics, every delegation
+     * this run made should be named, so each run composes its own
+     * disclosure exactly once, from exactly the delegations that happened
+     * during it.
+     */
+    public function composeDelegationDisclosure(?string $runId): ?string
+    {
+        if ($runId === null) {
+            return null;
+        }
+
+        $names = Delegation::where('parent_run_id', $runId)
+            ->get()
+            ->map(fn (Delegation $delegation) => Agent::withTrashed()->find($delegation->helper_agent_id)?->name ?? 'a retired agent')
+            ->unique()
+            ->values();
+
+        if ($names->isEmpty()) {
+            return null;
+        }
+
+        $quoted = $names->map(fn ($name) => "\"{$name}\"")->all();
+        $last = array_pop($quoted);
+        $joined = empty($quoted) ? $last : implode(', ', $quoted).' and '.$last;
+
+        return "This response included work delegated to {$joined}.";
     }
 
     /**

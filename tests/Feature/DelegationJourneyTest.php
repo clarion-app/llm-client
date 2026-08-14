@@ -276,6 +276,7 @@ class DelegationJourneyTest extends TestCase
             app(McpToolExecutor::class),
             app(OperationCache::class),
             $registry,
+            metricsRecorder: new \ClarionApp\LlmClient\Services\MetricsRecorder(),
             runTraceRecorder: config('llm-client.run_trace.enabled', false) ? app(RunTraceRecorder::class) : null,
         );
     }
