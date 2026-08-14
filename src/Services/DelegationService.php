@@ -280,7 +280,19 @@ class DelegationService
                     config('llm-client.delegation.result_output_cap_bytes', 8192),
                 );
                 $resultTruncated = $this->contentSanitizer->isTruncated($resultOutput);
-                $decodedOutput = json_decode($resultOutput, true);
+
+                // 099-result-aggregation Phase 7 gap fix (tasks.md T048,
+                // contracts §2's invariant): the tool-result's own `output`
+                // key must come from the PRE-truncation validated array,
+                // never from json_decode()-ing the (possibly truncated)
+                // stored string -- truncation can cut mid-JSON-object, and
+                // json_decode() on a cut string silently returns null,
+                // which would make a truncated success/partial result's
+                // `output` indistinguishable from a genuine failure's
+                // `output: null`. The DB column ($resultOutput, above)
+                // stays truncated exactly as before; only the in-memory
+                // tool-result's `output` changes source.
+                $decodedOutput = $validated['output'] ?? [];
             }
 
             $delegation->status = 'completed';

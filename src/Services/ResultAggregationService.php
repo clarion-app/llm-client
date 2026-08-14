@@ -129,12 +129,53 @@ class ResultAggregationService
         $sanitized = $this->contentSanitizer->truncate($encoded, $cap);
         $truncated = $this->contentSanitizer->isTruncated($sanitized);
 
+        // 099-result-aggregation Phase 7 gap fix (tasks.md T048, FR-014):
+        // `truncated` alone is not enough -- the combined view's own
+        // returned combined_output/conflicts must actually be reduced to
+        // fit within $cap when reassembled in the same {combined_output,
+        // conflicts} shape used above to detect the overage, applied once
+        // to the assembled whole regardless of contributor count
+        // (mutation-checklist row 7), never per-contributor and never
+        // conflated with result_output_cap_bytes.
+        if ($truncated) {
+            [$combinedOutput, $conflicts] = $this->pruneToFitCap($combinedOutput, $conflicts, $cap);
+        }
+
         return [
             'contributors' => $contributors,
             'combined_output' => $combinedOutput,
             'conflicts' => $conflicts,
             'truncated' => $truncated,
         ];
+    }
+
+    /**
+     * Drops whole combined_output entries first (arbitrary but
+     * deterministic order -- most-recently-unioned key first), then whole
+     * conflicts entries if still over cap, re-measuring the exact
+     * {combined_output, conflicts} pair -- the same shape a caller (API
+     * response, system-prompt renderer) actually receives -- after every
+     * removal, until it fits or nothing is left to drop.
+     *
+     * @return array{0: array<string, mixed>, 1: array<int, array<string, mixed>>}
+     */
+    private function pruneToFitCap(array $combinedOutput, array $conflicts, int $cap): array
+    {
+        $fits = fn (array $output, array $confl): bool => strlen(json_encode([
+            'combined_output' => $output,
+            'conflicts' => $confl,
+        ])) <= $cap;
+
+        $outputKeys = array_keys($combinedOutput);
+        while (!$fits($combinedOutput, $conflicts) && !empty($outputKeys)) {
+            unset($combinedOutput[array_pop($outputKeys)]);
+        }
+
+        while (!$fits($combinedOutput, $conflicts) && !empty($conflicts)) {
+            array_pop($conflicts);
+        }
+
+        return [$combinedOutput, $conflicts];
     }
 
     /**

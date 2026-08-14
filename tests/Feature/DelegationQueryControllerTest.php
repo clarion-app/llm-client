@@ -1035,4 +1035,106 @@ class DelegationQueryControllerTest extends TestCase
         $this->assertSame($normalizer->helper_agent_id, $normalizerValue['helper_agent_id']);
         $this->assertSame($normalizerName, $normalizerValue['helper_agent_name']);
     }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 7 (US6), tasks.md T047 -- a dedicated,
+    // cap-forcing proof (at the read-API layer) of both size bounds
+    // (research.md D4, quickstart scenarios 6/7): under a low
+    // combined_output_cap_bytes, GET /agent-runs/{runId}/combined-results
+    // reflects truncated: true; separately, GET /delegations/{id} surfaces
+    // the raw truncated result_output string (not null) for a delegation
+    // whose result_output was actually truncated by a low
+    // result_output_cap_bytes, confirming Grounding note item 7's
+    // defensive-decode fix (T020) holds under real truncation.
+    // =================================================================
+
+    #[Test]
+    public function combined_results_reflects_truncated_true_under_a_low_combined_output_cap(): void
+    {
+        config(['llm-client.delegation.combined_output_cap_bytes' => 200]);
+
+        $runId = $this->makeRun($this->user);
+
+        $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Extracted the line items.',
+            'result_output' => json_encode(['line_items' => ['Widget A with a fairly long descriptive name', 'Widget B with a fairly long descriptive name']]),
+            'result_undone' => '',
+        ]);
+        $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Normalized the currency.',
+            'result_output' => json_encode(['currency' => 'USD', 'exchange_rate' => '1.08432', 'source' => 'central-bank-feed']),
+            'result_undone' => '',
+        ]);
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson($this->combinedResultsUrl($runId));
+
+        $response->assertStatus(200);
+
+        $body = $response->json();
+        $this->assertTrue(
+            $body['truncated'],
+            'GET /agent-runs/{runId}/combined-results must reflect truncated: true when the assembled combined view exceeds the configured combined_output_cap_bytes',
+        );
+    }
+
+    #[Test]
+    public function get_delegation_surfaces_the_raw_truncated_result_output_string_rather_than_null(): void
+    {
+        config(['llm-client.delegation.result_output_cap_bytes' => 50]);
+
+        $parent = $this->makeAgent($this->user, 'parent-truncated-output');
+        $helper = $this->makeAgent($this->user, 'helper-truncated-output');
+        $this->assignHelper($this->user, $parent->id, $helper->id);
+        $conversation = $this->makeConversation($this->user, $parent);
+
+        $largeOutput = ['line_items' => array_fill(0, 10, 'Widget with a fairly long descriptive name')];
+        $this->assertGreaterThan(
+            50,
+            strlen(json_encode($largeOutput)),
+            'fixture sanity: the encoded output must actually exceed the configured 50-byte cap',
+        );
+
+        $mock = Mockery::mock(AgentLoopService::class);
+        $mock->shouldReceive('run')->once()->andReturn([
+            'status' => 'completed',
+            'content' => json_encode($largeOutput),
+            'validated' => [
+                'status' => 'success',
+                'summary' => 'Extracted all line items.',
+                'output' => $largeOutput,
+                'undone' => '',
+            ],
+            'message_id' => null,
+        ]);
+        $this->app->instance(AgentLoopService::class, $mock);
+
+        app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+
+        $delegation = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($delegation, 'fixture sanity: the delegation must still write a Delegation row');
+        $this->assertTrue($delegation->result_truncated, 'fixture sanity: the stored result_output must actually have been truncated');
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/delegations/{$delegation->id}");
+
+        $response->assertStatus(200);
+
+        $row = $response->json();
+        $this->assertTrue($row['result_truncated']);
+        $this->assertNotNull(
+            $row['result_output'],
+            'a truncated (non-JSON) result_output must surface as the raw truncated string, not be silently swallowed to null by json_decode()',
+        );
+        $this->assertIsString(
+            $row['result_output'],
+            'a truncated result_output fails json_decode() (cut mid-object plus a non-JSON trailing marker), so the defensive fallback must return the raw string, not a decoded array',
+        );
+        $this->assertStringEndsWith(
+            "\n\n[TRUNCATED: original content exceeded cap]",
+            $row['result_output'],
+        );
+    }
 }

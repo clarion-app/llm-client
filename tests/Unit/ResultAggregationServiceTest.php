@@ -500,4 +500,68 @@ class ResultAggregationServiceTest extends TestCase
         );
         $this->assertSame([], $combined['conflicts']);
     }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 7 (US6), tasks.md T046: a dedicated,
+    // cap-forcing proof that the combined-view truncation (Phase 5/T033,
+    // ResultAggregationService's own ContentSanitizer::truncate() call
+    // against config('llm-client.delegation.combined_output_cap_bytes'))
+    // applies to the ASSEMBLED WHOLE, not per-contributor -- directly
+    // targeting mutation-checklist row 7's own named failure mode (quickstart
+    // scenario 7). Four contributors, each individually well within its own
+    // default 8192-byte result_output_cap_bytes, must still force
+    // truncated: true and an assembled byte length at or under the 200-byte
+    // combined cap regardless of contributor count.
+    // =================================================================
+
+    #[Test]
+    public function combined_output_is_truncated_against_the_combined_cap_regardless_of_how_many_contributors_are_individually_under_their_own_cap(): void
+    {
+        config(['llm-client.delegation.combined_output_cap_bytes' => 200]);
+
+        $runId = (string) Str::uuid();
+
+        $helperNames = [
+            'helper-combined-cap-one',
+            'helper-combined-cap-two',
+            'helper-combined-cap-three',
+            'helper-combined-cap-four',
+        ];
+
+        foreach ($helperNames as $i => $name) {
+            $helper = $this->makeAgent($name);
+            $output = ["field_{$i}" => "a moderately descriptive value for contributor number {$i}"];
+
+            $this->assertLessThan(
+                8192,
+                strlen(json_encode($output)),
+                'fixture sanity: each individual contributor\'s own output must stay well within its own default result_output_cap_bytes',
+            );
+
+            $this->makeDelegationRow($runId, $helper, [
+                'result_status' => 'success',
+                'result_summary' => "Done ({$i}).",
+                'result_output' => json_encode($output),
+                'result_undone' => '',
+            ]);
+        }
+
+        $combined = $this->service()->combineForRun($runId);
+
+        $this->assertNotNull($combined);
+        $this->assertTrue(
+            $combined['truncated'],
+            'combineForRun() must report truncated: true when the assembled combined_output/conflicts payload exceeds the 200-byte combined cap, regardless of how many individually-small contributors fed into it',
+        );
+
+        $assembled = json_encode([
+            'combined_output' => $combined['combined_output'],
+            'conflicts' => $combined['conflicts'],
+        ]);
+        $this->assertLessThanOrEqual(
+            200,
+            strlen($assembled),
+            'the assembled combined_output/conflicts JSON must itself stay at or under the configured combined cap',
+        );
+    }
 }

@@ -485,4 +485,105 @@ class DelegationServiceResultMappingTest extends TestCase
         $this->assertNull($row->result_output);
         $this->assertNotSame('null', $row->result_output);
     }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 7 (US6), tasks.md T045: a dedicated,
+    // cap-forcing proof that the already-shipped single-result truncation
+    // (Phase 3/T017, DelegationService.php's own ContentSanitizer::truncate()
+    // call against config('llm-client.delegation.result_output_cap_bytes'))
+    // actually truncates when forced, and stays untouched when not
+    // (quickstart scenario 6, mutation-checklist row 4). This should
+    // already pass given T017/T009 -- if it does not, that is a real gap
+    // for this phase to close, not a pre-existing pass to merely confirm.
+    // =================================================================
+
+    #[Test]
+    public function a_validated_output_exceeding_the_configured_cap_is_truncated_and_marked_while_one_well_under_it_is_not(): void
+    {
+        config(['llm-client.delegation.result_output_cap_bytes' => 100]);
+
+        // -------------------------------------------------------------
+        // Forcing case: a validated output whose JSON encoding exceeds
+        // the 100-byte cap.
+        // -------------------------------------------------------------
+        [$helper, $conversation] = $this->makeDelegationFixture('truncation-forced');
+
+        $largeOutput = ['line_items' => array_fill(0, 30, 'Widget with a moderately long descriptive name')];
+        $this->assertGreaterThan(
+            100,
+            strlen(json_encode($largeOutput)),
+            'fixture sanity: the encoded output must actually exceed the configured 100-byte cap',
+        );
+
+        $this->mockRunReturning([
+            'status' => 'completed',
+            'content' => json_encode($largeOutput),
+            'validated' => [
+                'status' => 'success',
+                'summary' => 'Extracted all line items.',
+                'output' => $largeOutput,
+                'undone' => '',
+            ],
+            'message_id' => null,
+        ]);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+
+        $this->assertContractShape($result);
+        $this->assertTrue($result['truncated'] ?? null, 'the tool result must report truncated: true when the cap was exceeded');
+        $this->assertIsArray($result['output'] ?? null, 'a truncated-but-non-failure output is still decoded when possible');
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row);
+        $this->assertTrue($row->result_truncated, 'result_truncated must be true when the stored result_output actually exceeded the configured cap');
+        $this->assertStringEndsWith(
+            "\n\n[TRUNCATED: original content exceeded cap]",
+            (string) $row->result_output,
+            'the stored result_output must end with ContentSanitizer\'s own truncation marker',
+        );
+
+        // -------------------------------------------------------------
+        // Non-forcing case: a validated output well under the same
+        // 100-byte cap must be explicitly untruncated, not merely absent
+        // an assertion.
+        // -------------------------------------------------------------
+        [$helperTwo, $conversationTwo] = $this->makeDelegationFixture('truncation-not-forced');
+
+        $smallOutput = ['total' => '42'];
+        $this->assertLessThan(
+            100,
+            strlen(json_encode($smallOutput)),
+            'fixture sanity: the encoded output must stay well under the configured 100-byte cap',
+        );
+
+        $this->mockRunReturning([
+            'status' => 'completed',
+            'content' => json_encode($smallOutput),
+            'validated' => [
+                'status' => 'success',
+                'summary' => 'Computed the total.',
+                'output' => $smallOutput,
+                'undone' => '',
+            ],
+            'message_id' => null,
+        ]);
+
+        $resultUnderCap = app(DelegationService::class)->delegate($conversationTwo, $helperTwo->id, 'Compute the total.', 'Invoice #124.');
+
+        $this->assertContractShape($resultUnderCap);
+        $this->assertSame(
+            false,
+            $resultUnderCap['truncated'] ?? null,
+            'truncated must be explicitly false for output well under the cap, not merely absent from the array',
+        );
+        $this->assertSame($smallOutput, $resultUnderCap['output'] ?? null);
+
+        $rowUnderCap = Delegation::where('parent_conversation_id', $conversationTwo->id)->first();
+        $this->assertNotNull($rowUnderCap);
+        $this->assertFalse($rowUnderCap->result_truncated, 'result_truncated must be explicitly false, not merely absent, when the cap was not exceeded');
+        $this->assertStringEndsNotWith(
+            "\n\n[TRUNCATED: original content exceeded cap]",
+            (string) $rowUnderCap->result_output,
+        );
+    }
 }
