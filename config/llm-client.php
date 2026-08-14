@@ -755,5 +755,17 @@ return [
     'helpers' => [
         'max_depth' => (int) env('LLM_CLIENT_HELPERS_MAX_DEPTH', 10),
     ],
+
+    // Delegation Protocol (098-delegation-protocol) — the per-delegation
+    // effort/time ceilings (FR-006/FR-007, research.md D3) and the maximum
+    // depth a live chain of nested delegations may reach before a further
+    // delegation is refused (FR-010, research.md D4). Distinct from
+    // helpers.max_depth above, which bounds the static possible-helper graph,
+    // not how deep a single turn's actual delegation chain may recurse.
+    'delegation' => [
+        'max_iterations' => (int) env('LLM_CLIENT_DELEGATION_MAX_ITERATIONS', 10),
+        'max_seconds' => (int) env('LLM_CLIENT_DELEGATION_MAX_SECONDS', 120),
+        'max_chain_depth' => (int) env('LLM_CLIENT_DELEGATION_MAX_CHAIN_DEPTH', 5),
+    ],
 ];
 

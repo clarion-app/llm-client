@@ -288,6 +288,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineConversationHandoffSchema();
         $this->defineAgentShareGrantSchema();
         $this->defineAgentHelperAssignmentSchema();
+        $this->defineAgentDelegationSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -1009,6 +1010,46 @@ abstract class TestCase extends BaseTestCase
                 $table->index('parent_agent_id');
                 $table->index('helper_agent_id');
                 $table->index('owner_user_id');
+            });
+        }
+    }
+
+    /**
+     * agent_delegations — the record of a single parent→helper task
+     * handoff (098-delegation-protocol, data-model.md §1). Mirrors
+     * defineAgentHelperAssignmentSchema()'s exact shape: Schema::hasTable()
+     * guarded, hand-declared here since no test in this package ever runs
+     * real migrations (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_14_000001_create_agent_delegations_table.php
+     * exactly.
+     */
+    protected function defineAgentDelegationSchema(): void
+    {
+        if (!Schema::hasTable('agent_delegations')) {
+            Schema::create('agent_delegations', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('parent_conversation_id');
+                $table->uuid('parent_agent_id')->nullable();
+                $table->uuid('helper_agent_id');
+                $table->uuid('helper_conversation_id')->unique();
+                $table->uuid('helper_agent_version_id')->nullable();
+                $table->uuid('owner_user_id');
+                $table->text('task');
+                $table->longText('context')->nullable();
+                $table->unsignedInteger('depth');
+                $table->enum('status', ['in_progress', 'completed', 'exhausted', 'failed']);
+                $table->uuid('parent_run_id')->nullable();
+                $table->uuid('parent_action_id')->nullable();
+                $table->uuid('helper_run_id')->nullable();
+                $table->text('outcome_summary')->nullable();
+                $table->timestamp('started_at', 6);
+                $table->timestamp('completed_at', 6)->nullable();
+
+                $table->index('parent_conversation_id');
+                $table->index('helper_agent_id');
+                $table->index('owner_user_id');
+                $table->index('parent_run_id');
+                $table->index('helper_run_id');
             });
         }
     }

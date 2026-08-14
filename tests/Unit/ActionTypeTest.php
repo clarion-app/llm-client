@@ -26,10 +26,16 @@ class ActionTypeTest extends TestCase
     }
 
     /** @test */
-    public function has_exactly_three_cases(): void
+    public function has_delegation_case(): void
+    {
+        $this->assertEquals('delegation', ActionType::Delegation->value);
+    }
+
+    /** @test */
+    public function has_exactly_four_cases(): void
     {
         $cases = ActionType::cases();
-        $this->assertCount(3, $cases);
+        $this->assertCount(4, $cases);
     }
 
     /** @test */
@@ -38,6 +44,7 @@ class ActionTypeTest extends TestCase
         $this->assertIsString(ActionType::LlmRequest->value);
         $this->assertIsString(ActionType::ToolInvocation->value);
         $this->assertIsString(ActionType::ContextReshape->value);
+        $this->assertIsString(ActionType::Delegation->value);
     }
 
     /** @test */
@@ -46,6 +53,7 @@ class ActionTypeTest extends TestCase
         $this->assertSame(ActionType::LlmRequest, ActionType::from('llm_request'));
         $this->assertSame(ActionType::ToolInvocation, ActionType::from('tool_invocation'));
         $this->assertSame(ActionType::ContextReshape, ActionType::from('context_reshape'));
+        $this->assertSame(ActionType::Delegation, ActionType::from('delegation'));
     }
 
     /** @test */

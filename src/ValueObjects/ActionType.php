@@ -7,4 +7,5 @@ enum ActionType: string
     case LlmRequest     = 'llm_request';
     case ToolInvocation = 'tool_invocation';
     case ContextReshape = 'context_reshape';
+    case Delegation     = 'delegation';
 }
