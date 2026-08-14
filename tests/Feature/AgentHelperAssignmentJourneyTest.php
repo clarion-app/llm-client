@@ -571,6 +571,58 @@ YAML;
         $this->assertSame([$agentA->id, $agentB->id, $agentC->id], $cEntry['path']);
     }
 
+    /**
+     * Reconciliation gap-closure test (post-Phase-6): AgentHelperQuery::
+     * walkHierarchy() resolved each row's helper via the plain
+     * AgentHelperAssignment::helper() relation, unlike helpersFor()'s own
+     * Phase 5 trash-inclusive fix -- so a soft-deleted node mid-chain was
+     * silently skipped, and because the traversal never recursed past a
+     * skipped node, its entire still-active sub-tree vanished from the
+     * hierarchy too, not merely the gone node itself. This directly
+     * violated FR-007 ("the full helper hierarchy... MUST be traceable,
+     * not only its immediate helpers") and was inconsistent with
+     * helpersFor()'s own established 'gone' handling (research.md D4) for
+     * the identical underlying situation.
+     */
+    #[Test]
+    public function fr007_hierarchy_endpoint_marks_a_gone_middle_node_and_keeps_its_subtree_traceable(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->makeAgent($owner, 'hierarchy-gone-a', '"*"');
+        $agentB = $this->makeAgent($owner, 'hierarchy-gone-b', '"*"');
+        $agentC = $this->makeAgent($owner, 'hierarchy-gone-c', '"*"');
+
+        // A -> B -> C, both hops seeded via passing assignments.
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($agentA->id), [
+            'helper_agent_id' => $agentB->id,
+        ])->assertStatus(201);
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($agentB->id), [
+            'helper_agent_id' => $agentC->id,
+        ])->assertStatus(201);
+
+        // B is soft-deleted entirely (research.md D4 case 1) -- its own
+        // A->B assignment row is left untouched, no cascade, and B's own
+        // B->C assignment row is likewise untouched.
+        $agentB->delete();
+
+        $response = $this->actingAs($owner, 'api')->getJson($this->helpersUrl($agentA->id).'/hierarchy');
+        $response->assertStatus(200);
+
+        $data = collect($response->json('data'));
+        $this->assertCount(2, $data, 'B must still appear (marked gone) and C must remain traceable beneath it, not silently dropped');
+
+        $bEntry = $data->firstWhere('agent_id', $agentB->id);
+        $this->assertNotNull($bEntry, 'the soft-deleted B must still appear in the hierarchy, marked, not omitted');
+        $this->assertSame('gone', $bEntry['helper_status']);
+        $this->assertSame(1, $bEntry['depth']);
+
+        $cEntry = $data->firstWhere('agent_id', $agentC->id);
+        $this->assertNotNull($cEntry, 'C must remain traceable beneath a gone B -- the assignment graph beneath a retired/removed node never cascades away');
+        $this->assertSame(2, $cEntry['depth']);
+        $this->assertSame([$agentA->id, $agentB->id, $agentC->id], $cEntry['path']);
+    }
+
     // ---------------------------------------------------------------
     // T054 -- US4 (retirement/removal handling, data-model.md §1
     // state-transition table, research.md D4)

@@ -202,20 +202,27 @@ class AgentHelperQuery
     {
         $depth = count($path);
 
-        $assignments = AgentHelperAssignment::where('parent_agent_id', $parent->id)
-            ->with('helper')
-            ->get();
+        $assignments = AgentHelperAssignment::where('parent_agent_id', $parent->id)->get();
 
         foreach ($assignments as $assignment) {
-            $helper = $assignment->helper;
+            // Trash-inclusive, mirroring helpersFor()'s own Phase 5 fix
+            // (Agent::withTrashed()->find(), AgentQuery::findAgentIncludingTrashed()'s
+            // precedent) -- a soft-deleted helper mid-chain must not
+            // silently drop its own still-active sub-tree from the
+            // hierarchy (research.md D4: retiring/removing an agent never
+            // cascades to the assignment graph beneath it, so FR-007's
+            // "full helper hierarchy... not only its immediate helpers"
+            // still applies beneath a gone node).
+            $helper = Agent::withTrashed()->find($assignment->helper_agent_id);
 
             if ($helper === null || in_array($assignment->helper_agent_id, $path, true)) {
-                // A trash-inclusive resolution belongs to US4/Phase 5
-                // (matching helpersFor()'s own disclosed, temporary
-                // limitation); a would-be revisit of an agent already on
-                // this path is a pre-existing cycle in the data the
-                // traversal defends against rather than looping forever,
-                // exactly like wouldCreateCycle()'s own visited-set guard.
+                // Genuinely unresolvable (never happens through the real
+                // API, since an assignment always names two agents that
+                // existed at assignment time) or a would-be revisit of an
+                // agent already on this path -- a pre-existing cycle in
+                // the data the traversal defends against rather than
+                // looping forever, exactly like wouldCreateCycle()'s own
+                // visited-set guard.
                 continue;
             }
 
@@ -226,17 +233,23 @@ class AgentHelperQuery
             }
 
             $childPath = [...$path, $helper->id];
+            $isGone = $helper->trashed();
 
             $entries[] = [
                 'agent_id' => $helper->id,
                 'name' => $helper->name,
                 'depth' => $depth,
                 'path' => $childPath,
-                'helper_status' => $helper->is_active ? 'active' : 'deactivated',
-                'within_bounds' => $this->isWithinParentBounds($helper, $parent, $catalog),
-                'effective_operation_count' => count($this->effectiveOperationIds($helper, $parent, $catalog)),
+                'helper_status' => $isGone ? 'gone' : ($helper->is_active ? 'active' : 'deactivated'),
+                'within_bounds' => $isGone ? false : $this->isWithinParentBounds($helper, $parent, $catalog),
+                'effective_operation_count' => $isGone ? 0 : count($this->effectiveOperationIds($helper, $parent, $catalog)),
             ];
 
+            // Recurse regardless of whether $helper itself is gone -- the
+            // assignment graph beneath it is an independent structural
+            // fact (D4's "no cascade" posture), so a retired/removed node
+            // mid-chain must not truncate the traceable hierarchy beneath
+            // it.
             $this->walkHierarchy($helper, $childPath, $maxDepth, $catalog, $entries, $truncated);
         }
     }
