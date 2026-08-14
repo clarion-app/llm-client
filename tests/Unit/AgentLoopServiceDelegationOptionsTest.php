@@ -321,6 +321,53 @@ class AgentLoopServiceDelegationOptionsTest extends TestCase
         $this->assertSame('time_ceiling_reached', $result['code'] ?? null);
     }
 
+    #[Test]
+    public function deadline_at_option_exactly_equal_to_now_still_trips_the_ceiling_the_boundary_is_inclusive(): void
+    {
+        // Distinguishes >= from > at the exact instant, which a
+        // comfortably-past deadline (both tests above) or a real sleep
+        // (DelegationBoundExhaustionTest's own scenario 6) can never pin
+        // down -- both operators behave identically once the clock has
+        // moved on by any nonzero margin. Freezing "now" and setting the
+        // deadline to that identical frozen instant is the only way to
+        // exercise the boundary itself (research.md D3's own check is
+        // `now()->greaterThanOrEqualTo($deadlineAt)`).
+        $frozenNow = Carbon::now();
+        Carbon::setTestNow($frozenNow);
+
+        try {
+            $conversation = $this->newConversation();
+
+            $provider = Mockery::mock(LlmProvider::class);
+            $provider->shouldReceive('chat')->never();
+            $provider->shouldReceive('countTokens')->andReturnUsing(fn ($t) => (int) ceil(strlen((string) $t) / 4));
+
+            $registry = Mockery::mock(ProviderRegistry::class);
+            $registry->shouldReceive('resolve')->andReturn($provider);
+            $registry->shouldReceive('resolveByType')->andReturn($provider);
+
+            $service = new AgentLoopService(
+                app(McpToolRegistry::class),
+                app(McpToolExecutor::class),
+                app(OperationCache::class),
+                $registry,
+                runTraceRecorder: app(RunTraceRecorder::class),
+            );
+
+            $result = $service->run($conversation, 'Deadline exactly now.', [
+                'deadline_at' => $frozenNow->copy(),
+            ]);
+
+            $this->assertSame(
+                'time_ceiling_reached',
+                $result['code'] ?? null,
+                'a deadline exactly equal to now must still trip the ceiling -- the boundary is inclusive, not exclusive',
+            );
+        } finally {
+            Carbon::setTestNow();
+        }
+    }
+
     // =================================================================
     // Regression: every existing call site is unaffected -- the two new
     // keys are true no-ops when absent (research.md D3)

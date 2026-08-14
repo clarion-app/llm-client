@@ -361,6 +361,72 @@ class DelegationJourneyTest extends TestCase
     }
 
     #[Test]
+    public function the_helper_conversation_a_delegation_creates_never_appears_in_the_users_own_conversation_index(): void
+    {
+        // research.md D10: the ephemeral helper Conversation D1 creates for
+        // a delegation carries the real delegating user's own user_id (D9),
+        // so unlike an eval conversation it is not already excluded by
+        // ownedByRealUser() -- it would otherwise appear as a bare,
+        // orphan-looking row in the user's own conversation list.
+        // ConversationController::index() gained a dedicated
+        // channel <> 'agent-delegation' filter for exactly this reason;
+        // this is the one test that actually exercises it end to end
+        // (quickstart's own mutation-testing checklist row 10 names this
+        // scenario, but no existing test drove it through a real HTTP
+        // index() call before this one).
+        $parent = $this->makeAgent('parent-agent-index-exclusion');
+        $helper = $this->makeAgent('helper-agent-index-exclusion');
+        $this->assignHelper($parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        $service = $this->serviceWithScriptedProvider([
+            $this->toolCallReply([
+                $this->toolCall('delegate_to_helper', [
+                    'helper_agent_id' => $helper->id,
+                    'task' => 'Do a small, self-contained task.',
+                    'context' => null,
+                ], 'call_delegate_index_exclusion'),
+            ]),
+            $this->plainReply('The helper finished the task.'),
+            $this->plainReply('Here is the outcome, thanks to the helper.'),
+        ]);
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $result = $service->run($conversation->fresh(), 'Please delegate a small task.');
+        $this->assertSame('completed', $result['status'], 'fixture sanity: the parent turn must complete');
+
+        $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($delegationRow, 'fixture sanity: the delegation must have written its own row');
+        $this->assertNotNull($delegationRow->helper_conversation_id);
+
+        $helperConversation = Conversation::find($delegationRow->helper_conversation_id);
+        $this->assertNotNull($helperConversation, 'fixture sanity: the ephemeral helper conversation must exist');
+        $this->assertSame(
+            'agent-delegation',
+            $helperConversation->channel,
+            'fixture sanity: the helper conversation must carry the reserved channel D10 filters on',
+        );
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson('/api/clarion-app/llm-client/conversation');
+
+        $response->assertStatus(200);
+        $ids = collect($response->json())->pluck('id')->all();
+
+        $this->assertContains(
+            $conversation->id,
+            $ids,
+            'the parent\'s own ordinary conversation must still appear in the index -- this is an exclusion of the helper conversation specifically, not a blanket regression',
+        );
+        $this->assertNotContains(
+            $helperConversation->id,
+            $ids,
+            'a delegation\'s own ephemeral helper conversation must never appear in the user\'s own conversation list (research.md D10)',
+        );
+    }
+
+    #[Test]
     public function delegating_to_an_agent_that_is_not_an_assigned_helper_is_refused_writing_no_delegation_row_and_no_helper_conversation(): void
     {
         $parent = $this->makeAgent('parent-agent-no-helpers');

@@ -346,6 +346,81 @@ class DelegationBoundExhaustionTest extends TestCase
         $this->assertSame('exhausted', $delegationRow->status, 'the Delegation row itself must record the exhausted status');
     }
 
+    #[Test]
+    public function the_per_delegation_iteration_override_caps_the_helper_even_when_the_plain_agent_loop_ceiling_is_configured_much_higher(): void
+    {
+        // Deliberately DECOUPLED from the test above: `agent_loop.max_iterations`
+        // is set far higher than `delegation.max_iterations`, so this test can
+        // only pass if DelegationService's own $options['max_iterations']
+        // override is genuinely threaded into the nested run() call -- the
+        // test above sets both to the same low value specifically so its own
+        // fixture stays deterministic either way, which means it cannot by
+        // itself distinguish "the override actually took effect" from "the
+        // plain config ceiling, coincidentally equal, did the capping
+        // instead." This test closes that gap.
+        config(['llm-client.delegation.max_iterations' => 2]);
+        config(['llm-client.agent_loop.max_iterations' => 20]);
+
+        $parent = $this->makeAgent('parent-agent-exhaustion-decoupled');
+        $helper = $this->makeAgent('helper-agent-exhaustion-decoupled');
+        $this->assignHelper($parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        // A shared response script across BOTH the parent's own outer loop
+        // and the helper's nested loop (both driven by the same mocked
+        // provider instance, matching this file's own established
+        // convention). Call 1 delegates; calls 2-6 keep supplying tool-call
+        // replies that never resolve to a final answer; call 7+ finally
+        // gives a plain reply. If the per-delegation override correctly
+        // caps the helper at 2 iterations, the helper is cut off at call 3
+        // and never reaches the plain reply at all -- it is the PARENT's
+        // own subsequent iterations that eventually consume it. If the
+        // override is silently ignored (falling back to the much higher
+        // agent_loop.max_iterations=20 ceiling instead), the helper's own
+        // nested run keeps going past iteration 2, reaches the plain reply
+        // at call 7 itself, and completes normally -- `status: "completed"`,
+        // never `"exhausted"` -- a directly observable divergence.
+        $callCount = 0;
+        $toolCallBudget = 5;
+        $service = $this->serviceWithScriptedProvider(function () use (&$callCount, $toolCallBudget, $helper) {
+            $callCount++;
+
+            if ($callCount === 1) {
+                return $this->toolCallReply([
+                    $this->toolCall('delegate_to_helper', [
+                        'helper_agent_id' => $helper->id,
+                        'task' => 'Keep working without ever finishing, unless correctly cut off.',
+                        'context' => null,
+                    ], 'call_delegate_decoupled'),
+                ]);
+            }
+
+            if ($callCount <= 1 + $toolCallBudget) {
+                return $this->toolCallReply([$this->toolCall('list_applications', [], 'call_decoupled_'.$callCount)]);
+            }
+
+            return $this->plainReply('Finally done -- only ever reached by a helper NOT correctly capped at delegation.max_iterations, or by the parent\'s own later turn.');
+        });
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $service->run($conversation->fresh(), 'Please delegate this endless task, with decoupled ceilings.');
+
+        $decoded = $this->firstToolResult($conversation);
+        $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
+
+        $this->assertSame(
+            'exhausted',
+            $decoded['status'] ?? null,
+            'delegation.max_iterations (2) must cap the helper on its own -- independent of agent_loop.max_iterations (20) being configured far higher -- proving $options[\'max_iterations\'] is actually threaded into the nested run() call, not silently falling back to config()',
+        );
+        $this->assertSame('iteration_limit', $decoded['incomplete_because'] ?? null);
+
+        $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($delegationRow);
+        $this->assertSame('exhausted', $delegationRow->status, 'the Delegation row itself must record the exhausted status, capped by the per-delegation override alone');
+    }
+
     // =================================================================
     // Quickstart scenario 6 -- the per-delegation wall-clock DEADLINE
     // =================================================================
