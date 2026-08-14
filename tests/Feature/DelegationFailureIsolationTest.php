@@ -382,12 +382,16 @@ class DelegationFailureIsolationTest extends TestCase
         $decoded = $this->firstToolResult($conversation);
         $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
         $this->assertSame(
-            'failed',
+            'failure',
             $decoded['status'] ?? null,
-            'the delegate_to_helper tool result must report status: failed when the helper\'s own nested run throws (research.md D5)',
+            'the delegate_to_helper tool result must report status: failure when the helper\'s own nested run throws (research.md D5, superseded 099 shape)',
         );
         $this->assertSame($helper->name, $decoded['helper'] ?? null);
-        $this->assertArrayHasKey('error', $decoded);
+        $this->assertSame(
+            'exception',
+            $decoded['reason'] ?? null,
+            '099-result-aggregation (research.md D3): a generic thrown exception (not a SchemaValidationError) maps to reason: exception',
+        );
 
         $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($delegationRow, 'a failed delegation must still write a Delegation row');
@@ -609,14 +613,19 @@ class DelegationFailureIsolationTest extends TestCase
         $decoded = $this->firstToolResult($conversation);
         $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
         $this->assertSame(
-            'failed',
+            'failure',
             $decoded['status'] ?? null,
-            'a helper run that ends without producing a result must be reported to the parent as a failure -- never dressed up as status: completed with the failure text as its result (FR-008/SC-004)',
+            'a helper run that ends without producing a result must be reported to the parent as a failure -- never dressed up as status: completed with the failure text as its result (FR-008/SC-004, superseded 099 shape)',
         );
-        $this->assertArrayNotHasKey(
-            'result',
-            $decoded,
-            'a non-completion must never carry a `result` field -- the contract\'s failure shape carries `error`',
+        $this->assertSame(
+            'no_output',
+            $decoded['reason'] ?? null,
+            '099-result-aggregation (Grounding note item 6, research.md D3): the provider-returned-no-choices-at-all case maps to reason: no_output via the final fallback branch',
+        );
+        $this->assertArrayHasKey('output', $decoded, 'output key must be present (and null), not merely absent');
+        $this->assertNull(
+            $decoded['output'],
+            'a non-completion must never carry a genuine-looking output field (FR-007)',
         );
 
         $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();

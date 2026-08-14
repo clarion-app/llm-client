@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
@@ -184,15 +185,51 @@ class DelegationService
             // just a completed one (data-model.md §1: helper_run_id is
             // "null only if run tracing is disabled").
             $delegation->helper_run_id = $this->helperRunIdFor($helperConversation->id);
+
+            // 099-result-aggregation (research.md D2, checked FIRST, before
+            // the generic \Throwable handling below): a SchemaValidationError
+            // means the helper's own final answer either never conformed to
+            // the mandatory delegation_result schema, or was empty --
+            // getRawContent() is the only field that distinguishes the two
+            // (User Story 5 AC1 vs AC2).
+            if ($e instanceof SchemaValidationError) {
+                $resultReason = trim($e->getRawContent()) === '' ? 'no_output' : 'malformed_output';
+                $resultSummary = $resultReason === 'no_output'
+                    ? 'The helper produced no output at all.'
+                    : "The helper's output did not conform to the required result schema.";
+            } else {
+                $resultReason = 'exception';
+                $resultSummary = 'The delegation failed due to an unexpected error.';
+            }
+
+            // FR-007: a failure never carries content that could be mistaken
+            // for genuine output -- no content was ever produced on either
+            // of these paths, so result_output stays null.
+            $resultUndone = 'Everything -- the task could not be completed.';
+
+            $delegation->result_status = 'failure';
+            $delegation->result_reason = $resultReason;
+            $delegation->result_summary = $resultSummary;
+            $delegation->result_output = null;
+            $delegation->result_undone = $resultUndone;
+            $delegation->result_truncated = false;
             $delegation->save();
 
-            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason);
-
-            return [
-                'status' => 'failed',
-                'helper' => $helperAgent->name,
-                'error' => $failureReason,
+            $sixFieldResult = [
+                'status' => 'failure',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => $resultReason,
             ];
+
+            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason, json_encode($sixFieldResult));
+
+            return array_merge(
+                ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
+                $sixFieldResult,
+            );
         } finally {
             if ($enclosingRunId !== null) {
                 Context::add('run_id', $enclosingRunId);
@@ -341,18 +378,40 @@ class DelegationService
             500,
         );
 
+        // 099-result-aggregation (Grounding note item 6, research.md D3):
+        // the provider-returned-no-choices-at-all case (and any other
+        // non-completing, non-ceiling-coded return) is reported as
+        // result_reason: 'no_output' -- schema validation was never reached
+        // on this path either, so result_output stays null (FR-007).
+        $resultSummary = 'The helper\'s run ended without producing a result.';
+        $resultUndone = 'Everything -- the task could not be completed.';
+
         $delegation->status = 'failed';
         $delegation->completed_at = now();
         $delegation->outcome_summary = $failureReason;
+        $delegation->result_status = 'failure';
+        $delegation->result_reason = 'no_output';
+        $delegation->result_output = null;
+        $delegation->result_summary = $resultSummary;
+        $delegation->result_undone = $resultUndone;
+        $delegation->result_truncated = false;
         $delegation->save();
 
-        $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason);
-
-        return [
-            'status' => 'failed',
-            'helper' => $helperAgent->name,
-            'error' => $failureReason,
+        $sixFieldResult = [
+            'status' => 'failure',
+            'summary' => $resultSummary,
+            'output' => null,
+            'undone' => $resultUndone,
+            'truncated' => false,
+            'reason' => 'no_output',
         ];
+
+        $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason, json_encode($sixFieldResult));
+
+        return array_merge(
+            ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
+            $sixFieldResult,
+        );
     }
 
     /**

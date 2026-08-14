@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Unit;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
@@ -165,6 +166,16 @@ class DelegationServiceResultMappingTest extends TestCase
     {
         $mock = Mockery::mock(AgentLoopService::class);
         $mock->shouldReceive('run')->once()->andReturn($rawResult);
+        $this->app->instance(AgentLoopService::class, $mock);
+    }
+
+    /**
+     * 099-result-aggregation, Phase 4 (US5), tasks.md T023's own seam.
+     */
+    private function mockRunThrowing(\Throwable $e): void
+    {
+        $mock = Mockery::mock(AgentLoopService::class);
+        $mock->shouldReceive('run')->once()->andThrow($e);
         $this->app->instance(AgentLoopService::class, $mock);
     }
 
@@ -401,5 +412,77 @@ class DelegationServiceResultMappingTest extends TestCase
         $this->assertSame('', $decoded['undone'] ?? null);
         $this->assertSame(false, $decoded['truncated'] ?? null);
         $this->assertNull($decoded['reason']);
+    }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 4 (US5), tasks.md T024: across every
+    // result_status: 'failure' reason now producible (helper_reported from
+    // Phase 3, malformed_output/no_output/exception from Phase 4),
+    // result_output must be exactly null -- never {}, never a decoded
+    // value, never the string 'null' (FR-007, mutation-checklist row 3).
+    // The helper_reported case should already pass from Phase 3; the three
+    // Phase 4 reasons are expected to FAIL until T026/T027 land.
+    // =================================================================
+
+    #[Test]
+    public function result_output_is_exactly_null_for_every_failure_reason(): void
+    {
+        // helper_reported (Phase 3 -- should already pass)
+        [$helper, $conversation] = $this->makeDelegationFixture('failure-reason-helper-reported');
+        $this->mockRunReturning([
+            'status' => 'completed',
+            'content' => json_encode(['partial_data' => 'should never surface']),
+            'validated' => [
+                'status' => 'failure',
+                'summary' => 'Could not access the invoice attachment.',
+                'output' => ['partial_data' => 'should never surface'],
+                'undone' => 'Everything -- the task could not be started.',
+            ],
+            'message_id' => null,
+        ]);
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+        $this->assertSame('helper_reported', $result['reason'] ?? null, 'fixture sanity');
+        $this->assertNull($result['output']);
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNull($row->result_output);
+        $this->assertNotSame('null', $row->result_output);
+
+        // malformed_output (Phase 4)
+        [$helper, $conversation] = $this->makeDelegationFixture('failure-reason-malformed');
+        $this->mockRunThrowing(new SchemaValidationError(
+            'The response did not match the required schema.',
+            [],
+            'not valid json at all',
+        ));
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+        $this->assertSame('malformed_output', $result['reason'] ?? null, 'fixture sanity');
+        $this->assertNull($result['output']);
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNull($row->result_output);
+        $this->assertNotSame('null', $row->result_output);
+
+        // no_output (Phase 4, via SchemaValidationError with empty raw content)
+        [$helper, $conversation] = $this->makeDelegationFixture('failure-reason-no-output');
+        $this->mockRunThrowing(new SchemaValidationError(
+            'The response was empty.',
+            [],
+            '   ',
+        ));
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+        $this->assertSame('no_output', $result['reason'] ?? null, 'fixture sanity');
+        $this->assertNull($result['output']);
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNull($row->result_output);
+        $this->assertNotSame('null', $row->result_output);
+
+        // exception (Phase 4, a generic \Throwable)
+        [$helper, $conversation] = $this->makeDelegationFixture('failure-reason-exception');
+        $this->mockRunThrowing(new \RuntimeException('boom'));
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+        $this->assertSame('exception', $result['reason'] ?? null, 'fixture sanity');
+        $this->assertNull($result['output']);
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNull($row->result_output);
+        $this->assertNotSame('null', $row->result_output);
     }
 }

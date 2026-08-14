@@ -778,15 +778,15 @@ class DelegationServiceTest extends TestCase
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something that will explode.', null);
 
         $this->assertSame(
-            'failed',
+            'failure',
             $result['status'] ?? null,
-            'delegate() must catch a thrown exception from the nested run() call and return a structured failure result, never rethrow it to the parent\'s own loop (research.md D5/FR-008)',
+            'delegate() must catch a thrown exception from the nested run() call and return a structured failure result, never rethrow it to the parent\'s own loop (research.md D5/FR-008, superseded 099 shape)',
         );
         $this->assertSame($helper->name, $result['helper'] ?? null);
         $this->assertSame(
-            Str::limit($longMessage, 500),
-            $result['error'] ?? null,
-            'the failure result\'s error field must carry the caught exception\'s own message, truncated to 500 chars via Str::limit() (matching this package\'s own established truncation convention)',
+            'exception',
+            $result['reason'] ?? null,
+            '099-result-aggregation (research.md D3): a generic thrown exception (not a SchemaValidationError) maps to reason: exception -- the tool result no longer carries the raw exception message directly (that still lands in the Delegation row\'s outcome_summary, asserted below)',
         );
 
         $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
@@ -818,12 +818,8 @@ class DelegationServiceTest extends TestCase
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something that will fail quickly.', null);
 
-        $this->assertSame('failed', $result['status'] ?? null);
-        $this->assertSame(
-            $shortMessage,
-            $result['error'] ?? null,
-            'a message already under the 500-char limit must be reported unchanged, not padded or otherwise altered',
-        );
+        $this->assertSame('failure', $result['status'] ?? null);
+        $this->assertSame('exception', $result['reason'] ?? null);
 
         $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($row);

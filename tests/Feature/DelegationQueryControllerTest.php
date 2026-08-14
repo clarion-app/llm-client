@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
+use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
@@ -12,6 +13,7 @@ use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\AgentService;
+use ClarionApp\LlmClient\Services\DelegationService;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\OperationCache;
@@ -704,5 +706,82 @@ class DelegationQueryControllerTest extends TestCase
         $this->assertSame($output, $row['result_output'], 'result_output must be JSON-decoded to a native array, not left as a raw string');
         $this->assertSame('', $row['result_undone']);
         $this->assertFalse($row['result_truncated']);
+    }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 4 (US5), tasks.md T025: quickstart
+    // scenario 5 AC3 -- after a malformed-result delegation, GET
+    // /delegations/{id} reflects the same result_status/result_reason the
+    // incident produced. Driven through the real DelegationService::
+    // delegate() (not a hand-built Delegation row, unlike this file's own
+    // "includes the six new result fields" tests above): Phase 3's read
+    // path (DelegationController::delegationRows()) is already fully
+    // generic and would pass on a hand-built row regardless of whether
+    // Phase 4's catch-block mapping exists, so only driving the actual
+    // write path exercises the gap T026/T027 close.
+    // =================================================================
+
+    #[Test]
+    public function get_delegation_reflects_malformed_output_failure_after_the_incident(): void
+    {
+        $parent = $this->makeAgent($this->user, 'parent-malformed');
+        $helper = $this->makeAgent($this->user, 'helper-malformed');
+        $this->assignHelper($this->user, $parent->id, $helper->id);
+        $conversation = $this->makeConversation($this->user, $parent);
+
+        $mock = Mockery::mock(AgentLoopService::class);
+        $mock->shouldReceive('run')->once()->andThrow(new SchemaValidationError(
+            'The response did not match the required schema.',
+            [],
+            'not valid json at all',
+        ));
+        $this->app->instance(AgentLoopService::class, $mock);
+
+        app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+
+        $delegation = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($delegation, 'fixture sanity: the incident must still write a Delegation row');
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/delegations/{$delegation->id}");
+
+        $response->assertStatus(200);
+
+        $row = $response->json();
+        $this->assertSame('failure', $row['result_status']);
+        $this->assertSame('malformed_output', $row['result_reason']);
+        $this->assertNull($row['result_output']);
+    }
+
+    #[Test]
+    public function get_delegation_reflects_no_output_failure_after_the_incident(): void
+    {
+        $parent = $this->makeAgent($this->user, 'parent-no-output');
+        $helper = $this->makeAgent($this->user, 'helper-no-output');
+        $this->assignHelper($this->user, $parent->id, $helper->id);
+        $conversation = $this->makeConversation($this->user, $parent);
+
+        $mock = Mockery::mock(AgentLoopService::class);
+        $mock->shouldReceive('run')->once()->andThrow(new SchemaValidationError(
+            'The response was empty.',
+            [],
+            '   ',
+        ));
+        $this->app->instance(AgentLoopService::class, $mock);
+
+        app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
+
+        $delegation = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($delegation, 'fixture sanity: the incident must still write a Delegation row');
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/delegations/{$delegation->id}");
+
+        $response->assertStatus(200);
+
+        $row = $response->json();
+        $this->assertSame('failure', $row['result_status']);
+        $this->assertSame('no_output', $row['result_reason']);
+        $this->assertNull($row['result_output']);
     }
 }
