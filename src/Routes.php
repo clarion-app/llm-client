@@ -277,6 +277,10 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('agents/{id}/shares', [AgentShareController::class, "share"]);
     Route::get('agents/{id}/shares', [AgentShareController::class, "shares"]);
 
+    // Revoke a previously granted share (096-agent-sharing,
+    // contracts/agent-sharing-api.md §3, Phase 5/US3). Owner-only.
+    Route::delete('agents/{id}/shares/{recipientUserId}', [AgentShareController::class, "unshare"]);
+
     // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
     // contracts §4/§5). Named independently by two version ids, not nested
     // under a single agent (research.md D7) — no collision with the

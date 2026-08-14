@@ -425,13 +425,33 @@ class StoredAgentController extends Controller
     /**
      * POST /agents/{id}/clone (091-agent-clone-fork, contracts §1,
      * FR-002/FR-013/FR-014). Resolves the source via
-     * AgentQuery::findAgentIncludingTrashed() — a retired source is found,
-     * not 404'd (FR-013). A colliding destination name is refused with a
-     * 409, distinct from the 422 definition-error shape.
+     * findAgentIncludingTrashed() first, then falls back to
+     * AgentQuery::findAccessibleAgent() (096-agent-sharing, research.md D1's
+     * correction, data-model.md §7) — a recipient at either grant level must
+     * be able to make their own independent copy of a shared agent
+     * (spec.md's own Edge Case and FR-012); the clone becomes a wholly
+     * separate, independently-owned agent bound by the cloner's own
+     * authority ceiling, carrying none of the edit-rights risk
+     * findEditableAgent() exists to bound.
+     *
+     * The two-step resolution (rather than findAccessibleAgent() alone) is
+     * load-bearing: findAccessibleAgent() excludes soft-deleted agents even
+     * for their own owner, which would silently regress FR-013 (a retired
+     * source is found and cloned, never 404'd —
+     * AgentCloneJourneyTest::copying_a_retired_source_produces_a_fully_usable_new_agent_over_http).
+     * findAgentIncludingTrashed() alone preserves that owner/trashed case
+     * exactly as before; findAccessibleAgent() is only ever reached for a
+     * non-owner, and a shared grant's own target agent is never trashed
+     * while its owner still owns it, so the fallback never needs trash
+     * inclusion of its own.
+     *
+     * A colliding destination name is refused with a 409, distinct from the
+     * 422 definition-error shape.
      */
     public function clone(Request $request, string $id): JsonResponse
     {
-        $agent = $this->query->findAgentIncludingTrashed(Auth::id(), $id);
+        $agent = $this->query->findAgentIncludingTrashed(Auth::id(), $id)
+            ?? $this->query->findAccessibleAgent(Auth::id(), $id);
 
         if ($agent === null) {
             return $this->notFoundResponse();

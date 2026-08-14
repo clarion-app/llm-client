@@ -256,6 +256,15 @@ class AgentLoopService
         //    request mints.
         if ($runId === null) {
             $this->admitInteractiveWork($conversation, BudgetWorkKind::Interactive);
+
+            // Revocation check (096-agent-sharing, research.md D5) — same
+            // reasoning as run()'s own entry. start() is void/streamed, so
+            // the close-out happens directly and this method simply returns
+            // without dispatching a stream request for a turn that never
+            // begins.
+            if ($this->checkSharedAgentAccessRevoked($conversation) !== null) {
+                return;
+            }
         }
 
         // The user is engaging again, so this session is live: clear any end
@@ -329,6 +338,16 @@ class AgentLoopService
         // and a run already open, so "gate before anything is set" is not
         // available to it. Mirrors the expired-confirmation branch just below.
         $this->admitResumedWork($conversation, $runId);
+
+        // Revocation check (096-agent-sharing, research.md D5) — the async
+        // confirmation-continuation path must be refused identically to
+        // resumeSync()'s own sibling call below; omitting it here would let
+        // a revoked recipient's approved/declined tool call keep executing.
+        // A run/step is already open at this point (the original turn's),
+        // so this closes it in place rather than minting a new one.
+        if ($this->checkSharedAgentAccessRevoked($conversation, $runId, $toolData['step_id'] ?? null) !== null) {
+            return;
+        }
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
@@ -564,6 +583,102 @@ class AgentLoopService
     }
 
     /**
+     * Refuse a turn on a shared (not owned) agent whose access grant has
+     * been revoked since the conversation began (096-agent-sharing,
+     * research.md D5, data-model.md §8, Phase 5/US3).
+     *
+     * A new, distinct method — never folded into admitInteractiveWork()/
+     * admitResumedWork(), both of which stay void and throw-only and are
+     * otherwise unmodified by this feature. Called directly from each of
+     * run()'s, start()'s, resume()'s and resumeSync()'s own admission
+     * points, immediately after whichever of admitInteractiveWork()/
+     * admitResumedWork() that call site already reaches. Never throws: a
+     * revoked-access refusal for a conversation already underway must be a
+     * clean, in-band stop (contracts §5), not an HTTP 4xx/5xx.
+     *
+     * Only relevant when the conversation's agent is not owned by the
+     * conversation's own user — an owned agent (the overwhelmingly common
+     * case) or an agent-less conversation returns null immediately without
+     * ever touching agent_share_grants.
+     *
+     * Mirrors stopForWithheldTool()'s exact close-out shape: an assistant
+     * Message explaining the withdrawal, is_processing cleared, and
+     * ConversationLifecycleService::end() called so the session itself
+     * ends. A run/step already open (the resume()/resumeSync() call sites,
+     * continuing after a confirmation pause) is closed StoppedEarly in
+     * place; a turn refused before any run exists yet (run()'s/start()'s
+     * brand-new-turn entry, $runId null) still gets its own run record —
+     * minted and immediately closed StoppedEarly — so the refusal is never
+     * invisible to the run trace.
+     */
+    private function checkSharedAgentAccessRevoked(
+        Conversation $conversation,
+        ?string $runId = null,
+        ?string $currentStepId = null,
+    ): ?array {
+        if ($conversation->agent_id === null) {
+            return null;
+        }
+
+        $agent = Agent::find($conversation->agent_id);
+
+        if ($agent === null || $agent->user_id === $conversation->user_id) {
+            return null;
+        }
+
+        if (app(AgentQuery::class)->findAccessibleAgent((string) $conversation->user_id, $conversation->agent_id) !== null) {
+            return null;
+        }
+
+        $content = 'Access to this agent has been withdrawn by its owner. This conversation has ended.';
+        $reason = 'agent_access_revoked: '.$content;
+
+        $assistantMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $content,
+            'role' => 'assistant',
+            'user' => $conversation->character,
+            'responseTime' => 0,
+        ]);
+
+        $conversation->update(['is_processing' => false]);
+
+        if ($this->runTraceRecorder !== null) {
+            if ($runId === null) {
+                $runId = $this->runTraceRecorder->openRun(
+                    RunKind::Interactive,
+                    (string) $conversation->user_id,
+                    $conversation->id,
+                    streamed: false,
+                    model: $conversation->model,
+                    agentId: $conversation->character ?? $conversation->id,
+                );
+            } elseif ($currentStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $currentStepId,
+                    RunEndState::StoppedEarly,
+                    $reason,
+                );
+            }
+
+            $this->runTraceRecorder->closeRun(
+                $runId,
+                RunEndState::StoppedEarly,
+                $reason,
+            );
+        }
+
+        app(ConversationLifecycleService::class)->end($conversation);
+
+        return [
+            'status' => 'stopped',
+            'content' => $content,
+            'message_id' => $assistantMessage->id,
+            'code' => 'agent_access_revoked',
+        ];
+    }
+
+    /**
      * Synchronous agent loop execution for external channel integrations.
      * Returns the final response array or a confirmation-required structure.
      *
@@ -577,6 +692,14 @@ class AgentLoopService
         // opened: a refusal here has to be a clean no-op, and there is no path
         // that unwinds either of those for work that never started.
         $this->admitInteractiveWork($conversation, BudgetWorkKind::Interactive);
+
+        // Revocation check (096-agent-sharing, research.md D5): a shared
+        // agent whose grant has since been revoked refuses the turn here,
+        // cleanly, before is_processing is set and before a run is opened —
+        // identical reasoning to admitInteractiveWork() just above.
+        if (($revokedStop = $this->checkSharedAgentAccessRevoked($conversation)) !== null) {
+            return $revokedStop;
+        }
 
         // The user is engaging again, so this session is live: clear any end
         // marker set by the idle sweep, making the session eligible to end
@@ -1199,6 +1322,13 @@ class AgentLoopService
         // the same reason: a human wait of up to confirmation_timeout is a
         // window in which the ceiling can be crossed by somebody else.
         $this->admitResumedWork($conversation, $runId);
+
+        // Revocation check (096-agent-sharing, research.md D5) — see
+        // resume()'s identical call, immediately above the same relative
+        // point in that sibling method.
+        if (($revokedStop = $this->checkSharedAgentAccessRevoked($conversation, $runId, $toolData['step_id'] ?? null)) !== null) {
+            return $revokedStop;
+        }
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');

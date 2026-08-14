@@ -80,4 +80,39 @@ class AgentShareService
 
         return $grant;
     }
+
+    /**
+     * Revokes a recipient's access to an agent the caller owns
+     * (096-agent-sharing, data-model.md §4, Phase 5/US3). Same ownership
+     * resolution as grant() — an owner-only action, never reachable by a
+     * mere recipient regardless of their own permission level.
+     *
+     * Idempotent: soft-deletes the active (non-trashed) grant for the pair
+     * if one exists and returns true; returns false, never throws, when no
+     * active grant exists for the pair — mirroring
+     * ConversationLifecycleService::end()'s own established idempotency
+     * posture.
+     *
+     * @throws \RuntimeException when the caller does not own the target agent.
+     */
+    public function revoke(string $ownerUserId, string $agentId, string $recipientUserId): bool
+    {
+        $agent = $this->query->findAgent($ownerUserId, $agentId);
+
+        if ($agent === null) {
+            throw new \RuntimeException('Agent not found or not owned by the caller.');
+        }
+
+        $grant = AgentShareGrant::where('agent_id', $agentId)
+            ->where('recipient_user_id', $recipientUserId)
+            ->first();
+
+        if ($grant === null) {
+            return false;
+        }
+
+        $grant->delete();
+
+        return true;
+    }
 }

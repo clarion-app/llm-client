@@ -83,6 +83,30 @@ class AgentShareController extends Controller
     }
 
     /**
+     * DELETE /agents/{id}/shares/{recipientUserId} (contracts §3,
+     * 096-agent-sharing, Phase 5/US3). Owner-only, resolved the same way
+     * share()/shares() already are — before AgentShareService is ever
+     * called, so a non-owner caller gets the uniform 404 without the
+     * service needing to distinguish "not owned" from "nothing to revoke."
+     *
+     * Always 204: revoke() itself is idempotent (returns false rather than
+     * throwing when no active grant exists for the pair), and the caller's
+     * observable postcondition — "this recipient no longer has access" — is
+     * identical either way, so a distinct response for "there was nothing
+     * to revoke" would invite treating it as an error it is not.
+     */
+    public function unshare(Request $request, string $id, string $recipientUserId): JsonResponse
+    {
+        if ($this->agentQuery->findAgent(Auth::id(), $id) === null) {
+            return $this->notFoundResponse();
+        }
+
+        $this->service->revoke(Auth::id(), $id, $recipientUserId);
+
+        return response()->json(null, 204);
+    }
+
+    /**
      * The shape share()/shares() both return per grant (contracts §1/§2).
      */
     private function grantResource(AgentShareGrant $grant): array

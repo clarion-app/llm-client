@@ -235,4 +235,98 @@ class AgentShareServiceTest extends TestCase
         $this->assertSame($first->id, $second->id, 'the same underlying row must be reused, not replaced');
         $this->assertSame('use_and_edit', $second->fresh()->permission);
     }
+
+    // ---------------------------------------------------------------
+    // revoke() — 096-agent-sharing, Phase 5/US3, tasks.md T043.
+    //
+    // Written first, confirmed RED: AgentShareService::revoke() does not
+    // exist yet.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function revoke_soft_deletes_an_active_grant(): void
+    {
+        $owner = $this->user();
+        $recipient = $this->user();
+        $agent = $this->agent($owner);
+
+        $grant = $this->service()->grant($owner->id, $agent->id, $recipient->id, 'use');
+
+        $result = $this->service()->revoke($owner->id, $agent->id, $recipient->id);
+
+        $this->assertTrue($result, 'revoke() must return true when an active grant existed and was revoked');
+        $this->assertNull(
+            AgentShareGrant::where('agent_id', $agent->id)->where('recipient_user_id', $recipient->id)->first(),
+            'the default (non-trashed) query must no longer find the grant',
+        );
+
+        $trashed = AgentShareGrant::withTrashed()->find($grant->id);
+        $this->assertNotNull($trashed, 'the row itself must still exist — soft-deleted, not hard-deleted');
+        $this->assertNotNull($trashed->deleted_at);
+    }
+
+    #[Test]
+    public function revoke_returns_false_as_an_idempotent_no_op_when_no_active_grant_exists_for_the_pair(): void
+    {
+        $owner = $this->user();
+        $recipient = $this->user();
+        $agent = $this->agent($owner);
+
+        try {
+            $result = $this->service()->revoke($owner->id, $agent->id, $recipient->id);
+        } catch (\Throwable $e) {
+            $this->fail('revoke() must be an idempotent no-op for a pair with no active grant, never throw: '.$e->getMessage());
+        }
+
+        $this->assertFalse($result);
+    }
+
+    #[Test]
+    public function revoke_returns_false_on_a_second_call_for_an_already_revoked_pair(): void
+    {
+        $owner = $this->user();
+        $recipient = $this->user();
+        $agent = $this->agent($owner);
+
+        $this->service()->grant($owner->id, $agent->id, $recipient->id, 'use');
+
+        $this->assertTrue($this->service()->revoke($owner->id, $agent->id, $recipient->id));
+        $this->assertFalse(
+            $this->service()->revoke($owner->id, $agent->id, $recipient->id),
+            'revoking an already-revoked pair a second time must be a no-op, not an error',
+        );
+    }
+
+    #[Test]
+    public function a_grant_call_after_revoke_restores_the_same_row_rather_than_inserting_a_second_one(): void
+    {
+        $owner = $this->user();
+        $recipient = $this->user();
+        $agent = $this->agent($owner);
+
+        $original = $this->service()->grant($owner->id, $agent->id, $recipient->id, 'use');
+        $originalCreatedAt = $original->created_at;
+
+        $this->service()->revoke($owner->id, $agent->id, $recipient->id);
+
+        $restored = $this->service()->grant($owner->id, $agent->id, $recipient->id, 'use_and_edit');
+
+        $this->assertSame(
+            $original->id,
+            $restored->id,
+            'a re-grant after revoke() must restore the same lifetime row, not insert a second one (research.md D7)',
+        );
+        $this->assertSame(
+            1,
+            AgentShareGrant::withTrashed()->where('agent_id', $agent->id)->where('recipient_user_id', $recipient->id)->count(),
+            'exactly one row must exist for the pair across the whole grant/revoke/grant sequence, including soft-deleted',
+        );
+        $this->assertNull($restored->fresh()->deleted_at, 'the restored row must be active again');
+        $this->assertEquals(
+            $originalCreatedAt->toIso8601String(),
+            $restored->fresh()->created_at->toIso8601String(),
+            'created_at must be unchanged from the original grant, not reset by the restore',
+        );
+        $this->assertSame('use_and_edit', $restored->fresh()->permission);
+    }
 }
