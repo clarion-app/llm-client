@@ -290,6 +290,126 @@ YAML;
     }
 
     // ---------------------------------------------------------------
+    // guardAgainstExceedingActiveParents() — T009 (100-subagent-tool-
+    // restrictions, Phase 3/US1, tasks.md T009, data-model.md §2,
+    // mutation-testing checklist row 3).
+    //
+    // Not-yet-built: AgentHelperService has no
+    // guardAgainstExceedingActiveParents() method at all yet. Written
+    // first, confirmed RED: every case below currently errors with "Call
+    // to undefined method
+    // AgentHelperService::guardAgainstExceedingActiveParents()".
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function guard_against_exceeding_active_parents_returns_immediately_without_throwing_when_the_agent_has_no_active_parents(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agent = $this->agent($owner, 'guard-no-parents', '"*"');
+        $newDefinition = app(AgentDefinitionParser::class)->parse(
+            "name: guard-no-parents\ninstructions: Assist customers.\ntools:\n  allow:\n    - \"*\"\n"
+        );
+
+        $this->service()->guardAgainstExceedingActiveParents($agent, $newDefinition);
+
+        $this->assertTrue(true, 'no exception must be thrown when the agent has no currently-active parents -- the common case');
+    }
+
+    #[Test]
+    public function guard_against_exceeding_active_parents_throws_naming_the_parent_and_exact_excess_when_the_candidate_exceeds_its_only_parents_recursive_bound(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'guard-one-parent', 'contacts.*');
+        $helper = $this->agent($owner, 'guard-one-helper', 'contacts.*');
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $parent->id,
+            'helper_agent_id' => $helper->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        $newDefinition = app(AgentDefinitionParser::class)->parse(
+            "name: guard-one-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.*\n    - weather.get_forecast\n"
+        );
+
+        try {
+            $this->service()->guardAgainstExceedingActiveParents($helper, $newDefinition);
+            $this->fail('guardAgainstExceedingActiveParents() must throw when the candidate definition exceeds the parent\'s recursive bound');
+        } catch (HelperExceedsParentPermissionsException $e) {
+            $this->assertSame($parent->id, $e->parentAgentId);
+            $this->assertSame($helper->id, $e->helperAgentId);
+            $this->assertSame(['weather.get_forecast'], array_values($e->excessOperationIds));
+        }
+    }
+
+    #[Test]
+    public function guard_against_exceeding_active_parents_with_two_parents_throws_naming_only_the_one_actually_violated(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $wideParent = $this->agent($owner, 'guard-two-wide-parent', '"*"');
+        $narrowParent = $this->agent($owner, 'guard-two-narrow-parent', 'contacts.*');
+        $helper = $this->agent($owner, 'guard-two-helper', 'contacts.*');
+
+        // Both parents are currently active; only the narrow one is
+        // actually exceeded by the candidate below. Contracts §1's own
+        // "stable iteration order: by AgentHelperAssignment.id" governs
+        // which parent is named when *more than one* is violated -- not
+        // exercised by this case, since exactly one is -- so the
+        // assertion below only depends on the guard checking every active
+        // parent rather than stopping after the first (non-violating) one.
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $wideParent->id,
+            'helper_agent_id' => $helper->id,
+            'owner_user_id' => $owner->id,
+        ]);
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $narrowParent->id,
+            'helper_agent_id' => $helper->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        $newDefinition = app(AgentDefinitionParser::class)->parse(
+            "name: guard-two-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.*\n    - weather.get_forecast\n"
+        );
+
+        try {
+            $this->service()->guardAgainstExceedingActiveParents($helper, $newDefinition);
+            $this->fail('guardAgainstExceedingActiveParents() must throw when the candidate exceeds the narrow parent\'s bound, even though the wide parent permits it');
+        } catch (HelperExceedsParentPermissionsException $e) {
+            $this->assertSame(
+                $narrowParent->id,
+                $e->parentAgentId,
+                'only the narrow parent is actually violated -- the wide parent, though also active, permits the full candidate set',
+            );
+            $this->assertSame(['weather.get_forecast'], array_values($e->excessOperationIds));
+        }
+    }
+
+    #[Test]
+    public function guard_against_exceeding_active_parents_does_not_throw_when_the_candidate_definition_stays_within_every_active_parents_bound(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->agent($owner, 'guard-within-parent', '"*"');
+        $helper = $this->agent($owner, 'guard-within-helper', 'contacts.*');
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $parent->id,
+            'helper_agent_id' => $helper->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        $newDefinition = app(AgentDefinitionParser::class)->parse(
+            "name: guard-within-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.*\n"
+        );
+
+        $this->service()->guardAgainstExceedingActiveParents($helper, $newDefinition);
+
+        $this->assertTrue(true, 'no exception must be thrown when the candidate definition stays within every active parent\'s recursive bound');
+    }
+
+    // ---------------------------------------------------------------
     // remove() -- T053 (US4, data-model.md §1 state-transition table)
     //
     // Mirrors AgentShareService::revoke()'s exact idempotency idiom: finds

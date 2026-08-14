@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
+use Symfony\Component\Process\Process;
 use Tests\TestCase;
 
 /**
@@ -57,6 +58,16 @@ use Tests\TestCase;
  */
 class AgentHelperAssignmentJourneyTest extends TestCase
 {
+    /**
+     * Temp git repos created by T010's link()/sync-from-file() cases below
+     * (100-subagent-tool-restrictions) -- cleaned up in tearDown(),
+     * mirroring AgentLinkAndSyncErrorPathsTest.php's own established
+     * per-file $tempRepoPaths/removeDirectory() convention.
+     *
+     * @var list<string>
+     */
+    private array $tempRepoPaths = [];
+
     protected function tearDown(): void
     {
         $this->clearOperationCatalog();
@@ -67,7 +78,67 @@ class AgentHelperAssignmentJourneyTest extends TestCase
         DB::table('agents')->delete();
         DB::table('users')->delete();
 
+        foreach ($this->tempRepoPaths as $path) {
+            $this->removeDirectory($path);
+        }
+        $this->tempRepoPaths = [];
+
         parent::tearDown();
+    }
+
+    // ---------------------------------------------------------------
+    // Git fixture helpers -- T010 (100-subagent-tool-restrictions),
+    // copied in shape from AgentLinkAndSyncErrorPathsTest.php's own
+    // established convention: a real, throwaway git repository under this
+    // test's own tmp directory, never a fixture pointed at this monorepo
+    // itself.
+    // ---------------------------------------------------------------
+
+    private function createGitRepo(): string
+    {
+        $repoPath = sys_get_temp_dir().'/agent_helper_assignment_journey_test_'.uniqid('', true);
+        mkdir($repoPath, 0777, true);
+        $this->tempRepoPaths[] = $repoPath;
+
+        $this->runGit(['init'], $repoPath);
+        $this->runGit(['config', 'user.name', 'Test Author'], $repoPath);
+        $this->runGit(['config', 'user.email', 'test-author@example.test'], $repoPath);
+        $this->runGit(['config', 'commit.gpgsign', 'false'], $repoPath);
+
+        return $repoPath;
+    }
+
+    private function runGit(array $args, string $cwd): void
+    {
+        (new Process(array_merge(['git'], $args), $cwd))->mustRun();
+    }
+
+    private function writeFile(string $repoPath, string $relPath, string $content): void
+    {
+        file_put_contents($repoPath.'/'.$relPath, $content);
+    }
+
+    private function commitAll(string $repoPath, string $message): void
+    {
+        $this->runGit(['add', '.'], $repoPath);
+        $this->runGit(['commit', '-m', $message], $repoPath);
+    }
+
+    private function removeDirectory(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        foreach (new \FilesystemIterator($path) as $item) {
+            if ($item->isDir()) {
+                $this->removeDirectory($item->getPathname());
+            } else {
+                @unlink($item->getPathname());
+            }
+        }
+
+        @rmdir($path);
     }
 
     // ---------------------------------------------------------------
@@ -621,6 +692,183 @@ YAML;
         $this->assertNotNull($cEntry, 'C must remain traceable beneath a gone B -- the assignment graph beneath a retired/removed node never cascades away');
         $this->assertSame(2, $cEntry['depth']);
         $this->assertSame([$agentA->id, $agentB->id, $agentC->id], $cEntry['path']);
+    }
+
+    // ---------------------------------------------------------------
+    // T010 -- US1 (100-subagent-tool-restrictions, FR-015, quickstart.md
+    // scenario 8, contracts §1). Widening an already-assigned helper's own
+    // definition past its parent's (structurally recursive) bound is
+    // refused, with the same 422 shape, from all four write entry points
+    // -- update()/restore()/link()/sync-from-file() -- and nothing is
+    // written on any of the four refusals.
+    //
+    // AgentHelperService::guardAgainstExceedingActiveParents() does not
+    // exist yet, and AgentService::update()/restore()/link() do not call
+    // it yet -- every widening attempt below currently succeeds (the
+    // write goes through, 200) instead of being refused (422). Written
+    // first, confirmed RED for that reason.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function fr015_update_widening_past_the_parents_bound_is_refused_and_writes_nothing(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->makeAgent($owner, 'fr015-update-parent', 'contacts.*');
+        $helper = $this->makeAgent($owner, 'fr015-update-helper', 'contacts.store');
+
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($parent->id), [
+            'helper_agent_id' => $helper->id,
+        ])->assertStatus(201);
+
+        $versionCountBefore = DB::table('agent_versions')->where('agent_id', $helper->id)->count();
+        $currentVersionBefore = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id))->json('current_version_number');
+
+        $response = $this->actingAs($owner, 'api')->putJson($this->agentUrl($helper->id), [
+            'definition' => "name: fr015-update-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.store\n    - weather.get_forecast\n",
+        ]);
+
+        $response->assertStatus(422);
+        $response->assertJson(['error' => 'exceeds_parent_permissions']);
+        $this->assertSame(['weather.get_forecast'], array_values($response->json('excess_operation_ids')));
+        $this->assertStringContainsString($parent->id, (string) $response->json('message'), 'the 422 body must name the violated parent');
+
+        $this->assertSame(
+            $versionCountBefore,
+            DB::table('agent_versions')->where('agent_id', $helper->id)->count(),
+            'a refused update must not write a new version row',
+        );
+        $show = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id));
+        $this->assertSame($currentVersionBefore, $show->json('current_version_number'), 'the current (previous) version must be unchanged');
+    }
+
+    #[Test]
+    public function fr015_restore_to_an_old_broader_version_is_refused_and_writes_nothing(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->makeAgent($owner, 'fr015-restore-parent', 'contacts.*');
+
+        // H starts broad (version 1: {contacts.store, weather.get_forecast}),
+        // then is narrowed to {contacts.store} only (version 2) *before*
+        // ever being assigned to P -- so assign() itself, checked against
+        // the then-current narrow version, succeeds. The old, broader
+        // version 1 survives untouched in history (AgentService never
+        // rewrites a prior version) and is the restore target below.
+        $broadYaml = "name: fr015-restore-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.store\n    - weather.get_forecast\n";
+        $helper = app(AgentService::class)->create($owner->id, $broadYaml);
+        $oldVersionId = DB::table('agent_versions')
+            ->where('agent_id', $helper->id)
+            ->where('version_number', 1)
+            ->value('id');
+
+        $this->actingAs($owner, 'api')->putJson($this->agentUrl($helper->id), [
+            'definition' => "name: fr015-restore-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.store\n",
+        ])->assertStatus(200);
+
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($parent->id), [
+            'helper_agent_id' => $helper->id,
+        ])->assertStatus(201);
+
+        $versionCountBefore = DB::table('agent_versions')->where('agent_id', $helper->id)->count();
+        $currentVersionBefore = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id))->json('current_version_number');
+
+        $response = $this->actingAs($owner, 'api')->postJson($this->agentUrl($helper->id).'/versions/'.$oldVersionId.'/restore');
+
+        $response->assertStatus(422);
+        $response->assertJson(['error' => 'exceeds_parent_permissions']);
+        $this->assertSame(['weather.get_forecast'], array_values($response->json('excess_operation_ids')));
+
+        $this->assertSame(
+            $versionCountBefore,
+            DB::table('agent_versions')->where('agent_id', $helper->id)->count(),
+            'a refused restore must not write a new version row',
+        );
+        $show = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id));
+        $this->assertSame($currentVersionBefore, $show->json('current_version_number'), 'the current (previous) version must be unchanged');
+    }
+
+    #[Test]
+    public function fr015_link_to_an_over_broad_git_file_is_refused_and_writes_nothing(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->makeAgent($owner, 'fr015-link-parent', 'contacts.*');
+        $helper = $this->makeAgent($owner, 'fr015-link-helper', 'contacts.store');
+
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($parent->id), [
+            'helper_agent_id' => $helper->id,
+        ])->assertStatus(201);
+
+        $repoPath = $this->createGitRepo();
+        $this->writeFile($repoPath, 'agent.yaml', "name: fr015-link-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.store\n    - weather.get_forecast\n");
+        $this->commitAll($repoPath, 'over-broad definition');
+
+        $versionCountBefore = DB::table('agent_versions')->where('agent_id', $helper->id)->count();
+        $currentVersionBefore = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id))->json('current_version_number');
+
+        $response = $this->actingAs($owner, 'api')->putJson($this->agentUrl($helper->id).'/link', [
+            'repository_path' => $repoPath,
+            'file_path' => 'agent.yaml',
+        ]);
+
+        $response->assertStatus(422);
+        $response->assertJson(['error' => 'exceeds_parent_permissions']);
+        $this->assertSame(['weather.get_forecast'], array_values($response->json('excess_operation_ids')));
+
+        $this->assertSame(
+            $versionCountBefore,
+            DB::table('agent_versions')->where('agent_id', $helper->id)->count(),
+            'a refused link must not write a new version row',
+        );
+        $show = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id));
+        $this->assertSame($currentVersionBefore, $show->json('current_version_number'), 'the current (previous) version must be unchanged');
+        $this->assertFalse($show->json('linked'), 'a refused link must not mark the agent as linked either');
+    }
+
+    #[Test]
+    public function fr015_sync_from_file_against_an_over_broad_git_file_is_refused_and_writes_nothing(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $parent = $this->makeAgent($owner, 'fr015-sync-parent', 'contacts.*');
+        $helper = $this->makeAgent($owner, 'fr015-sync-helper', 'contacts.store');
+
+        $this->actingAs($owner, 'api')->postJson($this->helpersUrl($parent->id), [
+            'helper_agent_id' => $helper->id,
+        ])->assertStatus(201);
+
+        $repoPath = $this->createGitRepo();
+        $this->writeFile($repoPath, 'agent.yaml', "name: fr015-sync-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.store\n");
+        $this->commitAll($repoPath, 'initial within-bounds definition');
+
+        $this->actingAs($owner, 'api')->putJson($this->agentUrl($helper->id).'/link', [
+            'repository_path' => $repoPath,
+            'file_path' => 'agent.yaml',
+        ])->assertStatus(200);
+
+        // Widen the file on disk past P's bound and commit -- the sync
+        // attempt below must be refused exactly like a direct link() call
+        // would be (syncFromFile() delegates to link() unchanged).
+        $this->writeFile($repoPath, 'agent.yaml', "name: fr015-sync-helper\ninstructions: Assist customers.\ntools:\n  allow:\n    - contacts.store\n    - weather.get_forecast\n");
+        $this->commitAll($repoPath, 'over-broad definition');
+
+        $versionCountBefore = DB::table('agent_versions')->where('agent_id', $helper->id)->count();
+        $currentVersionBefore = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id))->json('current_version_number');
+
+        $response = $this->actingAs($owner, 'api')->postJson($this->agentUrl($helper->id).'/sync-from-file');
+
+        $response->assertStatus(422);
+        $response->assertJson(['error' => 'exceeds_parent_permissions']);
+        $this->assertSame(['weather.get_forecast'], array_values($response->json('excess_operation_ids')));
+
+        $this->assertSame(
+            $versionCountBefore,
+            DB::table('agent_versions')->where('agent_id', $helper->id)->count(),
+            'a refused sync-from-file must not write a new version row',
+        );
+        $show = $this->actingAs($owner, 'api')->getJson($this->agentUrl($helper->id));
+        $this->assertSame($currentVersionBefore, $show->json('current_version_number'), 'the current (previous) version must be unchanged');
     }
 
     // ---------------------------------------------------------------

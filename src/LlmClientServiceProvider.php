@@ -581,7 +581,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Services\AgentService::class, function ($app) {
             return new \ClarionApp\LlmClient\Services\AgentService(
                 $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class),
-                $app->make(\ClarionApp\LlmClient\Services\GitDefinitionFileReader::class)
+                $app->make(\ClarionApp\LlmClient\Services\GitDefinitionFileReader::class),
+                $app->make(\ClarionApp\LlmClient\Services\AgentHelperService::class)
             );
         });
 

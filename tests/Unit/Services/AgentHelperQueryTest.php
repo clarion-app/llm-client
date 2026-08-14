@@ -163,6 +163,62 @@ YAML;
     }
 
     /**
+     * Builds an agent permitted exactly the given list of operation ids
+     * (100-subagent-tool-restrictions) -- unlike agent()'s own single-
+     * pattern shape, tools.allow lists every id in $operationIds verbatim
+     * (no wildcard/group pattern), so a candidate's own permitted set can
+     * be constructed precisely rather than approximated via a group.
+     *
+     * @param list<string> $operationIds
+     */
+    private function agentPermitting(User $owner, string $name, array $operationIds): Agent
+    {
+        $allowLines = implode("\n", array_map(fn (string $id) => "    - {$id}", $operationIds));
+
+        $yaml = <<<YAML
+name: {$name}
+instructions: Assist customers.
+tools:
+  allow:
+{$allowLines}
+YAML;
+
+        return $this->agentService()->create($owner->id, $yaml);
+    }
+
+    /**
+     * Two disjoint, single-operation groups -- X and Y in the quickstart
+     * scenarios' own shorthand (quickstart.md scenarios 2/3/5) -- used by
+     * every structuralEffectiveBound()/multi-level test below, in place of
+     * the three-operation contacts group / weather.get_forecast catalog
+     * (whose grouping would blur the "X only" vs "X and Y" distinction
+     * those scenarios turn on).
+     */
+    private function seedXyOperationCatalog(): void
+    {
+        $this->seedOperationCatalog([
+            'x.operation' => ['path' => '/api/x', 'method' => 'get', 'summary' => 'X operation'],
+            'y.operation' => ['path' => '/api/y', 'method' => 'get', 'summary' => 'Y operation'],
+        ]);
+    }
+
+    /**
+     * Three disjoint, single-operation groups -- used only by the
+     * two-active-parents structuralEffectiveBound() case, where a third,
+     * partially-overlapping operation is needed to prove the result is a
+     * genuine intersection of both parents' own bounds, not merely
+     * whichever parent happens to be checked first.
+     */
+    private function seedXyzOperationCatalog(): void
+    {
+        $this->seedOperationCatalog([
+            'x.operation' => ['path' => '/api/x', 'method' => 'get', 'summary' => 'X operation'],
+            'y.operation' => ['path' => '/api/y', 'method' => 'get', 'summary' => 'Y operation'],
+            'z.operation' => ['path' => '/api/z', 'method' => 'get', 'summary' => 'Z operation'],
+        ]);
+    }
+
+    /**
      * Builds the live [{operationId, method}, ...] catalog once, the exact
      * shape AgentDefinition::permittedOperationIds()/
      * AgentSummaryQuery::buildCatalog() both expect as their $catalog
@@ -261,6 +317,198 @@ YAML;
             $this->sortedIds($this->query()->effectiveOperationIds($helper, $parent, $catalog)),
             'effectiveOperationIds() must return only the intersection with the parent, never the helper\'s own full 3-operation set',
         );
+    }
+
+    // ---------------------------------------------------------------
+    // structuralEffectiveBound() — T007 (100-subagent-tool-restrictions,
+    // Phase 3/US1, tasks.md T007, data-model.md §2, research.md D3).
+    //
+    // Not-yet-built: AgentHelperQuery has no structuralEffectiveBound()
+    // method at all yet. Written first, confirmed RED: every case below
+    // currently errors with "Call to undefined method
+    // AgentHelperQuery::structuralEffectiveBound()".
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function structural_effective_bound_of_an_agent_with_zero_active_parents_returns_its_own_permitted_operations_unchanged(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+        $agent = $this->agentPermitting($owner, 'sb-root-case', ['x.operation', 'y.operation']);
+        $catalog = $this->buildCatalog();
+
+        $this->assertSame(
+            $this->sortedIds($this->query()->permittedOperationIds($agent, $catalog)),
+            $this->sortedIds($this->query()->structuralEffectiveBound($agent, $catalog)),
+            'a root (never anyone\'s active helper) must get exactly its own permitted set back, unchanged -- the existing one-level behavior, preserved for the common case',
+        );
+    }
+
+    #[Test]
+    public function structural_effective_bound_with_a_single_active_parent_narrows_to_the_intersection_with_the_parent(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+        $parent = $this->agentPermitting($owner, 'sb-single-parent', ['x.operation']);
+        $helper = $this->agentPermitting($owner, 'sb-single-helper', ['x.operation', 'y.operation']);
+        $this->assign($parent, $helper, $owner);
+        $catalog = $this->buildCatalog();
+
+        $this->assertSame(
+            ['x.operation'],
+            $this->query()->structuralEffectiveBound($helper, $catalog),
+            'a single active parent must narrow the helper\'s own {X, Y} down to the parent\'s own {X}',
+        );
+    }
+
+    #[Test]
+    public function structural_effective_bound_narrows_through_both_levels_of_a_three_level_chain(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+        $agentA = $this->agentPermitting($owner, 'sb-chain-a', ['x.operation']);
+        $agentB = $this->agentPermitting($owner, 'sb-chain-b', ['x.operation', 'y.operation']);
+        $this->assign($agentA, $agentB, $owner);
+        $catalog = $this->buildCatalog();
+
+        $this->assertSame(
+            ['x.operation'],
+            $this->query()->structuralEffectiveBound($agentB, $catalog),
+            'B\'s own recursive bound must be A\'s {X}, not B\'s own raw {X, Y} -- the check must walk past the immediate parent',
+        );
+    }
+
+    #[Test]
+    public function structural_effective_bound_with_two_active_parents_is_the_intersection_of_both_parents_own_recursive_bounds(): void
+    {
+        $owner = $this->user();
+        $this->seedXyzOperationCatalog();
+        $parentOne = $this->agentPermitting($owner, 'sb-two-parents-one', ['x.operation', 'y.operation']);
+        $parentTwo = $this->agentPermitting($owner, 'sb-two-parents-two', ['y.operation', 'z.operation']);
+        $helper = $this->agentPermitting($owner, 'sb-two-parents-helper', ['x.operation', 'y.operation', 'z.operation']);
+        $this->assign($parentOne, $helper, $owner);
+        $this->assign($parentTwo, $helper, $owner);
+        $catalog = $this->buildCatalog();
+
+        $this->assertSame(
+            ['y.operation'],
+            $this->query()->structuralEffectiveBound($helper, $catalog),
+            'with two active parents ({X, Y} and {Y, Z}), the recursive bound must be the intersection of both parents\' own bounds (Y alone), never just one parent\'s',
+        );
+    }
+
+    #[Test]
+    public function structural_effective_bound_of_a_pre_existing_cycle_degrades_to_an_empty_set_rather_than_recursing_forever(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+        $agentA = $this->agentPermitting($owner, 'sb-cycle-a', ['x.operation', 'y.operation']);
+        $agentB = $this->agentPermitting($owner, 'sb-cycle-b', ['x.operation', 'y.operation']);
+
+        // A pre-existing 2-cycle, seeded directly at the model layer,
+        // bypassing AgentHelperService::assign()'s own cycle guard entirely
+        // (which would refuse this pair) -- the real API must never allow
+        // this, but the traversal itself must still defend against it via
+        // a visited-set, mirroring depthOf()'s own by-value posture rather
+        // than dfsForTarget()'s shared one (Grounding note item 1).
+        $this->assign($agentA, $agentB, $owner);
+        $this->assign($agentB, $agentA, $owner);
+        $catalog = $this->buildCatalog();
+
+        $this->assertSame(
+            [],
+            $this->query()->structuralEffectiveBound($agentA, $catalog),
+            'a pre-existing cycle must degrade to an empty bound, not recurse forever or error (mutation-testing checklist row 2)',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // isWithinParentBounds()/effectiveOperationIds() upgraded to compare
+    // against structuralEffectiveBound() — T008 (100-subagent-tool-
+    // restrictions, Phase 3/US1, tasks.md T008, contracts §2,
+    // quickstart.md scenario 2, mutation-testing checklist row 1).
+    //
+    // Both methods already exist (T015/097-subagent-model) but still
+    // compare against permittedOperationIds($parent, ...) directly -- a
+    // one-level check. The cases below currently fail against that
+    // shallow comparison (a genuine assertion failure, not a fatal error
+    // -- both methods do exist and do return a value, just the wrong one)
+    // and are expected to pass once T011 upgrades both internals to
+    // compare against structuralEffectiveBound($parent, ...) instead.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function is_within_parent_bounds_and_effective_operation_ids_now_compare_against_the_parents_recursive_bound_not_its_raw_permitted_set(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+        $agentA = $this->agentPermitting($owner, 't008-chain-a', ['x.operation']);
+        $agentB = $this->agentPermitting($owner, 't008-chain-b', ['x.operation', 'y.operation']);
+        $agentC = $this->agentPermitting($owner, 't008-chain-c', ['x.operation', 'y.operation']);
+        $this->assign($agentA, $agentB, $owner);
+        $catalog = $this->buildCatalog();
+
+        // C ⊆ B's own raw permitted set ({X, Y} == {X, Y}) -- a one-level
+        // check would wrongly call this within bounds. B's own *effective*
+        // bound (B ∩ A) is only {X}, since B is itself A's helper -- the
+        // check must now walk past B to reach that (quickstart scenario 2).
+        $this->assertFalse(
+            $this->query()->isWithinParentBounds($agentC, $agentB, $catalog),
+            'C exceeds B\'s recursive bound ({X}, narrowed by A) even though C is a byte-identical subset of B\'s own raw {X, Y}',
+        );
+        $this->assertSame(
+            ['x.operation'],
+            $this->query()->effectiveOperationIds($agentC, $agentB, $catalog),
+            'effectiveOperationIds() must reflect the narrower recursive bound, never B\'s raw {X, Y}',
+        );
+    }
+
+    #[Test]
+    public function helpers_for_shows_within_bounds_false_when_the_rows_own_parent_is_itself_narrowed_by_its_own_parent(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+        $agentA = $this->agentPermitting($owner, 't008-helpersfor-a', ['x.operation']);
+        $agentB = $this->agentPermitting($owner, 't008-helpersfor-b', ['x.operation', 'y.operation']);
+        $agentC = $this->agentPermitting($owner, 't008-helpersfor-c', ['x.operation', 'y.operation']);
+        $this->assign($agentA, $agentB, $owner); // B is A's helper -- narrows B's own effective bound
+        $this->assign($agentB, $agentC, $owner); // C is B's helper -- C's own direct relationship to B never changes
+
+        $result = $this->query()->helpersFor($owner->id, $agentB->id);
+        $row = $result->firstWhere('helper_agent_id', $agentC->id);
+
+        $this->assertNotNull($row);
+        $this->assertFalse(
+            $row->within_bounds,
+            'C is within B\'s own raw {X, Y}, but B\'s recursive bound (narrowed by A to {X}) must now govern this row, even though C\'s own relationship to B never changed',
+        );
+        $this->assertSame(
+            1,
+            $row->effective_operation_count,
+            'the effective count must be against B\'s recursive bound ({X}), not B\'s raw 2-operation set',
+        );
+    }
+
+    #[Test]
+    public function hierarchy_for_shows_within_bounds_false_for_a_grandchild_whose_immediate_parent_is_itself_narrowed(): void
+    {
+        $owner = $this->user();
+        $this->seedXyOperationCatalog();
+        $agentA = $this->agentPermitting($owner, 't008-hierarchy-a', ['x.operation']);
+        $agentB = $this->agentPermitting($owner, 't008-hierarchy-b', ['x.operation', 'y.operation']);
+        $agentC = $this->agentPermitting($owner, 't008-hierarchy-c', ['x.operation', 'y.operation']);
+        $this->assign($agentA, $agentB, $owner);
+        $this->assign($agentB, $agentC, $owner);
+
+        $result = $this->query()->hierarchyFor($owner->id, $agentA->id);
+        $cEntry = collect($result['data'])->firstWhere('agent_id', $agentC->id);
+
+        $this->assertNotNull($cEntry, 'C must still be reachable in the hierarchy beneath A');
+        $this->assertFalse(
+            $cEntry['within_bounds'],
+            'C\'s direct relationship to B never changed, but B\'s own recursive bound (narrowed by A to {X}) must now govern this entry',
+        );
+        $this->assertSame(1, $cEntry['effective_operation_count']);
     }
 
     // ---------------------------------------------------------------

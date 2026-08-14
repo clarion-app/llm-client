@@ -30,10 +30,27 @@ use Symfony\Component\Yaml\Yaml;
  */
 class AgentService
 {
+    private readonly AgentHelperService $helperService;
+
+    /**
+     * $helperService is nullable-defaulted rather than a required
+     * constructor-promoted dependency (100-subagent-tool-restrictions) —
+     * mirroring AgentLoopService's own established late-added-collaborator
+     * pattern (research.md-cited precedent, Grounding note item 5) — so
+     * every existing direct `new AgentService($parser, $fileReader)` call
+     * site across this package's own test suite keeps working unchanged;
+     * the real container-resolved instance always passes it explicitly
+     * (LlmClientServiceProvider).
+     */
     public function __construct(
         private readonly AgentDefinitionParser $parser,
         private readonly GitDefinitionFileReader $fileReader,
+        ?AgentHelperService $helperService = null,
     ) {
+        $this->helperService = $helperService ?? new AgentHelperService(
+            new AgentQuery($this->parser),
+            new AgentHelperQuery(new AgentQuery($this->parser), $this->parser),
+        );
     }
 
     /**
@@ -154,6 +171,8 @@ class AgentService
     {
         $definition = $this->parser->parse($rawYaml);
 
+        $this->helperService->guardAgainstExceedingActiveParents($agent, $definition);
+
         return DB::transaction(function () use ($agent, $userId, $rawYaml, $definition) {
             $nextVersionNumber = (int) AgentVersion::where('agent_id', $agent->id)->max('version_number') + 1;
 
@@ -194,6 +213,8 @@ class AgentService
     public function restore(Agent $agent, string $userId, AgentVersion $target): Agent
     {
         $definition = $this->parser->parse($target->raw_definition);
+
+        $this->helperService->guardAgainstExceedingActiveParents($agent, $definition);
 
         return DB::transaction(function () use ($agent, $userId, $target, $definition) {
             $nextVersionNumber = (int) AgentVersion::where('agent_id', $agent->id)->max('version_number') + 1;
@@ -239,6 +260,8 @@ class AgentService
     {
         $rawYaml = $this->fileReader->readWorkingTreeContent($repositoryPath, $filePath);
         $definition = $this->parser->parse($rawYaml);
+
+        $this->helperService->guardAgainstExceedingActiveParents($agent, $definition);
 
         return DB::transaction(function () use ($agent, $repositoryPath, $filePath, $rawYaml, $definition) {
             $contentHash = hash('sha256', $rawYaml);

@@ -5,7 +5,9 @@ namespace ClarionApp\LlmClient\Services;
 use ClarionApp\LlmClient\Exceptions\HelperAssignmentCycleException;
 use ClarionApp\LlmClient\Exceptions\HelperDepthLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\HelperExceedsParentPermissionsException;
+use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
+use ClarionApp\LlmClient\ValueObjects\AgentDefinition;
 
 /**
  * Write path for `agent_helper_assignments` (097-subagent-model,
@@ -150,5 +152,49 @@ class AgentHelperService
         $assignment->delete();
 
         return true;
+    }
+
+    /**
+     * Refuses a candidate definition that would exceed the recursive
+     * structural bound of any of $agent's own currently-active parents
+     * (100-subagent-tool-restrictions, data-model.md §2, FR-015). Compares
+     * against $newDefinition — the *candidate*, not-yet-saved definition —
+     * never against $agent's own currently-stored version, so a caller can
+     * check a would-be write before committing it. No active parents ⇒
+     * returns immediately (the common case, one cheap query).
+     *
+     * Active parents are checked in AgentHelperAssignment.id order
+     * (contracts §1); the first one violated is the one named in the
+     * thrown exception.
+     */
+    public function guardAgainstExceedingActiveParents(Agent $agent, AgentDefinition $newDefinition): void
+    {
+        $parentIds = AgentHelperAssignment::where('helper_agent_id', $agent->id)
+            ->orderBy('id')
+            ->pluck('parent_agent_id');
+
+        if ($parentIds->isEmpty()) {
+            return;
+        }
+
+        $catalog = $this->helperQuery->catalog();
+        $candidateOperationIds = $newDefinition->permittedOperationIds($catalog);
+
+        foreach ($parentIds as $parentId) {
+            $parent = Agent::withTrashed()->find($parentId);
+
+            if ($parent === null) {
+                continue;
+            }
+
+            $excess = array_values(array_diff(
+                $candidateOperationIds,
+                $this->helperQuery->structuralEffectiveBound($parent, $catalog),
+            ));
+
+            if ($excess !== []) {
+                throw new HelperExceedsParentPermissionsException($parent->id, $agent->id, $excess);
+            }
+        }
     }
 }

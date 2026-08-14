@@ -45,7 +45,7 @@ class AgentHelperQuery
     {
         $excess = array_diff(
             $this->permittedOperationIds($helper, $catalog),
-            $this->permittedOperationIds($parent, $catalog),
+            $this->structuralEffectiveBound($parent, $catalog),
         );
 
         return $excess === [];
@@ -64,8 +64,56 @@ class AgentHelperQuery
     {
         return array_values(array_intersect(
             $this->permittedOperationIds($helper, $catalog),
-            $this->permittedOperationIds($parent, $catalog),
+            $this->structuralEffectiveBound($parent, $catalog),
         ));
+    }
+
+    /**
+     * The recursive structural bound of a single agent (100-subagent-tool-
+     * restrictions, data-model.md §2, research.md D3): the agent's own
+     * currently permitted operations, intersected with the
+     * structuralEffectiveBound() of each of its own currently-active
+     * parents. An agent with zero active parents (a root) returns its own
+     * permittedOperationIds() unchanged — the pre-existing one-level
+     * behavior, preserved exactly for the common case.
+     *
+     * $visited is passed *by value*, mirroring depthOf()'s own posture
+     * (Grounding note item 1) rather than dfsForTarget()'s shared-by-
+     * reference one: a node reachable via more than one parent must remain
+     * visitable again on a sibling branch. Only a revisit of a node already
+     * on the *current* path — a pre-existing data cycle the real API
+     * refuses to ever create, but which this traversal must still defend
+     * against — degrades to an empty set rather than recursing forever.
+     *
+     * @param list<array{operationId: string, method: string}> $catalog
+     * @param array<string, bool> $visited
+     * @return list<string>
+     */
+    public function structuralEffectiveBound(Agent $agent, array $catalog, array $visited = []): array
+    {
+        if (isset($visited[$agent->id])) {
+            return [];
+        }
+
+        $visited[$agent->id] = true;
+
+        $bound = $this->permittedOperationIds($agent, $catalog);
+        $parentIds = $this->activeParentIdsOf($agent->id);
+
+        foreach ($parentIds as $parentId) {
+            $parent = Agent::withTrashed()->find($parentId);
+
+            if ($parent === null) {
+                continue;
+            }
+
+            $bound = array_values(array_intersect(
+                $bound,
+                $this->structuralEffectiveBound($parent, $catalog, $visited),
+            ));
+        }
+
+        return $bound;
     }
 
     /**

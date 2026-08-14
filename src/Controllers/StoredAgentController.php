@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Exceptions\AgentFileUnreadableException;
 use ClarionApp\LlmClient\Exceptions\AgentNameAlreadyInUseException;
+use ClarionApp\LlmClient\Exceptions\HelperExceedsParentPermissionsException;
 use ClarionApp\LlmClient\Exceptions\LastActiveAgentException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentShareGrant;
@@ -157,7 +158,11 @@ class StoredAgentController extends Controller
             return response()->json($this->checkResultResource($result), 422);
         }
 
-        $agent = $this->service->update($agent, Auth::id(), $rawYaml);
+        try {
+            $agent = $this->service->update($agent, Auth::id(), $rawYaml);
+        } catch (HelperExceedsParentPermissionsException $e) {
+            return $this->exceedsParentPermissionsResponse($e);
+        }
 
         return response()->json([
             ...$this->agentResource($agent),
@@ -256,6 +261,8 @@ class StoredAgentController extends Controller
             return $this->fileUnreadableResponse($e);
         } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
             return $this->definitionErrorResponse($e);
+        } catch (HelperExceedsParentPermissionsException $e) {
+            return $this->exceedsParentPermissionsResponse($e);
         }
 
         return response()->json($this->agentDetailResource($agent), 200);
@@ -324,6 +331,8 @@ class StoredAgentController extends Controller
             return $this->fileUnreadableResponse($e);
         } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
             return $this->definitionErrorResponse($e);
+        } catch (HelperExceedsParentPermissionsException $e) {
+            return $this->exceedsParentPermissionsResponse($e);
         }
 
         return response()->json($this->agentDetailResource($agent), 200);
@@ -417,6 +426,8 @@ class StoredAgentController extends Controller
             $agent = $this->service->restore($agent, Auth::id(), $version);
         } catch (AgentDefinitionParseException|AgentDefinitionResolutionException $e) {
             return $this->definitionErrorResponse($e);
+        } catch (HelperExceedsParentPermissionsException $e) {
+            return $this->exceedsParentPermissionsResponse($e);
         }
 
         return response()->json($this->agentResource($agent), 200);
@@ -601,6 +612,24 @@ class StoredAgentController extends Controller
         return response()->json([
             'error' => 'file_unreadable',
             'message' => $e->getMessage(),
+        ], 422);
+    }
+
+    /**
+     * The 422 body for update()/link()/syncFromFile()/restore() when the
+     * candidate definition would exceed the recursive structural bound of
+     * one of the agent's own currently-active parents
+     * (100-subagent-tool-restrictions, FR-015) — byte-identical in shape to
+     * AgentHelperController::assign()'s own inline body for the same
+     * exception (contracts §1), so a caller sees one consistent refusal
+     * shape regardless of which of the five write entry points produced it.
+     */
+    private function exceedsParentPermissionsResponse(HelperExceedsParentPermissionsException $e): JsonResponse
+    {
+        return response()->json([
+            'error' => 'exceeds_parent_permissions',
+            'message' => $e->getMessage(),
+            'excess_operation_ids' => $e->excessOperationIds,
         ], 422);
     }
 
