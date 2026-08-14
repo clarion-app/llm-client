@@ -205,6 +205,24 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             }
         }
 
+        // The ambient Context 'run_id' slot must be correct for THIS
+        // iteration's own executeMetaTool() dispatch (handleToolCalls(),
+        // below) -- in particular DelegationService::delegate()'s first
+        // line reads it as Delegation.parent_run_id (098-delegation-
+        // protocol, FR-012). openRun() above already sets it as a side
+        // effect on the run-opening iteration, but a CONTINUATION
+        // iteration (run_id read from the payload, never minted here)
+        // would otherwise leave it unset -- each streaming iteration is
+        // plausibly a separate process/job invocation, so a prior
+        // iteration's own ambient state cannot be assumed to still be
+        // set. Set unconditionally, regardless of which branch resolved
+        // $this->runId; closeRun() (every exit path below) already clears
+        // this slot in its own finally block, so no corresponding forget
+        // is needed here.
+        if ($this->runId !== null) {
+            \Illuminate\Support\Facades\Context::add('run_id', $this->runId);
+        }
+
         // Record LLM usage metrics for the final chunk (fire-and-forget, never throws)
         // Streaming responses may have usage in the final SSE chunk
         if ($this->metricsRecorder !== null) {
@@ -322,6 +340,16 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $handoffDisclosure = app(AgentLoopService::class)->composeHandoffDisclosure($conversation);
         if ($handoffDisclosure !== null) {
             $this->reply = $handoffDisclosure.' '.$this->reply;
+        }
+
+        // A delegation, if any happened during this run, is announced
+        // last of all three prepends -- landing first in the final string
+        // (098-delegation-protocol, research.md D7), completing the
+        // degradation, then handoff, then delegation stacking order.
+        // Mirrors run()'s own equivalent wiring verbatim.
+        $delegationDisclosure = app(AgentLoopService::class)->composeDelegationDisclosure($this->runId);
+        if ($delegationDisclosure !== null) {
+            $this->reply = $delegationDisclosure.' '.$this->reply;
         }
 
         $this->message->content = $this->reply;
