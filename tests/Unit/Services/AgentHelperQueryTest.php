@@ -219,6 +219,24 @@ YAML;
     }
 
     /**
+     * Ten distinct, single-operation groups -- used only by the User Story
+     * 3 (Phase 5, T025) composition cases below, where a parent permitting
+     * a realistically large catalog (10 operations) is narrowed by a
+     * helper whose own tools.allow lists only the couple of tools its job
+     * needs, without ever referencing the parent's set at all
+     * (FR-007/FR-008, spec.md's own "narrow a helper to just what its job
+     * needs" framing).
+     */
+    private function seedTenOperationCatalog(): void
+    {
+        $operations = [];
+        for ($i = 1; $i <= 10; $i++) {
+            $operations["op{$i}.operation"] = ['path' => "/api/op{$i}", 'method' => 'get', 'summary' => "Op {$i}"];
+        }
+        $this->seedOperationCatalog($operations);
+    }
+
+    /**
      * Builds the live [{operationId, method}, ...] catalog once, the exact
      * shape AgentDefinition::permittedOperationIds()/
      * AgentSummaryQuery::buildCatalog() both expect as their $catalog
@@ -460,6 +478,73 @@ YAML;
             ['x.operation'],
             $this->query()->effectiveOperationIds($agentC, $agentB, $catalog),
             'effectiveOperationIds() must reflect the narrower recursive bound, never B\'s raw {X, Y}',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // FR-007/FR-008 composition with the recursive structural bound —
+    // T025 (100-subagent-tool-restrictions, Phase 5/US3, tasks.md T025,
+    // spec.md's "narrow a helper to just what its job needs" framing).
+    //
+    // US3 adds no new production code (Ordering grounding note): a
+    // helper's own tools.allow/tools.deny YAML already lists only its own
+    // intended tools, never enumerating or negating the parent's set, and
+    // that has always been true. What these two cases prove is that this
+    // still holds now that T011's structuralEffectiveBound() walks the
+    // full ancestor chain rather than comparing only against the
+    // immediate parent's raw permitted set -- narrowing composes
+    // correctly with multi-level bounding, not just the single-level
+    // case T015/097-subagent-model originally covered.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_helper_narrowed_to_two_of_the_parents_ten_operations_is_within_bounds_and_effective_ids_are_exactly_its_own_two(): void
+    {
+        $owner = $this->user();
+        $this->seedTenOperationCatalog();
+        $allTen = array_map(fn (int $i) => "op{$i}.operation", range(1, 10));
+        $parent = $this->agentPermitting($owner, 't025-parent', $allTen);
+        $helper = $this->agentPermitting($owner, 't025-helper', ['op1.operation', 'op2.operation']);
+        $this->assign($parent, $helper, $owner);
+        $catalog = $this->buildCatalog();
+
+        $this->assertTrue(
+            $this->query()->isWithinParentBounds($helper, $parent, $catalog),
+            'a helper whose own config lists only 2 of the parent\'s 10 operations -- never referencing the parent\'s set at all -- is always within a broader parent\'s bound, at any recursion depth',
+        );
+        $this->assertSame(
+            ['op1.operation', 'op2.operation'],
+            $this->sortedIds($this->query()->effectiveOperationIds($helper, $parent, $catalog)),
+            'effectiveOperationIds() must return exactly the helper\'s own narrower 2, never the parent\'s full 10',
+        );
+    }
+
+    #[Test]
+    public function a_helper_narrowed_through_a_two_level_parent_chain_composes_correctly_through_the_recursive_bound(): void
+    {
+        $owner = $this->user();
+        $this->seedTenOperationCatalog();
+        $allTen = array_map(fn (int $i) => "op{$i}.operation", range(1, 10));
+        $rootA = $this->agentPermitting($owner, 't025-root-a', $allTen);
+        $middleB = $this->agentPermitting($owner, 't025-middle-b', ['op1.operation', 'op2.operation', 'op3.operation', 'op4.operation']);
+        $this->assign($rootA, $middleB, $owner);
+        $candidateC = $this->agentPermitting($owner, 't025-candidate-c', ['op1.operation', 'op2.operation']);
+        $this->assign($middleB, $candidateC, $owner);
+        $catalog = $this->buildCatalog();
+
+        $this->assertTrue(
+            $this->query()->isWithinParentBounds($candidateC, $middleB, $catalog),
+            'C\'s own 2 must be within B\'s recursive bound (B\'s own 4, itself already within root A\'s 10)',
+        );
+        $this->assertSame(
+            ['op1.operation', 'op2.operation'],
+            $this->sortedIds($this->query()->effectiveOperationIds($candidateC, $middleB, $catalog)),
+            'effectiveOperationIds() must reflect C\'s own narrower 2 even when B\'s own bound is itself the product of a recursive walk through A -- proving composition through the recursive bound, not merely a flat one-level check against B',
+        );
+        $this->assertSame(
+            ['op1.operation', 'op2.operation'],
+            $this->sortedIds($this->query()->structuralEffectiveBound($candidateC, $catalog)),
+            'C\'s own full recursive bound, walked through both B and A, must still be exactly C\'s own 2 -- composing correctly at 2 levels, not just 1',
         );
     }
 
