@@ -799,6 +799,124 @@ YAML;
     }
 
     // =================================================================
+    // T028/T029 — 095-agent-summary-cards, US3 (FR-009, SC-003,
+    // research.md D7, quickstart.md steps 11/12): a card reflects an edit
+    // or a new unit of activity on the very next GET /agents/search call,
+    // with no cache-clearing step performed between the two calls -- proof
+    // that Phase 3's AgentSummaryQuery::summariesFor() is cache-free by
+    // construction, not a red/green pair (Phase 4 adds zero production
+    // code in either repo).
+    // =================================================================
+
+    #[Test]
+    public function an_edited_agents_capabilities_memory_and_operation_count_are_reflected_with_no_cache_clearing(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact'],
+            'weather.get_forecast' => ['path' => '/api/weather/forecast', 'method' => 'get', 'summary' => 'Get forecast'],
+            'weather.get_alerts' => ['path' => '/api/weather/alerts', 'method' => 'get', 'summary' => 'Get alerts'],
+        ]);
+
+        $initialYaml = <<<YAML
+name: freshness-card-fields-agent
+instructions: Handles freshness verification for card fields.
+capabilities:
+  - memory_read
+memory:
+  scratch: disabled
+  short_term: disabled
+  long_term: disabled
+  episodic: disabled
+  declarative: disabled
+tools:
+  allow:
+    - contacts.*
+YAML;
+
+        $agentId = $this->createAgent($initialYaml);
+
+        $before = $this->actingAs($this->user)->getJson($this->searchUrl());
+        $before->assertStatus(200);
+        $beforeEntry = collect($before->json('data'))->firstWhere('id', $agentId);
+        $this->assertNotNull($beforeEntry);
+        $this->assertSame(['memory_read'], $beforeEntry['capabilities']);
+        $this->assertFalse($beforeEntry['memory_enabled'], 'every memory kind starts disabled');
+        $this->assertSame(1, $beforeEntry['operation_count'], 'contacts.* must match exactly the one seeded contacts operation');
+        $this->assertSame(1, $beforeEntry['current_version_number']);
+
+        // Changes all three fields this test tracks at once: adds a
+        // capability, enables a previously-disabled memory kind, and swaps
+        // the tools.allow pattern to match a different (larger) subset of
+        // the same seeded catalog.
+        $updatedYaml = <<<YAML
+name: freshness-card-fields-agent
+instructions: Handles freshness verification for card fields.
+capabilities:
+  - memory_read
+  - memory_search
+memory:
+  scratch: disabled
+  short_term: enabled
+  long_term: disabled
+  episodic: disabled
+  declarative: disabled
+tools:
+  allow:
+    - weather.*
+YAML;
+
+        $this->actingAs($this->user)->putJson($this->agentUrl($agentId), ['definition' => $updatedYaml])->assertStatus(200);
+
+        // Deliberately no cache-clearing step here -- proving the point.
+        $after = $this->actingAs($this->user)->getJson($this->searchUrl());
+        $after->assertStatus(200);
+        $afterEntry = collect($after->json('data'))->firstWhere('id', $agentId);
+        $this->assertNotNull($afterEntry);
+
+        $this->assertSame(['memory_read', 'memory_search'], $afterEntry['capabilities'], 'the edited capability list must be reflected, not the original one');
+        $this->assertTrue($afterEntry['memory_enabled'], 'short_term was just enabled by the edit');
+        $this->assertSame(2, $afterEntry['operation_count'], 'weather.* must now match exactly the two seeded weather operations, replacing the prior contacts.* match');
+        $this->assertSame(2, $afterEntry['current_version_number'], 'editing must have produced a new current version');
+    }
+
+    #[Test]
+    public function a_summary_reflects_one_more_unit_of_activity_immediately(): void
+    {
+        $this->seedPrice();
+        $agentId = $this->createAgent('name: freshness-activity-agent');
+
+        $this->recordUsageFor($agentId, ['prompt_tokens' => 1000, 'completion_tokens' => 500, 'total_tokens' => 1500]);
+        $this->recordToolCallFor($agentId, true);
+        $this->seedAgentRun($agentId);
+
+        $before = $this->actingAs($this->user)->getJson($this->searchUrl());
+        $before->assertStatus(200);
+        $beforeEntry = collect($before->json('data'))->firstWhere('id', $agentId);
+        $this->assertNotNull($beforeEntry);
+        $beforeUsage = $beforeEntry['usage'];
+        $this->assertTrue($beforeUsage['has_run'], 'fixture sanity: this agent must already show has_run true before the extra activity below');
+        $this->assertSame(1, $beforeUsage['run_count']);
+        $this->assertSame(1, $beforeUsage['reliability']['invocation_count']);
+        $this->assertSame(1, $beforeUsage['cost']['request_count']);
+
+        // Exactly one more unit of each kind of activity -- no
+        // cache-clearing step performed before the second GET below.
+        $this->recordUsageFor($agentId, ['prompt_tokens' => 400, 'completion_tokens' => 100, 'total_tokens' => 500]);
+        $this->recordToolCallFor($agentId, true);
+        $this->seedAgentRun($agentId);
+
+        $after = $this->actingAs($this->user)->getJson($this->searchUrl());
+        $after->assertStatus(200);
+        $afterEntry = collect($after->json('data'))->firstWhere('id', $agentId);
+        $this->assertNotNull($afterEntry);
+        $afterUsage = $afterEntry['usage'];
+
+        $this->assertSame($beforeUsage['run_count'] + 1, $afterUsage['run_count'], 'run_count must increment by exactly the one new agent_runs row');
+        $this->assertSame($beforeUsage['reliability']['invocation_count'] + 1, $afterUsage['reliability']['invocation_count'], 'reliability.invocation_count must increment by exactly the one new tool invocation');
+        $this->assertSame($beforeUsage['cost']['request_count'] + 1, $afterUsage['cost']['request_count'], 'cost.request_count must increment by exactly the one new usage record');
+    }
+
+    // =================================================================
     // T023 — US3 (spec.md Acceptance Scenarios, FR-009, SC-002,
     // quickstart.md step 11). Expected to pass immediately against Phase
     // 3's already-shipped searchForUser()/search() — this phase adds zero
