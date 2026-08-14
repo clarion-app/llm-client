@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Tests\Unit;
 
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
@@ -256,6 +257,71 @@ class AgentLoopServiceCombinedResultsSectionTest extends TestCase
             $conflictBlockPos,
             'the conflicts block is distinct from, and rendered after, the plain combined_output listing',
         );
+    }
+
+    // =================================================================
+    // Phase 8 (Polish) gap closure, mutation-checklist row 8: every test
+    // above invokes buildCombinedHelperResultsSection() directly via
+    // reflection, so none of them would notice the method's own call site
+    // being deleted from buildMessagesPayload() -- confirmed by manually
+    // applying that exact mutation (deleting the `$combinedHelperResultsSection
+    // = $this->buildCombinedHelperResultsSection($runId); ...` block at
+    // AgentLoopService.php's own buildMessagesPayload()) and observing the
+    // full suite, including every test in this file, stay green. This test
+    // drives the real public buildMessagesPayload($conversation, $runId)
+    // entry point instead -- mirroring AgentLoopServiceTest's own
+    // `build_messages_payload_includes_known_operations_section` precedent
+    // for its sibling section builder -- so a deleted call site is caught
+    // here even though the section-rendering logic itself is exercised
+    // only above.
+    // =================================================================
+
+    #[Test]
+    public function build_messages_payload_includes_the_combined_helper_results_section_when_wired(): void
+    {
+        $conversation = Conversation::factory()->create();
+        $runId = 'run-wired-through-build-messages-payload';
+
+        $this->mockCombineForRun([
+            'contributors' => [
+                [
+                    'delegation_id' => 'delegation-a',
+                    'helper_agent_id' => 'agent-a',
+                    'helper_agent_name' => 'Helper A',
+                    'status' => 'success',
+                    'summary' => 'Did the thing.',
+                    'undone' => '',
+                    'output' => ['result_field' => 'value-a'],
+                ],
+                [
+                    'delegation_id' => 'delegation-b',
+                    'helper_agent_id' => 'agent-b',
+                    'helper_agent_name' => 'Helper B',
+                    'status' => 'success',
+                    'summary' => 'Did the other thing.',
+                    'undone' => '',
+                    'output' => ['other_field' => 'value-b'],
+                ],
+            ],
+            'combined_output' => [
+                'result_field' => 'value-a',
+                'other_field' => 'value-b',
+            ],
+            'conflicts' => [],
+            'truncated' => false,
+        ], $runId);
+
+        $messages = $this->service()->buildMessagesPayload($conversation, $runId);
+
+        $systemMsg = collect($messages)->firstWhere('role', 'system');
+        $this->assertNotNull($systemMsg, 'buildMessagesPayload() must emit a system message carrying the combined section');
+        $this->assertStringContainsString(
+            '## Combined Helper Results',
+            $systemMsg['content'],
+            'buildMessagesPayload() must actually call buildCombinedHelperResultsSection($runId) and append its result -- mutation-checklist row 8',
+        );
+        $this->assertStringContainsString('result_field', $systemMsg['content']);
+        $this->assertStringContainsString('other_field', $systemMsg['content']);
     }
 
 }

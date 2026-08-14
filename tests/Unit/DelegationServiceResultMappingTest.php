@@ -287,6 +287,62 @@ class DelegationServiceResultMappingTest extends TestCase
     }
 
     // =================================================================
+    // Phase 8 (Polish) gap closure -- spec.md's own Edge Cases: "What
+    // happens when a result's 'produced output' field is legitimately
+    // empty because the task's nature had nothing to produce (e.g., a
+    // verification task that only confirms something)? This is distinct
+    // from malformed/empty-as-failure (User Story 5): a legitimate empty
+    // output is paired with a success or partial-success status and an
+    // accomplishment summary explaining why nothing was produced, whereas
+    // a malformed/empty result is paired with a failure status and no such
+    // explanation." No prior test in this file exercised a validated
+    // output of `[]` on the success/partial path -- only ever non-empty
+    // output maps (the completed-branch cases above) or a failure's
+    // always-null output (the malformed/no_output/exception cases below).
+    // =================================================================
+
+    #[Test]
+    public function a_legitimately_empty_output_paired_with_success_is_distinct_from_the_malformed_empty_as_failure_path(): void
+    {
+        [$helper, $conversation] = $this->makeDelegationFixture('empty-output-legitimate');
+
+        $summary = 'Verified the configuration is already correct; there was nothing new to produce.';
+
+        $this->mockRunReturning([
+            'status' => 'completed',
+            'content' => json_encode(['status' => 'success', 'summary' => $summary, 'output' => [], 'undone' => '']),
+            'validated' => [
+                'status' => 'success',
+                'summary' => $summary,
+                'output' => [],
+                'undone' => '',
+            ],
+            'message_id' => null,
+        ]);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Verify the configuration.', null);
+
+        $this->assertContractShape($result);
+        $this->assertSame('success', $result['status'] ?? null);
+        $this->assertSame(
+            [],
+            $result['output'] ?? 'unset',
+            'a legitimately empty output is [] (an empty object/array), never null -- null is reserved for the failure path (FR-007)',
+        );
+        $this->assertSame($summary, $result['summary'] ?? null, 'the accomplishment summary must explain why nothing was produced');
+        $this->assertNotSame('', $result['summary'], 'the summary must not itself be blank -- that would be indistinguishable from having nothing to say');
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row);
+        $this->assertSame('success', $row->result_status);
+        $this->assertNotNull(
+            $row->result_output,
+            'result_output must NOT be null for a legitimate empty-output success -- null is reserved for a failure outcome (FR-007), never for an intentionally-empty one',
+        );
+        $this->assertSame([], json_decode((string) $row->result_output, true));
+    }
+
+    // =================================================================
     // Assertions 3/5: validated status: partial (helper self-reported)
     // =================================================================
 
@@ -412,6 +468,58 @@ class DelegationServiceResultMappingTest extends TestCase
         $this->assertSame('', $decoded['undone'] ?? null);
         $this->assertSame(false, $decoded['truncated'] ?? null);
         $this->assertNull($decoded['reason']);
+    }
+
+    // =================================================================
+    // Phase 8 (Polish) gap closure, mutation-checklist row 11: the row
+    // names only the completed-branch and SchemaValidationError/
+    // final-fallback closeAction() $content assertions as the tests
+    // expected to catch a dropped 4th argument -- but DelegationService
+    // has a FOURTH closeAction() call, in the 'exhausted'-mapping branch,
+    // and no existing test (in this file, DelegationServiceMalformedResultTest,
+    // or the 098-era DelegationBoundExhaustionTest, which only inspects the
+    // tool-result's own status/reason keys, never RunTraceRecorder's
+    // closeAction() call) asserted on its $content argument at all.
+    // Confirmed via manual mutation: dropping the 4th argument from that
+    // call site left the full targeted-file run (this file +
+    // DelegationServiceMalformedResultTest + DelegationQueryControllerTest)
+    // green. This test closes that gap directly.
+    // =================================================================
+
+    #[Test]
+    public function the_exhausted_branch_passes_the_full_six_field_result_to_close_action_as_content(): void
+    {
+        [$helper, $conversation] = $this->makeDelegationFixture('close-action-exhausted');
+
+        $this->mockRunReturning([
+            'status' => 'error',
+            'code' => 'max_iterations',
+            'content' => '',
+            'message_id' => null,
+        ]);
+
+        $capturedContent = 'not-yet-captured';
+
+        $mockRecorder = Mockery::mock(RunTraceRecorder::class);
+        $mockRecorder->shouldReceive('openAction')->once()->andReturn('fake-action-id');
+        $mockRecorder->shouldReceive('closeAction')
+            ->once()
+            ->withArgs(function ($actionId, $outcome = null, $failureReason = null, $content = null) use (&$capturedContent) {
+                $capturedContent = $content;
+
+                return true;
+            });
+        $this->app->instance(RunTraceRecorder::class, $mockRecorder);
+
+        app(DelegationService::class)->delegate($conversation, $helper->id, 'Do a long task.', null);
+
+        $this->assertIsString($capturedContent, 'closeAction() must be called with a non-null $content argument for the exhausted/bound_exceeded branch (FR-015/SC-008, mutation-checklist row 11)');
+        $decoded = json_decode((string) $capturedContent, true);
+        $this->assertIsArray($decoded, 'closeAction()\'s $content argument must be valid JSON');
+        $this->assertSame('partial', $decoded['status'] ?? null);
+        $this->assertSame('bound_exceeded', $decoded['reason'] ?? null);
+        $this->assertArrayHasKey('output', $decoded);
+        $this->assertNull($decoded['output']);
     }
 
     // =================================================================

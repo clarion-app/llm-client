@@ -384,6 +384,141 @@ class ResultAggregationServiceTest extends TestCase
     }
 
     // =================================================================
+    // Phase 8 (Polish) gap closure -- spec.md's own Edge Cases: "What
+    // happens when a parent combines results from helpers where one
+    // succeeded, one partially succeeded, and one failed outright?" The
+    // two existing fixtures above only ever pair two of the three statuses
+    // at once (success+partial, success+failure); no test previously
+    // exercised a genuine three-way mix in a single combineForRun() call.
+    // Since the combined view carries no top-level "overall status" field
+    // at all (only array_keys() === ['contributors', 'combined_output',
+    // 'conflicts', 'truncated']), collapsing is structurally impossible --
+    // this test proves it directly rather than by inference, confirming
+    // each contributor's own status/summary/undone survives independently
+    // and combined_output still unions every non-failing contributor's
+    // keys.
+    // =================================================================
+
+    #[Test]
+    public function a_combined_view_mixing_success_partial_and_failure_contributors_never_collapses_into_one_overall_status(): void
+    {
+        $runId = (string) Str::uuid();
+        $succeeding = $this->makeAgent('helper-three-way-success');
+        $partial = $this->makeAgent('helper-three-way-partial');
+        $failing = $this->makeAgent('helper-three-way-failure');
+
+        $succeedingDelegation = $this->makeDelegationRow($runId, $succeeding, [
+            'result_status' => 'success',
+            'result_summary' => 'Fully done.',
+            'result_output' => json_encode(['a' => 1]),
+            'result_undone' => '',
+        ]);
+        $partialDelegation = $this->makeDelegationRow($runId, $partial, [
+            'result_status' => 'partial',
+            'result_reason' => 'helper_reported',
+            'result_summary' => 'Partly done.',
+            'result_output' => json_encode(['b' => 2]),
+            'result_undone' => 'Still need to check the edge cases.',
+        ]);
+        $failingDelegation = $this->makeDelegationRow($runId, $failing, [
+            'status' => 'failed',
+            'result_status' => 'failure',
+            'result_reason' => 'exception',
+            'result_summary' => 'The delegation failed due to an unexpected error.',
+            'result_output' => null,
+            'result_undone' => 'Everything -- the task could not be completed.',
+        ]);
+
+        $combined = $this->service()->combineForRun($runId);
+
+        $this->assertNotNull($combined);
+        $this->assertArrayNotHasKey(
+            'status',
+            $combined,
+            'the combined view itself must never carry a top-level overall status -- only each contributor\'s own status',
+        );
+        $this->assertCount(3, $combined['contributors']);
+
+        $byDelegationId = collect($combined['contributors'])->keyBy('delegation_id');
+        $this->assertSame('success', $byDelegationId[$succeedingDelegation->id]['status']);
+        $this->assertSame('partial', $byDelegationId[$partialDelegation->id]['status']);
+        $this->assertSame('failure', $byDelegationId[$failingDelegation->id]['status']);
+
+        $this->assertSame(
+            ['a' => 1, 'b' => 2],
+            $combined['combined_output'],
+            'combined_output unions every non-failing contributor\'s keys regardless of the mix of statuses present',
+        );
+    }
+
+    // =================================================================
+    // Phase 8 (Polish) gap closure -- spec.md's own Edge Cases: "What
+    // happens when the same helper is delegated to twice in the same
+    // parent turn and both results are combined? Each result keeps its
+    // own provenance (including which delegation/attempt it came from),
+    // even though the originating helper is the same for both." No prior
+    // test in this file ever created two Delegation rows sharing one
+    // helper_agent_id, so `$byDelegationId` keying in every other test
+    // never had two rows collide under the same helper.
+    // =================================================================
+
+    #[Test]
+    public function the_same_helper_delegated_to_twice_keeps_each_delegations_own_separate_provenance(): void
+    {
+        $runId = (string) Str::uuid();
+        $helper = $this->makeAgent('helper-delegated-to-twice');
+
+        $firstAttempt = $this->makeDelegationRow($runId, $helper, [
+            'result_status' => 'partial',
+            'result_reason' => 'bound_exceeded',
+            'result_summary' => 'Got through the first half before running out of time.',
+            'result_output' => null,
+            'result_undone' => 'Reached its time limit before finishing.',
+            'started_at' => now()->subMinutes(5),
+        ]);
+        $secondAttempt = $this->makeDelegationRow($runId, $helper, [
+            'result_status' => 'success',
+            'result_summary' => 'Finished the rest on a second attempt.',
+            'result_output' => json_encode(['remaining_items' => 3]),
+            'result_undone' => '',
+            'started_at' => now(),
+        ]);
+
+        $combined = $this->service()->combineForRun($runId);
+
+        $this->assertNotNull($combined);
+        $this->assertCount(2, $combined['contributors']);
+
+        $delegationIds = array_column($combined['contributors'], 'delegation_id');
+        $this->assertSame(
+            [$firstAttempt->id, $secondAttempt->id],
+            $delegationIds,
+            'each delegation attempt keeps its own separate delegation_id, ordered by started_at, even though both share one helper_agent_id',
+        );
+        $this->assertNotSame(
+            $firstAttempt->id,
+            $secondAttempt->id,
+            'fixture sanity: two genuinely distinct delegation rows',
+        );
+
+        $byDelegationId = collect($combined['contributors'])->keyBy('delegation_id');
+        $this->assertSame($helper->id, $byDelegationId[$firstAttempt->id]['helper_agent_id']);
+        $this->assertSame($helper->id, $byDelegationId[$secondAttempt->id]['helper_agent_id']);
+        $this->assertSame('partial', $byDelegationId[$firstAttempt->id]['status']);
+        $this->assertSame('success', $byDelegationId[$secondAttempt->id]['status']);
+        $this->assertSame(
+            'Got through the first half before running out of time.',
+            $byDelegationId[$firstAttempt->id]['summary'],
+        );
+        $this->assertSame(
+            'Finished the rest on a second attempt.',
+            $byDelegationId[$secondAttempt->id]['summary'],
+        );
+
+        $this->assertSame(['remaining_items' => 3], $combined['combined_output']);
+    }
+
+    // =================================================================
     // 099-result-aggregation, Phase 6 (US4), tasks.md T038 -- conflict
     // detection (research.md D6). Sequenced after T030's own tests above,
     // not [P]. `combineForRun()` currently hardcodes `conflicts` to `[]`
@@ -563,5 +698,81 @@ class ResultAggregationServiceTest extends TestCase
             strlen($assembled),
             'the assembled combined_output/conflicts JSON must itself stay at or under the configured combined cap',
         );
+    }
+
+    // =================================================================
+    // Phase 8 (Polish) gap closure -- spec.md's own Edge Cases: "What
+    // happens when truncation (User Story 6) occurs on a result that is
+    // also flagged partial success or conflicting? All three markers
+    // (partial-success, conflict, truncation) can be present
+    // simultaneously on the same result; they are independent flags, not
+    // mutually exclusive states." No prior test combined all three at
+    // once -- the conflict tests above never configured a low cap, and the
+    // cap-forcing test above never included a partial-status contributor
+    // or a conflicting key.
+    // =================================================================
+
+    #[Test]
+    public function truncation_partial_status_and_a_conflict_can_all_be_present_on_the_same_combined_view_simultaneously(): void
+    {
+        $runId = (string) Str::uuid();
+        $partialHelper = $this->makeAgent('helper-partial-with-conflict');
+        $successHelper = $this->makeAgent('helper-success-with-conflict');
+
+        $partialDelegation = $this->makeDelegationRow($runId, $partialHelper, [
+            'result_status' => 'partial',
+            'result_reason' => 'helper_reported',
+            'result_summary' => 'Got most of the way there.',
+            'result_output' => json_encode([
+                'shared' => 'value-from-partial',
+                'filler_partial' => str_repeat('p', 200),
+            ]),
+            'result_undone' => 'Still need to reconcile the totals.',
+        ]);
+        $this->makeDelegationRow($runId, $successHelper, [
+            'result_status' => 'success',
+            'result_summary' => 'Computed the shared value independently.',
+            'result_output' => json_encode([
+                'shared' => 'value-from-success',
+                'filler_success' => str_repeat('s', 200),
+            ]),
+            'result_undone' => '',
+        ]);
+
+        // Large enough to still hold the conflict entry after
+        // pruneToFitCap() drops both bulky filler keys, small enough that
+        // the unpruned assembled payload (well over 500 bytes, between the
+        // two ~200-byte filler values and the conflict's own provenance)
+        // genuinely exceeds it.
+        config(['llm-client.delegation.combined_output_cap_bytes' => 600]);
+
+        $combined = $this->service()->combineForRun($runId);
+
+        $this->assertNotNull($combined);
+
+        $partialRow = collect($combined['contributors'])->firstWhere('delegation_id', $partialDelegation->id);
+        $this->assertNotNull($partialRow);
+        $this->assertSame(
+            'partial',
+            $partialRow['status'],
+            'a contributor\'s own partial status must survive unaffected by truncation/conflict handling elsewhere in the same combined view',
+        );
+
+        $this->assertNotEmpty(
+            $combined['conflicts'],
+            'the "shared" key\'s conflict must still be recorded even though the combined view is also truncated',
+        );
+        $this->assertSame('shared', $combined['conflicts'][0]['key']);
+
+        $this->assertTrue(
+            $combined['truncated'],
+            'truncation, a partial-status contributor, and a conflict are independent flags -- none suppresses another',
+        );
+
+        $assembled = json_encode([
+            'combined_output' => $combined['combined_output'],
+            'conflicts' => $combined['conflicts'],
+        ]);
+        $this->assertLessThanOrEqual(600, strlen($assembled));
     }
 }
