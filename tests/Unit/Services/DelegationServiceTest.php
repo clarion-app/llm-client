@@ -528,4 +528,190 @@ class DelegationServiceTest extends TestCase
             'delegate() must restore the enclosing run id once the nested run() call returns, even though it was overwritten to a different value mid-call (research.md D6)',
         );
     }
+
+    // =================================================================
+    // T037 (US4) -- bound exhaustion mapping (research.md D3) and
+    // max_chain_depth enforcement (research.md D4)
+    //
+    // Written before DelegationService maps run()'s ceiling codes to a
+    // terminal 'exhausted' Delegation.status, or enforces
+    // max_chain_depth at all. Today delegate() only ever writes
+    // 'completed' when the mocked nested run() call itself returns
+    // 'completed' -- an 'error'/'max_iterations' or
+    // 'error'/'time_ceiling_reached' return is not mapped to anything,
+    // so the returned array still carries the unconditional
+    // 'status' => 'completed' the current implementation always
+    // returns, and the Delegation row is left 'in_progress' forever.
+    // Depth is computed and stored (T018) but never refused on until
+    // T042, so a depth landing beyond the configured max_chain_depth
+    // still succeeds today. Every case below is expected to FAIL.
+    // =================================================================
+
+    #[Test]
+    public function delegate_maps_a_max_iterations_ceiling_return_to_an_exhausted_delegation_with_iteration_limit(): void
+    {
+        config(['llm-client.delegation.max_iterations' => 2]);
+
+        $parent = $this->makeAgent('parent-agent-exhaustion-iterations');
+        $helper = $this->makeAgent('helper-agent-exhaustion-iterations');
+        app(AgentHelperService::class)->assign($this->user->id, $parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        $mockAgentLoopService = Mockery::mock(AgentLoopService::class);
+        $mockAgentLoopService->shouldReceive('run')
+            ->once()
+            ->andReturn([
+                'status' => 'error',
+                'content' => 'Maximum iterations reached',
+                'message_id' => null,
+                'code' => 'max_iterations',
+            ]);
+        $this->app->instance(AgentLoopService::class, $mockAgentLoopService);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something exhausting.', null);
+
+        $this->assertSame('exhausted', $result['status'] ?? null, 'a max_iterations ceiling return from the nested run() call must map to an exhausted delegation result, per contracts');
+        $this->assertSame($helper->name, $result['helper'] ?? null);
+        $this->assertArrayHasKey('partial_result', $result);
+        $this->assertSame('iteration_limit', $result['incomplete_because'] ?? null);
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row);
+        $this->assertSame('exhausted', $row->status, 'the Delegation row itself must record the exhausted status, matching the tool-result shape');
+    }
+
+    #[Test]
+    public function delegate_maps_a_time_ceiling_reached_return_to_an_exhausted_delegation_with_time_limit(): void
+    {
+        config(['llm-client.delegation.max_seconds' => 1]);
+
+        $parent = $this->makeAgent('parent-agent-exhaustion-time');
+        $helper = $this->makeAgent('helper-agent-exhaustion-time');
+        app(AgentHelperService::class)->assign($this->user->id, $parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        $mockAgentLoopService = Mockery::mock(AgentLoopService::class);
+        $mockAgentLoopService->shouldReceive('run')
+            ->once()
+            ->andReturn([
+                'status' => 'error',
+                'content' => 'Delegation time bound reached',
+                'message_id' => null,
+                'code' => 'time_ceiling_reached',
+            ]);
+        $this->app->instance(AgentLoopService::class, $mockAgentLoopService);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something slow.', null);
+
+        $this->assertSame('exhausted', $result['status'] ?? null);
+        $this->assertSame($helper->name, $result['helper'] ?? null);
+        $this->assertArrayHasKey('partial_result', $result);
+        $this->assertSame('time_limit', $result['incomplete_because'] ?? null, 'a time_ceiling_reached return from the nested run() call must map to incomplete_because: time_limit, per contracts');
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row);
+        $this->assertSame('exhausted', $row->status);
+    }
+
+    // -----------------------------------------------------------------
+    // max_chain_depth enforcement (research.md D4)
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function delegate_refuses_once_the_computed_depth_would_exceed_the_configured_max_chain_depth(): void
+    {
+        config(['llm-client.delegation.max_chain_depth' => 2]);
+
+        $parent = $this->makeAgent('parent-agent-depth-refused');
+        $helper = $this->makeAgent('helper-agent-depth-refused');
+        app(AgentHelperService::class)->assign($this->user->id, $parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        // This conversation is itself the HELPER conversation of some
+        // earlier, already-completed delegation at depth 2 -- so a
+        // further delegation from it computes depth 3, one past the
+        // configured limit of 2 (research.md D4's own O(1) lookup).
+        $enclosingHelper = $this->makeAgent('enclosing-helper-agent-depth-refused');
+        Delegation::create([
+            'parent_conversation_id' => (string) Str::uuid(),
+            'helper_agent_id' => $enclosingHelper->id,
+            'helper_conversation_id' => $conversation->id,
+            'owner_user_id' => $this->user->id,
+            'task' => 'An earlier, enclosing delegation.',
+            'depth' => 2,
+            'status' => 'completed',
+            'started_at' => now(),
+        ]);
+
+        // A properly-refused, depth-exceeding delegation must never
+        // reach the nested run() call at all -- bound explicitly so
+        // this test fails via a clean Mockery expectation violation
+        // (not an uncontrolled real network call to a live provider)
+        // for as long as depth enforcement doesn't exist yet.
+        $mockAgentLoopService = Mockery::mock(AgentLoopService::class);
+        $mockAgentLoopService->shouldReceive('run')->never();
+        $this->app->instance(AgentLoopService::class, $mockAgentLoopService);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'One hop too many.', null);
+
+        $this->assertSame(
+            'delegation_depth_exceeded',
+            $result['error'] ?? null,
+            'a computed depth of 3 must be refused once it exceeds the configured max_chain_depth of 2',
+        );
+        $this->assertSame(
+            1,
+            Delegation::count(),
+            'no NEW Delegation row may be written for a refused, depth-exceeding delegation -- only the one already-seeded enclosing row may exist',
+        );
+    }
+
+    #[Test]
+    public function delegate_still_succeeds_when_the_computed_depth_lands_exactly_at_the_configured_limit(): void
+    {
+        config(['llm-client.delegation.max_chain_depth' => 2]);
+
+        $parent = $this->makeAgent('parent-agent-depth-exact');
+        $helper = $this->makeAgent('helper-agent-depth-exact');
+        app(AgentHelperService::class)->assign($this->user->id, $parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        // This conversation is itself the HELPER conversation of an
+        // earlier delegation at depth 1 -- a further delegation from it
+        // computes depth 2, landing EXACTLY at the configured limit of
+        // 2, which must still be permitted (only EXCEEDING the limit is
+        // refused).
+        $enclosingHelper = $this->makeAgent('enclosing-helper-agent-depth-exact');
+        Delegation::create([
+            'parent_conversation_id' => (string) Str::uuid(),
+            'helper_agent_id' => $enclosingHelper->id,
+            'helper_conversation_id' => $conversation->id,
+            'owner_user_id' => $this->user->id,
+            'task' => 'An earlier, enclosing delegation.',
+            'depth' => 1,
+            'status' => 'completed',
+            'started_at' => now(),
+        ]);
+
+        $service = $this->serviceWithScriptedProvider([
+            $this->plainReply('Helper completed the task at exactly the depth limit.'),
+        ]);
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Right at the limit.', null);
+
+        $this->assertSame(
+            'completed',
+            $result['status'] ?? null,
+            'a computed depth landing EXACTLY at the configured limit must still succeed, not be refused',
+        );
+
+        $row = Delegation::where('helper_agent_id', $helper->id)->where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row);
+        $this->assertSame(2, $row->depth, 'fixture sanity: the computed depth must genuinely be 2, landing exactly at the configured limit');
+    }
 }
