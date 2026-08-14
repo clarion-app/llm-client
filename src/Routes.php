@@ -39,6 +39,7 @@ use ClarionApp\LlmClient\Controllers\StoredAgentController;
 use ClarionApp\LlmClient\Controllers\AgentVersionComparisonController;
 use ClarionApp\LlmClient\Controllers\AgentShareController;
 use ClarionApp\LlmClient\Controllers\AgentHelperController;
+use ClarionApp\LlmClient\Controllers\DelegationController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -99,6 +100,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agent-runs/{runId}/actions/{actionId}/children', [RunController::class, "actionChildren"]);
     // Agent run execution graph action-detail endpoint (070 US2)
     Route::get('agent-runs/{runId}/actions/{actionId}', [RunController::class, "actionDetail"]);
+
+    // Delegation protocol read endpoints (098 US3)
+    Route::get('agent-runs/{runId}/delegations', [DelegationController::class, "forRun"]);
+    Route::get('delegations/{id}', [DelegationController::class, "show"]);
+    Route::get('agent-runs/{runId}/cost-with-delegations', [DelegationController::class, "cost"]);
 
     // Model price configuration endpoints (073 US1) — operator-only
     Route::get('model-prices', [ModelPriceController::class, "index"]);
