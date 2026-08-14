@@ -264,6 +264,53 @@ YAML;
     }
 
     // ---------------------------------------------------------------
+    // permittedOperationIds() fail-closed degrade — T004 (100-subagent-
+    // tool-restrictions, Phase 2/Foundational, mutation-testing
+    // checklist row 10).
+    //
+    // Every structural (US1) and runtime (US2) walk this feature adds
+    // narrows by intersecting with permittedOperationIds() at some agent
+    // in a chain. That composition is only sound if a resolution failure
+    // degrades to the *empty* set (a no-op intersection input, i.e.
+    // "permits nothing") rather than the full catalog or null — either of
+    // which would make a broken agent's failure silently widen, not
+    // narrow, everything computed from it. This method and its
+    // try/catch are unmodified by this feature (Grounding note item 1);
+    // this test proves the property already holds and guards it going
+    // forward.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function permitted_operation_ids_degrades_to_an_empty_set_never_the_full_catalog_when_the_current_versions_raw_definition_no_longer_resolves(): void
+    {
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+
+        $server = \ClarionApp\LlmClient\Models\Server::forceCreate(['id' => (string) Str::uuid(), 'name' => 'Primary']);
+        $model = \ClarionApp\LlmClient\Models\LanguageModel::create(['id' => (string) Str::uuid(), 'name' => 'retiring-model', 'server_id' => $server->id]);
+
+        $agent = $this->agentService()->create(
+            $owner->id,
+            "name: unresolvable-agent\nmodel: retiring-model\ntools:\n  allow:\n    - \"*\"",
+        );
+
+        // The agent's named model no longer exists on this installation —
+        // raw_definition can no longer resolve (AgentDefinitionParser::
+        // parse() throws AgentDefinitionResolutionException), mirroring
+        // ConversationAgentDefinitionResolverTest's own established
+        // pattern for forcing this exact failure mode.
+        $model->delete();
+
+        $catalog = $this->buildCatalog();
+
+        $this->assertSame(
+            [],
+            $this->query()->permittedOperationIds($agent->fresh(), $catalog),
+            'a resolution failure must degrade to an empty set — never the full catalog and never null — so no downstream narrowing walk can ever fail open',
+        );
+    }
+
+    // ---------------------------------------------------------------
     // helpersFor() — T016 (US1)
     //
     // Written first, confirmed RED: AgentHelperQuery does not exist yet
