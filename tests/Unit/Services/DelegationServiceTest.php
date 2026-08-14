@@ -714,4 +714,93 @@ class DelegationServiceTest extends TestCase
         $this->assertNotNull($row);
         $this->assertSame(2, $row->depth, 'fixture sanity: the computed depth must genuinely be 2, landing exactly at the configured limit');
     }
+
+    // =================================================================
+    // T045 (US5) -- failure isolation (research.md D5)
+    //
+    // Written before delegate() wraps its existing try/finally with an
+    // additional catch (\Throwable $e) layer (T047). Today, a thrown
+    // exception from the nested run() call has nothing between it and
+    // this test method -- it propagates straight out of delegate()
+    // itself, so this case is expected to FAIL as an uncaught-exception
+    // PHPUnit error, not merely a failed assertion.
+    // =================================================================
+
+    #[Test]
+    public function delegate_catches_a_thrown_exception_from_the_nested_run_call_and_returns_a_structured_failure_result_instead_of_rethrowing(): void
+    {
+        $parent = $this->makeAgent('parent-agent-failure-isolation');
+        $helper = $this->makeAgent('helper-agent-failure-isolation');
+        app(AgentHelperService::class)->assign($this->user->id, $parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        // Deliberately well over 500 characters so this test actually
+        // exercises Str::limit()'s own truncation, not merely a message
+        // short enough to pass through unchanged either way.
+        $longMessage = 'The provider connection failed catastrophically and repeatedly. '
+            .str_repeat('Additional diagnostic detail that keeps piling up. ', 12);
+        $this->assertGreaterThan(500, strlen($longMessage), 'fixture sanity: the exception message must exceed 500 chars to actually exercise truncation');
+
+        $mockAgentLoopService = Mockery::mock(AgentLoopService::class);
+        $mockAgentLoopService->shouldReceive('run')
+            ->once()
+            ->andThrow(new \RuntimeException($longMessage));
+        $this->app->instance(AgentLoopService::class, $mockAgentLoopService);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something that will explode.', null);
+
+        $this->assertSame(
+            'failed',
+            $result['status'] ?? null,
+            'delegate() must catch a thrown exception from the nested run() call and return a structured failure result, never rethrow it to the parent\'s own loop (research.md D5/FR-008)',
+        );
+        $this->assertSame($helper->name, $result['helper'] ?? null);
+        $this->assertSame(
+            Str::limit($longMessage, 500),
+            $result['error'] ?? null,
+            'the failure result\'s error field must carry the caught exception\'s own message, truncated to 500 chars via Str::limit() (matching this package\'s own established truncation convention)',
+        );
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row, 'a failed delegation must still write a Delegation row -- the failure itself is part of what must be recoverable (FR-012)');
+        $this->assertSame('failed', $row->status);
+        $this->assertSame(
+            Str::limit($longMessage, 500),
+            $row->outcome_summary,
+            'the Delegation row\'s own outcome_summary must record the same truncated failure message the tool result reports',
+        );
+    }
+
+    #[Test]
+    public function delegate_catches_a_thrown_exception_whose_message_is_already_under_the_truncation_limit_and_reports_it_unchanged(): void
+    {
+        $parent = $this->makeAgent('parent-agent-failure-isolation-short');
+        $helper = $this->makeAgent('helper-agent-failure-isolation-short');
+        app(AgentHelperService::class)->assign($this->user->id, $parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        $shortMessage = 'Provider connection reset.';
+
+        $mockAgentLoopService = Mockery::mock(AgentLoopService::class);
+        $mockAgentLoopService->shouldReceive('run')
+            ->once()
+            ->andThrow(new \RuntimeException($shortMessage));
+        $this->app->instance(AgentLoopService::class, $mockAgentLoopService);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something that will fail quickly.', null);
+
+        $this->assertSame('failed', $result['status'] ?? null);
+        $this->assertSame(
+            $shortMessage,
+            $result['error'] ?? null,
+            'a message already under the 500-char limit must be reported unchanged, not padded or otherwise altered',
+        );
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row);
+        $this->assertSame('failed', $row->status);
+        $this->assertSame($shortMessage, $row->outcome_summary);
+    }
 }
