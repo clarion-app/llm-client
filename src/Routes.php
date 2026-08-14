@@ -38,6 +38,7 @@ use ClarionApp\LlmClient\Controllers\EvalDashboardController;
 use ClarionApp\LlmClient\Controllers\StoredAgentController;
 use ClarionApp\LlmClient\Controllers\AgentVersionComparisonController;
 use ClarionApp\LlmClient\Controllers\AgentShareController;
+use ClarionApp\LlmClient\Controllers\AgentHelperController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -280,6 +281,15 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Revoke a previously granted share (096-agent-sharing,
     // contracts/agent-sharing-api.md §3, Phase 5/US3). Owner-only.
     Route::delete('agents/{id}/shares/{recipientUserId}', [AgentShareController::class, "unshare"]);
+
+    // Assign a helper to an agent, and list its currently-active helpers
+    // (097-subagent-model, contracts/subagent-model-api.md §1/§2,
+    // Phase 3/US1+US2). Both owner-only. A helper's own permitted
+    // operations are refused if they exceed the parent's (US2); cycle/
+    // depth-limit protection and the hierarchy/remove endpoints are added
+    // in later phases.
+    Route::post('agents/{id}/helpers', [AgentHelperController::class, "assign"]);
+    Route::get('agents/{id}/helpers', [AgentHelperController::class, "helpers"]);
 
     // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
     // contracts §4/§5). Named independently by two version ids, not nested
