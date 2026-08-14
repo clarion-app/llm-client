@@ -138,7 +138,7 @@ class StoredAgentController extends Controller
      */
     public function update(Request $request, string $id): JsonResponse
     {
-        $agent = $this->query->findAgent(Auth::id(), $id);
+        $agent = $this->query->findEditableAgent(Auth::id(), $id);
 
         if ($agent === null) {
             return $this->notFoundResponse();
@@ -210,7 +210,7 @@ class StoredAgentController extends Controller
      */
     public function show(Request $request, string $id): JsonResponse
     {
-        $agent = $this->query->findAgent(Auth::id(), $id);
+        $agent = $this->query->findAccessibleAgent(Auth::id(), $id);
 
         if ($agent === null) {
             return $this->notFoundResponse();

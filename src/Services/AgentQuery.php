@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Services;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentShareGrant;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
@@ -61,6 +62,58 @@ class AgentQuery
             ->where('id', $agentId)
             ->where('user_id', $callerUserId)
             ->first();
+    }
+
+    /**
+     * Find an agent by id, accessible to the caller either because they
+     * own it or because an active (non-revoked) AgentShareGrant of either
+     * permission level names them as recipient (096-agent-sharing,
+     * data-model.md §3). Null uniformly for "doesn't exist," "not yours,"
+     * and "not shared with you," matching findAgent()'s own contract.
+     *
+     * A grant's default query already excludes soft-deleted (revoked) rows
+     * — AgentShareGrant uses SoftDeletes, so no explicit
+     * whereNull('deleted_at')/withTrashed() exclusion is needed here.
+     *
+     * @return Agent|null
+     */
+    public function findAccessibleAgent(string $callerUserId, string $agentId): ?Agent
+    {
+        return Agent::where('id', $agentId)
+            ->where(fn ($query) => $query
+                ->where('user_id', $callerUserId)
+                ->orWhereIn('id', $this->activeGrantAgentIds($callerUserId)))
+            ->first();
+    }
+
+    /**
+     * The editable counterpart to findAccessibleAgent() — identical
+     * shape, but a grant only satisfies it when its permission is
+     * 'use_and_edit'; a 'use'-only grant does not (096-agent-sharing,
+     * data-model.md §3).
+     *
+     * @return Agent|null
+     */
+    public function findEditableAgent(string $callerUserId, string $agentId): ?Agent
+    {
+        return Agent::where('id', $agentId)
+            ->where(fn ($query) => $query
+                ->where('user_id', $callerUserId)
+                ->orWhereIn('id', $this->activeGrantAgentIds($callerUserId, 'use_and_edit')))
+            ->first();
+    }
+
+    /**
+     * The ids of every agent actively (non-revoked) shared with
+     * $callerUserId, optionally narrowed to a specific permission level.
+     *
+     * @return Collection<int, string>
+     */
+    private function activeGrantAgentIds(string $callerUserId, ?string $permission = null): Collection
+    {
+        return AgentShareGrant::where('recipient_user_id', $callerUserId)
+            ->when($permission !== null, fn ($query) => $query->where('permission', $permission))
+            ->pluck('agent_id');
     }
 
     /**

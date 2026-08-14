@@ -286,6 +286,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineEvalPassRateSchema();
         $this->defineAgentSchema();
         $this->defineConversationHandoffSchema();
+        $this->defineAgentShareGrantSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -948,6 +949,36 @@ abstract class TestCase extends BaseTestCase
                 $table->timestamp('disclosed_at')->nullable();
 
                 $table->index('conversation_id');
+            });
+        }
+    }
+
+    /**
+     * agent_share_grants — one lifetime row per (agent_id,
+     * recipient_user_id) pair, recording that an owner granted a recipient
+     * use or use-and-edit access to an agent (096-agent-sharing,
+     * data-model.md §1). Mirrors the migration's own column set exactly.
+     * Guarded by Schema::hasTable() like every existing block here, and
+     * called from defineDatabaseMigrations() directly, immediately after
+     * defineConversationHandoffSchema(), matching this package's own
+     * established Foundational-phase precedent.
+     */
+    protected function defineAgentShareGrantSchema(): void
+    {
+        if (!Schema::hasTable('agent_share_grants')) {
+            Schema::create('agent_share_grants', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('agent_id');
+                $table->uuid('owner_user_id');
+                $table->uuid('recipient_user_id');
+                $table->string('permission', 20);
+                $table->timestamps();
+                $table->timestamp('deleted_at')->nullable();
+
+                $table->unique(['agent_id', 'recipient_user_id']);
+                $table->index('agent_id');
+                $table->index('owner_user_id');
+                $table->index('recipient_user_id');
             });
         }
     }

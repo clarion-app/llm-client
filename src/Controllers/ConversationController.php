@@ -81,7 +81,7 @@ class ConversationController extends Controller
 
         $agentId = $validatedData['agent_id'] ?? null;
         if ($agentId !== null) {
-            $agent = app(\ClarionApp\LlmClient\Services\AgentQuery::class)->findAgent(Auth::id(), $agentId);
+            $agent = app(\ClarionApp\LlmClient\Services\AgentQuery::class)->findAccessibleAgent(Auth::id(), $agentId);
             if ($agent === null) {
                 return response()->json([
                     'error' => 'Agent not found',

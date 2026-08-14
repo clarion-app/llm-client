@@ -129,17 +129,20 @@ class ConversationRecordsBoundAgentVersionJourneyTest extends TestCase
 
     /**
      * Mutation-checklist row 1 (research.md D2's capture-point discipline):
-     * store() must bind agent_version_id from the single AgentQuery::findAgent()
-     * read, never a second, later re-read (e.g. $agent->fresh()->current_version_id).
+     * store() must bind agent_version_id from the single
+     * AgentQuery::findAccessibleAgent() read (096-agent-sharing's
+     * access-relaxation swap of the prior findAgent() call, Phase 2/T010),
+     * never a second, later re-read (e.g. $agent->fresh()->current_version_id).
      * A test on step 1's own scenario alone can't distinguish the two, since
-     * nothing edits the agent between findAgent() and Conversation::create()
-     * in the ordinary happy path — so AgentQuery itself is intercepted here to
-     * simulate a write landing in that exact gap: the mock resolves the real
-     * agent (capturing its then-current version 1) and, as a side effect of
-     * that same call returning, edits the agent to version 2 before store()
-     * ever reaches Conversation::create(). Correct code still binds version 1
-     * (the value already captured in the returned Agent object); reading via
-     * a later fresh() re-query would incorrectly bind version 2.
+     * nothing edits the agent between findAccessibleAgent() and
+     * Conversation::create() in the ordinary happy path — so AgentQuery
+     * itself is intercepted here to simulate a write landing in that exact
+     * gap: the mock resolves the real agent (capturing its then-current
+     * version 1) and, as a side effect of that same call returning, edits
+     * the agent to version 2 before store() ever reaches
+     * Conversation::create(). Correct code still binds version 1 (the value
+     * already captured in the returned Agent object); reading via a later
+     * fresh() re-query would incorrectly bind version 2.
      */
     #[Test]
     public function the_bound_version_is_captured_at_the_single_find_agent_read_not_re_read_later(): void
@@ -150,7 +153,7 @@ class ConversationRecordsBoundAgentVersionJourneyTest extends TestCase
         $server = $this->makeServer();
 
         $agentQueryMock = Mockery::mock(AgentQuery::class);
-        $agentQueryMock->shouldReceive('findAgent')
+        $agentQueryMock->shouldReceive('findAccessibleAgent')
             ->once()
             ->andReturnUsing(function (string $callerUserId, string $agentId) use ($agent) {
                 $found = \ClarionApp\LlmClient\Models\Agent::where('id', $agentId)
