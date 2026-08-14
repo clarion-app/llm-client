@@ -16,12 +16,12 @@ use ClarionApp\LlmClient\Models\Delegation;
  * unit-testable without any agent-loop/LLM scaffolding (research.md D5),
  * exactly like `DelegationQuery`.
  *
- * Phase 5 (US3) ships the union-only shape: every contributing key is
- * merged into `combined_output` unconditionally, `conflicts` is always an
- * empty placeholder. Phase 6 (US4) extends `combineForRun()` with the
- * key-by-key conflict comparison (research.md D6) — excluding a
- * conflicting key from `combined_output` and recording it in `conflicts`
- * instead.
+ * Phase 6 (US4) adds the key-by-key conflict comparison (research.md D6):
+ * a key present in two or more contributors' `output` maps with differing
+ * values is excluded from `combined_output` and recorded, with every
+ * disagreeing value and its own provenance, in `conflicts`; a key present
+ * once, or present multiple times with an identical value, is unioned into
+ * `combined_output` as before.
  *
  * `contributors` entries carry one field beyond data-model.md §4's literal
  * list — `output`, each contributor's own decoded `result_output` — so
@@ -90,14 +90,36 @@ class ResultAggregationService
             }
         }
 
-        // Phase 6 (US4) will exclude conflicting keys from combined_output
-        // and populate conflicts instead (research.md D6). Phase 5 unions
-        // every key unconditionally, with no conflict exclusion yet.
+        // research.md D6: a key is a conflict only when two or more
+        // contributors disagree on its value -- a key present once, or
+        // present several times with an identical value, is unioned into
+        // combined_output normally. Comparing json_encode()'d values
+        // (rather than ===) treats two occurrences of an equal array/object
+        // value as identical regardless of incidental key order.
         $combinedOutput = [];
-        foreach ($keyOccurrences as $key => $occurrences) {
-            $combinedOutput[$key] = $occurrences[0]['value'];
-        }
         $conflicts = [];
+        foreach ($keyOccurrences as $key => $occurrences) {
+            $distinctValues = [];
+            foreach ($occurrences as $occurrence) {
+                $distinctValues[json_encode($occurrence['value'])] = true;
+            }
+
+            if (count($distinctValues) <= 1) {
+                $combinedOutput[$key] = $occurrences[0]['value'];
+
+                continue;
+            }
+
+            // Every disagreeing value is retained with its own provenance
+            // (FR-010/FR-011) -- never silently keeping only the most
+            // recent. $occurrences already carries exactly the
+            // value/delegation_id/helper_agent_id/helper_agent_name shape
+            // each conflict entry's own `values` array needs.
+            $conflicts[] = [
+                'key' => $key,
+                'values' => $occurrences,
+            ];
+        }
 
         $encoded = json_encode([
             'combined_output' => $combinedOutput,

@@ -173,4 +173,89 @@ class AgentLoopServiceCombinedResultsSectionTest extends TestCase
         );
     }
 
+    // =================================================================
+    // 099-result-aggregation, Phase 6 (US4), tasks.md T039 -- a non-empty
+    // `conflicts` renders a distinct "Conflicting values" block
+    // (contracts §3's exact format, mutation-checklist row 8, quickstart
+    // scenario 4's system-prompt assertion). Sequenced after T031's own
+    // test above, not [P].
+    // =================================================================
+
+    #[Test]
+    public function renders_a_conflicting_values_block_naming_both_values_and_their_originating_helpers_when_conflicts_is_non_empty(): void
+    {
+        $runId = 'run-with-a-conflict';
+
+        $this->mockCombineForRun([
+            'contributors' => [
+                [
+                    'delegation_id' => 'delegation-extractor',
+                    'helper_agent_id' => 'agent-extractor',
+                    'helper_agent_name' => 'Invoice Line-Item Extractor',
+                    'status' => 'success',
+                    'summary' => 'Computed the total.',
+                    'undone' => '',
+                    'output' => ['line_items' => ['Widget A', 'Widget B']],
+                ],
+                [
+                    'delegation_id' => 'delegation-normalizer',
+                    'helper_agent_id' => 'agent-normalizer',
+                    'helper_agent_name' => 'Currency Normalizer',
+                    'status' => 'success',
+                    'summary' => 'Recomputed the total.',
+                    'undone' => '',
+                    'output' => ['currency' => 'USD'],
+                ],
+            ],
+            'combined_output' => [
+                'line_items' => ['Widget A', 'Widget B'],
+                'currency' => 'USD',
+            ],
+            'conflicts' => [
+                [
+                    'key' => 'total',
+                    'values' => [
+                        [
+                            'value' => '1042.50',
+                            'delegation_id' => 'delegation-extractor',
+                            'helper_agent_id' => 'agent-extractor',
+                            'helper_agent_name' => 'Invoice Line-Item Extractor',
+                        ],
+                        [
+                            'value' => '1024.50',
+                            'delegation_id' => 'delegation-normalizer',
+                            'helper_agent_id' => 'agent-normalizer',
+                            'helper_agent_name' => 'Currency Normalizer',
+                        ],
+                    ],
+                ],
+            ],
+            'truncated' => false,
+        ], $runId);
+
+        $section = $this->invoke($this->service(), $runId);
+
+        $this->assertNotNull($section);
+        $this->assertStringContainsString(
+            '⚠ Conflicting values — not resolved automatically:',
+            $section,
+            'contracts §3\'s exact heading text for the conflicts block',
+        );
+        $this->assertStringContainsString(
+            '- total: "1042.50" (from "Invoice Line-Item Extractor") vs "1024.50" (from "Currency Normalizer")',
+            $section,
+            'contracts §3\'s exact per-conflict line format, naming both values and their originating helpers',
+        );
+
+        $conflictBlockPos = strpos($section, 'Conflicting values');
+        $combinedOutputPos = strpos($section, 'The following facts were produced');
+        $this->assertNotFalse($conflictBlockPos);
+        $this->assertNotFalse($combinedOutputPos);
+        $this->assertGreaterThan(
+            $combinedOutputPos,
+            $conflictBlockPos,
+            'the conflicts block is distinct from, and rendered after, the plain combined_output listing',
+        );
+    }
+
 }

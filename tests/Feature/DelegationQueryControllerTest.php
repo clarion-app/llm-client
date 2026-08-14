@@ -974,4 +974,65 @@ class DelegationQueryControllerTest extends TestCase
         $contributorIds = array_column($first->json()['contributors'], 'delegation_id');
         $this->assertEqualsCanonicalizing([$extractor->id, $normalizer->id], $contributorIds);
     }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 6 (US4), tasks.md T040 -- quickstart
+    // scenario 4: a genuine conflict between two helpers is surfaced, not
+    // silently resolved (FR-010/FR-011). Sequenced after T032's own tests
+    // above, not [P]. `ResultAggregationService::combineForRun()` still
+    // unions every key unconditionally today (conflicts hardcoded to
+    // `[]`), so this is expected to FAIL red until Phase 6's
+    // implementation (T041) exists.
+    // =================================================================
+
+    #[Test]
+    public function combined_results_excludes_a_conflicting_key_from_combined_output_and_records_it_in_conflicts_with_both_values_and_provenance(): void
+    {
+        $runId = $this->makeRun($this->user);
+
+        $extractor = $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Computed the total.',
+            'result_output' => json_encode(['total' => '1042.50']),
+            'result_undone' => '',
+        ]);
+        $normalizer = $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_summary' => 'Recomputed the total.',
+            'result_output' => json_encode(['total' => '1024.50']),
+            'result_undone' => '',
+        ]);
+
+        $extractorName = Agent::find($extractor->helper_agent_id)->name;
+        $normalizerName = Agent::find($normalizer->helper_agent_id)->name;
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson($this->combinedResultsUrl($runId));
+
+        $response->assertStatus(200);
+
+        $body = $response->json();
+        $this->assertArrayNotHasKey(
+            'total',
+            $body['combined_output'],
+            'a key with two differing values must never appear in combined_output',
+        );
+        $this->assertCount(1, $body['conflicts']);
+
+        $conflict = $body['conflicts'][0];
+        $this->assertSame('total', $conflict['key']);
+        $this->assertCount(2, $conflict['values']);
+
+        $byDelegationId = collect($conflict['values'])->keyBy('delegation_id');
+
+        $extractorValue = $byDelegationId[$extractor->id];
+        $this->assertSame('1042.50', $extractorValue['value']);
+        $this->assertSame($extractor->helper_agent_id, $extractorValue['helper_agent_id']);
+        $this->assertSame($extractorName, $extractorValue['helper_agent_name']);
+
+        $normalizerValue = $byDelegationId[$normalizer->id];
+        $this->assertSame('1024.50', $normalizerValue['value']);
+        $this->assertSame($normalizer->helper_agent_id, $normalizerValue['helper_agent_id']);
+        $this->assertSame($normalizerName, $normalizerValue['helper_agent_name']);
+    }
 }
