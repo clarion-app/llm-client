@@ -47,7 +47,7 @@ class AgentQueryTest extends TestCase
 
     private function query(): AgentQuery
     {
-        return new AgentQuery();
+        return new AgentQuery(new AgentDefinitionParser());
     }
 
     private function service(): AgentService

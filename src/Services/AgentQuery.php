@@ -2,6 +2,8 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
+use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentVersion;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
@@ -14,9 +16,16 @@ use Illuminate\Support\Collection;
  * StoredAgentController::update() to resolve the target agent before
  * handing it to AgentService::update(). listForUser()/versionsForAgent()/
  * findVersion() are Phase 4/US2's own addition (contracts §2/§5/§6).
+ * searchForUser() is 094-agent-search-listing's own addition (data-model.md
+ * §4) — the caller's full agent list, optionally narrowed by a free-text
+ * query over name/instructions, paginated.
  */
 class AgentQuery
 {
+    public function __construct(
+        private readonly AgentDefinitionParser $parser,
+    ) {}
+
     /**
      * Find an agent by id, filtered by caller's user ownership — verbatim
      * RunTraceQuery::findRun()'s shape (research.md D5).
@@ -101,5 +110,64 @@ class AgentQuery
         return AgentVersion::where('id', $versionId)
             ->where('agent_id', $agentId)
             ->first();
+    }
+
+    /**
+     * The caller's full agent list, optionally narrowed by a free-text
+     * query over name/instructions, paginated (094-agent-search-listing,
+     * data-model.md §4).
+     *
+     * @return array{
+     *   data: list<Agent>,   // already sliced to the requested page
+     *   total: int,          // count after filtering by $query
+     *   total_unfiltered: int, // count with no $query filter (research.md D7)
+     * }
+     */
+    public function searchForUser(
+        string $callerUserId,
+        ?string $query,
+        int $page,
+        int $perPage,
+    ): array {
+        $agents = Agent::where('user_id', $callerUserId)
+            ->with('currentVersion')
+            ->orderBy('name')
+            ->get();
+
+        $totalUnfiltered = $agents->count();
+
+        $trimmedQuery = $query !== null ? trim($query) : '';
+
+        if ($trimmedQuery === '') {
+            $filtered = $agents;
+        } else {
+            $needle = strtolower($trimmedQuery);
+
+            $filtered = $agents->filter(function (Agent $agent) use ($needle): bool {
+                if (str_contains(strtolower($agent->name), $needle)) {
+                    return true;
+                }
+
+                $instructions = '';
+
+                try {
+                    $instructions = $this->parser->parse($agent->currentVersion->raw_definition)->instructions;
+                } catch (AgentDefinitionParseException|AgentDefinitionResolutionException) {
+                    // Fall back to name-only matching for this one agent
+                    // rather than aborting the whole search (research.md D1).
+                }
+
+                return str_contains(strtolower($instructions), $needle);
+            })->values();
+        }
+
+        $total = $filtered->count();
+        $data = $filtered->slice(($page - 1) * $perPage, $perPage)->values()->all();
+
+        return [
+            'data' => $data,
+            'total' => $total,
+            'total_unfiltered' => $totalUnfiltered,
+        ];
     }
 }

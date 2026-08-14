@@ -242,6 +242,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Agent version history — list/read/restore (contracts/agent-versioning-api.md
     // §2/§3/§5/§6/§7, 087-agent-model-versioning, Phase 4/US2).
     Route::get('agents', [StoredAgentController::class, "index"]);
+
+    // Free-text search/browse (094-agent-search-listing, contracts/
+    // agent-search-api.md §1) -- registered before the `agents/{id}`
+    // wildcard below so a literal "search" is never swallowed as an id.
+    Route::get('agents/search', [StoredAgentController::class, "search"]);
+
     Route::get('agents/{id}', [StoredAgentController::class, "show"]);
     Route::get('agents/{id}/versions', [StoredAgentController::class, "versions"]);
     Route::get('agents/{id}/versions/{versionId}', [StoredAgentController::class, "versionDetail"]);

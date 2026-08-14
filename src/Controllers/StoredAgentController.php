@@ -175,6 +175,30 @@ class StoredAgentController extends Controller
     }
 
     /**
+     * GET /agents/search (094-agent-search-listing, contracts/
+     * agent-search-api.md §1). Serves both browsing every owned agent (`q`
+     * omitted/empty) and narrowing by a free-text query over name/parsed
+     * instructions (`q` present) — a single endpoint, one query method
+     * (data-model.md §4). Paginated in RunController's own `{data, meta}`
+     * envelope, plus a top-level `total_unfiltered` letting the caller
+     * distinguish "you have zero agents" from "your search matched zero"
+     * (research.md D7).
+     */
+    public function search(Request $request): JsonResponse
+    {
+        [$page, $perPage] = $this->paginationParams($request, 20, 100);
+
+        $result = $this->query->searchForUser(Auth::id(), $request->input('q'), $page, $perPage);
+
+        $data = array_map(fn (Agent $agent) => $this->agentSearchEntryResource($agent), $result['data']);
+
+        return response()->json([
+            ...$this->envelope($data, $result['total'], $page, $perPage),
+            'total_unfiltered' => $result['total_unfiltered'],
+        ]);
+    }
+
+    /**
      * GET /agents/{id} (contracts §3). Resolves the current definition
      * directly via AgentDefinitionParser::parse(), not through a cached or
      * denormalized copy (research.md D6). Embeds `link`/`divergence` only
@@ -695,5 +719,63 @@ class StoredAgentController extends Controller
             AgentDefinitionResolutionErrorKind::UnknownCapability => 'unknown_capability',
             AgentDefinitionResolutionErrorKind::EmptyOperationPattern => 'empty_operation_pattern',
         };
+    }
+
+    /**
+     * Resolve `page`/`per_page` query params against a per-endpoint default
+     * and cap (094-agent-search-listing, research.md D4) — copied verbatim
+     * in shape from RunController::paginationParams(). `per_page` below 1
+     * falls back to the default; above the cap is clamped down to it
+     * (FR-009, enforced server-side regardless of what the client requests).
+     *
+     * @return array{0: int, 1: int} [page, perPage]
+     */
+    private function paginationParams(Request $request, int $default, int $cap): array
+    {
+        $page = max(1, (int) $request->input('page', 1));
+
+        $perPage = (int) $request->input('per_page', $default);
+        if ($perPage < 1) {
+            $perPage = $default;
+        }
+        $perPage = min($perPage, $cap);
+
+        return [$page, $perPage];
+    }
+
+    /**
+     * The paginated `{data, meta}` envelope search() returns (data-model.md
+     * §5) — copied verbatim in shape from RunController::envelope(). The
+     * caller merges in `total_unfiltered` at the call site, exactly as
+     * RunController::index()'s own `action_count` merge-in pattern for a
+     * value this shared helper doesn't own.
+     */
+    private function envelope(array $data, int $total, int $page, int $perPage): array
+    {
+        return [
+            'data' => $data,
+            'meta' => [
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $total,
+                'last_page' => max(1, (int) ceil($total / $perPage)),
+            ],
+        ];
+    }
+
+    /**
+     * The shape search()'s `data` entries use (094-agent-search-listing,
+     * data-model.md §5, contracts/agent-search-api.md §1). `can_use` is
+     * always `true` today (research.md D6, FR-003).
+     */
+    private function agentSearchEntryResource(Agent $agent): array
+    {
+        return [
+            'id' => $agent->id,
+            'name' => $agent->name,
+            'is_active' => $agent->is_active,
+            'can_use' => true,
+            'current_version_number' => $agent->currentVersion?->version_number,
+        ];
     }
 }

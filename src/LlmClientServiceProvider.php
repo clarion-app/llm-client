@@ -571,8 +571,10 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         // AgentService holds only the already-singleton AgentDefinitionParser
         // — neither accumulates any per-request state across calls
         // (087-agent-model-versioning, Phase 3/US1).
-        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentQuery::class, function () {
-            return new \ClarionApp\LlmClient\Services\AgentQuery();
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentQuery::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\AgentQuery(
+                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionParser::class),
+            );
         });
 
         $this->app->singleton(\ClarionApp\LlmClient\Services\AgentService::class, function ($app) {
