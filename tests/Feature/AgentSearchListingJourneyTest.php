@@ -389,4 +389,84 @@ class AgentSearchListingJourneyTest extends TestCase
             'matching must run against parsed instructions text, never the raw YAML document containing the literal key name "instructions"'
         );
     }
+
+    // =================================================================
+    // T023 — US3 (spec.md Acceptance Scenarios, FR-009, SC-002,
+    // quickstart.md step 11). Expected to pass immediately against Phase
+    // 3's already-shipped searchForUser()/search() — this phase adds zero
+    // new backend production code (tasks.md's Ordering grounding note).
+    // Proves the pagination mechanism Phase 3 built holds up at spec.md's
+    // own "hundreds of agents" scale, both for the full unfiltered list and
+    // for a query-narrowed subset.
+    // =================================================================
+
+    #[Test]
+    public function pagination_holds_under_a_larger_seeded_count_and_narrows_correctly(): void
+    {
+        // 22 agents carry a distinctive marker in their name so the
+        // narrowed-search assertions below have a known subset whose count
+        // (22) differs from both the full seeded count (120) and its own
+        // page count (last_page = 2, vs. 6 for the full list) — proving
+        // meta.total/meta.last_page are recomputed from the narrowed set,
+        // not merely re-reported from the full one.
+        $markerCount = 22;
+        $totalCount = 120;
+
+        for ($i = 0; $i < $markerCount; $i++) {
+            $this->createAgent(sprintf('name: distinctivemarkerterm-agent-%03d', $i));
+        }
+        for ($i = $markerCount; $i < $totalCount; $i++) {
+            $this->createAgent(sprintf('name: filler-agent-%03d', $i));
+        }
+
+        // No `page` supplied at all: defaults to page 1, default per_page 20.
+        $firstPage = $this->actingAs($this->user)->getJson($this->searchUrl());
+        $firstPage->assertStatus(200);
+        $this->assertCount(20, $firstPage->json('data'), 'default page 1 must hold 20 rows');
+        $this->assertSame(120, $firstPage->json('meta.total'));
+        $this->assertSame(120, $firstPage->json('total_unfiltered'));
+        $this->assertSame(1, $firstPage->json('meta.current_page'));
+        $this->assertSame(20, $firstPage->json('meta.per_page'));
+        $this->assertSame(6, $firstPage->json('meta.last_page'), '120 agents at 20/page is exactly 6 pages');
+
+        // The last page holds the remaining rows (120 - 5*20 = 20, an exact
+        // final page here since 120 is evenly divisible by 20).
+        $lastPage = $this->actingAs($this->user)->getJson($this->searchUrl().'?page=6');
+        $lastPage->assertStatus(200);
+        $this->assertCount(20, $lastPage->json('data'), 'the final page must hold the remaining rows');
+        $this->assertSame(6, $lastPage->json('meta.current_page'));
+        $this->assertSame(120, $lastPage->json('meta.total'));
+
+        // Every id across page 1 and page 6 must be distinct (no overlap,
+        // no gap-induced duplication from an unstable ordering).
+        $firstPageIds = collect($firstPage->json('data'))->pluck('id');
+        $lastPageIds = collect($lastPage->json('data'))->pluck('id');
+        $this->assertCount(0, $firstPageIds->intersect($lastPageIds), 'page 1 and page 6 must not overlap');
+
+        // Narrowing by a term matching only the 22-agent marker subset
+        // paginates against the NARROWED count, not the full 120.
+        $start = microtime(true);
+        $narrowed = $this->actingAs($this->user)->getJson($this->searchUrl().'?q=distinctivemarkerterm&page=1');
+        $elapsed = microtime(true) - $start;
+
+        $narrowed->assertStatus(200);
+        $this->assertCount(20, $narrowed->json('data'), 'narrowed page 1 holds min(per_page, narrowed total) rows');
+        $this->assertSame($markerCount, $narrowed->json('meta.total'), 'meta.total must reflect the narrowed count, not the full 120');
+        $this->assertSame(120, $narrowed->json('total_unfiltered'), 'total_unfiltered must still reflect the full unfiltered count');
+        $this->assertSame(2, $narrowed->json('meta.last_page'), 'ceil(22 / 20) = 2 pages for the narrowed set, distinct from the full list\'s 6');
+
+        foreach ($narrowed->json('data') as $entry) {
+            $this->assertStringContainsString('distinctivemarkerterm', $entry['name']);
+        }
+
+        // Soft performance assertion (SC-002: locate a specific agent among
+        // 100+ in under 10 seconds) — a concrete recorded figure for this
+        // 120-agent request, not a strict microbenchmark gate that would
+        // make the suite flaky under CI load.
+        $this->assertLessThan(
+            10.0,
+            $elapsed,
+            "GET /agents/search?q=...&page=1 against 120 seeded agents took {$elapsed}s, expected well under SC-002's 10s budget"
+        );
+    }
 }
