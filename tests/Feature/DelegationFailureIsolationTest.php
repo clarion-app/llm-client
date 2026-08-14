@@ -544,4 +544,141 @@ class DelegationFailureIsolationTest extends TestCase
             'a subsequent delegation attempt to the same, now-deactivated helper must be refused the same way as an unassigned helper (research.md D8)',
         );
     }
+
+    // =================================================================
+    // (d) A nested run() that returns WITHOUT throwing and WITHOUT
+    // completing -- run()'s own 'No response from LLM' early return (a
+    // provider reply carrying no choices), which has no `code` and so
+    // matches neither the completion branch nor either ceiling branch.
+    // It is still a non-completion and must reach the parent as one
+    // (FR-008/SC-004), with the Delegation row reaching a terminal state
+    // (data-model.md §1) rather than being left in_progress forever.
+    // =================================================================
+
+    #[Test]
+    public function a_helper_run_that_returns_a_non_completion_without_throwing_is_reported_failed_and_the_row_reaches_a_terminal_state(): void
+    {
+        $parent = $this->makeAgent('parent-agent-noresult-d');
+        $helper = $this->makeAgent('helper-agent-noresult-d');
+        $this->assignHelper($parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        $callCount = 0;
+        $service = $this->serviceWithScriptedProvider(function () use (&$callCount, $helper) {
+            $callCount++;
+
+            if ($callCount === 1) {
+                // Parent's own first iteration: delegate immediately.
+                return $this->toolCallReply([
+                    $this->toolCall('delegate_to_helper', [
+                        'helper_agent_id' => $helper->id,
+                        'task' => 'Do something the provider will answer emptily.',
+                        'context' => null,
+                    ], 'call_delegate_noresult_d'),
+                ]);
+            }
+
+            if ($callCount === 2) {
+                // The helper's own nested run(): a provider reply with no
+                // `choices` at all. run() returns ['status' => 'error',
+                // 'content' => 'No response from LLM'] -- no exception, and
+                // no `code` either.
+                return ['choices' => []];
+            }
+
+            // Parent's own next iteration, after the tool result comes back.
+            return $this->plainReply('The helper came back empty-handed, but here is what I can say.');
+        });
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $result = $service->run($conversation->fresh(), 'Please delegate this task.');
+        $this->assertSame('completed', $result['status'], 'the parent\'s own turn must still resolve normally');
+
+        $decoded = $this->firstToolResult($conversation);
+        $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
+        $this->assertSame(
+            'failed',
+            $decoded['status'] ?? null,
+            'a helper run that ends without producing a result must be reported to the parent as a failure -- never dressed up as status: completed with the failure text as its result (FR-008/SC-004)',
+        );
+        $this->assertArrayNotHasKey(
+            'result',
+            $decoded,
+            'a non-completion must never carry a `result` field -- the contract\'s failure shape carries `error`',
+        );
+
+        $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($delegationRow);
+        $this->assertSame(
+            'failed',
+            $delegationRow->status,
+            'the Delegation row must reach a terminal state -- data-model.md §1 allows no path that leaves it in_progress once delegate() has returned',
+        );
+        $this->assertNotNull(
+            $delegationRow->completed_at,
+            'a terminal Delegation row must carry completed_at',
+        );
+    }
+
+    // =================================================================
+    // (e) A delegation whose helper run THREW must still link the run it
+    // opened -- data-model.md §1 scopes helper_run_id's own nullability
+    // to "run tracing is disabled", not to "the helper failed", and
+    // FR-012 wants a failed delegation just as recoverable as a
+    // completed one.
+    // =================================================================
+
+    #[Test]
+    public function a_failed_delegation_still_links_the_helper_run_it_opened(): void
+    {
+        if (!config('llm-client.run_trace.enabled', false)) {
+            $this->markTestSkipped('run tracing is disabled in this environment, so there is no helper run id to link');
+        }
+
+        $parent = $this->makeAgent('parent-agent-failedlink-e');
+        $helper = $this->makeAgent('helper-agent-failedlink-e');
+        $this->assignHelper($parent->id, $helper->id);
+
+        $conversation = $this->makeConversation($parent);
+
+        $callCount = 0;
+        $service = $this->serviceWithScriptedProvider(function () use (&$callCount, $helper) {
+            $callCount++;
+
+            if ($callCount === 1) {
+                return $this->toolCallReply([
+                    $this->toolCall('delegate_to_helper', [
+                        'helper_agent_id' => $helper->id,
+                        'task' => 'Do something that will fail partway through.',
+                        'context' => null,
+                    ], 'call_delegate_failedlink_e'),
+                ]);
+            }
+
+            if ($callCount === 2) {
+                throw new \RuntimeException('The provider connection was reset unexpectedly.');
+            }
+
+            return $this->plainReply('The helper ran into a problem.');
+        });
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $service->run($conversation->fresh(), 'Please delegate this task.');
+
+        $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($delegationRow);
+        $this->assertSame('failed', $delegationRow->status);
+
+        $helperRun = DB::table('agent_runs')
+            ->where('conversation_id', $delegationRow->helper_conversation_id)
+            ->first();
+        $this->assertNotNull($helperRun, 'fixture sanity: the helper\'s own run must have been opened before it threw');
+
+        $this->assertSame(
+            $helperRun->id,
+            $delegationRow->helper_run_id,
+            'a failed delegation must still point at the helper run it opened, so the failure is as recoverable after the fact as a success is (FR-012)',
+        );
+    }
 }

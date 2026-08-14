@@ -391,4 +391,90 @@ class DelegationDepthLimitTest extends TestCase
             'no Delegation row may ever be written for the refused fourth hop -- only the two successful hops (A-to-B, B-to-C) may exist',
         );
     }
+
+    // =================================================================
+    // research.md D9 / contracts §3 -- a run whose own delegation
+    // delegated FURTHER must have that second-level spend included in
+    // the rollup ("a helper that itself delegated further is included,
+    // since its own run's Delegation rows are reachable the same way").
+    // The single-hop rollup is covered by DelegationQueryControllerTest;
+    // only the chain fixture here can exercise the transitive walk.
+    // =================================================================
+
+    #[Test]
+    public function a_nested_delegation_chains_own_spend_rolls_up_transitively_to_the_top_level_run(): void
+    {
+        $agentA = $this->makeAgent('rollup-agent-a');
+        $agentB = $this->makeAgent('rollup-agent-b');
+        $agentC = $this->makeAgent('rollup-agent-c');
+
+        $this->assignHelper($agentA->id, $agentB->id);
+        $this->assignHelper($agentB->id, $agentC->id);
+
+        $conversationA = $this->makeConversation($agentA);
+
+        $service = $this->serviceWithScriptedProvider([
+            // A's own turn: delegate to B (depth 1).
+            $this->toolCallReply([
+                $this->toolCall('delegate_to_helper', [
+                    'helper_agent_id' => $agentB->id,
+                    'task' => 'Handle the first hop.',
+                    'context' => null,
+                ], 'call_rollup_a_to_b'),
+            ]),
+            // B's own nested turn: delegate to C (depth 2).
+            $this->toolCallReply([
+                $this->toolCall('delegate_to_helper', [
+                    'helper_agent_id' => $agentC->id,
+                    'task' => 'Handle the second hop.',
+                    'context' => null,
+                ], 'call_rollup_b_to_c'),
+            ]),
+            $this->plainReply("C's final answer."),
+            $this->plainReply("B's final answer."),
+            $this->plainReply("A's final answer."),
+        ]);
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $result = $service->run($conversationA->fresh(), 'Please handle this chained task.');
+        $this->assertSame('completed', $result['status'], 'fixture sanity: the top-level turn must complete');
+
+        $parentRun = DB::table('agent_runs')->where('conversation_id', $conversationA->id)->first();
+        $this->assertNotNull($parentRun, 'fixture sanity: the top-level turn must have opened its own run trace');
+
+        $delegationAB = Delegation::where('parent_conversation_id', $conversationA->id)->first();
+        $this->assertNotNull($delegationAB);
+        $delegationBC = Delegation::where('parent_conversation_id', $delegationAB->helper_conversation_id)->first();
+        $this->assertNotNull($delegationBC, 'fixture sanity: the second hop must have been made from inside the first helper\'s own nested run');
+
+        // The link the transitive walk actually follows: the nested
+        // delegation's parent_run_id is the enclosing delegation's own
+        // helper_run_id.
+        $this->assertNotNull($delegationAB->helper_run_id);
+        $this->assertSame(
+            $delegationAB->helper_run_id,
+            $delegationBC->parent_run_id,
+            'a nested delegation must record the enclosing helper run as its own parent run -- this is the edge DelegationQuery::costForRun() walks',
+        );
+
+        $rollup = app(\ClarionApp\LlmClient\Services\DelegationQuery::class)
+            ->costForRun((string) $this->user->id, $parentRun->id);
+
+        $this->assertSame(
+            2,
+            $rollup['delegation_count'],
+            'both hops must be counted -- the direct A-to-B delegation and the transitively-reached B-to-C one (research.md D9)',
+        );
+
+        $expectedTokens = (int) DB::table('usage_records')
+            ->whereIn('conversation_id', [$delegationAB->helper_conversation_id, $delegationBC->helper_conversation_id])
+            ->sum('total_tokens');
+        $this->assertGreaterThan(0, $expectedTokens, 'fixture sanity: both nested runs must have recorded real usage');
+
+        $this->assertSame(
+            $expectedTokens,
+            $rollup['total_tokens'],
+            'the rollup must sum BOTH levels of the chain, not only the directly-delegated one',
+        );
+    }
 }

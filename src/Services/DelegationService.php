@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
+use ClarionApp\LlmClient\ValueObjects\RunKind;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -71,8 +72,17 @@ class DelegationService
             ];
         }
 
-        // D4: depth, computed and enforced.
-        $enclosingDelegation = Delegation::where('helper_conversation_id', $parentConversation->id)->latest()->first();
+        // D4: depth, computed and enforced. Ordered by started_at, never a
+        // bare latest(): agent_delegations has no created_at column (the
+        // model is $timestamps = false with its own started_at/completed_at,
+        // data-model.md §1), and Eloquent's argument-less latest() would
+        // emit `order by created_at desc` -- silently tolerated by SQLite
+        // (an unresolvable double-quoted identifier degrades to a string
+        // literal) but a hard "Unknown column in 'order clause'" error on
+        // MySQL/MariaDB, i.e. on every real delegation in production.
+        $enclosingDelegation = Delegation::where('helper_conversation_id', $parentConversation->id)
+            ->latest('started_at')
+            ->first();
         $depth = $enclosingDelegation !== null ? $enclosingDelegation->depth + 1 : 1;
 
         if ($depth > config('llm-client.delegation.max_chain_depth', 5)) {
@@ -156,6 +166,12 @@ class DelegationService
             $delegation->status = 'failed';
             $delegation->completed_at = now();
             $delegation->outcome_summary = $failureReason;
+            // A helper run that opened and then threw still has its own,
+            // fully-traced (Failed-closed) run row -- linking it here keeps
+            // FR-012 recoverability true of a failed delegation too, not
+            // just a completed one (data-model.md §1: helper_run_id is
+            // "null only if run tracing is disabled").
+            $delegation->helper_run_id = $this->helperRunIdFor($helperConversation->id);
             $delegation->save();
 
             $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason);
@@ -171,18 +187,8 @@ class DelegationService
             }
         }
 
-        // The run id the helper's own run() call opened -- not readable
-        // from Context after the call returns (closeRun() has already
-        // cleared it by then), so resolved from the run trace itself,
-        // scoped to the ephemeral helper conversation (one delegation, one
-        // nested run, never reused).
-        $helperRunId = DB::table('agent_runs')
-            ->where('conversation_id', $helperConversation->id)
-            ->orderByDesc('created_at')
-            ->value('id');
-
         $content = $rawResult['content'] ?? '';
-        $delegation->helper_run_id = $helperRunId;
+        $delegation->helper_run_id = $this->helperRunIdFor($helperConversation->id);
 
         // D3: a ceiling-reached return from the nested run() maps to a
         // terminal 'exhausted' Delegation.status -- distinct from a
@@ -240,19 +246,58 @@ class DelegationService
             ];
         }
 
-        // Neither completed nor a recognized ceiling -- left in_progress,
-        // a known, disclosed limitation until Phase 6 (US5) adds failure
-        // catching around the nested run() call.
-        $delegation->outcome_summary = Str::limit((string) $content, 500);
+        // Neither completed nor a recognized ceiling: every other shape
+        // run() can return without throwing -- 'No response from LLM' (a
+        // provider reply with no choices), a 'confirmation_required' pause
+        // no one can ever answer inside a delegated run, an
+        // 'agent_access_revoked' stop -- is a non-completion, and must
+        // reach the parent as one. Reporting it as 'completed' would hand
+        // the parent a failure message dressed as a result and leave the
+        // Delegation row permanently in_progress, contradicting both
+        // FR-008/SC-004 and data-model.md §1's own "updated once to a
+        // terminal state after it returns (or throws)".
+        $failureReason = Str::limit(
+            (string) ($content !== '' ? $content : 'The helper\'s run ended without producing a result.'),
+            500,
+        );
+
+        $delegation->status = 'failed';
+        $delegation->completed_at = now();
+        $delegation->outcome_summary = $failureReason;
         $delegation->save();
 
-        $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Success);
+        $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason);
 
         return [
-            'status' => 'completed',
+            'status' => 'failed',
             'helper' => $helperAgent->name,
-            'result' => $content,
+            'error' => $failureReason,
         ];
+    }
+
+    /**
+     * The run id the helper's own run() call opened -- not readable from
+     * Context after the call returns (closeRun() has already cleared it by
+     * then), so resolved from the run trace itself, scoped to the ephemeral
+     * helper conversation (one delegation, one nested run, never reused).
+     */
+    private function helperRunIdFor(string $helperConversationId): ?string
+    {
+        // Scoped to the INTERACTIVE run and to the OLDEST one, never simply
+        // the newest run on the conversation: a helper conversation starts
+        // untitled, so run()'s own first-exchange title generation opens a
+        // second, system_initiated run against the very same conversation a
+        // moment later. Taking the newest row therefore linked the title
+        // job instead of the helper's own work -- pointing the RunDiagram
+        // drill-down at the wrong trace, and (worse) breaking
+        // DelegationQuery::costForRun()'s transitive walk, which looks for
+        // further delegations whose parent_run_id is this id and would
+        // never match a title run.
+        return DB::table('agent_runs')
+            ->where('conversation_id', $helperConversationId)
+            ->where('kind', RunKind::Interactive->value)
+            ->orderBy('created_at')
+            ->value('id');
     }
 
     /**
