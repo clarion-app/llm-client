@@ -29,11 +29,16 @@ use Illuminate\Support\Str;
  */
 class DelegationService
 {
+    private ContentSanitizer $contentSanitizer;
+
     public function __construct(
         private readonly AgentQuery $agentQuery,
         private readonly AgentLoopService $agentLoopService,
         private readonly RunTraceRecorder $runTraceRecorder,
-    ) {}
+        ?ContentSanitizer $contentSanitizer = null,
+    ) {
+        $this->contentSanitizer = $contentSanitizer ?? app(ContentSanitizer::class);
+    }
 
     /**
      * @return array<string, mixed> JSON-encodable -- either a refusal
@@ -152,6 +157,13 @@ class DelegationService
         $delegationOptions = [
             'max_iterations' => config('llm-client.delegation.max_iterations', 10),
             'deadline_at' => now()->addSeconds(config('llm-client.delegation.max_seconds', 120)),
+            // 099-result-aggregation (research.md D1): every delegated
+            // helper's final answer is schema-validated against the
+            // mandatory delegation_result shape, with its own retry ceiling
+            // distinct from the delegation's own iteration/time bounds.
+            'preset' => 'delegation_result',
+            'retry_on_validation_failure' => true,
+            'max_schema_retries' => config('llm-client.delegation.max_result_schema_retries', 2),
         ];
 
         try {
@@ -200,18 +212,66 @@ class DelegationService
         $code = $rawResult['code'] ?? null;
 
         if (($rawResult['status'] ?? null) === 'completed') {
+            // 099-result-aggregation (data-model.md §3, research.md D3): the
+            // schema-validated result -- not the raw content string -- is
+            // the source of truth for every result_* column and for the
+            // revised delegate_to_helper tool-result shape.
+            $validated = $rawResult['validated'] ?? [];
+            $validatedStatus = $validated['status'] ?? null;
+
+            $reasonForStatus = [
+                'success' => null,
+                'partial' => 'helper_reported',
+                'failure' => 'helper_reported',
+            ];
+
+            $resultStatus = $validatedStatus;
+            $resultReason = $reasonForStatus[$validatedStatus] ?? null;
+            $resultSummary = $validated['summary'] ?? null;
+            $resultUndone = $validated['undone'] ?? '';
+
+            if ($resultStatus === 'failure') {
+                // FR-007: a failure never carries content that could be
+                // mistaken for genuine output, regardless of whatever the
+                // helper's own output object contained.
+                $resultOutput = null;
+                $resultTruncated = false;
+                $decodedOutput = null;
+            } else {
+                $resultOutput = $this->contentSanitizer->truncate(
+                    json_encode($validated['output'] ?? []),
+                    config('llm-client.delegation.result_output_cap_bytes', 8192),
+                );
+                $resultTruncated = $this->contentSanitizer->isTruncated($resultOutput);
+                $decodedOutput = json_decode($resultOutput, true);
+            }
+
             $delegation->status = 'completed';
             $delegation->completed_at = now();
             $delegation->outcome_summary = Str::limit((string) $content, 500);
+            $delegation->result_status = $resultStatus;
+            $delegation->result_reason = $resultReason;
+            $delegation->result_summary = $resultSummary;
+            $delegation->result_output = $resultOutput;
+            $delegation->result_undone = $resultUndone;
+            $delegation->result_truncated = $resultTruncated;
             $delegation->save();
 
-            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Success);
-
-            return [
-                'status' => 'completed',
-                'helper' => $helperAgent->name,
-                'result' => $content,
+            $sixFieldResult = [
+                'status' => $resultStatus,
+                'summary' => $resultSummary,
+                'output' => $decodedOutput,
+                'undone' => $resultUndone,
+                'truncated' => $resultTruncated,
+                'reason' => $resultReason,
             ];
+
+            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Success, null, json_encode($sixFieldResult));
+
+            return array_merge(
+                ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
+                $sixFieldResult,
+            );
         }
 
         if ($code !== null && array_key_exists($code, $exhaustionReasons)) {
@@ -226,24 +286,44 @@ class DelegationService
                 ->orderByDesc('created_at')
                 ->value('content') ?? '');
 
+            // 099-result-aggregation (FR-016): a bound-exceeded delegation
+            // is System-detected partial success -- result_output stays
+            // null since schema validation was never reached on an
+            // exhausted run (research.md D3).
+            $resultSummary = Str::limit($partialResult, 500);
+            $resultUndone = "Reached its {$incompleteBecause} before finishing.";
+
             $delegation->status = 'exhausted';
             $delegation->completed_at = now();
-            $delegation->outcome_summary = Str::limit($partialResult, 500);
+            $delegation->outcome_summary = $resultSummary;
+            $delegation->result_status = 'partial';
+            $delegation->result_reason = 'bound_exceeded';
+            $delegation->result_output = null;
+            $delegation->result_summary = $resultSummary;
+            $delegation->result_undone = $resultUndone;
+            $delegation->result_truncated = false;
             $delegation->save();
+
+            $sixFieldResult = [
+                'status' => 'partial',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => 'bound_exceeded',
+            ];
 
             $this->runTraceRecorder->closeAction(
                 $actionId,
                 ActionOutcome::Unfinished,
                 null,
-                "Delegation exhausted its {$incompleteBecause} before the helper could finish.",
+                json_encode($sixFieldResult),
             );
 
-            return [
-                'status' => 'exhausted',
-                'helper' => $helperAgent->name,
-                'partial_result' => $partialResult,
-                'incomplete_because' => $incompleteBecause,
-            ];
+            return array_merge(
+                ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
+                $sixFieldResult,
+            );
         }
 
         // Neither completed nor a recognized ceiling: every other shape

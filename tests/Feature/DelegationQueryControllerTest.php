@@ -608,4 +608,101 @@ class DelegationQueryControllerTest extends TestCase
 
         $response->assertStatus(404)->assertJsonStructure(['error', 'code']);
     }
+
+    // =================================================================
+    // 099-result-aggregation, Phase 3 (US1 + US2), tasks.md T015 --
+    // additive result_* fields on the two existing per-delegation read
+    // endpoints (contracts/result-aggregation-api.md §1, data-model.md
+    // §6). Written before DelegationController::delegationRows() emits
+    // any of the six new keys -- every assertion below is expected to
+    // FAIL red.
+    // =================================================================
+
+    /**
+     * The exact key order delegationRows() is expected to produce once
+     * Phase 3's T020 lands: the six new result_* keys inserted after
+     * outcome_summary, before started_at (Grounding note item 7),
+     * every existing key otherwise unchanged.
+     */
+    private function expectedDelegationRowKeyOrder(): array
+    {
+        return [
+            'id', 'parent_conversation_id', 'helper_agent_id', 'helper_agent_name',
+            'helper_conversation_id', 'depth', 'status', 'task', 'context',
+            'parent_run_id', 'parent_action_id', 'helper_run_id', 'outcome_summary',
+            'result_status', 'result_reason', 'result_summary', 'result_output',
+            'result_undone', 'result_truncated',
+            'started_at', 'completed_at',
+        ];
+    }
+
+    #[Test]
+    public function delegations_for_run_includes_the_six_new_result_fields_after_a_successful_delegation(): void
+    {
+        $runId = $this->makeRun($this->user);
+        $output = ['line_items' => ['Widget A', 'Widget B'], 'total' => '1042.50'];
+
+        $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_reason' => null,
+            'result_summary' => 'Extracted all line items from the invoice.',
+            'result_output' => json_encode($output),
+            'result_undone' => '',
+            'result_truncated' => false,
+        ]);
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}/delegations");
+
+        $response->assertStatus(200)->assertJsonCount(1);
+
+        $row = $response->json()[0];
+        $this->assertSame(
+            $this->expectedDelegationRowKeyOrder(),
+            array_keys($row),
+            'the six new result_* keys must appear immediately after outcome_summary, before started_at, with every existing key unchanged',
+        );
+
+        $this->assertSame('success', $row['result_status']);
+        $this->assertNull($row['result_reason']);
+        $this->assertSame('Extracted all line items from the invoice.', $row['result_summary']);
+        $this->assertSame($output, $row['result_output'], 'result_output must be JSON-decoded to a native array, not left as a raw string');
+        $this->assertSame('', $row['result_undone']);
+        $this->assertFalse($row['result_truncated']);
+    }
+
+    #[Test]
+    public function a_single_delegation_includes_the_six_new_result_fields_after_a_successful_delegation(): void
+    {
+        $runId = $this->makeRun($this->user);
+        $output = ['currency' => 'USD'];
+
+        $delegation = $this->makeDelegationRow($this->user, $runId, [
+            'result_status' => 'success',
+            'result_reason' => null,
+            'result_summary' => 'Normalized the currency field.',
+            'result_output' => json_encode($output),
+            'result_undone' => '',
+            'result_truncated' => false,
+        ]);
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/delegations/{$delegation->id}");
+
+        $response->assertStatus(200);
+
+        $row = $response->json();
+        $this->assertSame(
+            $this->expectedDelegationRowKeyOrder(),
+            array_keys($row),
+            'the six new result_* keys must appear immediately after outcome_summary, before started_at, with every existing key unchanged',
+        );
+
+        $this->assertSame('success', $row['result_status']);
+        $this->assertNull($row['result_reason']);
+        $this->assertSame('Normalized the currency field.', $row['result_summary']);
+        $this->assertSame($output, $row['result_output'], 'result_output must be JSON-decoded to a native array, not left as a raw string');
+        $this->assertSame('', $row['result_undone']);
+        $this->assertFalse($row['result_truncated']);
+    }
 }

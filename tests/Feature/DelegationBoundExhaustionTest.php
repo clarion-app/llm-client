@@ -244,6 +244,7 @@ class DelegationBoundExhaustionTest extends TestCase
             app(McpToolExecutor::class),
             app(OperationCache::class),
             $registry,
+            presetRegistry: app(\ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry::class),
             metricsRecorder: new \ClarionApp\LlmClient\Services\MetricsRecorder(),
             runTraceRecorder: config('llm-client.run_trace.enabled', false) ? app(RunTraceRecorder::class) : null,
         );
@@ -336,10 +337,10 @@ class DelegationBoundExhaustionTest extends TestCase
         $decoded = $this->firstToolResult($conversation);
         $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
 
-        $this->assertSame('exhausted', $decoded['status'] ?? null, 'the delegate_to_helper tool result must report status: exhausted once the iteration ceiling is reached');
+        $this->assertSame('partial', $decoded['status'] ?? null, 'the delegate_to_helper tool result must report status: partial once the iteration ceiling is reached');
         $this->assertSame($helper->name, $decoded['helper'] ?? null);
-        $this->assertArrayHasKey('partial_result', $decoded);
-        $this->assertSame('iteration_limit', $decoded['incomplete_because'] ?? null);
+        $this->assertSame('bound_exceeded', $decoded['reason'] ?? null);
+        $this->assertStringContainsString('iteration_limit', $decoded['undone'] ?? '');
 
         $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($delegationRow);
@@ -410,11 +411,12 @@ class DelegationBoundExhaustionTest extends TestCase
         $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
 
         $this->assertSame(
-            'exhausted',
+            'partial',
             $decoded['status'] ?? null,
             'delegation.max_iterations (2) must cap the helper on its own -- independent of agent_loop.max_iterations (20) being configured far higher -- proving $options[\'max_iterations\'] is actually threaded into the nested run() call, not silently falling back to config()',
         );
-        $this->assertSame('iteration_limit', $decoded['incomplete_because'] ?? null);
+        $this->assertSame('bound_exceeded', $decoded['reason'] ?? null);
+        $this->assertStringContainsString('iteration_limit', $decoded['undone'] ?? '');
 
         $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($delegationRow);
@@ -486,10 +488,10 @@ class DelegationBoundExhaustionTest extends TestCase
         $decoded = $this->firstToolResult($conversation);
         $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
 
-        $this->assertSame('exhausted', $decoded['status'] ?? null, 'the delegate_to_helper tool result must report status: exhausted once the wall-clock deadline is reached');
+        $this->assertSame('partial', $decoded['status'] ?? null, 'the delegate_to_helper tool result must report status: partial once the wall-clock deadline is reached');
         $this->assertSame($helper->name, $decoded['helper'] ?? null);
-        $this->assertArrayHasKey('partial_result', $decoded);
-        $this->assertSame('time_limit', $decoded['incomplete_because'] ?? null, 'a wall-clock deadline stop must report incomplete_because: time_limit, distinct from an iteration-ceiling stop');
+        $this->assertSame('bound_exceeded', $decoded['reason'] ?? null);
+        $this->assertStringContainsString('time_limit', $decoded['undone'] ?? '', 'a wall-clock deadline stop must report undone naming time_limit, distinct from an iteration-ceiling stop');
 
         $delegationRow = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($delegationRow);

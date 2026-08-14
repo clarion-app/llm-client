@@ -280,6 +280,7 @@ class DelegationFailureIsolationTest extends TestCase
             app(McpToolExecutor::class),
             app(OperationCache::class),
             $registry,
+            presetRegistry: app(\ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry::class),
             metricsRecorder: new \ClarionApp\LlmClient\Services\MetricsRecorder(),
             runTraceRecorder: config('llm-client.run_trace.enabled', false) ? app(RunTraceRecorder::class) : null,
         );
@@ -420,7 +421,12 @@ class DelegationFailureIsolationTest extends TestCase
                     'context' => 'A scanned invoice image is attached.',
                 ], 'call_delegate_gap_b'),
             ]),
-            $this->plainReply($gapStatement),
+            $this->plainReply(json_encode([
+                'status' => 'failure',
+                'summary' => $gapStatement,
+                'output' => [],
+                'undone' => 'Everything -- the task could not be started without the missing information.',
+            ], JSON_FORCE_OBJECT)),
             $this->plainReply('The helper reported it is missing information: '.$gapStatement),
         ]);
         $this->app->instance(AgentLoopService::class, $service);
@@ -431,14 +437,14 @@ class DelegationFailureIsolationTest extends TestCase
         $decoded = $this->firstToolResult($conversation);
         $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
         $this->assertSame(
-            'completed',
+            'failure',
             $decoded['status'] ?? null,
-            'fixture sanity: the delegation itself completes -- the helper CHOOSING to report a gap is ordinary model content, not a distinct code path (research.md D11)',
+            'fixture sanity: the delegation itself completes at the execution level -- the helper CHOOSING to honestly report status: failure for a missing-information gap is ordinary model content, not a distinct code path (research.md D11)',
         );
         $this->assertSame(
             $gapStatement,
-            $decoded['result'] ?? null,
-            'the helper\'s own stated missing-information gap must survive completely untouched through to the delegate_to_helper tool result\'s result field -- no post-processing, truncation, or rewriting may alter it (FR-009, research.md D11)',
+            $decoded['summary'] ?? null,
+            'the helper\'s own stated missing-information gap must survive completely untouched through to the delegate_to_helper tool result\'s summary field -- no post-processing, truncation, or rewriting may alter it (FR-009, research.md D11)',
         );
     }
 
@@ -498,7 +504,12 @@ class DelegationFailureIsolationTest extends TestCase
             if ($callCount === 3) {
                 // Helper's own final answer, completing the nested run
                 // despite having been retired mid-flight.
-                return $this->plainReply('Task completed despite being retired mid-flight.');
+                return $this->plainReply(json_encode([
+                    'status' => 'success',
+                    'summary' => 'Task completed despite being retired mid-flight.',
+                    'output' => [],
+                    'undone' => '',
+                ], JSON_FORCE_OBJECT));
             }
 
             // Parent's own next iteration, after the tool result comes back.
@@ -518,7 +529,7 @@ class DelegationFailureIsolationTest extends TestCase
         $this->assertNotNull($decoded, 'fixture sanity: the delegating iteration must have produced a tool result');
         $this->assertContains(
             $decoded['status'] ?? null,
-            ['completed', 'exhausted', 'failed'],
+            ['success', 'partial', 'failure'],
             'an in-flight delegation whose helper is deactivated mid-run must still reach ONE of its ordinary terminal outcomes -- never hang, never crash',
         );
 

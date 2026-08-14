@@ -251,6 +251,7 @@ class DelegationServiceTest extends TestCase
             app(McpToolExecutor::class),
             app(OperationCache::class),
             $registry,
+            presetRegistry: app(\ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry::class),
             runTraceRecorder: config('llm-client.run_trace.enabled', false) ? app(RunTraceRecorder::class) : null,
         );
     }
@@ -274,15 +275,20 @@ class DelegationServiceTest extends TestCase
         $conversation = $this->makeConversation($parent);
 
         $service = $this->serviceWithScriptedProvider([
-            $this->plainReply('Helper completed the task.'),
+            $this->plainReply(json_encode([
+                'status' => 'success',
+                'summary' => 'Helper completed the task.',
+                'output' => [],
+                'undone' => '',
+            ], JSON_FORCE_OBJECT)),
         ]);
         $this->app->instance(AgentLoopService::class, $service);
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Extract line items.', 'Invoice #123.');
 
-        $this->assertSame('completed', $result['status'] ?? null, 'a delegation to a real, active assigned helper must complete');
+        $this->assertSame('success', $result['status'] ?? null, 'a delegation to a real, active assigned helper must complete');
         $this->assertSame($helper->name, $result['helper'] ?? null);
-        $this->assertSame('Helper completed the task.', $result['result'] ?? null);
+        $this->assertSame('Helper completed the task.', $result['summary'] ?? null);
 
         $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($row, 'a successful delegate() call must write a Delegation row');
@@ -390,7 +396,12 @@ class DelegationServiceTest extends TestCase
         ]);
 
         $service = $this->serviceWithScriptedProvider([
-            $this->plainReply('Helper reply, unrelated to any prior content.'),
+            $this->plainReply(json_encode([
+                'status' => 'success',
+                'summary' => 'Helper reply, unrelated to any prior content.',
+                'output' => [],
+                'undone' => '',
+            ], JSON_FORCE_OBJECT)),
         ]);
         $this->app->instance(AgentLoopService::class, $service);
 
@@ -398,7 +409,7 @@ class DelegationServiceTest extends TestCase
         $context = 'Invoice #123, vendor Acme Corp.';
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, $task, $context);
-        $this->assertSame('completed', $result['status'] ?? null, 'fixture sanity: the delegation itself must succeed');
+        $this->assertSame('success', $result['status'] ?? null, 'fixture sanity: the delegation itself must succeed');
 
         $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($row);
@@ -456,14 +467,19 @@ class DelegationServiceTest extends TestCase
         $conversation = $this->makeConversation($parent);
 
         $service = $this->serviceWithScriptedProvider([
-            $this->plainReply('Helper reply.'),
+            $this->plainReply(json_encode([
+                'status' => 'success',
+                'summary' => 'Helper reply.',
+                'output' => [],
+                'undone' => '',
+            ], JSON_FORCE_OBJECT)),
         ]);
         $this->app->instance(AgentLoopService::class, $service);
 
         $task = 'Summarize the attached document.';
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, $task, null);
-        $this->assertSame('completed', $result['status'] ?? null, 'fixture sanity: the delegation itself must succeed');
+        $this->assertSame('success', $result['status'] ?? null, 'fixture sanity: the delegation itself must succeed');
 
         $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $helperConversation = Conversation::find($row->helper_conversation_id);
@@ -506,6 +522,12 @@ class DelegationServiceTest extends TestCase
                 return [
                     'status' => 'completed',
                     'content' => 'Helper reply.',
+                    'validated' => [
+                        'status' => 'success',
+                        'summary' => 'Helper reply.',
+                        'output' => [],
+                        'undone' => '',
+                    ],
                     'message_id' => null,
                 ];
             });
@@ -514,7 +536,7 @@ class DelegationServiceTest extends TestCase
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something.', null);
 
-        $this->assertSame('completed', $result['status'] ?? null, 'fixture sanity: the delegation itself must succeed');
+        $this->assertSame('success', $result['status'] ?? null, 'fixture sanity: the delegation itself must succeed');
         $this->assertNotNull($capturedMidCallRunId, 'fixture sanity: the mocked nested run() must actually have been invoked');
         $this->assertNotSame(
             $enclosingRunId,
@@ -571,10 +593,10 @@ class DelegationServiceTest extends TestCase
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something exhausting.', null);
 
-        $this->assertSame('exhausted', $result['status'] ?? null, 'a max_iterations ceiling return from the nested run() call must map to an exhausted delegation result, per contracts');
+        $this->assertSame('partial', $result['status'] ?? null, 'a max_iterations ceiling return from the nested run() call must map to a partial/bound_exceeded delegation result, per contracts');
         $this->assertSame($helper->name, $result['helper'] ?? null);
-        $this->assertArrayHasKey('partial_result', $result);
-        $this->assertSame('iteration_limit', $result['incomplete_because'] ?? null);
+        $this->assertSame('bound_exceeded', $result['reason'] ?? null);
+        $this->assertStringContainsString('iteration_limit', $result['undone'] ?? '');
 
         $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($row);
@@ -605,10 +627,10 @@ class DelegationServiceTest extends TestCase
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do something slow.', null);
 
-        $this->assertSame('exhausted', $result['status'] ?? null);
+        $this->assertSame('partial', $result['status'] ?? null);
         $this->assertSame($helper->name, $result['helper'] ?? null);
-        $this->assertArrayHasKey('partial_result', $result);
-        $this->assertSame('time_limit', $result['incomplete_because'] ?? null, 'a time_ceiling_reached return from the nested run() call must map to incomplete_because: time_limit, per contracts');
+        $this->assertSame('bound_exceeded', $result['reason'] ?? null);
+        $this->assertStringContainsString('time_limit', $result['undone'] ?? '', 'a time_ceiling_reached return from the nested run() call must map to undone naming time_limit, per contracts');
 
         $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
         $this->assertNotNull($row);
@@ -698,14 +720,19 @@ class DelegationServiceTest extends TestCase
         ]);
 
         $service = $this->serviceWithScriptedProvider([
-            $this->plainReply('Helper completed the task at exactly the depth limit.'),
+            $this->plainReply(json_encode([
+                'status' => 'success',
+                'summary' => 'Helper completed the task at exactly the depth limit.',
+                'output' => [],
+                'undone' => '',
+            ], JSON_FORCE_OBJECT)),
         ]);
         $this->app->instance(AgentLoopService::class, $service);
 
         $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Right at the limit.', null);
 
         $this->assertSame(
-            'completed',
+            'success',
             $result['status'] ?? null,
             'a computed depth landing EXACTLY at the configured limit must still succeed, not be refused',
         );

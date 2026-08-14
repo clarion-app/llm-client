@@ -116,6 +116,15 @@ class DelegationController extends Controller
         $names = empty($agentIds) ? [] : Agent::whereIn('id', $agentIds)->pluck('name', 'id')->all();
 
         return array_map(function (Delegation $d) use ($names) {
+            // 099-result-aggregation (data-model.md §6, Grounding note item
+            // 7): result_output is stored as a ContentSanitizer::truncate()
+            // string -- when truncation actually occurred it is not valid
+            // JSON, so json_decode() would silently return null exactly as
+            // it would for a genuinely-null column. Decode defensively,
+            // falling back to the raw (possibly truncated) string rather
+            // than losing it.
+            $decodedResultOutput = $d->result_output !== null ? json_decode($d->result_output, true) : null;
+
             return [
                 'id' => $d->id,
                 'parent_conversation_id' => $d->parent_conversation_id,
@@ -130,6 +139,12 @@ class DelegationController extends Controller
                 'parent_action_id' => $d->parent_action_id,
                 'helper_run_id' => $d->helper_run_id,
                 'outcome_summary' => $d->outcome_summary,
+                'result_status' => $d->result_status,
+                'result_reason' => $d->result_reason,
+                'result_summary' => $d->result_summary,
+                'result_output' => $decodedResultOutput ?? $d->result_output,
+                'result_undone' => $d->result_undone,
+                'result_truncated' => $d->result_truncated,
                 'started_at' => $d->started_at?->toJSON(),
                 'completed_at' => $d->completed_at?->toJSON(),
             ];
