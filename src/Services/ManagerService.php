@@ -16,12 +16,11 @@ use Illuminate\Support\Facades\Log;
  * write path for ManagedTask/ManagedTaskPart -- mirrors DelegationService's
  * own role as the sole owner of its table(s).
  *
- * Phase 3 (US1) implements createManagedTask()/planParts()/assignPart()/
- * assignParts() -- the decomposition and suitability-based assignment
- * half of the feature. Phase 4 (US2) adds acceptPart()/
- * acceptPartRefusal() -- judging a part's outstanding result.
- * reportShortfall()/finalize()/finalizeWithShortfall() are added by later
- * phases (US3/US4/US5).
+ * Phase 3 (US1) implements createManagedTask()/planParts()/assignPart() --
+ * the decomposition and suitability-based assignment half of the feature.
+ * Phase 4 (US2) adds acceptPart()/acceptPartRefusal() -- judging a part's
+ * outstanding result. reportShortfall()/finalize()/finalizeWithShortfall()
+ * are added by later phases (US3/US4/US5).
  *
  * assignPart()'s transactional guard (research.md D4) ships complete in
  * this phase, not split across the phases that later add dedicated proof
@@ -33,6 +32,21 @@ use Illuminate\Support\Facades\Log;
  * enforced inside one locked transaction, admitAssignmentRound(), before
  * the nested DelegationService::delegate()/delegateBatch() call is ever
  * made outside that transaction.
+ *
+ * Batched calls (two or more assign_part/delegate_to_helper tool calls in
+ * one manager turn) do NOT go through a batch entry point on this class --
+ * admitAssignmentRound() is the sole, public admission decision point, and
+ * AgentLoopService::resolveDelegateToHelperBatchResults() (research.md D2)
+ * calls it once per assign_part call directly, merging admitted calls with
+ * any delegate_to_helper calls in the same turn before making exactly one
+ * DelegationService::delegateBatch() call for the combined, ordered set --
+ * required because a mixed batch cannot be split into two delegateBatch()
+ * calls without breaking 101's own single-batch concurrency ceiling. An
+ * earlier, assign_part-only assignParts() convenience method existed here
+ * but was never wired to that call site and could not itself merge with
+ * delegate_to_helper calls, so it was removed rather than left as dead,
+ * untested code that data-model.md §5 inaccurately described as the actual
+ * batched-call path.
  */
 class ManagerService
 {
@@ -157,74 +171,6 @@ class ManagerService
         }
 
         return $result;
-    }
-
-    /**
-     * research.md D2/D4, data-model.md §5. Mirrors
-     * DelegationService::delegateBatch()'s own "validate all up front,
-     * batch id shared, dispatch after" shape for several assign_part calls
-     * landing in one manager turn: every call's admission is decided (and,
-     * for an admitted call, written) before any of them are dispatched, so
-     * the round ceiling is always evaluated against the batch's true
-     * arrival order rather than racing itself.
-     *
-     * @param array<int, array{tool_call_id: string, part_id: string, helper_agent_id: string, task: string, context: ?string}> $calls
-     * @return array<string, array<string, mixed>> keyed by, and in, the
-     *   original $calls order.
-     */
-    public function assignParts(ManagedTask $task, array $calls): array
-    {
-        $results = [];
-        $validCalls = [];
-
-        foreach ($calls as $call) {
-            $toolCallId = $call['tool_call_id'];
-
-            $part = ManagedTaskPart::where('managed_task_id', $task->id)
-                ->where('id', $call['part_id'] ?? null)
-                ->first();
-
-            if ($part === null) {
-                $results[$toolCallId] = ['error' => 'unknown_part', 'message' => 'The named part could not be found for this managed task.'];
-                continue;
-            }
-
-            $refusal = $this->admitAssignmentRound($task, $part);
-            if ($refusal !== null) {
-                $results[$toolCallId] = $refusal;
-                continue;
-            }
-
-            $validCalls[$toolCallId] = [
-                'tool_call_id' => $toolCallId,
-                'helper_agent_id' => $call['helper_agent_id'],
-                'task' => $call['task'],
-                'context' => $call['context'] ?? null,
-                'managed_task_id' => $task->id,
-                'part_id' => $part->id,
-            ];
-        }
-
-        if (!empty($validCalls)) {
-            $conversation = Conversation::find($task->conversation_id);
-            $batchResults = app(DelegationService::class)->delegateBatch($conversation, array_values($validCalls));
-
-            foreach ($batchResults as $toolCallId => $result) {
-                $results[$toolCallId] = $result;
-
-                if (isset($result['delegation_id'], $validCalls[$toolCallId])) {
-                    ManagedTaskPart::where('id', $validCalls[$toolCallId]['part_id'])
-                        ->update(['current_delegation_id' => $result['delegation_id']]);
-                }
-            }
-        }
-
-        $ordered = [];
-        foreach ($calls as $call) {
-            $ordered[$call['tool_call_id']] = $results[$call['tool_call_id']];
-        }
-
-        return $ordered;
     }
 
     /**
