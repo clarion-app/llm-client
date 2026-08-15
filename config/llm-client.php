@@ -808,6 +808,16 @@ return [
             // treats it as abandoned (research.md D4, layer 3).
             'stale_after_minutes' => (int) env('LLM_CLIENT_DELEGATION_STALE_AFTER_MINUTES', 10),
         ],
+
+        // 106-multi-agent-run-view: the defensive cap on how many delegation
+        // rows a single arrangement fetch will walk before truncating
+        // (research.md D5/D9) -- protects against the theoretical worst case
+        // (repeated maximum-width batches at maximum chain depth) without
+        // requiring pagination for the overwhelmingly common, much smaller
+        // case.
+        'arrangement' => [
+            'max_nodes' => (int) env('LLM_CLIENT_DELEGATION_ARRANGEMENT_MAX_NODES', 200),
+        ],
     ],
 
     // Manager Agent (103-manager-agent) — the whole-task round/wall-clock
