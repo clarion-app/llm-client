@@ -343,6 +343,9 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('consensus-requests', [ConsensusController::class, "store"]);
     Route::get('consensus-requests/{id}', [ConsensusController::class, "show"]);
     Route::post('consensus-requests/cost-estimate', [ConsensusController::class, "estimateCost"]);
+    // Individual contributor answers, for every terminal status (Phase
+    // 6/US4, contracts/consensus-api.md §3, FR-008).
+    Route::get('consensus-requests/{id}/contributors', [ConsensusController::class, "contributors"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

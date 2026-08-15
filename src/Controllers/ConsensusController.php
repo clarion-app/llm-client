@@ -78,6 +78,26 @@ class ConsensusController extends Controller
     }
 
     /**
+     * GET /consensus-requests/{id}/contributors -- every individual
+     * contributor's own answer, available regardless of the request's
+     * terminal status (contracts §3, FR-008).
+     */
+    public function contributors(Request $request, string $id): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $contributors = $this->consensusQuery->contributorsForRequest($callerUserId, $id);
+        if ($contributors === null) {
+            return $this->notFoundResponse('Consensus request not found', 'consensus_request_not_found');
+        }
+
+        return response()->json([
+            'consensus_request_id' => $id,
+            'contributors' => $contributors,
+        ], 200);
+    }
+
+    /**
      * POST /consensus-requests/cost-estimate -- preview the additional cost
      * before submitting (contracts §4, US2). Same body shape, conversation-
      * resolution, and 404/422 error shapes as store() (T032), but creates
