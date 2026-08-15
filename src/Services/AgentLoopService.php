@@ -3435,6 +3435,90 @@ class AgentLoopService
     }
 
     /**
+     * Builds a "Task Progress" section for the system prompt
+     * (103-manager-agent, research.md D9, data-model.md §4/§2's
+     * accepted_summary column) -- mirrors buildKnownHelpersSection()/
+     * buildCombinedHelperResultsSection()'s exact "query fresh per call,
+     * append only when non-empty" shape. Returns null when
+     * $managedTaskId is null (every conversation outside a managed task)
+     * or the task has no parts yet (before the first plan_parts call).
+     *
+     * Lists every part's own sequence/description/current state, and --
+     * for accepted parts only -- the part's own accepted_summary (never
+     * the full result_output, the same "summary, not raw content" choice
+     * buildCombinedHelperResultsSection() already makes for its own
+     * contributors view), plus the shortfall reason for a part reported
+     * as a shortfall. This is what keeps FR-014's "track the state of
+     * every part" and FR-007's "assemble a single coherent response"
+     * reliable across a long task's many RunManagedTaskStepJob
+     * invocations even once the generic condensation/tool_result_
+     * condensation config (unmodified, still applying underneath) has
+     * trimmed early assign_part/accept_part tool-result messages out of
+     * the raw history -- without this section, a manager many rounds in
+     * could lose sight of an already-accepted part's own summary and
+     * either omit it from finalize_task's own final_response or,
+     * short of the server-side guard (D4) refusing it outright, reason
+     * as though the part were still open.
+     *
+     * The assembled section is passed through ContentSanitizer::
+     * truncate() against llm-client.manager.context_budget_bytes (default
+     * 24576) so the manager's own accumulating context cannot grow
+     * unboundedly across a long task -- the same concern 099's own
+     * combined-results view already solved for a single run. When
+     * truncation actually occurred (ContentSanitizer::isTruncated()),
+     * append one explicit line noting that some part summaries may have
+     * been dropped from this section specifically -- not that those
+     * parts' own state changed -- since a truncated *prompt section* must
+     * never be mistaken for a lost *database* record (GET
+     * /managed-tasks/{id}/parts remains the authoritative source).
+     */
+    private function buildManagedTaskProgressSection(?string $managedTaskId): ?string
+    {
+        if ($managedTaskId === null) {
+            return null;
+        }
+
+        $parts = ManagedTaskPart::where('managed_task_id', $managedTaskId)
+            ->orderBy('sequence')
+            ->get();
+
+        if ($parts->isEmpty()) {
+            return null;
+        }
+
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '## Task Progress';
+        $lines[] = '';
+
+        foreach ($parts as $part) {
+            $lines[] = "**Part {$part->sequence}** ({$part->id}) — {$part->state}";
+            $lines[] = "  - Description: {$part->description}";
+
+            if ($part->state === 'accepted' && $part->accepted_summary !== null) {
+                $lines[] = "  - Accepted result: {$part->accepted_summary}";
+            }
+
+            if ($part->state === 'reported_as_shortfall' && $part->shortfall_reason !== null) {
+                $lines[] = "  - Shortfall: {$part->shortfall_reason}";
+            }
+        }
+
+        $section = implode(PHP_EOL, $lines);
+
+        $sanitizer = app(ContentSanitizer::class);
+        $cap = (int) config('llm-client.manager.context_budget_bytes', 24576);
+        $truncated = $sanitizer->truncate($section, $cap);
+
+        if ($sanitizer->isTruncated($truncated)) {
+            $truncated .= PHP_EOL . PHP_EOL
+                . '(This progress section was truncated to fit the context budget -- some parts\' summaries above may be incomplete or missing. This does not change any part\'s actual state; see GET /managed-tasks/{id}/parts for the authoritative record.)';
+        }
+
+        return $truncated;
+    }
+
+    /**
      * Build the auto-retrieved memory section for injection into the system prompt.
      * Uses AutoMemoryRetriever when available, falls back to PreferenceInjector.
      *
@@ -3585,6 +3669,21 @@ class AgentLoopService
         $combinedHelperResultsSection = $this->buildCombinedHelperResultsSection($runId);
         if ($combinedHelperResultsSection !== null) {
             $systemPrompt .= $combinedHelperResultsSection;
+        }
+
+        // Append "Task Progress" section for a managed-task conversation
+        // (103-manager-agent, research.md D9) -- $managedTaskId is looked
+        // up from $conversation only when channel === 'managed-task', the
+        // same "outside the mechanism, contributes nothing" shape every
+        // other channel-gated section here already has (Grounding note
+        // item 8). ManagedTask.conversation_id is unique, so this is a
+        // single indexed lookup, not a query per part.
+        $managedTaskId = $conversation->channel === 'managed-task'
+            ? ManagedTask::where('conversation_id', $conversation->id)->value('id')
+            : null;
+        $managedTaskProgressSection = $this->buildManagedTaskProgressSection($managedTaskId);
+        if ($managedTaskProgressSection !== null) {
+            $systemPrompt .= $managedTaskProgressSection;
         }
 
         if (!empty($systemPrompt)) {

@@ -387,6 +387,51 @@ class ManagerServiceAssignPartTest extends TestCase
         $this->assertSame(2, $task->rounds_used);
     }
 
+    #[Test]
+    public function assigning_the_busy_part_itself_is_still_admitted_when_only_its_own_assignment_count_exceeds_the_ceiling(): void
+    {
+        // Direct discriminator for mutation-checklist row 2: the sibling
+        // test above only ever assigns the FRESH part (assignment_count
+        // 0), so a mutated check reading the PART's own assignment_count
+        // instead of ManagedTask.rounds_used would still admit that call
+        // too -- both a correct and a mutated check agree there. This
+        // test assigns the BUSY part itself (assignment_count already
+        // over what would be the ceiling if read per-part) while
+        // ManagedTask.rounds_used stays well under round_ceiling --
+        // correct code (rounds_used-based) admits it; code mutated to
+        // check the part's own assignment_count instead would wrongly
+        // refuse it.
+        $manager = $this->makeAgent('manager-busypart-wholetask');
+        $helper = $this->makeAgent('helper-busypart-wholetask');
+        app(AgentHelperService::class)->assign($this->user->id, $manager->id, $helper->id);
+
+        $task = app(ManagerService::class)->createManagedTask($this->user->id, $manager->id, 'Busy-part whole-task ceiling check.');
+        $task->round_ceiling = 5;
+        $task->rounds_used = 1;
+        $task->save();
+
+        // Bump assignment_count alone, leaving state/current_delegation_id
+        // at planParts()'s own not_yet_assigned/null defaults -- touching
+        // either would trip the SEPARATE "assignment already outstanding"
+        // guard (a null current_delegation_id while state is
+        // out_for_assignment/out_for_correction is treated defensively as
+        // still-outstanding), which is not what this test isolates.
+        [$busyPart] = app(ManagerService::class)->planParts($task, ['Busy part.']);
+        $busyPart->assignment_count = 6;
+        $busyPart->save();
+
+        $this->app->instance(AgentLoopService::class, $this->serviceWithScriptedProvider([
+            $this->successResultReply(),
+        ]));
+
+        $result = app(ManagerService::class)->assignPart($task, $busyPart, $helper->id, 'Correct the busy part again.', null);
+
+        $this->assertArrayNotHasKey('error', $result, 'the check must read ManagedTask.rounds_used (1, under the ceiling of 5), never this part\'s own assignment_count (6, already over it)');
+
+        $task->refresh();
+        $this->assertSame(2, $task->rounds_used);
+    }
+
     // =================================================================
     // Success path -- atomic writes, ordering, Delegation stamping
     // =================================================================
