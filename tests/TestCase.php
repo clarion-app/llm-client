@@ -291,6 +291,8 @@ abstract class TestCase extends BaseTestCase
         $this->defineAgentShareGrantSchema();
         $this->defineAgentHelperAssignmentSchema();
         $this->defineAgentDelegationSchema();
+        $this->defineManagedTaskSchema();
+        $this->defineManagedTaskPartSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -1066,6 +1068,80 @@ abstract class TestCase extends BaseTestCase
                 $table->longText('result_output')->nullable();
                 $table->text('result_undone')->nullable();
                 $table->boolean('result_truncated')->default(false);
+            });
+        }
+
+        if (!Schema::hasColumn('agent_delegations', 'managed_task_id')) {
+            Schema::table('agent_delegations', function (Blueprint $table) {
+                $table->uuid('managed_task_id')->nullable()->index();
+                $table->uuid('part_id')->nullable()->index();
+            });
+        }
+    }
+
+    /**
+     * managed_tasks — one row per manager-driven task (103-manager-agent,
+     * data-model.md §1). Schema::hasTable() guarded, hand-declared here
+     * since no test in this package ever runs real migrations
+     * (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000000_create_managed_tasks_table.php
+     * exactly.
+     */
+    protected function defineManagedTaskSchema(): void
+    {
+        if (!Schema::hasTable('managed_tasks')) {
+            Schema::create('managed_tasks', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id')->unique();
+                $table->uuid('owner_user_id');
+                $table->uuid('manager_agent_id')->nullable();
+                $table->longText('original_request');
+                $table->enum('status', ['in_progress', 'completed', 'completed_with_shortfalls', 'failed'])->default('in_progress');
+                $table->unsignedInteger('round_ceiling');
+                $table->unsignedInteger('rounds_used')->default(0);
+                $table->unsignedInteger('max_seconds');
+                $table->timestamp('last_progress_at', 6);
+                $table->longText('final_response')->nullable();
+                $table->text('shortfall_note')->nullable();
+                $table->text('conflict_note')->nullable();
+                $table->timestamp('started_at', 6);
+                $table->timestamp('completed_at', 6)->nullable();
+
+                $table->index('owner_user_id');
+                $table->index('status');
+                $table->index('last_progress_at');
+            });
+        }
+    }
+
+    /**
+     * managed_task_parts — a distinct, self-contained, bounded slice of a
+     * managed task (103-manager-agent, data-model.md §2). Schema::hasTable()
+     * guarded, hand-declared here since no test in this package ever runs
+     * real migrations (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000001_create_managed_task_parts_table.php
+     * exactly.
+     */
+    protected function defineManagedTaskPartSchema(): void
+    {
+        if (!Schema::hasTable('managed_task_parts')) {
+            Schema::create('managed_task_parts', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('managed_task_id');
+                $table->unsignedInteger('sequence');
+                $table->text('description');
+                $table->enum('state', ['not_yet_assigned', 'out_for_assignment', 'out_for_correction', 'accepted', 'reported_as_shortfall'])->default('not_yet_assigned');
+                $table->uuid('current_delegation_id')->nullable();
+                $table->uuid('accepted_delegation_id')->nullable();
+                $table->text('accepted_summary')->nullable();
+                $table->text('shortfall_reason')->nullable();
+                $table->unsignedInteger('assignment_count')->default(0);
+                $table->timestamp('created_at', 6);
+                $table->timestamp('updated_at', 6);
+
+                $table->index('managed_task_id');
+                $table->index(['managed_task_id', 'state']);
+                $table->index('current_delegation_id');
             });
         }
     }

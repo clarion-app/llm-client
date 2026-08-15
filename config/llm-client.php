@@ -809,5 +809,24 @@ return [
             'stale_after_minutes' => (int) env('LLM_CLIENT_DELEGATION_STALE_AFTER_MINUTES', 10),
         ],
     ],
+
+    // Manager Agent (103-manager-agent) — the whole-task round/wall-clock
+    // ceilings (FR-009/FR-017, research.md D5), the per-step-job bound on how
+    // many manager-loop iterations one RunManagedTaskStepJob invocation may
+    // run before persisting and yielding (research.md D6), the queue it
+    // dispatches onto, the staleness threshold the crash-recovery sweep uses
+    // (research.md D7), and the context-budget cap on the accumulated
+    // part-results section injected into the manager's own prompt
+    // (research.md D9). Distinct from delegation.max_iterations/max_seconds/
+    // max_chain_depth above, which continue to bound each individual
+    // assignment round's own nested agent loop unchanged.
+    'manager' => [
+        'max_rounds' => (int) env('LLM_CLIENT_MANAGER_MAX_ROUNDS', 30),
+        'max_seconds' => (int) env('LLM_CLIENT_MANAGER_MAX_SECONDS', 1800),
+        'step_max_iterations' => (int) env('LLM_CLIENT_MANAGER_STEP_MAX_ITERATIONS', 4),
+        'queue' => env('LLM_CLIENT_MANAGER_QUEUE', 'managed-tasks'),
+        'stale_after_minutes' => (int) env('LLM_CLIENT_MANAGER_STALE_AFTER_MINUTES', 10),
+        'context_budget_bytes' => (int) env('LLM_CLIENT_MANAGER_CONTEXT_BUDGET_BYTES', 24576),
+    ],
 ];
 

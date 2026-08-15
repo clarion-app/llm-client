@@ -4,48 +4,39 @@ namespace ClarionApp\LlmClient\Models;
 
 use Illuminate\Database\Eloquent\Model;
 
-class Delegation extends Model
+class ManagedTask extends Model
 {
-    protected $table = 'agent_delegations';
+    protected $table = 'managed_tasks';
 
     protected $keyType = 'string';
     public $incrementing = false;
     public $timestamps = false;
 
     protected $fillable = [
-        'parent_conversation_id',
-        'parent_agent_id',
-        'helper_agent_id',
-        'helper_conversation_id',
-        'helper_agent_version_id',
+        'conversation_id',
         'owner_user_id',
-        'task',
-        'context',
-        'depth',
+        'manager_agent_id',
+        'original_request',
         'status',
-        'batch_id',
-        'parent_run_id',
-        'parent_action_id',
-        'helper_run_id',
-        'outcome_summary',
+        'round_ceiling',
+        'rounds_used',
+        'max_seconds',
+        'last_progress_at',
+        'final_response',
+        'shortfall_note',
+        'conflict_note',
         'started_at',
         'completed_at',
-        'result_status',
-        'result_reason',
-        'result_summary',
-        'result_output',
-        'result_undone',
-        'result_truncated',
-        'managed_task_id',
-        'part_id',
     ];
 
     protected $casts = [
-        'depth' => 'integer',
         'status' => 'string',
+        'round_ceiling' => 'integer',
+        'rounds_used' => 'integer',
+        'max_seconds' => 'integer',
+        'last_progress_at' => 'datetime',
         'started_at' => 'datetime',
         'completed_at' => 'datetime',
-        'result_truncated' => 'boolean',
     ];
 
     protected static function booted(): void
