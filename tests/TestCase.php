@@ -545,7 +545,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('id')->primary();
                 $table->uuid('run_id');
                 $table->uuid('step_id');
-                $table->enum('action_type', ['llm_request', 'tool_invocation', 'context_reshape']);
+                $table->enum('action_type', ['llm_request', 'tool_invocation', 'context_reshape', 'delegation']);
                 $table->string('target', 256)->nullable();
                 $table->uuid('attempt_group_id')->nullable();
                 $table->uuid('parent_action_id')->nullable();
