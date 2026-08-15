@@ -409,4 +409,86 @@ class AutomaticRoutingJourneyTest extends TestCase
         $this->assertSame($technicalAgent->current_version_id, $message->agent_version_id);
         $this->assertNotSame($billingAgent->id, $message->agent_id);
     }
+
+    // =================================================================
+    // 3. A conversation whose first turn legitimately matches no
+    //    specialist (agent_id stays null, no default configured) must NOT
+    //    be re-evaluated on a later turn, even once that later turn's own
+    //    message would clearly have matched a specialist —
+    //    attemptInitialRouting()'s "exactly one user message" gate
+    //    (research.md D2 — "not silently re-evaluated on every message")
+    //    fires only on the conversation's genuine first turn. Added during
+    //    Phase 7's mutation-testing checklist (quickstart.md row 3): no
+    //    existing test exercised this gate directly before this case was
+    //    added — a conversation that is ALREADY bound is separately
+    //    protected by attemptInitialRouting()'s own agent_id === null
+    //    guard, so only the "stays legitimately unbound" scenario actually
+    //    isolates this specific gate.
+    // =================================================================
+
+    #[Test]
+    public function a_conversation_left_unbound_after_its_first_turn_is_not_re_routed_on_a_later_clearly_matching_turn(): void
+    {
+        $billingAgent = app(AgentService::class)->create(
+            $this->user->id,
+            "name: billing-agent\ninstructions: Handles billing invoices, payment questions, and account charges.",
+        );
+        // A second candidate is required so FR-016's single-candidate
+        // short-circuit never fires — this case is specifically about a
+        // genuine scoring pass that finds no positive-scoring candidate
+        // (RouterDefaultFallbackJourneyTest's own "no default, no match"
+        // fixture precedent).
+        app(AgentService::class)->create(
+            $this->user->id,
+            "name: technical-agent\ninstructions: Handles technical software bugs, crashes, and system errors.",
+        );
+
+        $conversation = $this->makeUnboundConversation($this->user->id);
+
+        // Turn 1: a message matching no configured specialist and no
+        // default handler is configured — the conversation legitimately
+        // stays unbound (RouterDefaultFallbackJourneyTest's own "no
+        // default, no match" case, D5).
+        $firstService = $this->serviceWithScriptedProvider([
+            $this->plainReply('An ordinary reply, no agent involved.'),
+        ]);
+        $firstResult = $firstService->run(
+            $conversation->fresh(),
+            'What time does the movie start tonight?',
+        );
+        $this->assertSame('completed', $firstResult['status']);
+
+        $conversation = $conversation->fresh();
+        $this->assertNull($conversation->agent_id, 'fixture sanity: the first turn must legitimately leave the conversation unbound');
+        $this->assertNull($conversation->routing_reason);
+
+        // Turn 2: a clearly billing-shaped follow-up in the SAME,
+        // still-unbound conversation — the "exactly one user message"
+        // gate must prevent this later turn from being treated as a fresh
+        // first turn, so the conversation must stay unbound rather than
+        // routing now.
+        $secondService = $this->serviceWithScriptedProvider([
+            $this->plainReply('Still an ordinary reply.'),
+        ]);
+        $secondResult = $secondService->run(
+            $conversation->fresh(),
+            'I have a question about my billing invoice and a payment that was charged twice.',
+        );
+        $this->assertSame('completed', $secondResult['status']);
+
+        $conversation = $conversation->fresh();
+        $this->assertNull(
+            $conversation->agent_id,
+            'a later turn must never re-trigger automatic routing on a conversation that legitimately stayed unbound after its genuine first turn — only the first turn is the routing decision point (D2)',
+        );
+        $this->assertNull($conversation->routing_reason);
+
+        $secondMessage = Message::find($secondResult['message_id']);
+        $this->assertNotNull($secondMessage);
+        $this->assertNull(
+            $secondMessage->agent_id,
+            'the second turn\'s own produced Message must stay unattributed — it must never be silently routed to the billing specialist on a later turn',
+        );
+        $this->assertNotSame($billingAgent->id, $secondMessage->agent_id);
+    }
 }
