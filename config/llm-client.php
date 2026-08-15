@@ -828,5 +828,18 @@ return [
         'stale_after_minutes' => (int) env('LLM_CLIENT_MANAGER_STALE_AFTER_MINUTES', 10),
         'context_budget_bytes' => (int) env('LLM_CLIENT_MANAGER_CONTEXT_BUDGET_BYTES', 24576),
     ],
+
+    // Multi-Agent Consensus (104-multi-agent-consensus) — how many
+    // contributors are dispatched by default and the installation floor
+    // below which multi-opinion mode will not attempt to run (FR-003,
+    // research.md D4), the fraction of dispatched contributors that must
+    // succeed for a meaningful outcome (research.md D4's quorum floor),
+    // and the source label used for the reconciliation judge's own budget
+    // admission check (mirrors eval_judging's own role-scoped config).
+    'consensus' => [
+        'default_contributor_count' => (int) env('LLM_CLIENT_CONSENSUS_DEFAULT_CONTRIBUTOR_COUNT', 3),
+        'min_contributor_count' => (int) env('LLM_CLIENT_CONSENSUS_MIN_CONTRIBUTOR_COUNT', 2),
+        'quorum_fraction' => (float) env('LLM_CLIENT_CONSENSUS_QUORUM_FRACTION', 0.5),
+    ],
 ];
 

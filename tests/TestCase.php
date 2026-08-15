@@ -293,6 +293,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineAgentDelegationSchema();
         $this->defineManagedTaskSchema();
         $this->defineManagedTaskPartSchema();
+        $this->defineConsensusRequestSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -1142,6 +1143,50 @@ abstract class TestCase extends BaseTestCase
                 $table->index('managed_task_id');
                 $table->index(['managed_task_id', 'state']);
                 $table->index('current_delegation_id');
+            });
+        }
+    }
+
+    /**
+     * consensus_requests — one row per user question submitted with
+     * multi-opinion mode enabled (104-multi-agent-consensus,
+     * data-model.md §1). Schema::hasTable() guarded, hand-declared here
+     * since no test in this package ever runs real migrations
+     * (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000000_create_consensus_requests_table.php
+     * exactly.
+     */
+    protected function defineConsensusRequestSchema(): void
+    {
+        if (!Schema::hasTable('consensus_requests')) {
+            Schema::create('consensus_requests', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id');
+                $table->uuid('owner_user_id');
+                $table->uuid('coordinator_agent_id')->nullable();
+                $table->longText('question');
+                $table->uuid('answer_message_id')->nullable();
+                $table->uuid('batch_id')->nullable();
+                $table->unsignedInteger('dispatched_count');
+                $table->unsignedInteger('quorum_required')->nullable();
+                $table->unsignedInteger('successful_count')->nullable();
+                $table->enum('status', ['in_progress', 'completed', 'insufficient_quorum', 'single_contributor_fallback', 'failed']);
+                $table->enum('agreement_classification', ['agreed', 'materially_disagreed', 'no_consensus'])->nullable();
+                $table->longText('reconciled_answer')->nullable();
+                $table->json('disagreement_detail')->nullable();
+                $table->text('independence_note')->nullable();
+                $table->decimal('estimated_additional_cost', 20, 10)->nullable();
+                $table->decimal('actual_additional_cost', 20, 10)->nullable();
+                $table->text('failure_reason')->nullable();
+                $table->timestamp('started_at', 6);
+                $table->timestamp('completed_at', 6)->nullable();
+
+                $table->index('conversation_id');
+                $table->index('owner_user_id');
+                $table->index('coordinator_agent_id');
+                $table->index('answer_message_id');
+                $table->index('batch_id');
+                $table->index('status');
             });
         }
     }
