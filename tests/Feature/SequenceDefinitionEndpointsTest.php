@@ -110,6 +110,25 @@ class SequenceDefinitionEndpointsTest extends TestCase
     }
 
     #[Test]
+    public function store_returns_422_empty_name_for_a_missing_name(): void
+    {
+        $coordinator = $this->makeAgent($this->user, 'coordinator-missing-name');
+        $helper = $this->makeAgent($this->user, 'helper-missing-name');
+        app(AgentHelperService::class)->assign($this->user->id, $coordinator->id, $helper->id);
+
+        $response = $this->actingAs($this->user, 'api')
+            ->postJson('/api/clarion-app/llm-client/sequence-definitions', [
+                'coordinator_agent_id' => $coordinator->id,
+                'stages' => [
+                    ['name' => 'Stage', 'helper_agent_id' => $helper->id],
+                ],
+            ]);
+
+        $response->assertStatus(422);
+        $this->assertSame('empty_name', $response->json('error'));
+    }
+
+    #[Test]
     public function store_returns_422_empty_stages_for_an_empty_stages_array(): void
     {
         $coordinator = $this->makeAgent($this->user, 'coordinator-empty-stages');

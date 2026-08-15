@@ -123,6 +123,44 @@ class SequenceServiceDefineTest extends TestCase
     }
 
     #[Test]
+    public function refuses_an_empty_name(): void
+    {
+        $coordinator = $this->makeAgent('coordinator-empty-name');
+        $helper = $this->makeAgent('helper-empty-name');
+        app(AgentHelperService::class)->assign($this->user->id, $coordinator->id, $helper->id);
+
+        try {
+            app(SequenceService::class)->defineSequence($this->user->id, '', null, $coordinator->id, [
+                ['name' => 'Stage', 'helper_agent_id' => $helper->id],
+            ]);
+            $this->fail('expected a SequenceDefinitionValidationException for an empty name');
+        } catch (SequenceDefinitionValidationException $e) {
+            $this->assertSame('empty_name', $e->errorCode);
+        }
+
+        $this->assertSame(0, StageSequenceDefinition::count(), 'a refused defineSequence() call must never create a row');
+    }
+
+    #[Test]
+    public function refuses_a_whitespace_only_name(): void
+    {
+        $coordinator = $this->makeAgent('coordinator-blank-name');
+        $helper = $this->makeAgent('helper-blank-name');
+        app(AgentHelperService::class)->assign($this->user->id, $coordinator->id, $helper->id);
+
+        try {
+            app(SequenceService::class)->defineSequence($this->user->id, "   \t  ", null, $coordinator->id, [
+                ['name' => 'Stage', 'helper_agent_id' => $helper->id],
+            ]);
+            $this->fail('expected a SequenceDefinitionValidationException for a whitespace-only name');
+        } catch (SequenceDefinitionValidationException $e) {
+            $this->assertSame('empty_name', $e->errorCode);
+        }
+
+        $this->assertSame(0, StageSequenceDefinition::count());
+    }
+
+    #[Test]
     public function refuses_an_empty_stages_array(): void
     {
         $coordinator = $this->makeAgent('coordinator-empty');

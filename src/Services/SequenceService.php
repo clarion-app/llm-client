@@ -56,6 +56,16 @@ class SequenceService
      */
     public function defineSequence(string $ownerUserId, string $name, ?string $description, string $coordinatorAgentId, array $stages): StageSequenceDefinition
     {
+        // contracts §1: "name (required, non-empty)" -- confirmed absent
+        // from the shipped code by an independent 105-stage-pipeline
+        // reconciliation pass (2026-08-15): neither this method nor
+        // SequenceController::store() rejected a missing/blank name before
+        // this fix, so a definition could be created with name = "" and
+        // would show up that way in every GET /sequence-definitions list.
+        if (trim($name) === '') {
+            throw new SequenceDefinitionValidationException('empty_name', 'A sequence must have a non-empty name.');
+        }
+
         if (empty($stages)) {
             throw new SequenceDefinitionValidationException('empty_stages', 'A sequence must define at least one stage.');
         }
