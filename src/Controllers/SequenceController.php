@@ -75,11 +75,9 @@ class SequenceController extends Controller
     {
         $callerUserId = Auth::user()->id;
 
-        $definitions = StageSequenceDefinition::where('owner_user_id', $callerUserId)
-            ->orderByDesc('created_at')
-            ->get();
+        $definitions = $this->sequenceQuery->definitionsForOwner($callerUserId);
 
-        return response()->json($definitions->map(fn (StageSequenceDefinition $definition) => [
+        return response()->json(collect($definitions)->map(fn (StageSequenceDefinition $definition) => [
             'sequence_definition_id' => $definition->id,
             'name' => $definition->name,
             'description' => $definition->description,

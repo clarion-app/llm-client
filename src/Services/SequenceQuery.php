@@ -20,6 +20,25 @@ use ClarionApp\LlmClient\Models\StageSequenceDefinition;
 class SequenceQuery
 {
     /**
+     * GET /sequence-definitions (contracts §2) -- the caller's own
+     * definitions, most recently created first. T065 (Phase 7 Constitution
+     * alignment pass): centralizes the owner_user_id comparison here rather
+     * than inline in SequenceController::index(), matching this class's own
+     * "every read compares owner_user_id in one place" shape (data-model.md
+     * §7) and RunTraceQuery::runsForUserPaginated()'s identical precedent
+     * for an owner-scoped list endpoint.
+     *
+     * @return array<int, StageSequenceDefinition>
+     */
+    public function definitionsForOwner(string $callerUserId): array
+    {
+        return StageSequenceDefinition::where('owner_user_id', $callerUserId)
+            ->orderByDesc('created_at')
+            ->get()
+            ->all();
+    }
+
+    /**
      * @return StageSequenceDefinition|null Null when absent or owned by
      *   another user.
      */
