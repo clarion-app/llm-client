@@ -103,6 +103,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agent-runs/{runId}/actions/{actionId}/children', [RunController::class, "actionChildren"]);
     // Agent run execution graph action-detail endpoint (070 US2)
     Route::get('agent-runs/{runId}/actions/{actionId}', [RunController::class, "actionDetail"]);
+    // Multi-agent arrangement read endpoint (106 US1)
+    Route::get('agent-runs/{runId}/arrangement', [RunController::class, "arrangement"]);
 
     // Delegation protocol read endpoints (098 US3)
     Route::get('agent-runs/{runId}/delegations', [DelegationController::class, "forRun"]);

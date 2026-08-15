@@ -2,10 +2,13 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Support\Decimal;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Owner-scoped read path over the Delegation rows DelegationService writes
@@ -146,6 +149,105 @@ class DelegationQuery
             'total_tokens' => (int) ($usage->tokens ?? 0),
             'delegation_count' => count($allDelegations),
         ];
+    }
+
+    /**
+     * 106-multi-agent-run-view (US1, contracts/arrangement-api.md §1,
+     * data-model.md §1.1/§2): the full shape of the multi-agent
+     * collaboration rooted at $runId -- the root run plus every
+     * agent_delegations row transitively reachable from it, plus a
+     * RunSummary (070, unmodified) for every run referenced along the way.
+     *
+     * @return array{root_run_id: string, has_delegations: bool, truncated: bool,
+     *               runs: array<string, array>, delegations: array<int, array>}|null
+     *   Null when the run doesn't exist or isn't owned by the caller
+     *   (findRun()'s existing contract, reused). Never null for an owned
+     *   run with zero delegations -- has_delegations is false in that case,
+     *   per FR-014.
+     */
+    public function arrangementForRun(string $callerUserId, string $runId): ?array
+    {
+        $run = $this->runTraceQuery->findRun($callerUserId, $runId);
+        if ($run === null) {
+            return null;
+        }
+
+        $directDelegations = $this->delegationsForRun($callerUserId, $runId) ?? [];
+        $allDelegations = $this->collectTransitiveDelegations($callerUserId, $directDelegations);
+
+        // Defensive cap (research.md D5/D9) against the theoretical worst
+        // case (repeated maximum-width batches at maximum chain depth) --
+        // the ordinary case (config-bounded depth/width) never hits it.
+        $maxNodes = (int) config('llm-client.delegation.arrangement.max_nodes', 200);
+        $truncated = count($allDelegations) > $maxNodes;
+        if ($truncated) {
+            $allDelegations = array_slice($allDelegations, 0, $maxNodes);
+        }
+
+        // Every run referenced by the root or by any delegation's
+        // helper_run_id, resolved in one whereIn() query rather than one
+        // per contributor (mirrors RunController::index()'s own N-to-1
+        // action_count aggregate pattern, data-model.md §2 item 3). A
+        // queued delegation with no helper_run_id yet contributes no id
+        // here -- there is no run to describe (FR-013).
+        $referencedRunIds = array_values(array_unique(array_merge(
+            [$runId],
+            array_values(array_filter(array_map(fn (Delegation $d) => $d->helper_run_id, $allDelegations))),
+        )));
+
+        $runs = AgentRun::whereIn('id', $referencedRunIds)->get()->keyBy('id');
+        $actionCounts = empty($referencedRunIds) ? collect() : DB::table('agent_run_actions')
+            ->select('run_id', DB::raw('COUNT(*) as cnt'))
+            ->whereIn('run_id', $referencedRunIds)
+            ->groupBy('run_id')
+            ->pluck('cnt', 'run_id');
+
+        $runsMap = [];
+        foreach ($runs as $id => $runRow) {
+            $runsMap[$id] = $this->runTraceQuery->runSummaryRow($runRow, (int) ($actionCounts[$id] ?? 0));
+        }
+
+        return [
+            'root_run_id' => $runId,
+            'has_delegations' => count($allDelegations) > 0,
+            'truncated' => $truncated,
+            'runs' => $runsMap,
+            'delegations' => $this->arrangementDelegationRows($allDelegations),
+        ];
+    }
+
+    /**
+     * Project a batch of Delegation rows to the ArrangementResponse.
+     * delegations[] wire shape (contracts/arrangement-api.md §1) --
+     * resolves helper_agent_name for the whole batch in one query, mirroring
+     * DelegationController::delegationRows()'s own N+1-avoidance technique
+     * (data-model.md §2 item 4). task/context/outcome_summary/result_* are
+     * intentionally omitted -- not needed for the shape-at-a-glance view,
+     * already reachable via the existing GET /delegations/{id} for anyone
+     * who follows a link into one (data-model.md §1.1's own FR-011/FR-021
+     * "don't transfer what isn't needed for the view being rendered" note).
+     *
+     * @param Delegation[] $delegations
+     * @return array<int, array<string, mixed>>
+     */
+    private function arrangementDelegationRows(array $delegations): array
+    {
+        $agentIds = array_values(array_unique(array_map(fn (Delegation $d) => $d->helper_agent_id, $delegations)));
+        $names = empty($agentIds) ? [] : Agent::whereIn('id', $agentIds)->pluck('name', 'id')->all();
+
+        return array_map(fn (Delegation $d) => [
+            'id' => $d->id,
+            'parent_run_id' => $d->parent_run_id,
+            'parent_action_id' => $d->parent_action_id,
+            'helper_run_id' => $d->helper_run_id,
+            'helper_agent_id' => $d->helper_agent_id,
+            'helper_agent_name' => $names[$d->helper_agent_id] ?? null,
+            'depth' => $d->depth,
+            'status' => $d->status,
+            'batch_id' => $d->batch_id,
+            'started_at' => $d->started_at?->toJSON(),
+            'completed_at' => $d->completed_at?->toJSON(),
+        ], $delegations);
     }
 
     /**

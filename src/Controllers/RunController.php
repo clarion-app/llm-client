@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Services\ContentSanitizer;
+use ClarionApp\LlmClient\Services\DelegationQuery;
 use ClarionApp\LlmClient\Services\RunTraceQuery;
 use Auth;
 use Illuminate\Http\JsonResponse;
@@ -28,6 +29,7 @@ class RunController extends Controller
     public function __construct(
         private readonly RunTraceQuery $runTraceQuery,
         private readonly ContentSanitizer $contentSanitizer,
+        private readonly DelegationQuery $delegationQuery,
     ) {}
 
     /**
@@ -201,6 +203,27 @@ class RunController extends Controller
             'content' => $content,
             'content_truncated' => $content !== null && $this->contentSanitizer->isTruncated($content),
         ]);
+    }
+
+    /**
+     * GET /agent-runs/{runId}/arrangement — the full shape of the
+     * multi-agent collaboration rooted at $runId (106-multi-agent-run-view,
+     * US1, contracts/arrangement-api.md §1): the entry-point run, every
+     * transitively-reachable delegation, and a RunSummary for every run
+     * referenced along the way. Same uniform-404 contract as every other
+     * endpoint on this controller for an absent, purged, or foreign-owned
+     * run (FR-014, research.md D2).
+     */
+    public function arrangement(Request $request, string $runId): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $arrangement = $this->delegationQuery->arrangementForRun($callerUserId, $runId);
+        if ($arrangement === null) {
+            return $this->notFoundResponse();
+        }
+
+        return response()->json($arrangement);
     }
 
     /**
