@@ -280,6 +280,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('agents/{id}/activate', [StoredAgentController::class, "activate"]);
     Route::post('agents/{id}/deactivate', [StoredAgentController::class, "deactivate"]);
 
+    // Set/clear an agent as the caller's default handler (102-router-pattern,
+    // contracts/routing-mechanism.md §4, Phase 6/US4).
+    Route::post('agents/{id}/default-handler', [StoredAgentController::class, "setDefaultHandler"]);
+    Route::delete('agents/{id}/default-handler', [StoredAgentController::class, "clearDefaultHandler"]);
+
     // Share an agent with another installation user, and list who currently
     // has access (096-agent-sharing, contracts/agent-sharing-api.md §1/§2,
     // Phase 3/US1). Both owner-only.

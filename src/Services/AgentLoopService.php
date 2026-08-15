@@ -274,6 +274,7 @@ class AgentLoopService
             // a no-op unless this is genuinely the conversation's first
             // turn and no agent is already bound.
             $this->attemptInitialRouting($conversation, Message::find($triggerMessageId)?->content ?? '');
+            $this->ensureSpecialistAvailable($conversation);
         }
 
         // The user is engaging again, so this session is live: clear any end
@@ -747,6 +748,81 @@ class AgentLoopService
     }
 
     /**
+     * D7's automatic unavailability fallback (102-router-pattern, US4,
+     * contracts/routing-mechanism.md §3): when the conversation's own
+     * currently-effective agent (via ConversationHandoff::
+     * currentAgentIdentityFor(), which already resolves the latest handoff
+     * over the conversation's original agent_id) has since been
+     * deactivated, route to a fallback and record it as a new handoff row
+     * with reason 'unavailable' — rather than letting a deactivated agent
+     * silently keep answering, or the conversation stall.
+     *
+     * A no-op when the conversation has no real owner, when there is no
+     * currently-effective agent identity at all, or when the
+     * currently-effective agent is still active (the overwhelming common
+     * case, including immediately after attemptInitialRouting() itself
+     * binds a fresh — and therefore always active — agent).
+     *
+     * Excludes every agent already in this conversation's own handoff
+     * chain (093's own cycle-prevention query, reused verbatim) plus the
+     * now-unavailable agent itself. When the chain is already at its
+     * configured max length, this degrades to a no-op rather than writing
+     * past the bound (the documented last-resort degrade, research.md D7)
+     * — mirroring handleHandoffToAgent()'s own chain-bound check, but
+     * silent here since there is no caller-facing tool response to return
+     * an error through.
+     */
+    private function ensureSpecialistAvailable(Conversation $conversation): void
+    {
+        if ($conversation->user_id === null) {
+            return;
+        }
+
+        $current = ConversationHandoff::currentAgentIdentityFor($conversation);
+
+        if ($current['agent_id'] === null) {
+            return;
+        }
+
+        $currentAgent = Agent::find($current['agent_id']);
+
+        if ($currentAgent === null || $currentAgent->is_active !== false) {
+            return;
+        }
+
+        $chainLength = ConversationHandoff::where('conversation_id', $conversation->id)->count();
+
+        if ($chainLength >= config('llm-client.handoff.max_chain_length', 5)) {
+            return;
+        }
+
+        $excludeAgentIds = ConversationHandoff::where('conversation_id', $conversation->id)
+            ->pluck('to_agent_id')
+            ->push($conversation->agent_id)
+            ->push($currentAgent->id)
+            ->filter()
+            ->all();
+
+        $decision = app(RouterService::class)->route(
+            (string) $conversation->user_id,
+            $this->getLastUserMessage($conversation)?->content ?? '',
+            $excludeAgentIds,
+        );
+
+        if (!$decision->hasAgent()) {
+            return;
+        }
+
+        $target = Agent::find($decision->agentId);
+
+        if ($target === null) {
+            return;
+        }
+
+        $this->writeHandoffRow($conversation, $target, 'unavailable');
+    }
+
+    /**
      * Synchronous agent loop execution for external channel integrations.
      * Returns the final response array or a confirmation-required structure.
      *
@@ -840,6 +916,7 @@ class AgentLoopService
         // no-op unless this is genuinely the conversation's first turn and
         // no agent is already bound.
         $this->attemptInitialRouting($conversation, $message);
+        $this->ensureSpecialistAvailable($conversation);
 
         $maxIterations = $options['max_iterations'] ?? config('llm-client.agent_loop.max_iterations', 20);
         $deadlineAt = $options['deadline_at'] ?? null;
@@ -1481,6 +1558,7 @@ class AgentLoopService
             $conversation,
             Message::where('conversation_id', $conversation->id)->where('role', 'user')->first()?->content ?? '',
         );
+        $this->ensureSpecialistAvailable($conversation);
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
@@ -3533,24 +3611,38 @@ class AgentLoopService
             return json_encode(['error' => "This conversation has reached its handoff limit ({$chainLength}) and cannot be handed off again."]);
         }
 
-        $from = ConversationHandoff::where('conversation_id', $conversation->id)
-            ->orderByDesc('position')
-            ->value('to_agent_id') ?? $conversation->agent_id;
-        $position = 1 + ConversationHandoff::where('conversation_id', $conversation->id)->count();
-
-        ConversationHandoff::create([
-            'conversation_id' => $conversation->id,
-            'position' => $position,
-            'from_agent_id' => $from,
-            'to_agent_id' => $target->id,
-            'to_agent_version_id' => $target->current_version_id,
-            'created_at' => now(),
-        ]);
+        $handoff = $this->writeHandoffRow($conversation, $target);
 
         return json_encode([
             'success' => true,
             'handed_off_to' => $target->name,
             'agent_id' => $target->id,
+        ]);
+    }
+
+    /**
+     * The write $handleHandoffToAgent() and $ensureSpecialistAvailable()
+     * both share (102-router-pattern, contracts §5): compute the chain's
+     * next position from its current tail, then create the
+     * ConversationHandoff row. $reason distinguishes an ordinary,
+     * agent-initiated handoff (null, unchanged behavior) from an automatic
+     * unavailability fallback ('unavailable', D7).
+     */
+    private function writeHandoffRow(Conversation $conversation, Agent $target, ?string $reason = null): ConversationHandoff
+    {
+        $from = ConversationHandoff::where('conversation_id', $conversation->id)
+            ->orderByDesc('position')
+            ->value('to_agent_id') ?? $conversation->agent_id;
+        $position = 1 + ConversationHandoff::where('conversation_id', $conversation->id)->count();
+
+        return ConversationHandoff::create([
+            'conversation_id' => $conversation->id,
+            'position' => $position,
+            'from_agent_id' => $from,
+            'to_agent_id' => $target->id,
+            'to_agent_version_id' => $target->current_version_id,
+            'reason' => $reason,
+            'created_at' => now(),
         ]);
     }
 
@@ -3692,7 +3784,9 @@ class AgentLoopService
 
         $latest = $undisclosed->last();
         $name = Agent::withTrashed()->find($latest->to_agent_id)?->name ?? 'a retired agent';
-        $sentence = "This conversation has been handed off to \"{$name}\".";
+        $sentence = $latest->reason === 'unavailable'
+            ? "The previous specialist became unavailable; this conversation has moved to \"{$name}\"."
+            : "This conversation has been handed off to \"{$name}\".";
 
         ConversationHandoff::where('conversation_id', $conversation->id)
             ->whereNull('disclosed_at')

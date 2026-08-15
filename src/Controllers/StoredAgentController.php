@@ -538,6 +538,44 @@ class StoredAgentController extends Controller
     }
 
     /**
+     * POST /agents/{id}/default-handler (102-router-pattern, contracts §4,
+     * FR-004/FR-005). Resolves via the *ordinary* AgentQuery::findAgent().
+     * Always 200: setDefaultHandler() is idempotent, so there is no
+     * failure mode beyond "not found."
+     */
+    public function setDefaultHandler(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $agent = $this->service->setDefaultHandler($agent);
+
+        return response()->json($this->agentResource($agent), 200);
+    }
+
+    /**
+     * DELETE /agents/{id}/default-handler (102-router-pattern, contracts
+     * §4). Resolves via the *ordinary* AgentQuery::findAgent(). Always
+     * 200: clearDefaultHandler() is idempotent, so there is no failure
+     * mode beyond "not found."
+     */
+    public function clearDefaultHandler(Request $request, string $id): JsonResponse
+    {
+        $agent = $this->query->findAgent(Auth::id(), $id);
+
+        if ($agent === null) {
+            return $this->notFoundResponse();
+        }
+
+        $agent = $this->service->clearDefaultHandler($agent);
+
+        return response()->json($this->agentResource($agent), 200);
+    }
+
+    /**
      * The shape show()/link()/unlink()/syncFromFile() all share (contracts
      * §3): the current definition, plus `link`/`divergence` embedded only
      * when the agent is actually linked — never present-but-null
@@ -690,6 +728,7 @@ class StoredAgentController extends Controller
             'linked' => $agent->linked_repository_path !== null,
             'created_at' => $agent->created_at?->toIso8601String(),
             'is_active' => $agent->is_active,
+            'is_default_handler' => $agent->is_default_handler,
         ];
 
         if ($agent->cloned_from_agent_id !== null) {

@@ -57,7 +57,7 @@ final class RouterService
             ->values();
 
         if ($candidates->isEmpty()) {
-            return new RouterDecision(null, null, 'none');
+            return $this->defaultHandlerOrNone($callerUserId);
         }
 
         if ($candidates->count() === 1) {
@@ -85,10 +85,28 @@ final class RouterService
         }
 
         if ($winner === null) {
-            return new RouterDecision(null, null, 'none');
+            return $this->defaultHandlerOrNone($callerUserId);
         }
 
         return new RouterDecision($winner->id, $winner->current_version_id, 'automatic');
+    }
+
+    /**
+     * Step 5 (data-model.md §1/D5): consulted only once steps 1-4 have
+     * already failed to produce a match — no candidates at all, or no
+     * candidate scoring above 0. Found: the caller's designated default
+     * handler, reason 'default'. Not found: the original, pre-Phase-6
+     * degrade, reason 'none'.
+     */
+    private function defaultHandlerOrNone(string $callerUserId): RouterDecision
+    {
+        $default = app(AgentQuery::class)->findDefaultHandler($callerUserId);
+
+        if ($default !== null) {
+            return new RouterDecision($default->id, $default->current_version_id, 'default');
+        }
+
+        return new RouterDecision(null, null, 'none');
     }
 
     /**

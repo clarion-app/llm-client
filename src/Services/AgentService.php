@@ -382,4 +382,46 @@ class AgentService
 
         return $agent->fresh();
     }
+
+    /**
+     * Designate an agent as the caller's default handler (102-router-pattern,
+     * FR-004/FR-005). A clean no-op when the agent is already the default.
+     * Otherwise, inside a transaction, clears any other `true` row for the
+     * same `user_id` before setting this one — at most one default handler
+     * per owner at any time. No last-agent-style guard: setting or clearing
+     * a default handler is always valid.
+     */
+    public function setDefaultHandler(Agent $agent): Agent
+    {
+        if ($agent->is_default_handler === true) {
+            return $agent;
+        }
+
+        DB::transaction(function () use ($agent) {
+            Agent::where('user_id', $agent->user_id)
+                ->where('is_default_handler', true)
+                ->update(['is_default_handler' => false]);
+
+            $agent->is_default_handler = true;
+            $agent->save();
+        });
+
+        return $agent->fresh();
+    }
+
+    /**
+     * Clear an agent's default-handler designation (102-router-pattern).
+     * A clean no-op when the agent is not currently the default.
+     */
+    public function clearDefaultHandler(Agent $agent): Agent
+    {
+        if ($agent->is_default_handler === false) {
+            return $agent;
+        }
+
+        $agent->is_default_handler = false;
+        $agent->save();
+
+        return $agent->fresh();
+    }
 }

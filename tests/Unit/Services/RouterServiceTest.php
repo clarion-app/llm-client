@@ -251,11 +251,37 @@ class RouterServiceTest extends TestCase
     }
 
     // ---------------------------------------------------------------
-    // (f) no match at all — 'none', no default-handler consultation
+    // (f) no match at all — 'none' with no default configured, 'default'
+    // once Phase 6 (US4) wires step 5 in
     // ---------------------------------------------------------------
 
     #[Test]
-    public function no_candidate_matching_the_trigger_text_returns_none_without_consulting_a_default_handler(): void
+    public function no_candidate_matching_the_trigger_text_returns_none_when_no_default_handler_is_configured(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+
+        $this->service()->create(
+            $user->id,
+            "name: billing-agent\ninstructions: Handles billing invoice and payment matters.",
+        );
+        $this->service()->create(
+            $user->id,
+            "name: weather-agent\ninstructions: Talks about weather forecasts and cloud cover.",
+        );
+
+        // No default handler configured for this caller — step 5 (Phase 6,
+        // 102-router-pattern) has nothing to fall back to, so this is the
+        // original, pre-Phase-6 degrade.
+        $decision = $this->router()->route($user->id, 'What time does the movie start tonight?');
+
+        $this->assertNull($decision->agentId);
+        $this->assertNull($decision->agentVersionId);
+        $this->assertSame('none', $decision->reason);
+    }
+
+    #[Test]
+    public function no_candidate_matching_the_trigger_text_falls_back_to_the_configured_default_handler(): void
     {
         $this->seedOperationCatalog();
         $user = $this->user();
@@ -269,19 +295,16 @@ class RouterServiceTest extends TestCase
             "name: weather-agent\ninstructions: Talks about weather forecasts and cloud cover.",
         );
 
-        // Even though a default handler IS configured, Phase 3's route()
-        // implements only contracts §1 steps 1-4 — step 5 (the
-        // default-handler fallback) is deliberately deferred to Phase 6
-        // (tasks.md's own Ordering rationale). A 'none' result here, with a
-        // default handler present, is exactly what proves step 5 is not yet
-        // being consulted.
+        // Phase 6 (US4, contracts §1 step 5): once a default handler is
+        // configured, a trigger message matching no candidate's declared
+        // focus falls back to it, reason 'default', rather than 'none'.
         DB::table('agents')->where('id', $weatherAgent->id)->update(['is_default_handler' => true]);
 
         $decision = $this->router()->route($user->id, 'What time does the movie start tonight?');
 
-        $this->assertNull($decision->agentId);
-        $this->assertNull($decision->agentVersionId);
-        $this->assertSame('none', $decision->reason);
+        $this->assertSame($weatherAgent->id, $decision->agentId);
+        $this->assertSame($weatherAgent->current_version_id, $decision->agentVersionId);
+        $this->assertSame('default', $decision->reason);
     }
 
     // ---------------------------------------------------------------
