@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Delegation;
+use ClarionApp\LlmClient\Models\ManagedTaskPart;
 
 /**
  * ResultAggregationService (099-result-aggregation, US3/US4, data-model.md
@@ -137,6 +138,123 @@ class ResultAggregationService
         // to the assembled whole regardless of contributor count
         // (mutation-checklist row 7), never per-contributor and never
         // conflated with result_output_cap_bytes.
+        if ($truncated) {
+            [$combinedOutput, $conflicts] = $this->pruneToFitCap($combinedOutput, $conflicts, $cap);
+        }
+
+        return [
+            'contributors' => $contributors,
+            'combined_output' => $combinedOutput,
+            'conflicts' => $conflicts,
+            'truncated' => $truncated,
+        ];
+    }
+
+    /**
+     * 103-manager-agent (US3, data-model.md §7, Grounding note item 14,
+     * tasks.md T037/T041). The same conflict-detection algorithm
+     * combineForRun() implements above, regrouped: reads every `accepted`
+     * ManagedTaskPart's own accepted_delegation_id row (NOT a
+     * parent_run_id-scoped set -- a managed task's parts span many
+     * different manager-turn runs) rather than one run's full delegation
+     * set. Returns null when fewer than two accepted parts have a
+     * resolvable accepted_delegation_id, exactly mirroring
+     * combineForRun()'s own "fewer than two qualifying contributors"
+     * null contract.
+     *
+     * Each contributor/conflict-occurrence entry carries an additional
+     * `part_id` field beyond combineForRun()'s own shape, since
+     * `ManagerService::finalize()`'s conflict_note (FR-016) and any
+     * future part-level UI both need to attribute a conflicting value
+     * back to the specific PART it came from, not only the helper.
+     *
+     * @return array{contributors: array<int, array<string, mixed>>, combined_output: array<string, mixed>, conflicts: array<int, array<string, mixed>>, truncated: bool}|null
+     */
+    public function combineForManagedTask(string $managedTaskId): ?array
+    {
+        $parts = ManagedTaskPart::where('managed_task_id', $managedTaskId)
+            ->where('state', 'accepted')
+            ->whereNotNull('accepted_delegation_id')
+            ->get();
+
+        if ($parts->count() < 2) {
+            return null;
+        }
+
+        $delegationIds = $parts->pluck('accepted_delegation_id')->unique()->values()->all();
+        $delegations = Delegation::whereIn('id', $delegationIds)->orderBy('started_at')->get();
+
+        if ($delegations->count() < 2) {
+            return null;
+        }
+
+        $partsByDelegationId = $parts->keyBy('accepted_delegation_id');
+
+        $agentIds = $delegations->pluck('helper_agent_id')->filter()->unique()->values()->all();
+        $names = empty($agentIds) ? [] : Agent::whereIn('id', $agentIds)->pluck('name', 'id')->all();
+
+        $contributors = [];
+        $keyOccurrences = [];
+
+        foreach ($delegations as $delegation) {
+            $part = $partsByDelegationId[$delegation->id] ?? null;
+            $decodedOutput = $this->decodeOutput($delegation->result_output);
+
+            $contributors[] = [
+                'part_id' => $part?->id,
+                'delegation_id' => $delegation->id,
+                'helper_agent_id' => $delegation->helper_agent_id,
+                'helper_agent_name' => $names[$delegation->helper_agent_id] ?? null,
+                'status' => $delegation->result_status,
+                'summary' => $delegation->result_summary,
+                'undone' => $delegation->result_undone,
+                'output' => $decodedOutput,
+            ];
+
+            if (is_array($decodedOutput)) {
+                foreach ($decodedOutput as $key => $value) {
+                    $keyOccurrences[$key][] = [
+                        'value' => $value,
+                        'part_id' => $part?->id,
+                        'delegation_id' => $delegation->id,
+                        'helper_agent_id' => $delegation->helper_agent_id,
+                        'helper_agent_name' => $names[$delegation->helper_agent_id] ?? null,
+                    ];
+                }
+            }
+        }
+
+        // research.md D6 (same rule combineForRun() applies): a key is a
+        // conflict only when two or more contributors disagree on its
+        // value.
+        $combinedOutput = [];
+        $conflicts = [];
+        foreach ($keyOccurrences as $key => $occurrences) {
+            $distinctValues = [];
+            foreach ($occurrences as $occurrence) {
+                $distinctValues[json_encode($occurrence['value'])] = true;
+            }
+
+            if (count($distinctValues) <= 1) {
+                $combinedOutput[$key] = $occurrences[0]['value'];
+
+                continue;
+            }
+
+            $conflicts[] = [
+                'key' => $key,
+                'values' => $occurrences,
+            ];
+        }
+
+        $encoded = json_encode([
+            'combined_output' => $combinedOutput,
+            'conflicts' => $conflicts,
+        ]);
+        $cap = (int) config('llm-client.delegation.combined_output_cap_bytes', 16384);
+        $sanitized = $this->contentSanitizer->truncate($encoded, $cap);
+        $truncated = $this->contentSanitizer->isTruncated($sanitized);
+
         if ($truncated) {
             [$combinedOutput, $conflicts] = $this->pruneToFitCap($combinedOutput, $conflicts, $cap);
         }

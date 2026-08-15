@@ -40,6 +40,7 @@ class ManagerService
 
     public function __construct(
         private readonly AgentQuery $agentQuery,
+        private readonly ResultAggregationService $resultAggregationService,
     ) {}
 
     /**
@@ -400,6 +401,115 @@ class ManagerService
         $task->save();
 
         $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
+    }
+
+    /**
+     * 103-manager-agent (US3, contracts/manager-agent-meta-tools.md §5,
+     * tasks.md T036/T040). The ONE decision point for whether
+     * finalize_task may proceed -- exposed publicly (mirrors
+     * acceptPartRefusal()'s own "one shared guard" shape) so
+     * AgentLoopService::handleFinalizeTask() can surface the SAME
+     * structured refusal reason contracts §5 specifies before ever
+     * calling the void finalize() write.
+     *
+     * `parts_outstanding`: any part is still not_yet_assigned/
+     * out_for_assignment/out_for_correction -- UNLESS the round ceiling
+     * has already been reached (ManagedTask.rounds_used >= round_ceiling,
+     * the numeric check only, T042), in which case this refusal is
+     * bypassed and finalize_task is admitted despite the outstanding
+     * part (the system-forced finalizeWithShortfall() path itself is
+     * Phase 6/US4's own addition -- this bypass only stops the guard
+     * from blocking the MODEL's own finalize_task call once the ceiling
+     * condition is already true).
+     *
+     * `shortfall_note_required`: any part is reported_as_shortfall and
+     * no $shortfallNote was given (FR-010).
+     *
+     * @return array{error: string, message: string}|null Null means
+     *   finalize() may proceed.
+     */
+    public function finalizeRefusal(ManagedTask $task, ?string $shortfallNote): ?array
+    {
+        $parts = ManagedTaskPart::where('managed_task_id', $task->id)->get();
+
+        $hasOutstandingPart = $parts->contains(
+            fn (ManagedTaskPart $part) => in_array($part->state, ['not_yet_assigned', 'out_for_assignment', 'out_for_correction'], true)
+        );
+
+        if ($hasOutstandingPart && $task->rounds_used < $task->round_ceiling) {
+            return ['error' => 'parts_outstanding', 'message' => 'Every part must be accepted or reported as a shortfall before the task can be finalized.'];
+        }
+
+        $hasShortfallPart = $parts->contains(fn (ManagedTaskPart $part) => $part->state === 'reported_as_shortfall');
+
+        if ($hasShortfallPart && empty($shortfallNote)) {
+            return ['error' => 'shortfall_note_required', 'message' => 'A shortfall_note is required when any part was reported as a shortfall.'];
+        }
+
+        return null;
+    }
+
+    /**
+     * research.md D6, contracts/manager-agent-meta-tools.md §5, tasks.md
+     * T040. On success (finalizeRefusal() returns null):
+     * ResultAggregationService::combineForManagedTask()'s conflict check
+     * populates conflict_note (FR-016) when two or more accepted parts'
+     * outputs genuinely conflict; status is set to completed_with_shortfalls
+     * when any part is reported_as_shortfall, completed otherwise;
+     * final_response/shortfall_note are written verbatim (the model's own
+     * composed text -- this method never rewrites or augments it); and
+     * completed_at is stamped.
+     */
+    public function finalize(ManagedTask $task, string $finalResponse, ?string $shortfallNote): void
+    {
+        if ($this->finalizeRefusal($task, $shortfallNote) !== null) {
+            return;
+        }
+
+        $conflictNote = null;
+        $combined = $this->resultAggregationService->combineForManagedTask($task->id);
+        if ($combined !== null && !empty($combined['conflicts'])) {
+            $conflictNote = $this->describeConflicts($combined['conflicts']);
+        }
+
+        $hasShortfallPart = ManagedTaskPart::where('managed_task_id', $task->id)
+            ->where('state', 'reported_as_shortfall')
+            ->exists();
+
+        $task->status = $hasShortfallPart ? 'completed_with_shortfalls' : 'completed';
+        $task->final_response = $finalResponse;
+        $task->shortfall_note = $shortfallNote;
+        $task->conflict_note = $conflictNote;
+        $task->completed_at = now();
+        $task->last_progress_at = now();
+        $task->save();
+
+        $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
+    }
+
+    /**
+     * A plain, human-readable account of every conflicting key
+     * combineForManagedTask() reported -- never silently favoring one
+     * part's value (FR-016). Kept deliberately simple: the conflict's own
+     * structured shape (key/values/provenance) is what a caller wanting
+     * the full detail should read from combineForManagedTask() directly;
+     * this text is only the ManagedTask.conflict_note summary.
+     */
+    private function describeConflicts(array $conflicts): string
+    {
+        $lines = [];
+        foreach ($conflicts as $conflict) {
+            $key = $conflict['key'];
+            $valueDescriptions = array_map(function (array $occurrence) {
+                $helper = $occurrence['helper_agent_name'] ?? $occurrence['helper_agent_id'] ?? 'an unknown helper';
+
+                return sprintf('%s (from %s)', json_encode($occurrence['value']), $helper);
+            }, $conflict['values']);
+
+            $lines[] = sprintf('%s: %s', $key, implode(' vs. ', $valueDescriptions));
+        }
+
+        return 'Conflicting values were found across accepted parts: '.implode('; ', $lines).'.';
     }
 
     /**

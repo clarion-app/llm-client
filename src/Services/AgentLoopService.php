@@ -2642,6 +2642,31 @@ class AgentLoopService
                     ],
                 ],
             ];
+
+            // 103-manager-agent (US3, contracts/manager-agent-meta-tools.md
+            // §5): verbatim schema, gated identically to plan_parts/
+            // assign_part/accept_part above.
+            $tools[] = [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'finalize_task',
+                    'description' => 'Conclude the managed task and deliver the final response — a single, coherent answer to the original task, not a list of separate worker outputs. Every part must be accepted or reported as a shortfall before you can finalize; if any part conflicts with another (e.g. contradictory conclusions), name the conflict in the response rather than silently picking one.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'final_response' => [
+                                'type' => 'string',
+                                'description' => 'The single coherent answer to the original task.',
+                            ],
+                            'shortfall_note' => [
+                                'type' => 'string',
+                                'description' => 'Optional. Required if any part is reported_as_shortfall — a plain, specific account of what fell short and why.',
+                            ],
+                        ],
+                        'required' => ['final_response'],
+                    ],
+                ],
+            ];
         }
 
         if (empty($withheld)) {
@@ -2807,6 +2832,7 @@ class AgentLoopService
             'plan_parts' => $this->handlePlanParts($arguments, $conversation),
             'assign_part' => $this->handleAssignPart($arguments, $conversation),
             'accept_part' => $this->handleAcceptPart($arguments, $conversation),
+            'finalize_task' => $this->handleFinalizeTask($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -3922,6 +3948,38 @@ class AgentLoopService
         app(ManagerService::class)->acceptPart($managedTask, $part);
 
         return json_encode(['part_id' => $part->id, 'state' => 'accepted']);
+    }
+
+    /**
+     * 103-manager-agent (US3, contracts/manager-agent-meta-tools.md §5).
+     * Pulls the required arg exactly as handlePlanParts()/handleAssignPart()/
+     * handleAcceptPart() do, then surfaces ManagerService::finalizeRefusal()'s
+     * own structured refusal reason directly (the same guard finalize()
+     * itself consults) before ever calling the void finalize() write.
+     */
+    private function handleFinalizeTask(array $arguments, Conversation $conversation): string
+    {
+        $managedTask = ManagedTask::where('conversation_id', $conversation->id)->first();
+        if ($managedTask === null) {
+            return json_encode(['error' => 'not_a_managed_task', 'message' => 'finalize_task is only usable inside a managed task.']);
+        }
+
+        $finalResponse = $arguments['final_response'] ?? null;
+        if (empty($finalResponse)) {
+            return json_encode(['error' => 'final_response is required']);
+        }
+
+        $shortfallNote = $arguments['shortfall_note'] ?? null;
+
+        $refusal = app(ManagerService::class)->finalizeRefusal($managedTask, $shortfallNote);
+        if ($refusal !== null) {
+            return json_encode($refusal);
+        }
+
+        app(ManagerService::class)->finalize($managedTask, $finalResponse, $shortfallNote);
+        $managedTask->refresh();
+
+        return json_encode(['managed_task_id' => $managedTask->id, 'status' => $managedTask->status]);
     }
 
     /**

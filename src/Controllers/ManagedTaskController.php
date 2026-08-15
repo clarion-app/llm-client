@@ -103,6 +103,25 @@ class ManagedTaskController extends Controller
     }
 
     /**
+     * GET /managed-tasks/{id}/parts -- the breakdown (contracts §3,
+     * FR-008/US3 AC2). ManagedTaskQuery::partsForTask() itself
+     * ownership-checks via findManagedTask() first, so a task not owned
+     * by the caller and an unknown task id both collapse to the same
+     * uniform 404 as show()'s own.
+     */
+    public function parts(Request $request, string $id): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $parts = $this->managedTaskQuery->partsForTask($callerUserId, $id);
+        if ($parts === null) {
+            return $this->notFoundResponse('Managed task not found', 'managed_task_not_found');
+        }
+
+        return response()->json($parts);
+    }
+
+    /**
      * The uniform "not found" body shape (matches DelegationController's
      * own precedent) -- every controller in this package declares its own
      * private copy, there is no shared base-class helper (Grounding note
