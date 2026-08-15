@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Events\DelegationUpdated;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Jobs\RunDelegationBatchMemberJob;
 use ClarionApp\LlmClient\Models\Agent;
@@ -15,6 +16,7 @@ use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 /**
@@ -222,6 +224,25 @@ class DelegationService
     }
 
     /**
+     * 106-multi-agent-run-view (US2, research.md D4a -- the concrete
+     * resolution of tasks.md T029's original open "implementation
+     * detail"): the queued -> in_progress admission write itself lives in
+     * DelegationConcurrencyGate::tryAdmit() (a plain query-builder update,
+     * not a Delegation model save inside this class), so it cannot fire
+     * this class's own private broadcast() calls the way every other
+     * status write here does. RunDelegationBatchMemberJob::handle() calls
+     * this method immediately after a successful tryAdmit() and before
+     * runBatchMember(), so the admission transition still gets its
+     * DelegationUpdated. Performs no read of admission state and makes no
+     * assumption about WHY it is being called -- it cannot itself become a
+     * second source of truth about whether admission actually happened.
+     */
+    public function broadcastDelegationAdmitted(string $delegationId): void
+    {
+        $this->broadcast(fn () => event(new DelegationUpdated($delegationId)));
+    }
+
+    /**
      * 101-parallel-subagent-execution (T017/contracts §5): the job's own
      * failed() hook -- fired when the queue worker kills the job for
      * exceeding its own $timeout, or when an exception escapes handle()
@@ -257,6 +278,8 @@ class DelegationService
         $delegation->result_undone = $resultUndone;
         $delegation->result_truncated = false;
         $delegation->save();
+
+        $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
 
         if ($delegation->parent_action_id !== null) {
             $sixFieldResult = [
@@ -305,6 +328,8 @@ class DelegationService
         $delegation->result_undone = $resultUndone;
         $delegation->result_truncated = false;
         $delegation->save();
+
+        $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
 
         if ($delegation->parent_action_id !== null) {
             $sixFieldResult = [
@@ -473,6 +498,11 @@ class DelegationService
             $delegation->save();
         }
 
+        // Row creation -- 'queued' for a batch member, 'in_progress' for a
+        // solo delegation (research.md D4) -- fired once here regardless of
+        // whether the conditional parent_action_id save above ran.
+        $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
+
         return $delegation;
     }
 
@@ -560,6 +590,8 @@ class DelegationService
             $delegation->result_undone = $resultUndone;
             $delegation->result_truncated = false;
             $delegation->save();
+
+            $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
 
             $sixFieldResult = [
                 'status' => 'failure',
@@ -652,6 +684,8 @@ class DelegationService
             $delegation->result_truncated = $resultTruncated;
             $delegation->save();
 
+            $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
+
             $sixFieldResult = [
                 'status' => $resultStatus,
                 'summary' => $resultSummary,
@@ -699,6 +733,8 @@ class DelegationService
             $delegation->result_truncated = false;
             $delegation->save();
 
+            $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
+
             $sixFieldResult = [
                 'status' => 'partial',
                 'summary' => $resultSummary,
@@ -745,6 +781,8 @@ class DelegationService
             $delegation->result_undone = $resultUndone;
             $delegation->result_truncated = false;
             $delegation->save();
+
+            $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
 
             $sixFieldResult = [
                 'status' => 'failure',
@@ -795,6 +833,8 @@ class DelegationService
         $delegation->result_undone = $resultUndone;
         $delegation->result_truncated = false;
         $delegation->save();
+
+        $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
 
         $sixFieldResult = [
             'status' => 'failure',
@@ -1039,5 +1079,24 @@ class DelegationService
             ."\n"
             ."## Context\n"
             .$contextSection;
+    }
+
+    /**
+     * 106-multi-agent-run-view (US2, research.md D4): the verbatim
+     * three-line try/catch-and-log shape RunTraceRecorder/ManagerService/
+     * SequenceService already use for their own broadcast() helpers -- a
+     * broadcast failure must never change delegate()'s/delegateBatch()'s
+     * own return value, nor prevent the row write it accompanies from
+     * succeeding.
+     */
+    private function broadcast(\Closure $emit): void
+    {
+        try {
+            $emit();
+        } catch (\Throwable $e) {
+            Log::warning('DelegationService: broadcast failed', [
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 }

@@ -102,9 +102,14 @@ class RunDelegationBatchMemberJobTest extends TestCase
             ->andReturn(true);
 
         $service = Mockery::mock(DelegationService::class);
+        $service->shouldReceive('broadcastDelegationAdmitted')
+            ->once()
+            ->with($delegation->id)
+            ->ordered();
         $service->shouldReceive('runBatchMember')
             ->once()
-            ->with(Mockery::on(fn ($d) => $d instanceof Delegation && $d->id === $delegation->id));
+            ->with(Mockery::on(fn ($d) => $d instanceof Delegation && $d->id === $delegation->id))
+            ->ordered();
 
         $job = new RunDelegationBatchMemberJob($delegation->id);
         $job->withFakeQueueInteractions();
@@ -115,6 +120,15 @@ class RunDelegationBatchMemberJobTest extends TestCase
         $job->assertNotDeleted();
         $job->assertNotFailed();
     }
+
+    // -----------------------------------------------------------------
+    // 106-multi-agent-run-view (US2, research.md D4a): broadcastDelegationAdmitted()
+    // is called exactly once on the successful-admission path, immediately
+    // after tryAdmit() and before runBatchMember() (asserted above via
+    // ->ordered()), and never at all on the release-and-retry or
+    // already-admitted/already-terminal no-op paths (asserted by the three
+    // tests below extending this file's existing coverage of those paths).
+    // -----------------------------------------------------------------
 
     // -----------------------------------------------------------------
     // Refused -> release(), never marked terminal
@@ -134,6 +148,7 @@ class RunDelegationBatchMemberJobTest extends TestCase
             ->andReturn(false);
 
         $service = Mockery::mock(DelegationService::class);
+        $service->shouldNotReceive('broadcastDelegationAdmitted');
         $service->shouldNotReceive('runBatchMember');
 
         $job = new RunDelegationBatchMemberJob($delegation->id);
@@ -165,6 +180,7 @@ class RunDelegationBatchMemberJobTest extends TestCase
         $gate->shouldNotReceive('tryAdmit');
 
         $service = Mockery::mock(DelegationService::class);
+        $service->shouldNotReceive('broadcastDelegationAdmitted');
         $service->shouldNotReceive('runBatchMember');
 
         $job = new RunDelegationBatchMemberJob($delegation->id);
@@ -187,6 +203,7 @@ class RunDelegationBatchMemberJobTest extends TestCase
         $gate->shouldNotReceive('tryAdmit');
 
         $service = Mockery::mock(DelegationService::class);
+        $service->shouldNotReceive('broadcastDelegationAdmitted');
         $service->shouldNotReceive('runBatchMember');
 
         $job = new RunDelegationBatchMemberJob($delegation->id);

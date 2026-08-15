@@ -109,6 +109,11 @@ class RunDelegationBatchMemberJobQueueRetryTest extends TestCase
         // once admitted (DelegationConcurrencyCeilingTest's own established
         // precedent for isolating exactly this).
         $service = Mockery::mock(DelegationService::class);
+        // 106-multi-agent-run-view (US2, research.md D4a): the job calls
+        // this immediately after the successful (third-delivery) admission,
+        // before runBatchMember() -- a no-op double here, this test's own
+        // concern is the admission retry mechanics, not the broadcast.
+        $service->shouldReceive('broadcastDelegationAdmitted')->once();
         $service->shouldReceive('runBatchMember')->once()->andReturnNull();
         $this->app->instance(DelegationService::class, $service);
 

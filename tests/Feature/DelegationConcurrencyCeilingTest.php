@@ -80,6 +80,11 @@ class DelegationConcurrencyCeilingTest extends TestCase
     private function noOpService(): DelegationService
     {
         $service = Mockery::mock(DelegationService::class);
+        // 106-multi-agent-run-view (US2, research.md D4a): the job calls
+        // this on every successful admission, immediately before
+        // runBatchMember() -- a no-op double here too, this test's own
+        // concern is the concurrency ceiling's admission decisions.
+        $service->shouldReceive('broadcastDelegationAdmitted')->andReturnNull();
         $service->shouldReceive('runBatchMember')->andReturnNull();
 
         return $service;

@@ -137,6 +137,15 @@ class RunDelegationBatchMemberJob implements ShouldQueue
                 return;
             }
 
+            // 106-multi-agent-run-view (US2, research.md D4a): the
+            // queued -> in_progress admission write above just happened
+            // inside tryAdmit() itself (a plain query-builder update, not a
+            // DelegationService write), so DelegationService cannot fire
+            // its own broadcast() for it directly -- this is the one
+            // concrete call site that does, immediately after admission and
+            // before the member actually runs.
+            $service->broadcastDelegationAdmitted($delegation->id);
+
             $service->runBatchMember($delegation->fresh());
         } catch (\Throwable $e) {
             $this->fail($e);
