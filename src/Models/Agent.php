@@ -26,6 +26,7 @@ class Agent extends Model
 
     protected $casts = [
         'is_active' => 'boolean',
+        'is_default_handler' => 'boolean',
     ];
 
     protected $fillable = [

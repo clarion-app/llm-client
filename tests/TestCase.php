@@ -167,6 +167,8 @@ abstract class TestCase extends BaseTestCase
                 $table->string('provider_override')->nullable();
                 $table->boolean('is_processing')->default(false);
                 $table->timestamp('ended_at')->nullable();
+                $table->string('routing_reason', 16)->nullable();
+                $table->timestamp('routing_disclosed_at')->nullable();
                 $table->index('user_id');
                 $table->index('agent_id');
                 $table->index('agent_version_id');
@@ -897,6 +899,7 @@ abstract class TestCase extends BaseTestCase
                 $table->string('linked_synced_file_hash', 64)->nullable();
                 $table->uuid('cloned_from_agent_id')->nullable();
                 $table->boolean('is_active')->default(true);
+                $table->boolean('is_default_handler')->default(false);
                 $table->timestamps();
                 $table->softDeletes();
 
@@ -949,6 +952,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('to_agent_version_id');
                 $table->timestamp('created_at');
                 $table->timestamp('disclosed_at')->nullable();
+                $table->string('reason', 32)->nullable();
 
                 $table->index('conversation_id');
             });

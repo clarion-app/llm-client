@@ -27,6 +27,7 @@ class ConversationHandoff extends Model
     protected $fillable = [
         'conversation_id', 'position', 'from_agent_id',
         'to_agent_id', 'to_agent_version_id', 'created_at', 'disclosed_at',
+        'reason',
     ];
 
     protected $casts = [

@@ -128,6 +128,30 @@ class AgentQuery
     }
 
     /**
+     * Owned, active agents for $callerUserId — the router's own candidate
+     * pool (D3), shared by RouterService (initial pick + mid-conversation
+     * rescoring) and AgentLoopService::buildKnownSpecialistsSection().
+     *
+     * @return Collection<int, Agent>
+     */
+    public function listActiveForUser(string $callerUserId): Collection
+    {
+        return Agent::where('user_id', $callerUserId)->where('is_active', true)->get();
+    }
+
+    /**
+     * The caller's owned, active default handler, if any (D5) — the
+     * routing fallback consulted only when no candidate scores a match.
+     */
+    public function findDefaultHandler(string $callerUserId): ?Agent
+    {
+        return Agent::where('user_id', $callerUserId)
+            ->where('is_active', true)
+            ->where('is_default_handler', true)
+            ->first();
+    }
+
+    /**
      * Every version of an agent, in order, paginated (contracts §5). Null
      * uniformly when the agent itself doesn't exist or isn't the caller's
      * own (research.md D5) — the same "not found" signal findAgent() gives,

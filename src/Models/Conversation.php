@@ -14,12 +14,13 @@ class Conversation extends Model
 {
     use HasFactory, EloquentMultiChainBridge;
 
-    protected $fillable = ['server_id', 'title', 'model', 'character', 'user_id', 'is_processing', 'channel', 'provider_override', 'ended_at', 'agent_id', 'agent_version_id'];
+    protected $fillable = ['server_id', 'title', 'model', 'character', 'user_id', 'is_processing', 'channel', 'provider_override', 'ended_at', 'agent_id', 'agent_version_id', 'routing_reason', 'routing_disclosed_at'];
 
     protected $casts = [
         'is_processing' => 'boolean',
         'provider_override' => ProviderType::class,
         'ended_at' => 'datetime',
+        'routing_disclosed_at' => 'datetime',
     ];
 
     public function getChannelAttribute(): string
