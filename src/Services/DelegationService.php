@@ -761,9 +761,36 @@ class DelegationService
      * 101-parallel-subagent-execution (research.md D1/D3/D4 layer 2,
      * contracts §1): bounded-polls $validRows (keyed by tool_call_id) until
      * every row reaches a terminal status, then force-finalizes whatever
-     * is still not -- PROVIDED the batch has shown at least one genuine
-     * sign of being live (research.md D4 layer 2's "queue pickup latency"
-     * framing presumes a functioning queue somewhere behind this batch).
+     * is still not, unconditionally -- matching research.md D4 layer 2
+     * verbatim: "If any member is still non-terminal when this deadline
+     * passes, the parent force-finalizes it directly... and then proceeds
+     * exactly as if that member had reported failure on its own." There is
+     * no carve-out for the case where NO member of the batch ever showed
+     * any progress at all (Phase 7 Polish reconciliation, 2026-08-14):
+     * an earlier revision of this method returned early without
+     * finalizing anything whenever every row was still 'queued' at the
+     * deadline, reasoning that it could not distinguish "the queue is
+     * genuinely down" from "nothing has looked at this batch yet". That
+     * distinction is real, but it does not justify skipping
+     * force-finalization -- doing so left every row 'queued' indefinitely
+     * (until the scheduled resolve-stalled-delegation-batches sweep,
+     * layer 3, eventually got to it, up to stale_after_minutes later) while
+     * delegateBatch() itself still returned immediately once its own
+     * bounded deadline passed, reconstructing a six-field result from a
+     * row that was never terminal -- every result_* column null, since
+     * they are only ever populated on a terminal transition. That is a
+     * dishonest, not merely delayed, account of the member's outcome
+     * (violates FR-004/FR-005/FR-010's "the parent must eventually receive
+     * a COMBINED result", not a combined result standing in front of rows
+     * still mid-flight). Whether the queue is down or merely hasn't looked
+     * yet, this method's own bounded deadline (below) has already passed
+     * either way, so the correct action is the same one layer 2 always
+     * takes for a non-terminal row at its deadline: force-finalize it
+     * honestly as 'exhausted'/'batch_join_timeout'. The scheduled sweep
+     * (layer 3) remains the backstop for the case THIS layer cannot cover
+     * at all -- the parent's own process dying before this method ever
+     * gets to run its own deadline check -- not for the case where it does
+     * run but finds zero progress.
      *
      * The bound is deliberately NOT a flat `now() + max_seconds + grace`
      * measured from dispatch time -- under a real async worker (or a test
@@ -777,17 +804,9 @@ class DelegationService
      * row is observed 'in_progress' or terminal, ITS OWN deadline (if
      * still running) becomes admission-time + the per-member max_seconds +
      * the same grace period, tracked from the moment this loop first
-     * observes it.
-     *
-     * If EVERY member of the batch is still 'queued' when the grace
-     * deadline passes -- none ever admitted, none ever completed -- this
-     * call has no way to distinguish "the queue is genuinely down" from
-     * "nothing has looked at this batch yet at all", so it leaves every
-     * row exactly as it is rather than guessing; the scheduled
-     * llm-client:resolve-stalled-delegation-batches sweep (research.md D4
-     * layer 3) is the backstop for that case. The instant any ONE member
-     * shows real progress (admitted, or terminal), the remaining
-     * stragglers are held to their own bounds as described above.
+     * observes it. This grace-period bound applies identically whether one
+     * member of the batch has shown progress or none has -- the wait is
+     * never open-ended in either case.
      *
      * @param array<string, Delegation> $validRows
      */
@@ -804,7 +823,6 @@ class DelegationService
 
         $admissionDeadline = now()->addSeconds($graceSeconds);
         $runDeadlines = [];
-        $anyProgressEverObserved = false;
 
         while (true) {
             $rows = Delegation::whereIn('id', $ids)->get(['id', 'status']);
@@ -813,12 +831,10 @@ class DelegationService
 
             foreach ($rows as $row) {
                 if (in_array($row->status, ['completed', 'exhausted', 'failed'], true)) {
-                    $anyProgressEverObserved = true;
                     continue;
                 }
 
                 if ($row->status === 'in_progress') {
-                    $anyProgressEverObserved = true;
                     if (!isset($runDeadlines[$row->id])) {
                         $runDeadlines[$row->id] = $now->copy()->addSeconds($maxSeconds + $graceSeconds);
                     }
@@ -842,10 +858,11 @@ class DelegationService
             usleep($pollIntervalMs * 1000);
         }
 
-        if (!$anyProgressEverObserved) {
-            return;
-        }
-
+        // Unconditional: force-finalize whatever is still non-terminal once
+        // the loop's own bounded deadline passes, regardless of whether any
+        // member of the batch ever showed progress (see this method's own
+        // doc above -- the zero-progress case is not a reason to leave rows
+        // 'queued' indefinitely).
         $stillPending = Delegation::whereIn('id', $ids)
             ->whereIn('status', ['queued', 'in_progress'])
             ->get();

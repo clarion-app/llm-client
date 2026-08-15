@@ -542,6 +542,71 @@ class ParallelDelegationJourneyTest extends TestCase
     }
 
     // =================================================================
+    // Scenario 9b (FR-010, research.md D4 layer 2 -- Phase 7 Polish
+    // reconciliation): the ZERO-PROGRESS case, distinct from scenario 9
+    // above. Scenario 9 has one healthy member alongside one hung member,
+    // so joinWait() observes real progress (member A going terminal) and
+    // already force-finalizes the straggler correctly. This scenario
+    // covers the case where NO member of the batch ever shows any sign of
+    // life at all -- every job is simply never run, simulating a worker
+    // pool that is entirely down. delegateBatch() must still return within
+    // a bounded time AND every member must be force-finalized
+    // exhausted/batch_join_timeout, exactly as research.md D4 layer 2
+    // states ("If any member is still non-terminal when this deadline
+    // passes, the parent force-finalizes it directly... and then proceeds
+    // exactly as if that member had reported failure on its own") -- with
+    // no carve-out for the case where nothing in the batch ever progressed.
+    // =================================================================
+
+    #[Test]
+    public function scenario_9b_a_whole_batch_whose_jobs_never_run_at_all_is_still_force_finalized_within_a_bounded_time(): void
+    {
+        config(['llm-client.delegation.max_seconds' => 1]);
+        config(['llm-client.delegation.concurrency.join_poll_interval_ms' => 20]);
+
+        $fixture = $this->makeParentWithHelpers($this->user, 2, 'scenario9b');
+        [$helperA, $helperB] = $fixture['helpers'];
+
+        $mockAgentLoopService = Mockery::mock(AgentLoopService::class);
+        $mockAgentLoopService->shouldReceive('run')->never();
+        $this->app->instance(AgentLoopService::class, $mockAgentLoopService);
+
+        // Fake EVERY dispatched job in this batch -- simulating a worker
+        // pool that never picks anything up at all, not just one hung
+        // member alongside a healthy sibling (scenario 9 above).
+        Bus::fake([RunDelegationBatchMemberJob::class]);
+
+        Context::add('run_id', (string) Str::uuid());
+
+        $start = microtime(true);
+        $results = app(DelegationService::class)->delegateBatch($fixture['conversation'], [
+            $this->delegateCall('call_a', $helperA->id, 'Task A.'),
+            $this->delegateCall('call_b', $helperB->id, 'Task B.'),
+        ]);
+        $elapsedSeconds = microtime(true) - $start;
+
+        $this->assertLessThan(
+            10.0,
+            $elapsedSeconds,
+            'the parent must never be held open indefinitely even when NO member of the batch ever shows any progress at all',
+        );
+
+        $rows = Delegation::where('parent_conversation_id', $fixture['conversation']->id)->get()->keyBy('helper_agent_id');
+        $this->assertSame('exhausted', $rows[$helperA->id]->status, 'a member that never even reached in_progress must still be force-finalized once the join-wait deadline passes, not left queued forever');
+        $this->assertSame('exhausted', $rows[$helperB->id]->status);
+        $this->assertSame('batch_join_timeout', $rows[$helperA->id]->result_reason);
+        $this->assertSame('batch_join_timeout', $rows[$helperB->id]->result_reason);
+
+        // The parent's own turn must receive an HONEST failure account for
+        // each member -- never a null-filled six-field result reconstructed
+        // from a row that was silently left non-terminal.
+        foreach (['call_a', 'call_b'] as $toolCallId) {
+            $this->assertSame('failure', $results[$toolCallId]['status'] ?? null, "{$toolCallId}'s own result must be an honest failure, never a null status from a row left non-terminal");
+            $this->assertSame('batch_join_timeout', $results[$toolCallId]['reason'] ?? null);
+        }
+    }
+
+    // =================================================================
     // Scenario 11 (FR-011, SC-006): completion order never changes the
     // combined outcome -- PRE-EXISTING, unmodified combineForRun();
     // expected to ALREADY PASS today (mutation-checklist row 9).
@@ -636,6 +701,81 @@ class ParallelDelegationJourneyTest extends TestCase
                 );
             }
         }
+    }
+
+    // =================================================================
+    // Phase 7 Polish (mutation-checklist row 9): scenario 11 above proves
+    // order-INDEPENDENCE with respect to INSERTION order, because its own
+    // fixture sets each row's completed_at equal to its own started_at --
+    // so reordering combineForRun()'s query by completed_at instead of
+    // started_at (row 9's own literal mutation) coincidentally produces
+    // the identical result and stays invisible to that test alone. This
+    // test decouples the two columns -- started_at ascending order is
+    // deliberately the REVERSE of completed_at ascending order across the
+    // three rows -- so it can actually distinguish "ordered by started_at"
+    // (099's own real, documented behavior) from "ordered by completed_at"
+    // (row 9's mutation).
+    // =================================================================
+
+    #[Test]
+    public function combineforrun_orders_contributors_by_started_at_not_completed_at(): void
+    {
+        $runId = $this->makeRun($this->user);
+
+        $parentAgent = $this->makeAgent($this->user, 'orderfix-parent');
+        $parentConversation = $this->makeConversation($this->user, $parentAgent);
+
+        $specs = [
+            // label => [started_at offset, completed_at offset]
+            'first-started-last-completed' => [0, 20],
+            'second-started-second-completed' => [10, 10],
+            'last-started-first-completed' => [20, 0],
+        ];
+
+        $delegationIdsByLabel = [];
+        $base = now();
+
+        foreach ($specs as $label => [$startedOffset, $completedOffset]) {
+            $helperAgent = $this->makeAgent($this->user, 'orderfix-'.$label);
+            $helperConversation = $this->makeConversation($this->user, $helperAgent);
+            $delegationId = (string) Str::uuid();
+            $delegationIdsByLabel[$label] = $delegationId;
+
+            DB::table('agent_delegations')->insert([
+                'id' => $delegationId,
+                'parent_conversation_id' => $parentConversation->id,
+                'parent_agent_id' => $parentAgent->id,
+                'helper_agent_id' => $helperAgent->id,
+                'helper_conversation_id' => $helperConversation->id,
+                'owner_user_id' => $this->user->id,
+                'task' => 'Row-9 order-decoupling fixture.',
+                'depth' => 1,
+                'status' => 'completed',
+                'parent_run_id' => $runId,
+                'result_status' => 'success',
+                'result_summary' => $label,
+                'result_output' => json_encode([]),
+                'result_undone' => '',
+                'result_truncated' => false,
+                'started_at' => $base->copy()->addSeconds($startedOffset)->toDateTimeString(),
+                'completed_at' => $base->copy()->addSeconds($completedOffset)->toDateTimeString(),
+            ]);
+        }
+
+        $combined = app(ResultAggregationService::class)->combineForRun($runId);
+        $this->assertNotNull($combined);
+
+        $observedOrder = collect($combined['contributors'])->pluck('delegation_id')->all();
+
+        $this->assertSame(
+            [
+                $delegationIdsByLabel['first-started-last-completed'],
+                $delegationIdsByLabel['second-started-second-completed'],
+                $delegationIdsByLabel['last-started-first-completed'],
+            ],
+            $observedOrder,
+            'combineForRun() must order contributors by started_at -- if it were ordered by completed_at instead (row 9\'s mutation), this exact fixture would observe the REVERSE order',
+        );
     }
 
     // =================================================================
