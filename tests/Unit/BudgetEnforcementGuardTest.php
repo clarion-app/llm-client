@@ -108,6 +108,17 @@ class BudgetEnforcementGuardTest extends TestCase
         // is exactly as visible to an operator either way.
         'Services/RubricJudge.php',
 
+        // Consensus reconciliation calls BudgetGate::admit() DIRECTLY, for
+        // the identical reason RubricJudge's own entry above does: the
+        // reconciliation judge conversation's user id is always null
+        // (system-initiated work) and traceSystemRun()'s $userId parameter
+        // is non-nullable. admit() writes its own refusal record on a stop,
+        // and ConsensusReconciliationJudge converts that refusal into an
+        // explicit unreconciled result rather than propagating it -- a
+        // refusal is exactly as visible to an operator either way
+        // (104-multi-agent-consensus, mirrors RubricJudge exactly).
+        'Services/ConsensusReconciliationJudge.php',
+
         // Dead legacy classes. They are on the list because they genuinely
         // contain the constructs and the assertion is an equality — not
         // because they are gated. The separate assertion below is what keeps
@@ -138,6 +149,7 @@ class BudgetEnforcementGuardTest extends TestCase
         'Services/EmbeddingService.php',
         'Services/RoleTestRunner.php',
         'Services/RubricJudge.php',
+        'Services/ConsensusReconciliationJudge.php',
         'Jobs/GenerateEpisodicMemoryJob.php',
         'Jobs/PreWarmChunkSummaryJob.php',
         'OpenAIGenerateConversationTitleRequest.php',

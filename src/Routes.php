@@ -41,6 +41,7 @@ use ClarionApp\LlmClient\Controllers\AgentShareController;
 use ClarionApp\LlmClient\Controllers\AgentHelperController;
 use ClarionApp\LlmClient\Controllers\DelegationController;
 use ClarionApp\LlmClient\Controllers\ManagedTaskController;
+use ClarionApp\LlmClient\Controllers\ConsensusController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -331,6 +332,16 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('managed-tasks/{id}', [ManagedTaskController::class, "show"]);
     Route::get('managed-tasks/{id}/parts', [ManagedTaskController::class, "parts"]);
     Route::get('managed-tasks/{id}/cost', [ManagedTaskController::class, "cost"]);
+
+    // Multi-agent consensus -- ask a question with multi-opinion mode
+    // enabled, and read back a past request's stored result
+    // (104-multi-agent-consensus, US1, contracts/consensus-api.md §1/§2).
+    // Synchronous end-to-end (research.md D5): store() does not return
+    // until a terminal ConsensusRequest.status is reached, mirroring the
+    // existing POST /agent endpoint's own blocking shape rather than
+    // managed-tasks' 202.
+    Route::post('consensus-requests', [ConsensusController::class, "store"]);
+    Route::get('consensus-requests/{id}', [ConsensusController::class, "show"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
