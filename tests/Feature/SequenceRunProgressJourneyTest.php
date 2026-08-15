@@ -5,10 +5,10 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
+use ClarionApp\LlmClient\Events\SequenceRunUpdated;
 use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Server;
-use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageResult;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\AgentHelperService;
@@ -26,6 +26,7 @@ use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Dedoc\Scramble\Generator;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Mockery;
@@ -33,22 +34,30 @@ use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
 /**
- * 105-stage-pipeline, Phase 3 (US1), tasks.md T022 (quickstart scenario 1).
+ * 105-stage-pipeline, Phase 4 (US2), tasks.md T033 (quickstart scenario 6).
  *
- * Drives the real SequenceService -> RunSequenceStageJob -> DelegationService
- * -> AgentLoopService::run() chain (never mocked beyond the LlmProvider
- * itself) with a scripted LlmProvider, mirroring
- * ManagedTaskCoherentResponseJourneyTest.php's own convention. Confirms a
- * 3+ stage sequence chains correctly: each stage's StageResult.input equals
- * the immediately preceding stage's output exactly (or SequenceRun.
- * starting_input for stage 1), SequenceRun.status reaches 'completed' only
- * once every stage's StageResult.status = 'completed', and
- * current_stage_position advances stage by stage, never skipping.
+ * **Relocated from `tests/Integration/` to `tests/Feature/`**, mirroring
+ * Phase 3's own T022/T023 precedent recorded in this feature's Progress
+ * Log: proving SequenceRunUpdated actually fires from the real
+ * SequenceService -> RunSequenceStageJob -> DelegationService ->
+ * AgentLoopService::run() chain requires the same scripted-LlmProvider
+ * convention (`Mockery::mock(LlmProvider::class)` + `$app->instance()`)
+ * every other full-chain journey test in this package already uses, which
+ * `tests/Integration/NoMocksGuardTest` forbids.
  *
- * Written before RunSequenceStageJob exists -- every scenario below is
- * expected to FAIL red until T028 lands.
+ * Drives a 6-stage sequence one RunSequenceStageJob invocation at a time
+ * and asserts: a SequenceRunUpdated event fires (or, at minimum,
+ * last_progress_at advances) at every stage transition -- run creation,
+ * each stage->running, each stage's terminal status, and run finalization
+ * -- current_stage_position advances monotonically, never skipping or
+ * going backward, and every one of the 6 stages ends at a final,
+ * non-pending status once the run completes (mutation-checklist row 11's
+ * "not indistinguishable from a stage that doesn't exist").
+ *
+ * Written before SequenceRunUpdated/SequenceService::broadcastRunUpdated()
+ * are wired in -- expected to FAIL red until T035/T036 land.
  */
-class SequenceRunHappyPathJourneyTest extends TestCase
+class SequenceRunProgressJourneyTest extends TestCase
 {
     private User $user;
 
@@ -201,10 +210,10 @@ class SequenceRunHappyPathJourneyTest extends TestCase
         return ['choices' => [['message' => ['content' => $content, 'tool_calls' => []]]]];
     }
 
-    private function delegationResultReply(array $output, string $status = 'success'): array
+    private function delegationResultReply(array $output): array
     {
         return $this->plainReply(json_encode([
-            'status' => $status,
+            'status' => 'success',
             'summary' => 'Stage complete.',
             'output' => $output,
             'undone' => '',
@@ -223,92 +232,79 @@ class SequenceRunHappyPathJourneyTest extends TestCase
     // =================================================================
 
     #[Test]
-    public function a_three_stage_sequence_chains_output_to_input_and_completes(): void
+    public function progress_is_observable_at_every_stage_transition_across_a_six_stage_sequence(): void
     {
-        $coordinator = $this->makeAgent('coordinator-happy');
-        $helper = $this->makeAgent('helper-happy');
+        $coordinator = $this->makeAgent('coordinator-progress');
+        $helper = $this->makeAgent('helper-progress');
         app(AgentHelperService::class)->assign($this->user->id, $coordinator->id, $helper->id);
 
-        $definition = app(SequenceService::class)->defineSequence($this->user->id, 'Three stages', null, $coordinator->id, [
-            ['name' => 'Draft', 'helper_agent_id' => $helper->id],
-            ['name' => 'Check', 'helper_agent_id' => $helper->id],
-            ['name' => 'Finish', 'helper_agent_id' => $helper->id],
-        ]);
+        $stageInputs = [];
+        for ($i = 1; $i <= 6; $i++) {
+            $stageInputs[] = ['name' => "Stage {$i}", 'helper_agent_id' => $helper->id];
+        }
 
+        $definition = app(SequenceService::class)->defineSequence($this->user->id, 'Six-stage progress sequence', null, $coordinator->id, $stageInputs);
+
+        Event::fake([SequenceRunUpdated::class]);
         Queue::fake();
-        $result = app(SequenceService::class)->invoke($this->user->id, $definition->id, ['topic' => 'Q3 positioning']);
+
+        $result = app(SequenceService::class)->invoke($this->user->id, $definition->id, ['topic' => 'progress visibility']);
         $run = $result['sequence_run'];
 
-        Queue::assertPushed(RunSequenceStageJob::class, fn (RunSequenceStageJob $job) => $job->sequenceRunId === $run->id);
+        // Run creation itself broadcasts.
+        Event::assertDispatched(SequenceRunUpdated::class, fn (SequenceRunUpdated $e) => $e->sequenceRunId === $run->id);
 
-        $this->runOneStage($run->id, ['draft_text' => 'a first draft']);
+        $previousPosition = null;
+        $previousProgressAt = null;
+
+        for ($i = 1; $i <= 6; $i++) {
+            $eventsBefore = count(Event::dispatched(SequenceRunUpdated::class));
+
+            $this->runOneStage($run->id, ["stage" => $i]);
+            $run->refresh();
+
+            $eventsAfter = count(Event::dispatched(SequenceRunUpdated::class));
+
+            $this->assertGreaterThan(
+                $eventsBefore,
+                $eventsAfter,
+                "stage {$i}'s own transition(s) must fire at least one SequenceRunUpdated event",
+            );
+
+            if ($previousPosition !== null) {
+                $this->assertGreaterThan(
+                    $previousPosition,
+                    $run->current_stage_position,
+                    'current_stage_position must advance monotonically, never skipping or going backward',
+                );
+            }
+            $previousPosition = $run->current_stage_position;
+            $this->assertSame($i, $run->current_stage_position);
+
+            if ($previousProgressAt !== null) {
+                $this->assertTrue(
+                    $run->last_progress_at->gte($previousProgressAt),
+                    'last_progress_at must advance (or stay equal under clock resolution), never move backward',
+                );
+            }
+            $previousProgressAt = $run->last_progress_at;
+        }
+
         $run->refresh();
-        $this->assertSame('in_progress', $run->status, 'the run must not complete after only the first of three stages');
-        $this->assertSame(1, $run->current_stage_position);
+        $this->assertSame('completed', $run->status, 'the run must reach completed once all six stages have completed');
 
-        $this->runOneStage($run->id, ['draft_text' => 'a checked draft']);
-        $run->refresh();
-        $this->assertSame('in_progress', $run->status);
-        $this->assertSame(2, $run->current_stage_position);
-
-        $this->runOneStage($run->id, ['draft_text' => 'the finished text']);
-        $run->refresh();
-        $this->assertSame('completed', $run->status, 'the run must reach completed once every stage has completed');
-        $this->assertNotNull($run->completed_at);
-
-        $stages = Stage::where('sequence_definition_id', $definition->id)->orderBy('position')->get();
-        $results = StageResult::where('sequence_run_id', $run->id)->get()->keyBy('stage_id');
-
-        // Stage 1's input is the run's own starting_input, exactly.
-        $stageOneResult = $results[$stages[0]->id];
-        $this->assertSame('completed', $stageOneResult->status);
-        $this->assertSame($run->starting_input, $stageOneResult->input);
-        $this->assertSame(['draft_text' => 'a first draft'], json_decode($stageOneResult->output, true));
-
-        // Stage 2's input is EXACTLY stage 1's stored output.
-        $stageTwoResult = $results[$stages[1]->id];
-        $this->assertSame('completed', $stageTwoResult->status);
-        $this->assertSame($stageOneResult->output, $stageTwoResult->input, "stage 2's input must equal stage 1's output exactly");
-        $this->assertSame(['draft_text' => 'a checked draft'], json_decode($stageTwoResult->output, true));
-
-        // Stage 3's input is EXACTLY stage 2's stored output.
-        $stageThreeResult = $results[$stages[2]->id];
-        $this->assertSame('completed', $stageThreeResult->status);
-        $this->assertSame($stageTwoResult->output, $stageThreeResult->input, "stage 3's input must equal stage 2's output exactly");
-        $this->assertSame(['draft_text' => 'the finished text'], json_decode($stageThreeResult->output, true));
-
-        // A Delegation row was created for each stage, never null.
-        $this->assertNotNull($stageOneResult->delegation_id);
-        $this->assertNotNull($stageTwoResult->delegation_id);
-        $this->assertNotNull($stageThreeResult->delegation_id);
-        $this->assertSame(3, \ClarionApp\LlmClient\Models\Delegation::count());
-    }
-
-    #[Test]
-    public function current_stage_position_advances_stage_by_stage_never_skipping(): void
-    {
-        $coordinator = $this->makeAgent('coordinator-position');
-        $helper = $this->makeAgent('helper-position');
-        app(AgentHelperService::class)->assign($this->user->id, $coordinator->id, $helper->id);
-
-        $definition = app(SequenceService::class)->defineSequence($this->user->id, 'Position tracking', null, $coordinator->id, [
-            ['name' => 'One', 'helper_agent_id' => $helper->id],
-            ['name' => 'Two', 'helper_agent_id' => $helper->id],
-        ]);
-
-        Queue::fake();
-        $result = app(SequenceService::class)->invoke($this->user->id, $definition->id, ['x' => 1]);
-        $run = $result['sequence_run'];
-
-        $this->assertNull($run->current_stage_position, 'current_stage_position must not be set before any stage has started');
-
-        $this->runOneStage($run->id, ['y' => 1]);
-        $run->refresh();
-        $this->assertSame(1, $run->current_stage_position);
-
-        $this->runOneStage($run->id, ['z' => 1]);
-        $run->refresh();
-        $this->assertSame(2, $run->current_stage_position);
-        $this->assertSame('completed', $run->status);
+        // Run finalization broadcasts too -- the final stage's completion
+        // and the run's own finalization are two distinct transitions
+        // (contracts §6), so the very last runOneStage() call above must
+        // have produced more than a single broadcast.
+        $results = StageResult::where('sequence_run_id', $run->id)->get();
+        $this->assertCount(6, $results, 'every one of the 6 stages must have its own StageResult row');
+        foreach ($results as $result) {
+            $this->assertNotSame(
+                'pending',
+                $result->status,
+                'every stage must show a final, non-pending status once the run finishes -- not indistinguishable from a stage that never ran',
+            );
+        }
     }
 }

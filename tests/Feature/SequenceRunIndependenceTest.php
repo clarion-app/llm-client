@@ -211,7 +211,7 @@ class SequenceRunIndependenceTest extends TestCase
         $service = $this->serviceWithScriptedProvider([$this->delegationResultReply($output)]);
         $this->app->instance(AgentLoopService::class, $service);
 
-        (new RunSequenceStageJob($runId))->handle(app(DelegationService::class), app(ContentSanitizer::class));
+        (new RunSequenceStageJob($runId))->handle(app(DelegationService::class), app(ContentSanitizer::class), app(SequenceService::class));
     }
 
     // =================================================================

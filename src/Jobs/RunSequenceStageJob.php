@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageResult;
 use ClarionApp\LlmClient\Services\ContentSanitizer;
 use ClarionApp\LlmClient\Services\DelegationService;
+use ClarionApp\LlmClient\Services\SequenceService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -47,7 +48,7 @@ class RunSequenceStageJob implements ShouldQueue
     {
     }
 
-    public function handle(DelegationService $delegationService, ContentSanitizer $contentSanitizer): void
+    public function handle(DelegationService $delegationService, ContentSanitizer $contentSanitizer, SequenceService $sequenceService): void
     {
         $run = SequenceRun::find($this->sequenceRunId);
         if ($run === null || in_array($run->status, self::TERMINAL_STATUSES, true)) {
@@ -78,6 +79,10 @@ class RunSequenceStageJob implements ShouldQueue
         $run->last_progress_at = now();
         $run->save();
 
+        // research.md D8 (Phase 4/US2): a stage transitioning to running
+        // is one of the five named broadcast points.
+        $sequenceService->broadcastRunUpdated($run->id);
+
         $conversation = Conversation::find($run->conversation_id);
 
         $taskDescription = "Execute stage \"{$stage->name}\" of an automated sequence pipeline, using the input provided below.";
@@ -99,12 +104,22 @@ class RunSequenceStageJob implements ShouldQueue
         $run->last_progress_at = now();
         $run->save();
 
+        // research.md D8 (Phase 4/US2): a stage reaching a terminal
+        // per-stage status is one of the five named broadcast points.
+        $sequenceService->broadcastRunUpdated($run->id);
+
         $totalStages = Stage::where('sequence_definition_id', $run->sequence_definition_id)->count();
 
         if ($stage->position >= $totalStages) {
             $run->status = 'completed';
             $run->completed_at = now();
             $run->save();
+
+            // research.md D8 (Phase 4/US2): run finalization is one of
+            // the five named broadcast points -- distinct from the
+            // per-stage terminal broadcast just above, even though both
+            // fire within this same job invocation for the last stage.
+            $sequenceService->broadcastRunUpdated($run->id);
 
             return;
         }

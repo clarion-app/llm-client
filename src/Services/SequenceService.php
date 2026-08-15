@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Events\SequenceRunUpdated;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Exceptions\SequenceDefinitionValidationException;
 use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
@@ -13,6 +14,7 @@ use ClarionApp\LlmClient\Models\StageResult;
 use ClarionApp\LlmClient\Models\StageSequenceDefinition;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * 105-stage-pipeline. The business-logic layer behind SequenceController --
@@ -22,8 +24,12 @@ use Illuminate\Support\Facades\DB;
  * (tasks.md "Ordering rationale"): FR-016's pre-check runs before ANY row
  * is created, but the boundary-mismatch (FR-006/FR-007) and stage-failure
  * (FR-008) branches are Phase 5/US3's own addition, layered onto
- * RunSequenceStageJob, not this class. Phase 4 (US2) adds the broadcast()
- * helper, Phase 6 (US4) adds resumeSafety().
+ * RunSequenceStageJob, not this class. Phase 4 (US2) adds the
+ * broadcastRunUpdated()/broadcast() helper (research.md D8, Grounding
+ * note item 8) -- a verbatim copy of RunTraceRecorder's/ManagerService's
+ * own three-line try/catch shape, so a broadcast failure can never turn
+ * an already-successful write's return value into null. Phase 6 (US4)
+ * adds resumeSafety().
  */
 class SequenceService
 {
@@ -204,7 +210,44 @@ class SequenceService
 
         RunSequenceStageJob::dispatch($run->id)->onQueue(config('llm-client.pipeline.queue', 'sequence-runs'));
 
+        // research.md D8 (Phase 4/US2): run creation is one of the five
+        // named broadcast points.
+        $this->broadcastRunUpdated($run->id);
+
         return ['sequence_run' => $run];
+    }
+
+    /**
+     * research.md D8/contracts §6 (Phase 4, US2). Fires SequenceRunUpdated
+     * for the given run id, wrapped in the private broadcast() try/catch
+     * helper below so a broadcast failure can never turn an already-
+     * successful write's return value into null. Public so
+     * RunSequenceStageJob (a different write point -- each stage
+     * transitioning to running, each stage reaching a terminal per-stage
+     * status, and run finalization) and SequenceController::resume()
+     * (Phase 6) can call it too, rather than duplicating the try/catch
+     * shape at every call site.
+     */
+    public function broadcastRunUpdated(string $sequenceRunId): void
+    {
+        $this->broadcast(fn () => event(new SequenceRunUpdated($sequenceRunId)));
+    }
+
+    /**
+     * Verbatim copy of RunTraceRecorder's/ManagerService's own three-line
+     * try/catch shape (research.md D8, Grounding note item 8) -- not a
+     * shared trait, per those two features' own established precedent of
+     * each declaring their own private copy.
+     */
+    private function broadcast(\Closure $emit): void
+    {
+        try {
+            $emit();
+        } catch (\Throwable $e) {
+            Log::warning('SequenceService: broadcast failed', [
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
