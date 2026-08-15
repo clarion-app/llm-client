@@ -43,9 +43,15 @@ use Illuminate\Support\Str;
  */
 class DelegationService
 {
-    /** research.md D4 layer 2: the shared bound a batch member that never
-     *  even reaches in_progress is held to -- see joinWait()'s own doc. */
-    private const JOIN_WAIT_GRACE_SECONDS = 5;
+    /** research.md D4 layer 2: the shared grace period added on top of a
+     *  batch member's own max_seconds bound before joinWait() gives up and
+     *  force-finalizes it -- see joinWait()'s own doc. Public: also reused
+     *  by RunDelegationBatchMemberJob::retryUntil() so a member's own
+     *  admission-retry window (via the job's deliberate release() calls)
+     *  is sized consistently with the SAME bound the parent's own
+     *  join-wait already applies to it, rather than two independently
+     *  maintained numbers that could drift apart. */
+    public const JOIN_WAIT_GRACE_SECONDS = 5;
 
     private ContentSanitizer $contentSanitizer;
 
@@ -792,21 +798,43 @@ class DelegationService
      * gets to run its own deadline check -- not for the case where it does
      * run but finds zero progress.
      *
-     * The bound is deliberately NOT a flat `now() + max_seconds + grace`
-     * measured from dispatch time -- under a real async worker (or a test
-     * double simulating one, e.g. a selectively-faked Bus job), a member
-     * that is admitted late but still within a legitimate wait for a
-     * ceiling slot to free (FR-006) must not be punished for the time it
-     * spent merely queued. Instead: a row still 'queued' is bounded by a
-     * SMALL, fixed grace period alone ("queue pickup latency the
-     * per-member $timeout itself does not need to account for, since that
-     * timer only starts once a worker actually begins the job"); once a
-     * row is observed 'in_progress' or terminal, ITS OWN deadline (if
-     * still running) becomes admission-time + the per-member max_seconds +
-     * the same grace period, tracked from the moment this loop first
-     * observes it. This grace-period bound applies identically whether one
-     * member of the batch has shown progress or none has -- the wait is
-     * never open-ended in either case.
+     * The bound is `max(member deadlines) + a small fixed grace period`,
+     * exactly research.md D4 layer 2's own wording -- applied UNIFORMLY to
+     * every non-terminal row regardless of whether it currently reads
+     * 'queued' or 'in_progress'. Each row's own deadline is first computed
+     * the moment this loop first observes that row (admission-time +
+     * max_seconds + the shared grace period), and is never recomputed
+     * afterwards even if the row later transitions from 'queued' to
+     * 'in_progress'.
+     *
+     * Reconciliation fix (roadmap.implement step 5, post-Phase-7): an
+     * earlier revision bounded a still-'queued' row to the flat grace
+     * period ALONE (no max_seconds), reasoning that "queue pickup latency"
+     * -- the grace period's own, narrow justification -- is all a merely-
+     * dispatched-but-not-yet-picked-up row is owed. That conflated two
+     * different reasons a row can still be 'queued': genuine pickup
+     * latency (seconds), and a member legitimately WAITING BEHIND A FULL
+     * CONCURRENCY CEILING for a slot to free (FR-006/US4's own explicit
+     * "wait and begin only as running slots free up" guarantee, and the
+     * Edge Cases section's "must still eventually run and account for
+     * every part -- nothing is silently dropped because it had to wait for
+     * a slot"). Since a running member's own legitimate work can take up
+     * to max_seconds (spec.md SC-001's own example: ~2 minutes), bounding
+     * a queued sibling to just the grace period (a handful of seconds)
+     * meant ANY batch whose size exceeded the concurrency ceiling would
+     * have its excess members routinely force-finalized as 'exhausted'/
+     * 'batch_join_timeout' long before the ceiling could possibly free up
+     * -- the opposite of US4 Acceptance Scenario 3's "every part is
+     * included exactly as if the ceiling had never constrained it". A row
+     * still 'queued' now gets the identical max_seconds + grace budget an
+     * 'in_progress' row already had, so a member waiting on a real,
+     * eventually-freed ceiling slot is given the same chance to actually
+     * be admitted and run as one that got a slot immediately. This
+     * uniform bound still applies whether one member of the batch has
+     * shown progress or none has -- the wait is never open-ended in
+     * either case, and a genuinely dead queue (nothing ever picks up any
+     * job) is still caught, just at the same bound a hung in_progress
+     * member always was.
      *
      * @param array<string, Delegation> $validRows
      */
@@ -821,8 +849,7 @@ class DelegationService
         $graceSeconds = self::JOIN_WAIT_GRACE_SECONDS;
         $pollIntervalMs = max(1, (int) config('llm-client.delegation.concurrency.join_poll_interval_ms', 200));
 
-        $admissionDeadline = now()->addSeconds($graceSeconds);
-        $runDeadlines = [];
+        $deadlines = [];
 
         while (true) {
             $rows = Delegation::whereIn('id', $ids)->get(['id', 'status']);
@@ -834,19 +861,14 @@ class DelegationService
                     continue;
                 }
 
-                if ($row->status === 'in_progress') {
-                    if (!isset($runDeadlines[$row->id])) {
-                        $runDeadlines[$row->id] = $now->copy()->addSeconds($maxSeconds + $graceSeconds);
-                    }
-                    if ($now->lt($runDeadlines[$row->id])) {
-                        $anyStillWaiting = true;
-                    }
-                    continue;
+                // Uniform deadline (queued or in_progress alike): the
+                // per-member max_seconds bound plus the shared grace
+                // period, anchored the first moment this loop observes
+                // the row -- never recomputed on a later status change.
+                if (!isset($deadlines[$row->id])) {
+                    $deadlines[$row->id] = $now->copy()->addSeconds($maxSeconds + $graceSeconds);
                 }
-
-                // Still 'queued' -- bounded by the shared admission grace
-                // period alone, per this method's own doc above.
-                if ($now->lt($admissionDeadline)) {
+                if ($now->lt($deadlines[$row->id])) {
                     $anyStillWaiting = true;
                 }
             }

@@ -190,6 +190,16 @@ class DelegationServiceBatchTest extends TestCase
     #[Test]
     public function delegatebatch_creates_n_rows_sharing_one_freshly_generated_batch_id_all_queued_and_dispatches_a_job_per_row(): void
     {
+        // Reconciliation fix (roadmap.implement step 5): joinWait() now
+        // gives a still-'queued' row the SAME max_seconds+grace deadline an
+        // 'in_progress' row already had (previously a flat 5s grace alone
+        // -- see joinwait_gives_a_still_queued_member_the_same_max_seconds_budget...
+        // below for why that was itself a bug). Every job here is faked
+        // and never runs, so every row stays 'queued' for the whole of
+        // joinWait()'s own wait; without this override that would now take
+        // the full default max_seconds(120)+grace(5) instead of ~5s.
+        config(['llm-client.delegation.max_seconds' => 1]);
+
         // Capture each row's status AT THE MOMENT its job is dispatched --
         // this happens synchronously inside delegateBatch()'s own dispatch
         // loop, strictly before joinWait() ever runs (delegateBatch()
@@ -261,6 +271,13 @@ class DelegationServiceBatchTest extends TestCase
     #[Test]
     public function delegatebatch_refuses_an_invalid_call_immediately_with_no_row_and_no_job_while_the_other_valid_calls_still_proceed_together(): void
     {
+        // See the max_seconds override note on
+        // delegatebatch_creates_n_rows_... above -- the 2 valid rows'
+        // jobs are faked here too and never run, so joinWait() would
+        // otherwise wait the full default max_seconds+grace before
+        // delegateBatch() returns.
+        config(['llm-client.delegation.max_seconds' => 1]);
+
         Bus::fake([RunDelegationBatchMemberJob::class]);
 
         $parent = $this->makeAgent('parent-agent-batch-mixed');
@@ -346,7 +363,7 @@ class DelegationServiceBatchTest extends TestCase
     // for the life of the test -- simulating a member that is still
     // genuinely running, well within its own deadline, at the exact
     // moment a sibling finishes. The elapsed-time lower bound below (3.0s,
-    // with max_seconds=1 and the private JOIN_WAIT_GRACE_SECONDS=5)
+    // with max_seconds=1 and DelegationService::JOIN_WAIT_GRACE_SECONDS=5)
     // sits strictly between "max_seconds alone" (~1s, what either
     // mutation would produce) and the correct "max_seconds + grace"
     // (~6s), so it fails under row 2's mutation (returns near-instantly,
@@ -427,6 +444,113 @@ class DelegationServiceBatchTest extends TestCase
 
         // A's already-terminal, already-correct result must be completely
         // undisturbed by B's own timeout.
+        $rowA->refresh();
+        $this->assertSame('completed', $rowA->status);
+        $this->assertSame('success', $rowA->result_status);
+    }
+
+    /**
+     * 101-parallel-subagent-execution reconciliation (roadmap.implement
+     * step 5, post-Phase-7): a batch member that is STILL 'queued' --
+     * because a real concurrency ceiling has not yet freed a slot for it,
+     * exactly FR-006/US4's own "wait and begin only as a running slot
+     * frees" guarantee -- must be given the SAME kind of deadline budget
+     * as an already-admitted member (its own max_seconds bound, plus the
+     * shared grace period), not a flat, tiny grace period alone.
+     *
+     * Before this fix, joinWait() bounded a still-'queued' row to
+     * JOIN_WAIT_GRACE_SECONDS (5s) ALONE, regardless of max_seconds --
+     * conflating "queue pickup latency" (research.md D4 layer 2's actual,
+     * narrow justification for the grace period) with "still legitimately
+     * waiting behind a full concurrency ceiling for a slot to free" (the
+     * scenario FR-006/US4 Edge Cases/SC-004 explicitly require to
+     * eventually succeed, not fail). Since realistic per-member work
+     * (spec.md SC-001's own example: ~2 minutes) vastly exceeds 5 seconds,
+     * ANY batch whose size exceeds the concurrency ceiling would have its
+     * excess members routinely force-finalized as 'exhausted'/
+     * 'batch_join_timeout' by the parent's own join-wait, long before the
+     * ceiling could possibly free up -- the opposite of "every part still
+     * eventually runs and contributes to the combined outcome" (US4 AC3).
+     *
+     * A large max_seconds(8) vs. the fixed grace(5) makes the two possible
+     * behaviors unambiguous: the (buggy) queued-only-gets-grace behavior
+     * force-finalizes row B at ~5s; the correct behavior -- treating a
+     * queued row exactly like an in_progress one, per research.md D4 layer
+     * 2's own "max(member deadlines) + a small fixed grace period" wording
+     * -- waits until ~max_seconds(8) + grace(5) = ~13s.
+     */
+    #[Test]
+    public function joinwait_gives_a_still_queued_member_the_same_max_seconds_budget_as_an_admitted_one_not_just_the_flat_grace_period(): void
+    {
+        config(['llm-client.delegation.max_seconds' => 8]);
+        config(['llm-client.delegation.concurrency.join_poll_interval_ms' => 50]);
+
+        $parentAgent = $this->makeAgent('joinwait-queued-parent');
+        $helperA = $this->makeAgent('joinwait-queued-helper-a');
+        $helperB = $this->makeAgent('joinwait-queued-helper-b');
+        $parentConversation = $this->makeConversation($parentAgent);
+        $helperConversationA = $this->makeConversation($helperA);
+        $helperConversationB = $this->makeConversation($helperB);
+
+        $batchId = (string) \Illuminate\Support\Str::uuid();
+
+        $rowA = Delegation::create([
+            'parent_conversation_id' => $parentConversation->id,
+            'parent_agent_id' => $parentAgent->id,
+            'helper_agent_id' => $helperA->id,
+            'helper_conversation_id' => $helperConversationA->id,
+            'helper_agent_version_id' => $helperA->current_version_id,
+            'owner_user_id' => $this->user->id,
+            'task' => 'Task A (already done -- freed its own slot).',
+            'depth' => 1,
+            'status' => 'completed',
+            'batch_id' => $batchId,
+            'started_at' => now(),
+            'completed_at' => now(),
+            'result_status' => 'success',
+            'result_reason' => null,
+            'result_summary' => 'Done already.',
+            'result_output' => json_encode([]),
+            'result_undone' => '',
+            'result_truncated' => false,
+        ]);
+
+        // Genuinely still 'queued' -- never touched again for the life of
+        // this test, standing in for a member still legitimately waiting
+        // behind a full concurrency ceiling for a slot (FR-006), NOT a
+        // broken/never-looked-at queue.
+        $rowB = Delegation::create([
+            'parent_conversation_id' => $parentConversation->id,
+            'parent_agent_id' => $parentAgent->id,
+            'helper_agent_id' => $helperB->id,
+            'helper_conversation_id' => $helperConversationB->id,
+            'helper_agent_version_id' => $helperB->current_version_id,
+            'owner_user_id' => $this->user->id,
+            'task' => 'Task B (still queued, waiting for a ceiling slot).',
+            'depth' => 1,
+            'status' => 'queued',
+            'batch_id' => $batchId,
+            'started_at' => now(),
+        ]);
+
+        $service = app(DelegationService::class);
+        $method = new \ReflectionMethod(DelegationService::class, 'joinWait');
+        $method->setAccessible(true);
+
+        $start = microtime(true);
+        $method->invoke($service, ['call_a' => $rowA, 'call_b' => $rowB]);
+        $elapsedSeconds = microtime(true) - $start;
+
+        $this->assertGreaterThanOrEqual(
+            10.0,
+            $elapsedSeconds,
+            'joinWait() must give a still-queued member B the SAME max_seconds(8)+grace(5) budget an admitted member gets, not the flat grace(5) period alone -- an elapsed time under 10.0s here means the queued-row deadline is still bounded to the grace period alone, which force-finalizes any real ceiling-wait member long before a realistic ceiling could ever free up (FR-006/US4 AC3/SC-004)',
+        );
+
+        $rowB->refresh();
+        $this->assertSame('exhausted', $rowB->status, 'B must still end up force-finalized once its own (correctly-sized) deadline genuinely passes');
+        $this->assertSame('batch_join_timeout', $rowB->result_reason);
+
         $rowA->refresh();
         $this->assertSame('completed', $rowA->status);
         $this->assertSame('success', $rowA->result_status);

@@ -312,6 +312,13 @@ class ParallelDelegationJourneyTest extends TestCase
     #[Test]
     public function scenario_1_all_members_of_a_batch_are_dispatched_together_not_serialized_one_completion_at_a_time(): void
     {
+        // Reconciliation fix (roadmap.implement step 5): joinWait() now
+        // gives a still-'queued' row the same max_seconds+grace deadline
+        // an 'in_progress' row already had. Every job here is faked and
+        // never runs, so without this override delegateBatch() would wait
+        // the full default max_seconds(120)+grace(5) before returning.
+        config(['llm-client.delegation.max_seconds' => 1]);
+
         Bus::fake([RunDelegationBatchMemberJob::class]);
 
         $fixture = $this->makeParentWithHelpers($this->user, 3, 'scenario1-dispatch');
