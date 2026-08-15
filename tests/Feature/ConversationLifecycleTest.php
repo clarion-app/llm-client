@@ -38,6 +38,16 @@ class ConversationLifecycleTest extends TestCase
         $this->defineConversationWorkSchema();
         $this->defineDegradationSchema();
 
+        // 102-router-pattern: every real-user-owned conversation with a
+        // still-null agent_id now crosses AgentLoopService::
+        // attemptInitialRouting() -> RouterService::route() ->
+        // AgentQuery::listActiveForUser() at the very start of run()/
+        // start()/resumeSync() (before is_processing/routing state is even
+        // touched) — so the 'agents' table must exist here too, even though
+        // this test never seeds any agent (an empty candidate pool is a
+        // clean 'none' decision, never a table-missing error).
+        $this->defineAgentSchema();
+
         Schema::create('users', function (Blueprint $table) {
             $table->uuid('id')->primary();
             $table->string('name');

@@ -269,6 +269,11 @@ class AgentLoopService
             if ($this->checkSharedAgentAccessRevoked($conversation) !== null) {
                 return;
             }
+
+            // Automatic routing (102-router-pattern, US1, research.md D2) —
+            // a no-op unless this is genuinely the conversation's first
+            // turn and no agent is already bound.
+            $this->attemptInitialRouting($conversation, Message::find($triggerMessageId)?->content ?? '');
         }
 
         // The user is engaging again, so this session is live: clear any end
@@ -702,6 +707,46 @@ class AgentLoopService
     }
 
     /**
+     * Automatic routing to the right specialist for a conversation's very
+     * first turn (102-router-pattern, US1, contracts/routing-mechanism.md
+     * §2, research.md D2). A no-op unless every precondition holds:
+     * $conversation->agent_id is still null, the conversation has a real
+     * owner, and exactly one 'role = user' message exists for it (i.e. this
+     * genuinely is the first turn, so this never re-evaluates on a later
+     * message).
+     *
+     * Phase 3 wires only RouterService::route()'s steps 1-4 (no
+     * default-handler fallback yet — Phase 6's own scope). A decision with
+     * an agent binds conversation.agent_id/agent_version_id/routing_reason
+     * in one call; a 'none' decision writes nothing, leaving the
+     * conversation exactly as unbound as before this method ran.
+     */
+    private function attemptInitialRouting(Conversation $conversation, string $triggerText): void
+    {
+        if ($conversation->agent_id !== null || $conversation->user_id === null) {
+            return;
+        }
+
+        $userMessageCount = Message::where('conversation_id', $conversation->id)
+            ->where('role', 'user')
+            ->count();
+
+        if ($userMessageCount !== 1) {
+            return;
+        }
+
+        $decision = app(RouterService::class)->route((string) $conversation->user_id, $triggerText);
+
+        if ($decision->hasAgent()) {
+            $conversation->update([
+                'agent_id' => $decision->agentId,
+                'agent_version_id' => $decision->agentVersionId,
+                'routing_reason' => $decision->reason,
+            ]);
+        }
+    }
+
+    /**
      * Synchronous agent loop execution for external channel integrations.
      * Returns the final response array or a confirmation-required structure.
      *
@@ -790,6 +835,11 @@ class AgentLoopService
                 RunRelation::Trigger,
             );
         }
+
+        // Automatic routing (102-router-pattern, US1, research.md D2) — a
+        // no-op unless this is genuinely the conversation's first turn and
+        // no agent is already bound.
+        $this->attemptInitialRouting($conversation, $message);
 
         $maxIterations = $options['max_iterations'] ?? config('llm-client.agent_loop.max_iterations', 20);
         $deadlineAt = $options['deadline_at'] ?? null;
@@ -1410,6 +1460,16 @@ class AgentLoopService
         if (($revokedStop = $this->checkSharedAgentAccessRevoked($conversation, $runId, $toolData['step_id'] ?? null)) !== null) {
             return $revokedStop;
         }
+
+        // Automatic routing (102-router-pattern, US1, research.md D2) —
+        // defensive, mirroring checkSharedAgentAccessRevoked()'s own
+        // defensive presence at this same site; a no-op unless this is
+        // genuinely the conversation's first turn and no agent is already
+        // bound.
+        $this->attemptInitialRouting(
+            $conversation,
+            Message::where('conversation_id', $conversation->id)->where('role', 'user')->first()?->content ?? '',
+        );
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
