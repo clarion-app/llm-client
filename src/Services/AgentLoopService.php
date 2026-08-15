@@ -3054,6 +3054,62 @@ class AgentLoopService
     }
 
     /**
+     * Builds a "Known Specialists" section for the system prompt
+     * (102-router-pattern, Phase 5/US3, contracts/routing-mechanism.md §7)
+     * -- mirrors buildKnownHelpersSection()'s exact shape. Returns null
+     * when the conversation has no bound agent, no user, or the caller
+     * owns no other active agent besides the one already assigned.
+     *
+     * Lets the currently-assigned specialist's own turn-time reasoning
+     * discover every other real candidate id/name so it can call the
+     * existing handoff_to_agent meta-tool (093, unchanged) when the user
+     * indicates a poor fit or the topic has shifted -- no new mechanism is
+     * introduced. Each candidate's instructions are read from its own
+     * current AgentVersion's raw_definition, parsed the same way
+     * ConversationAgentDefinitionResolver resolves a bound definition; a
+     * candidate whose current version is missing or fails to parse is
+     * skipped rather than aborting the whole section.
+     */
+    private function buildKnownSpecialistsSection(Conversation $conversation): ?string
+    {
+        if ($conversation->agent_id === null || $conversation->user_id === null) {
+            return null;
+        }
+
+        $others = app(AgentQuery::class)->listActiveForUser((string) $conversation->user_id)
+            ->reject(fn ($a) => $a->id === $conversation->agent_id);
+
+        if ($others->isEmpty()) {
+            return null;
+        }
+
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '## Known Specialists';
+        $lines[] = "If the user indicates the current specialist isn't the right fit, or the conversation's topic has shifted to something better covered below, call handoff_to_agent with the best-matching id.";
+        $lines[] = '';
+
+        foreach ($others as $agent) {
+            $version = $agent->currentVersion;
+
+            if ($version === null) {
+                continue;
+            }
+
+            try {
+                $instructions = app(AgentDefinitionParser::class)->parse($version->raw_definition)->instructions;
+            } catch (\Throwable) {
+                continue;
+            }
+
+            $lines[] = "**{$agent->id}** — {$agent->name}";
+            $lines[] = '  - Focus: '.mb_substr($instructions, 0, 200);
+        }
+
+        return implode(PHP_EOL, $lines);
+    }
+
+    /**
      * Builds a "Combined Helper Results" section for the system prompt
      * (099-result-aggregation, contracts/result-aggregation-meta-tool.md
      * §3, data-model.md §5) -- mirrors buildKnownHelpersSection()'s exact
@@ -3237,6 +3293,16 @@ class AgentLoopService
         $knownHelpersSection = $this->buildKnownHelpersSection($conversation);
         if ($knownHelpersSection !== null) {
             $systemPrompt .= $knownHelpersSection;
+        }
+
+        // Append "Known Specialists" section when the caller owns at
+        // least one other active agent besides the one already assigned
+        // (102-router-pattern, contracts §7) -- lets the acting agent's
+        // own turn-time reasoning discover a mid-conversation reassignment
+        // target for the existing handoff_to_agent meta-tool (093).
+        $knownSpecialistsSection = $this->buildKnownSpecialistsSection($conversation);
+        if ($knownSpecialistsSection !== null) {
+            $systemPrompt .= $knownSpecialistsSection;
         }
 
         // Append "Combined Helper Results" section when the current run
