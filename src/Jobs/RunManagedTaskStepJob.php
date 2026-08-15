@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ManagedTask;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\ManagerService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -34,9 +35,15 @@ use Illuminate\Queue\SerializesModels;
  * no-op-on-non-eligible-status shape.
  *
  * The round/wall-clock ceiling check BEFORE starting a step (research.md
- * D5/D7's forced finalize) and the crash-recovery sweep are both Phase
- * 6/US4's own addition -- this phase's handle() only re-dispatches or
- * stops on the model's own terminal call.
+ * D5/D7's forced finalize, tasks.md T050) runs first in handle() below:
+ * if ManagedTask.rounds_used has already reached round_ceiling, or the
+ * task's own wall-clock max_seconds bound (measured from started_at) has
+ * already been exceeded, ManagerService::finalizeWithShortfall() runs
+ * directly and AgentLoopService::run() is never called for that
+ * invocation -- the model is never given a chance to keep requesting
+ * rounds past the bound (contracts/manager-agent-meta-tools.md §6). The
+ * crash-recovery sweep itself (ResolveStalledManagedTasksCommand) is a
+ * separate class, T051.
  */
 class RunManagedTaskStepJob implements ShouldQueue
 {
@@ -57,6 +64,23 @@ class RunManagedTaskStepJob implements ShouldQueue
 
         $conversation = Conversation::find($task->conversation_id);
         if ($conversation === null) {
+            return;
+        }
+
+        // research.md D5/D7, tasks.md T050: checked BEFORE calling
+        // AgentLoopService::run() at all -- a task that has already
+        // reached either bound is force-finalized directly, never given
+        // another turn.
+        $roundCeilingReached = $task->rounds_used >= $task->round_ceiling;
+        $wallClockCeilingReached = $task->started_at->diffInSeconds(now(), false) >= $task->max_seconds;
+
+        if ($roundCeilingReached || $wallClockCeilingReached) {
+            $reason = $roundCeilingReached
+                ? "The task's round ceiling was reached before this part could be completed."
+                : "The task's time limit was reached before this part could be completed.";
+
+            app(ManagerService::class)->finalizeWithShortfall($task, $reason);
+
             return;
         }
 

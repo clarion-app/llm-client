@@ -513,6 +513,89 @@ class ManagerService
     }
 
     /**
+     * research.md D5/D7, contracts/manager-agent-meta-tools.md §6, tasks.md
+     * T049. The SYSTEM-forced finalize path -- no model call, no
+     * ResultAggregationService call (there is no free text from the model
+     * to conflict-check; the response is composed directly from
+     * already-accepted summaries). Called by RunManagedTaskStepJob::
+     * handle() (T050) when a step is about to start but the round or
+     * wall-clock ceiling has already been reached, and by
+     * ResolveStalledManagedTasksCommand (T051) when its own sweep finds a
+     * stale task already past its wall-clock bound.
+     *
+     * Every part not already 'accepted' is closed 'reported_as_shortfall'
+     * with $reason (a plain, generic account of WHY the system stepped
+     * in -- ceiling or wall-clock) stamped as that part's own
+     * shortfall_reason; final_response is assembled from every
+     * already-accepted part's accepted_summary (US4 AC2 -- "the best
+     * available answer using every accepted part"), or a plain fallback
+     * sentence if no part was ever accepted; ManagedTask.shortfall_note
+     * additionally names each still-unaccepted part specifically (by its
+     * own sequence/description), so a caller reading only the task-level
+     * fields -- never the per-part breakdown -- still learns exactly what
+     * fell short. status = 'completed_with_shortfalls'; completed_at set.
+     * Never touches rounds_used -- a forced finalize is not itself a
+     * round.
+     */
+    public function finalizeWithShortfall(ManagedTask $task, string $reason): void
+    {
+        $parts = ManagedTaskPart::where('managed_task_id', $task->id)->get();
+
+        $acceptedSummaries = [];
+        $shortfallParts = [];
+
+        foreach ($parts as $part) {
+            if ($part->state === 'accepted') {
+                if (!empty($part->accepted_summary)) {
+                    $acceptedSummaries[] = $part->accepted_summary;
+                }
+
+                continue;
+            }
+
+            $part->state = 'reported_as_shortfall';
+            $part->shortfall_reason = $reason;
+            $part->save();
+
+            $shortfallParts[] = $part;
+        }
+
+        $task->status = 'completed_with_shortfalls';
+        $task->final_response = empty($acceptedSummaries)
+            ? 'No part of this task could be completed within the allowed rounds or time.'
+            : implode(' ', $acceptedSummaries);
+        $task->shortfall_note = $this->composeSystemShortfallNote($shortfallParts, $reason);
+        $task->completed_at = now();
+        $task->last_progress_at = now();
+        $task->save();
+
+        $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
+    }
+
+    /**
+     * Task-level shortfall_note for finalizeWithShortfall() -- names each
+     * still-unaccepted part specifically (its own sequence and
+     * description), never just a generic "some parts were incomplete"
+     * (US4 AC2/quickstart scenario 4's own "shortfall_note names the
+     * still-unaccepted part(s) specifically").
+     *
+     * @param ManagedTaskPart[] $shortfallParts
+     */
+    private function composeSystemShortfallNote(array $shortfallParts, string $reason): string
+    {
+        if (empty($shortfallParts)) {
+            return $reason;
+        }
+
+        $descriptions = array_map(
+            fn (ManagedTaskPart $part) => sprintf('part %d ("%s")', $part->sequence, $part->description),
+            $shortfallParts,
+        );
+
+        return sprintf('%s The following part(s) could not be completed: %s.', $reason, implode(', ', $descriptions));
+    }
+
+    /**
      * RunTraceRecorder::broadcast()'s exact three-line shape (Grounding
      * note item 9) -- a private copy on ManagerService itself (not a
      * shared trait), so a broadcast failure can never turn an

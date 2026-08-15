@@ -124,6 +124,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledDelegationBatchesCommand::class,
+                \ClarionApp\LlmClient\Commands\ResolveStalledManagedTasksCommand::class,
                 \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentCreateCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentKindsCommand::class,
@@ -188,6 +189,16 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // cover: the parent's own process dying before that check
             // ever runs.
             $schedule->command('llm-client:resolve-stalled-delegation-batches')
+                ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Restart-survival sweep for managed tasks (103-manager-agent,
+            // US4, research.md D7): resumes a task whose worker died
+            // mid-task by re-dispatching a fresh RunManagedTaskStepJob, or
+            // force-finalizes it with a shortfall once its own wall-clock
+            // bound has already passed -- so a stalled task is never
+            // resumed forever.
+            $schedule->command('llm-client:resolve-stalled-managed-tasks')
                 ->everyFiveMinutes()
                 ->withoutOverlapping();
 
