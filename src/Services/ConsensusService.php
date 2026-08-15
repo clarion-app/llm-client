@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\ConsensusRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\ModelPrice;
 use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
@@ -62,10 +63,7 @@ class ConsensusService
         $ownerUserId = (string) $conversation->user_id;
         $agentId = $conversation->agent_id;
 
-        $eligible = $agentId !== null
-            ? AgentHelperAssignment::where('parent_agent_id', $agentId)->whereNull('deleted_at')->get()
-            : collect();
-
+        $eligible = $this->eligibleContributors($agentId);
         $eligibleCount = $eligible->count();
         $minRequired = (int) config('llm-client.consensus.min_contributor_count', 2);
 
@@ -87,6 +85,59 @@ class ConsensusService
         }
 
         return $this->dispatchBatch($conversation, $question, $eligible, $ownerUserId);
+    }
+
+    /**
+     * Dry-run cost preview (contracts/consensus-api.md §4, tasks.md T032):
+     * the identical eligible-count branch logic dispatch() uses (same
+     * exceptions, same load-bearing "exactly one" ordering), but never
+     * persists a ConsensusRequest row and never calls DelegationService at
+     * all -- a pure computation over the resolved conversation's currently
+     * active helper assignments.
+     *
+     * @return array{dispatched_count: int, estimated_additional_cost: ?string}
+     * @throws ConsensusNoEligibleContributorsException mirrors dispatch()'s
+     *   own 0 / (>=2 but below min_contributor_count) refusal exactly -- no
+     *   row ever existed to leave behind either way, since this method
+     *   never creates one.
+     */
+    public function estimateCost(Conversation $conversation, string $question): array
+    {
+        $ownerUserId = (string) $conversation->user_id;
+        $agentId = $conversation->agent_id;
+
+        $eligible = $this->eligibleContributors($agentId);
+        $eligibleCount = $eligible->count();
+        $minRequired = (int) config('llm-client.consensus.min_contributor_count', 2);
+
+        if ($eligibleCount === 0) {
+            throw new ConsensusNoEligibleContributorsException(0, $minRequired);
+        }
+
+        if ($eligibleCount === 1) {
+            // Mirrors single_contributor_fallback's own null override
+            // (contracts §5, consensus-api.md §4): no multi-opinion cost
+            // would ever be incurred for a single contributor.
+            return ['dispatched_count' => 1, 'estimated_additional_cost' => null];
+        }
+
+        if ($eligibleCount < $minRequired) {
+            throw new ConsensusNoEligibleContributorsException($eligibleCount, $minRequired);
+        }
+
+        $defaultCount = (int) config('llm-client.consensus.default_contributor_count', 3);
+        $selected = $eligible->take($defaultCount)->values();
+        $selectedCount = $selected->count();
+
+        $resolutions = [];
+        foreach ($selected as $assignment) {
+            $resolutions[] = $this->resolveContributorModel($ownerUserId);
+        }
+
+        return [
+            'dispatched_count' => $selectedCount,
+            'estimated_additional_cost' => $this->estimateAdditionalCost($conversation, $question, $resolutions, $selectedCount),
+        ];
     }
 
     /**
@@ -284,6 +335,18 @@ class ConsensusService
     // -----------------------------------------------------------------
 
     /**
+     * The active AgentHelperAssignment rows for a coordinator agent --
+     * shared by dispatch() and estimateCost() so both branch identically on
+     * eligible count (T032).
+     */
+    private function eligibleContributors(?string $agentId): \Illuminate\Support\Collection
+    {
+        return $agentId !== null
+            ? AgentHelperAssignment::where('parent_agent_id', $agentId)->whereNull('deleted_at')->get()
+            : collect();
+    }
+
+    /**
      * The resolved (provider_type, model) pair a given contributor would run
      * under -- currently always RoleResolver's own Inference-role
      * resolution for the owning user (there is no per-agent model override
@@ -357,13 +420,19 @@ class ConsensusService
     }
 
     /**
-     * research.md D6, contracts §5 (T021 -- basic non-zero wiring only;
-     * Phase 4/T029 completes the full formula, including the priced
-     * question-text addition and the exact (dispatched_count - 1)
-     * multiplier's averaging discipline across differently-priced models).
-     * An unpriced/unresolvable contributor contributes 0 rather than
-     * aborting the whole computation (graceful degradation, mirrors
-     * UnpricedModelPolicy's own posture).
+     * research.md D6, contracts §5 (T029 -- full formula): per contributor,
+     * CostEstimator::estimate() prices only the conversation's already-
+     * persisted message history -- the pending $question text has not been
+     * saved as a Message yet, so it would under-count input by exactly that
+     * text. The question's own input-token cost is therefore priced
+     * separately, using the SAME resolved price's fresh_input_rate
+     * CostEstimator itself uses internally, and added on top. The average
+     * of that per-contributor total across every selected contributor,
+     * times (selectedCount - 1), is the additional cost beyond one
+     * contributor. A selected contributor with an unpriced/unresolvable
+     * model contributes 0 to the average rather than aborting the whole
+     * computation (graceful degradation, mirrors UnpricedModelPolicy's own
+     * posture elsewhere in this package).
      *
      * @param  RoleResolution[]  $resolutions
      */
@@ -377,11 +446,7 @@ class ConsensusService
             return null;
         }
 
-        // Wired in per T021 (basic, non-zero estimate) -- the pending
-        // question text is not yet persisted on the conversation, so
-        // CostEstimator::estimate() alone would under-count by exactly this
-        // much; the full priced treatment of this figure is Phase 4's job.
-        $this->usageEstimator->estimateInput($question);
+        $questionTokens = $this->usageEstimator->estimateInput($question);
 
         $amounts = [];
         foreach ($resolutions as $resolution) {
@@ -390,13 +455,22 @@ class ConsensusService
                 continue;
             }
 
-            $estimated = $this->costEstimator->estimate(
-                $conversation->id,
-                $resolution->server->provider_type->value,
-                $resolution->model,
-            );
+            $providerType = $resolution->server->provider_type->value;
+            $model = $resolution->model;
 
-            $amounts[] = ($estimated->unpriced || $estimated->amount === null) ? '0' : $estimated->amount;
+            $estimated = $this->costEstimator->estimate($conversation->id, $providerType, $model);
+
+            if ($estimated->unpriced || $estimated->amount === null) {
+                $amounts[] = '0';
+                continue;
+            }
+
+            $price = ModelPrice::currentFor($providerType, $model, now());
+            $questionCost = $price !== null
+                ? Decimal::round(bcdiv(bcmul((string) $questionTokens, (string) $price->fresh_input_rate, 20), '1000000', 20), 10)
+                : '0';
+
+            $amounts[] = bcadd($estimated->amount, $questionCost, 10);
         }
 
         $sum = array_reduce($amounts, fn (string $carry, string $amount) => bcadd($carry, $amount, 10), '0');

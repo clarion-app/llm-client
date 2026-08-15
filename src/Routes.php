@@ -342,6 +342,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // managed-tasks' 202.
     Route::post('consensus-requests', [ConsensusController::class, "store"]);
     Route::get('consensus-requests/{id}', [ConsensusController::class, "show"]);
+    Route::post('consensus-requests/cost-estimate', [ConsensusController::class, "estimateCost"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

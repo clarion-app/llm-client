@@ -41,25 +41,11 @@ class ConsensusController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
-        $validated = $request->validate([
-            'question' => 'nullable|string',
-            // Deliberately no `exists:conversations,id` here (a divergence
-            // from AgentController::__invoke()'s own validation rule,
-            // Grounding note item 4): that rule would make Laravel's own
-            // automatic 422 validation-failure response fire for a
-            // genuinely nonexistent id before this method's own 404 logic
-            // below is ever reached -- contracts/consensus-api.md §1
-            // requires 404 for that case, so the existence check is left to
-            // resolveConversation()'s own explicit lookup instead.
-            'conversation_id' => 'nullable|string',
-            'channel' => ['nullable', 'string', 'max:50', 'regex:/^[a-z0-9_-]+$/'],
-        ]);
+        $validated = $this->validateQuestionRequest($request);
 
-        if (trim((string) ($validated['question'] ?? '')) === '') {
-            return response()->json([
-                'error' => 'empty_question',
-                'message' => 'question must be a non-empty string.',
-            ], 422);
+        $emptyQuestionResponse = $this->emptyQuestionResponseIfNeeded($validated);
+        if ($emptyQuestionResponse !== null) {
+            return $emptyQuestionResponse;
         }
 
         $conversationOrResponse = $this->resolveConversation($validated);
@@ -70,10 +56,7 @@ class ConsensusController extends Controller
         try {
             $consensusRequest = $this->consensusService->dispatch($conversationOrResponse, $validated['question']);
         } catch (ConsensusNoEligibleContributorsException $e) {
-            return response()->json([
-                'error' => 'no_eligible_contributors',
-                'message' => $e->getMessage(),
-            ], 422);
+            return $this->noEligibleContributorsResponse($e);
         }
 
         return $this->responseForRequest($consensusRequest);
@@ -92,6 +75,81 @@ class ConsensusController extends Controller
         }
 
         return $this->responseForRequest($consensusRequest);
+    }
+
+    /**
+     * POST /consensus-requests/cost-estimate -- preview the additional cost
+     * before submitting (contracts §4, US2). Same body shape, conversation-
+     * resolution, and 404/422 error shapes as store() (T032), but creates
+     * NO ConsensusRequest row -- ConsensusService::estimateCost() is a pure
+     * computation over the resolved conversation's currently active helper
+     * assignments, reusing dispatch()'s own estimated_additional_cost
+     * formula without ever persisting anything.
+     */
+    public function estimateCost(Request $request): JsonResponse
+    {
+        $validated = $this->validateQuestionRequest($request);
+
+        $emptyQuestionResponse = $this->emptyQuestionResponseIfNeeded($validated);
+        if ($emptyQuestionResponse !== null) {
+            return $emptyQuestionResponse;
+        }
+
+        $conversationOrResponse = $this->resolveConversation($validated);
+        if ($conversationOrResponse instanceof JsonResponse) {
+            return $conversationOrResponse;
+        }
+
+        try {
+            $result = $this->consensusService->estimateCost($conversationOrResponse, $validated['question']);
+        } catch (ConsensusNoEligibleContributorsException $e) {
+            return $this->noEligibleContributorsResponse($e);
+        }
+
+        return response()->json([
+            'dispatched_count' => $result['dispatched_count'],
+            'estimated_additional_cost' => $result['estimated_additional_cost'],
+        ], 200);
+    }
+
+    /**
+     * Shared request validation for store()/estimateCost() -- identical
+     * body shape (contracts §1/§4). Deliberately no `exists:conversations,id`
+     * on conversation_id (a divergence from AgentController::__invoke()'s
+     * own validation rule, Grounding note item 4): that rule would make
+     * Laravel's own automatic 422 validation-failure response fire for a
+     * genuinely nonexistent id before this class's own 404 logic below is
+     * ever reached -- contracts/consensus-api.md §1 requires 404 for that
+     * case, so the existence check is left to resolveConversation()'s own
+     * explicit lookup instead.
+     */
+    private function validateQuestionRequest(Request $request): array
+    {
+        return $request->validate([
+            'question' => 'nullable|string',
+            'conversation_id' => 'nullable|string',
+            'channel' => ['nullable', 'string', 'max:50', 'regex:/^[a-z0-9_-]+$/'],
+        ]);
+    }
+
+    private function emptyQuestionResponseIfNeeded(array $validated): ?JsonResponse
+    {
+        if (trim((string) ($validated['question'] ?? '')) !== '') {
+            return null;
+        }
+
+        return response()->json([
+            'error' => 'empty_question',
+            'message' => 'question must be a non-empty string.',
+        ], 422);
+    }
+
+    private function noEligibleContributorsResponse(ConsensusNoEligibleContributorsException $e): JsonResponse
+    {
+        return response()->json([
+            'error' => 'no_eligible_contributors',
+            'message' => $e->getMessage(),
+        ], 422);
     }
 
     /**
