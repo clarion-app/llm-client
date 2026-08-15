@@ -2643,9 +2643,33 @@ class AgentLoopService
                 ],
             ];
 
+            // 103-manager-agent (US5, contracts/manager-agent-meta-tools.md
+            // §4): verbatim schema, gated identically to plan_parts/
+            // assign_part/accept_part above.
+            $tools[] = [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'report_shortfall',
+                    'description' => 'Report that a part cannot be completed — after reassignment to another suitable helper was tried and also fell short, or was not possible, and adapting the part\'s scope was not workable either. This closes the part; its shortfall will be named honestly in the final response rather than presented as done.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'part_id' => [
+                                'type' => 'string',
+                            ],
+                            'reason' => [
+                                'type' => 'string',
+                                'description' => 'A specific, honest account of why this part could not be completed — named in the final response verbatim or near-verbatim.',
+                            ],
+                        ],
+                        'required' => ['part_id', 'reason'],
+                    ],
+                ],
+            ];
+
             // 103-manager-agent (US3, contracts/manager-agent-meta-tools.md
             // §5): verbatim schema, gated identically to plan_parts/
-            // assign_part/accept_part above.
+            // assign_part/accept_part/report_shortfall above.
             $tools[] = [
                 'type' => 'function',
                 'function' => [
@@ -2832,6 +2856,7 @@ class AgentLoopService
             'plan_parts' => $this->handlePlanParts($arguments, $conversation),
             'assign_part' => $this->handleAssignPart($arguments, $conversation),
             'accept_part' => $this->handleAcceptPart($arguments, $conversation),
+            'report_shortfall' => $this->handleReportShortfall($arguments, $conversation),
             'finalize_task' => $this->handleFinalizeTask($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
@@ -3948,6 +3973,47 @@ class AgentLoopService
         app(ManagerService::class)->acceptPart($managedTask, $part);
 
         return json_encode(['part_id' => $part->id, 'state' => 'accepted']);
+    }
+
+    /**
+     * 103-manager-agent (US5, contracts/manager-agent-meta-tools.md §4).
+     * Pulls the required args exactly as handlePlanParts()/
+     * handleAssignPart()/handleAcceptPart() do, then surfaces
+     * ManagerService::reportShortfallRefusal()'s own structured refusal
+     * reason directly (the same "already finalized" guard
+     * admitAssignmentRound() and acceptPartRefusal() both consult) before
+     * ever calling the void reportShortfall() write.
+     */
+    private function handleReportShortfall(array $arguments, Conversation $conversation): string
+    {
+        $managedTask = ManagedTask::where('conversation_id', $conversation->id)->first();
+        if ($managedTask === null) {
+            return json_encode(['error' => 'not_a_managed_task', 'message' => 'report_shortfall is only usable inside a managed task.']);
+        }
+
+        $partId = $arguments['part_id'] ?? null;
+        if (empty($partId)) {
+            return json_encode(['error' => 'part_id is required']);
+        }
+
+        $reason = $arguments['reason'] ?? null;
+        if (empty($reason)) {
+            return json_encode(['error' => 'reason is required']);
+        }
+
+        $part = ManagedTaskPart::where('managed_task_id', $managedTask->id)->where('id', $partId)->first();
+        if ($part === null) {
+            return json_encode(['error' => 'unknown_part', 'message' => 'The named part could not be found for this managed task.']);
+        }
+
+        $refusal = app(ManagerService::class)->reportShortfallRefusal($part);
+        if ($refusal !== null) {
+            return json_encode($refusal);
+        }
+
+        app(ManagerService::class)->reportShortfall($managedTask, $part, $reason);
+
+        return json_encode(['part_id' => $part->id, 'state' => 'reported_as_shortfall']);
     }
 
     /**

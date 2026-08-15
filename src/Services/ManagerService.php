@@ -450,6 +450,65 @@ class ManagerService
     }
 
     /**
+     * research.md D3, contracts/manager-agent-meta-tools.md §4, tasks.md
+     * T054. The ONE decision point for whether report_shortfall may
+     * proceed -- exposed publicly (mirrors acceptPartRefusal()'s own "one
+     * shared guard" shape) so AgentLoopService::handleReportShortfall()
+     * can surface the SAME structured refusal reason contracts §4
+     * specifies before ever calling the void reportShortfall() write.
+     *
+     * `part_already_finalized`: the part's own state is already
+     * 'accepted' or 'reported_as_shortfall' -- the SAME "already
+     * finalized" condition admitAssignmentRound() refuses assign_part
+     * for (a part is closed once, by either accept_part or
+     * report_shortfall, never both -- contracts §4's own "same guard as
+     * §3's first row" -- so this method and admitAssignmentRound() must
+     * agree on what "already finalized" means).
+     *
+     * @return array{error: string, message: string}|null Null means the
+     *   part may be reported as a shortfall.
+     */
+    public function reportShortfallRefusal(ManagedTaskPart $part): ?array
+    {
+        if (in_array($part->state, ['accepted', 'reported_as_shortfall'], true)) {
+            return ['error' => 'part_already_finalized', 'message' => 'This part has already been finalized and cannot be reported as a shortfall.'];
+        }
+
+        return null;
+    }
+
+    /**
+     * research.md D3, contracts/manager-agent-meta-tools.md §4, tasks.md
+     * T056. On success (reportShortfallRefusal() returns null): state =
+     * 'reported_as_shortfall', shortfall_reason = $reason. Terminal -- a
+     * later assignPart() on this part_id is refused by
+     * admitAssignmentRound()'s own "already finalized" check, exactly as
+     * an accepted part's would be.
+     *
+     * Reassignment (a further assign_part call naming a different
+     * helper_agent_id) and adaptation (the same helper_agent_id with a
+     * narrowed task) are both already-supported assign_part calls --
+     * research.md D2's "no new dispatch mechanism" -- so this method's
+     * only job is closing a part honestly once neither of those is
+     * workable.
+     */
+    public function reportShortfall(ManagedTask $task, ManagedTaskPart $part, string $reason): void
+    {
+        if ($this->reportShortfallRefusal($part) !== null) {
+            return;
+        }
+
+        $part->state = 'reported_as_shortfall';
+        $part->shortfall_reason = $reason;
+        $part->save();
+
+        $task->last_progress_at = now();
+        $task->save();
+
+        $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
+    }
+
+    /**
      * research.md D6, contracts/manager-agent-meta-tools.md §5, tasks.md
      * T040. On success (finalizeRefusal() returns null):
      * ResultAggregationService::combineForManagedTask()'s conflict check
