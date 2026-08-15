@@ -1069,6 +1069,14 @@ class AgentLoopService
                 $toolResults = [];
                 $pendingConfirmation = null;
 
+                // 101-parallel-subagent-execution (US1, Grounding note item
+                // 6 -- Site 2): a 2+ delegate_to_helper burst in this
+                // iteration is dispatched together, ahead of the loop below
+                // ever reaching any of them. null (0 or 1 such calls) means
+                // the existing inline per-call path is completely
+                // unaffected.
+                $batchDelegationResults = $this->resolveDelegateToHelperBatchResults($toolCalls, $conversation);
+
                 foreach ($toolCalls as $tcIndex => $toolCall) {
                     $toolName = $toolCall['function']['name'] ?? '';
                     $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
@@ -1139,7 +1147,17 @@ class AgentLoopService
                         );
                     }
 
-                    $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                    // 101-parallel-subagent-execution (US1, contracts §1):
+                    // a delegate_to_helper call that was part of a 2+ burst
+                    // this iteration already has its result from the one
+                    // delegateBatch() call above -- never re-executed
+                    // inline through executeMetaTool()/delegate() a second
+                    // time.
+                    if ($toolName === 'delegate_to_helper' && $batchDelegationResults !== null && array_key_exists($toolCallId, $batchDelegationResults)) {
+                        $result = json_encode($batchDelegationResults[$toolCallId]);
+                    } else {
+                        $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                    }
                     $decoded = json_decode($result, true);
 
                     if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
@@ -1670,6 +1688,13 @@ class AgentLoopService
 
             // Handle tool calls in the continuation
             $toolResults = [];
+
+            // 101-parallel-subagent-execution (US1, Grounding note item 6
+            // -- Site 6): the identical batch-detection check run()'s own
+            // loop makes above, ahead of resumeSync()'s own,
+            // structurally-equivalent loop.
+            $batchDelegationResults = $this->resolveDelegateToHelperBatchResults($toolCalls, $conversation);
+
             foreach ($toolCalls as $tcIndex => $toolCall) {
                 $toolName = $toolCall['function']['name'] ?? '';
                 $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
@@ -1732,7 +1757,13 @@ class AgentLoopService
                     );
                 }
 
-                $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                // 101-parallel-subagent-execution (US1, contracts §1): see
+                // the identical check in run()'s own tool-call loop above.
+                if ($toolName === 'delegate_to_helper' && $batchDelegationResults !== null && array_key_exists($toolCall['id'] ?? '', $batchDelegationResults)) {
+                    $result = json_encode($batchDelegationResults[$toolCall['id'] ?? '']);
+                } else {
+                    $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                }
                 $decoded = json_decode($result, true);
 
                 if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
@@ -3402,6 +3433,48 @@ class AgentLoopService
         $result = app(DelegationService::class)->delegate($conversation, $helperAgentId, $task, $context);
 
         return json_encode($result);
+    }
+
+    /**
+     * 101-parallel-subagent-execution (US1, contracts §1, Grounding note
+     * item 6): scans one iteration's own tool_calls for delegate_to_helper
+     * entries ahead of either of run()'s/resumeSync()'s per-tool-call
+     * loops actually reaching any of them. Zero or one such entries take
+     * the existing inline path completely unchanged -- this returns null
+     * and DelegationService::delegateBatch() is never called (US1 AC3,
+     * "zero added latency"). Two or more are dispatched together via one
+     * delegateBatch() call with the full ordered set; the returned
+     * per-call results (keyed by tool_call_id, contracts §1) are threaded
+     * back into each delegate_to_helper call's own original loop position
+     * by the caller -- every other tool call in the same iteration still
+     * executes through the unmodified loop body, unaffected.
+     *
+     * @param array<int, array<string, mixed>> $toolCalls
+     * @return array<string, array<string, mixed>>|null
+     */
+    private function resolveDelegateToHelperBatchResults(array $toolCalls, Conversation $conversation): ?array
+    {
+        $delegateCalls = array_values(array_filter(
+            $toolCalls,
+            fn (array $toolCall) => ($toolCall['function']['name'] ?? '') === 'delegate_to_helper',
+        ));
+
+        if (count($delegateCalls) < 2) {
+            return null;
+        }
+
+        $calls = array_map(function (array $toolCall) {
+            $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+
+            return [
+                'tool_call_id' => $toolCall['id'] ?? '',
+                'helper_agent_id' => $arguments['helper_agent_id'] ?? null,
+                'task' => $arguments['task'] ?? null,
+                'context' => $arguments['context'] ?? null,
+            ];
+        }, $delegateCalls);
+
+        return app(DelegationService::class)->delegateBatch($conversation, $calls);
     }
 
     /**

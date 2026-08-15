@@ -3,6 +3,8 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
+use ClarionApp\LlmClient\Jobs\RunDelegationBatchMemberJob;
+use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
@@ -27,9 +29,24 @@ use Illuminate\Support\Str;
  * and a structured failure result instead of letting it propagate to the
  * parent's own loop, while the finally block unconditionally restores the
  * ambient run id (D6) regardless of which of try/catch ran.
+ *
+ * 101-parallel-subagent-execution split this method's original body into
+ * four private extractions -- resolveAndValidate() (refusal checks +
+ * depth), createDelegationRow() (the ephemeral helper Conversation, the
+ * Delegation row, and the ActionType::Delegation action open), and
+ * runDelegatedTask() (composing the seed message, the nested run() call,
+ * and every outcome-to-result mapping) -- plus one new public entry point,
+ * runBatchMember(), so delegateBatch()/RunDelegationBatchMemberJob can
+ * reuse the identical row-creation and per-member execution paths a solo
+ * delegate() call already used, without a second, independently-maintained
+ * copy of either recipe (contracts §1, research.md D1/D2).
  */
 class DelegationService
 {
+    /** research.md D4 layer 2: the shared bound a batch member that never
+     *  even reaches in_progress is held to -- see joinWait()'s own doc. */
+    private const JOIN_WAIT_GRACE_SECONDS = 5;
+
     private ContentSanitizer $contentSanitizer;
 
     public function __construct(
@@ -48,6 +65,236 @@ class DelegationService
      *   delegation-protocol-meta-tool.md).
      */
     public function delegate(Conversation $parentConversation, string $helperAgentId, string $task, ?string $context): array
+    {
+        $resolved = $this->resolveAndValidate($parentConversation, $helperAgentId);
+        if (isset($resolved['error'])) {
+            return $resolved;
+        }
+
+        $delegation = $this->createDelegationRow(
+            $parentConversation,
+            $resolved['helperAgent'],
+            $resolved['depth'],
+            $task,
+            $context,
+            'in_progress',
+            null,
+        );
+
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+
+        return $this->runDelegatedTask($delegation, $resolved['helperAgent'], $helperConversation);
+    }
+
+    /**
+     * 101-parallel-subagent-execution (US1, contracts §1, research.md
+     * D1/D3, tasks.md T019). $calls is the ordered list of one turn
+     * iteration's delegate_to_helper tool calls, each
+     * `{tool_call_id, helper_agent_id, task, context}`.
+     *
+     * Every call is validated up front via resolveAndValidate() -- a
+     * refusal is recorded immediately, keyed by that call's own
+     * tool_call_id, with no Delegation row and no job ever dispatched for
+     * it. Every valid call gets its row created via the shared
+     * createDelegationRow(), status 'queued', sharing one batch_id
+     * generated once per invocation. Only once every valid row exists are
+     * the jobs dispatched, so the per-batch ceiling is always evaluated
+     * against the batch's true final size.
+     *
+     * @param array<int, array{tool_call_id: string, helper_agent_id: string, task: string, context: ?string}> $calls
+     * @return array<string, array<string, mixed>> keyed by, and in, the
+     *   original $calls order (contracts §1's ordering guarantee) --
+     *   regardless of which member actually finished first.
+     */
+    public function delegateBatch(Conversation $parentConversation, array $calls): array
+    {
+        $results = [];
+        $validRows = [];
+        $batchId = null;
+
+        foreach ($calls as $call) {
+            $toolCallId = $call['tool_call_id'];
+
+            $resolved = $this->resolveAndValidate($parentConversation, $call['helper_agent_id']);
+            if (isset($resolved['error'])) {
+                $results[$toolCallId] = $resolved;
+                continue;
+            }
+
+            if ($batchId === null) {
+                $batchId = (string) Str::uuid();
+            }
+
+            $validRows[$toolCallId] = $this->createDelegationRow(
+                $parentConversation,
+                $resolved['helperAgent'],
+                $resolved['depth'],
+                $call['task'],
+                $call['context'] ?? null,
+                'queued',
+                $batchId,
+            );
+        }
+
+        if (!empty($validRows)) {
+            $queue = config('llm-client.delegation.concurrency.queue', 'delegation-batches');
+
+            // Every valid row already exists BEFORE any job is dispatched
+            // -- the per-batch/installation ceiling counts DelegationConcurrencyGate
+            // evaluates are always against the batch's true final size.
+            foreach ($validRows as $delegation) {
+                RunDelegationBatchMemberJob::dispatch($delegation->id)->onQueue($queue);
+            }
+
+            $this->joinWait($validRows);
+
+            foreach ($validRows as $toolCallId => $delegation) {
+                $results[$toolCallId] = $this->sixFieldResultFromRow(Delegation::find($delegation->id));
+            }
+        }
+
+        // Reassemble in the ORIGINAL $calls order regardless of the order
+        // refusals/completions landed in $results above.
+        $ordered = [];
+        foreach ($calls as $call) {
+            $ordered[$call['tool_call_id']] = $results[$call['tool_call_id']];
+        }
+
+        return $ordered;
+    }
+
+    /**
+     * 101-parallel-subagent-execution (T018d): the public entry point
+     * RunDelegationBatchMemberJob::handle() calls once DelegationConcurrencyGate
+     * has admitted this member. The row and its helper Agent/Conversation
+     * already exist by this point -- created up front by delegateBatch()
+     * via the shared createDelegationRow() -- so this loads them back and
+     * runs the exact same per-member execution path (runDelegatedTask())
+     * a solo delegate() call already uses, guaranteeing identical
+     * partial-failure handling and identical effort/spend accounting
+     * (research.md D4/D5) between the batch and solo paths.
+     */
+    public function runBatchMember(Delegation $delegation): void
+    {
+        $helperAgent = $this->agentQuery->findAgent($delegation->owner_user_id, $delegation->helper_agent_id)
+            ?? Agent::withTrashed()->find($delegation->helper_agent_id);
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+
+        $this->runDelegatedTask($delegation, $helperAgent, $helperConversation);
+    }
+
+    /**
+     * 101-parallel-subagent-execution (T017/contracts §5): the job's own
+     * failed() hook -- fired when the queue worker kills the job for
+     * exceeding its own $timeout, or when an exception escapes handle()
+     * before runDelegatedTask()'s own try/catch ever gets a chance to
+     * write a terminal row. No-op against a row that is already terminal
+     * by some other path (runDelegatedTask() itself already finished, or
+     * the parent's own join-wait deadline / the stale-batch sweep already
+     * force-finalized it).
+     */
+    public function recordBatchMemberTimeoutOrFailure(string $delegationId, \Throwable $e): void
+    {
+        $delegation = Delegation::find($delegationId);
+        if ($delegation === null || in_array($delegation->status, ['completed', 'exhausted', 'failed'], true)) {
+            return;
+        }
+
+        $reason = str_contains(strtolower($e->getMessage()), 'timeout') || str_contains(strtolower(get_class($e)), 'timeout')
+            ? 'timeout'
+            : 'exception';
+
+        $resultSummary = $reason === 'timeout'
+            ? 'The delegation was terminated for exceeding its own time limit.'
+            : 'The delegation failed due to an unexpected error.';
+        $resultUndone = 'Everything -- the task could not be completed.';
+
+        $delegation->status = 'failed';
+        $delegation->completed_at = now();
+        $delegation->outcome_summary = Str::limit($e->getMessage(), 500);
+        $delegation->result_status = 'failure';
+        $delegation->result_reason = $reason;
+        $delegation->result_summary = $resultSummary;
+        $delegation->result_output = null;
+        $delegation->result_undone = $resultUndone;
+        $delegation->result_truncated = false;
+        $delegation->save();
+
+        if ($delegation->parent_action_id !== null) {
+            $sixFieldResult = [
+                'status' => 'failure',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => $reason,
+            ];
+
+            $this->runTraceRecorder->closeAction(
+                $delegation->parent_action_id,
+                ActionOutcome::Failure,
+                Str::limit($e->getMessage(), 500),
+                json_encode($sixFieldResult),
+            );
+        }
+    }
+
+    /**
+     * 101-parallel-subagent-execution (research.md D4 layer 2, contracts
+     * §1): force-finalizes a batch member that never reached a terminal
+     * status within delegateBatch()'s own join-wait bound, or that
+     * llm-client:resolve-stalled-delegation-batches finds still stale.
+     * Idempotent against a row that is already terminal by the time either
+     * caller reaches it (the parent's own join-wait deadline check and the
+     * sweep can both race to finalize the same row).
+     */
+    public function forceFinalizeBatchJoinTimeout(Delegation $delegation): void
+    {
+        if (in_array($delegation->status, ['completed', 'exhausted', 'failed'], true)) {
+            return;
+        }
+
+        $resultSummary = 'The batch join-wait deadline passed before this member reached a terminal status.';
+        $resultUndone = 'Everything -- the task could not be completed.';
+
+        $delegation->status = 'exhausted';
+        $delegation->completed_at = now();
+        $delegation->outcome_summary = $resultSummary;
+        $delegation->result_status = 'failure';
+        $delegation->result_reason = 'batch_join_timeout';
+        $delegation->result_summary = $resultSummary;
+        $delegation->result_output = null;
+        $delegation->result_undone = $resultUndone;
+        $delegation->result_truncated = false;
+        $delegation->save();
+
+        if ($delegation->parent_action_id !== null) {
+            $sixFieldResult = [
+                'status' => 'failure',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => 'batch_join_timeout',
+            ];
+
+            $this->runTraceRecorder->closeAction(
+                $delegation->parent_action_id,
+                ActionOutcome::Unfinished,
+                null,
+                json_encode($sixFieldResult),
+            );
+        }
+    }
+
+    /**
+     * 101-parallel-subagent-execution (T018a): the refusal checks +
+     * depth computation shared by delegate() and delegateBatch() -- the
+     * original delegate()'s own L52-99, unchanged in behavior.
+     *
+     * @return array{error: string, message: string}|array{helperAgent: Agent, depth: int}
+     */
+    private function resolveAndValidate(Conversation $parentConversation, string $helperAgentId): array
     {
         if ($parentConversation->agent_id === null) {
             return [
@@ -98,6 +345,31 @@ class DelegationService
             ];
         }
 
+        return ['helperAgent' => $helperAgent, 'depth' => $depth];
+    }
+
+    /**
+     * 101-parallel-subagent-execution (T018b): the ephemeral helper
+     * Conversation creation, the Delegation row creation, and the
+     * ActionType::Delegation action open -- the original delegate()'s own
+     * L101-145, now the ONE shared write path for row+action creation so
+     * delegate()/delegateBatch() cannot silently drift apart.
+     * Parameterized on $status/$batchId: delegate() calls this with
+     * status: 'in_progress'/batchId: null (its own existing behavior,
+     * unchanged); delegateBatch() calls it with status: 'queued'/batchId:
+     * the batch's own freshly-generated id.
+     */
+    private function createDelegationRow(
+        Conversation $parentConversation,
+        Agent $helperAgent,
+        int $depth,
+        string $task,
+        ?string $context,
+        string $status,
+        ?string $batchId,
+    ): Delegation {
+        $ownerUserId = (string) $parentConversation->user_id;
+
         // D1: a brand-new, isolated ephemeral conversation for this one
         // delegation -- the exact server/model resolution recipe
         // ConversationController::store() already uses for any other
@@ -120,7 +392,7 @@ class DelegationService
 
         $delegation = Delegation::create([
             'parent_conversation_id' => $parentConversation->id,
-            'parent_agent_id' => $currentAgentId,
+            'parent_agent_id' => $parentConversation->agent_id,
             'helper_agent_id' => $helperAgent->id,
             'helper_conversation_id' => $helperConversation->id,
             'helper_agent_version_id' => $helperAgent->current_version_id,
@@ -128,7 +400,8 @@ class DelegationService
             'task' => $task,
             'context' => $context,
             'depth' => $depth,
-            'status' => 'in_progress',
+            'status' => $status,
+            'batch_id' => $batchId,
             'parent_run_id' => $parentRunId,
             'started_at' => now(),
         ]);
@@ -144,7 +417,24 @@ class DelegationService
             $delegation->save();
         }
 
-        $composedMessage = $this->composeSeedMessage($task, $context);
+        return $delegation;
+    }
+
+    /**
+     * 101-parallel-subagent-execution (T018c): composing the seed
+     * message, the try/catch/finally around the nested run() call, and
+     * every outcome-to-Delegation-column/six-field-result mapping -- the
+     * original delegate()'s own L147-467, unchanged in behavior, now
+     * called by delegate() for the solo path exactly as before and by
+     * runBatchMember() for a concurrent batch member.
+     *
+     * @return array<string, mixed>
+     */
+    private function runDelegatedTask(Delegation $delegation, Agent $helperAgent, Conversation $helperConversation): array
+    {
+        $actionId = $delegation->parent_action_id;
+
+        $composedMessage = $this->composeSeedMessage($delegation->task, $delegation->context);
 
         // D6: the parent's own ambient run id must survive the nested
         // run() call below -- openRun()/closeRun() (inside the helper's
@@ -465,6 +755,131 @@ class DelegationService
             ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
             $sixFieldResult,
         );
+    }
+
+    /**
+     * 101-parallel-subagent-execution (research.md D1/D3/D4 layer 2,
+     * contracts §1): bounded-polls $validRows (keyed by tool_call_id) until
+     * every row reaches a terminal status, then force-finalizes whatever
+     * is still not -- PROVIDED the batch has shown at least one genuine
+     * sign of being live (research.md D4 layer 2's "queue pickup latency"
+     * framing presumes a functioning queue somewhere behind this batch).
+     *
+     * The bound is deliberately NOT a flat `now() + max_seconds + grace`
+     * measured from dispatch time -- under a real async worker (or a test
+     * double simulating one, e.g. a selectively-faked Bus job), a member
+     * that is admitted late but still within a legitimate wait for a
+     * ceiling slot to free (FR-006) must not be punished for the time it
+     * spent merely queued. Instead: a row still 'queued' is bounded by a
+     * SMALL, fixed grace period alone ("queue pickup latency the
+     * per-member $timeout itself does not need to account for, since that
+     * timer only starts once a worker actually begins the job"); once a
+     * row is observed 'in_progress' or terminal, ITS OWN deadline (if
+     * still running) becomes admission-time + the per-member max_seconds +
+     * the same grace period, tracked from the moment this loop first
+     * observes it.
+     *
+     * If EVERY member of the batch is still 'queued' when the grace
+     * deadline passes -- none ever admitted, none ever completed -- this
+     * call has no way to distinguish "the queue is genuinely down" from
+     * "nothing has looked at this batch yet at all", so it leaves every
+     * row exactly as it is rather than guessing; the scheduled
+     * llm-client:resolve-stalled-delegation-batches sweep (research.md D4
+     * layer 3) is the backstop for that case. The instant any ONE member
+     * shows real progress (admitted, or terminal), the remaining
+     * stragglers are held to their own bounds as described above.
+     *
+     * @param array<string, Delegation> $validRows
+     */
+    private function joinWait(array $validRows): void
+    {
+        $ids = array_values(array_map(fn (Delegation $d) => $d->id, $validRows));
+        if (empty($ids)) {
+            return;
+        }
+
+        $maxSeconds = (int) config('llm-client.delegation.max_seconds', 120);
+        $graceSeconds = self::JOIN_WAIT_GRACE_SECONDS;
+        $pollIntervalMs = max(1, (int) config('llm-client.delegation.concurrency.join_poll_interval_ms', 200));
+
+        $admissionDeadline = now()->addSeconds($graceSeconds);
+        $runDeadlines = [];
+        $anyProgressEverObserved = false;
+
+        while (true) {
+            $rows = Delegation::whereIn('id', $ids)->get(['id', 'status']);
+            $now = now();
+            $anyStillWaiting = false;
+
+            foreach ($rows as $row) {
+                if (in_array($row->status, ['completed', 'exhausted', 'failed'], true)) {
+                    $anyProgressEverObserved = true;
+                    continue;
+                }
+
+                if ($row->status === 'in_progress') {
+                    $anyProgressEverObserved = true;
+                    if (!isset($runDeadlines[$row->id])) {
+                        $runDeadlines[$row->id] = $now->copy()->addSeconds($maxSeconds + $graceSeconds);
+                    }
+                    if ($now->lt($runDeadlines[$row->id])) {
+                        $anyStillWaiting = true;
+                    }
+                    continue;
+                }
+
+                // Still 'queued' -- bounded by the shared admission grace
+                // period alone, per this method's own doc above.
+                if ($now->lt($admissionDeadline)) {
+                    $anyStillWaiting = true;
+                }
+            }
+
+            if (!$anyStillWaiting) {
+                break;
+            }
+
+            usleep($pollIntervalMs * 1000);
+        }
+
+        if (!$anyProgressEverObserved) {
+            return;
+        }
+
+        $stillPending = Delegation::whereIn('id', $ids)
+            ->whereIn('status', ['queued', 'in_progress'])
+            ->get();
+
+        foreach ($stillPending as $delegation) {
+            $this->forceFinalizeBatchJoinTimeout($delegation);
+        }
+    }
+
+    /**
+     * 101-parallel-subagent-execution: converts a terminal Delegation row's
+     * own result_* columns back into the six-field delegate_to_helper
+     * tool-result shape (contracts §1) plus delegation_id/helper -- the
+     * same shape runDelegatedTask() returns in-process, reconstructed here
+     * from the persisted row because a batch member's own execution
+     * happens inside a separate job dispatch, decoupled from
+     * delegateBatch()'s own return.
+     */
+    private function sixFieldResultFromRow(Delegation $delegation): array
+    {
+        $decodedOutput = $delegation->result_output !== null ? json_decode($delegation->result_output, true) : null;
+
+        $helperName = Agent::withTrashed()->find($delegation->helper_agent_id)?->name ?? $delegation->helper_agent_id;
+
+        return [
+            'delegation_id' => $delegation->id,
+            'helper' => $helperName,
+            'status' => $delegation->result_status,
+            'summary' => $delegation->result_summary,
+            'output' => $decodedOutput,
+            'undone' => $delegation->result_undone,
+            'truncated' => (bool) $delegation->result_truncated,
+            'reason' => $delegation->result_reason,
+        ];
     }
 
     /**

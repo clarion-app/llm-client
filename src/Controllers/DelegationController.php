@@ -172,6 +172,7 @@ class DelegationController extends Controller
                 'helper_conversation_id' => $d->helper_conversation_id,
                 'depth' => $d->depth,
                 'status' => $d->status,
+                'batch_id' => $d->batch_id,
                 'task' => $d->task,
                 'context' => $d->context,
                 'parent_run_id' => $d->parent_run_id,

@@ -78,6 +78,37 @@ class DelegationQuery
     }
 
     /**
+     * 101-parallel-subagent-execution (FR-012, contracts §3, data-model.md
+     * §3): every agent_delegations row sharing one batch_id -- a Concurrent
+     * Batch has no row of its own, so "membership" is always this query,
+     * never cached or duplicated elsewhere. Owner-scoped via the batch's
+     * own rows' owner_user_id, mirroring delegationsForRun()'s exact
+     * "null collapses both absent and not-the-caller's" contract.
+     *
+     * @return Delegation[]|null Null when the batch id is unknown or not
+     *                           owned by the caller. Empty array for an
+     *                           owned batch with zero members (defensive --
+     *                           data-model.md §1 treats this as an anomaly
+     *                           that should not occur in practice).
+     */
+    public function membersForBatch(string $callerUserId, string $batchId): ?array
+    {
+        $owned = Delegation::where('batch_id', $batchId)
+            ->where('owner_user_id', $callerUserId)
+            ->exists();
+
+        if (!$owned) {
+            return null;
+        }
+
+        return Delegation::where('batch_id', $batchId)
+            ->where('owner_user_id', $callerUserId)
+            ->orderBy('started_at')
+            ->get()
+            ->all();
+    }
+
+    /**
      * Rolled-up delegated cost for a run (research.md D9): every delegation
      * made directly from this run, plus transitively every further
      * delegation made from each of those helper runs in turn (a helper that

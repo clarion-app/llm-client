@@ -123,6 +123,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\ForwardRunTracesCommand::class,
                 \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
+                \ClarionApp\LlmClient\Commands\ResolveStalledDelegationBatchesCommand::class,
                 \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentCreateCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentKindsCommand::class,
@@ -177,6 +178,16 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // resumption mechanism, so an operator does not have to
             // notice and manually resume every interrupted run.
             $schedule->command('llm-client:resolve-stalled-eval-runs')
+                ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Force-finalize stalled concurrent delegation batch members
+            // every five minutes (101-parallel-subagent-execution, US3,
+            // research.md D4 layer 3) — the crash-recovery backstop for
+            // the case delegateBatch()'s own join-wait deadline cannot
+            // cover: the parent's own process dying before that check
+            // ever runs.
+            $schedule->command('llm-client:resolve-stalled-delegation-batches')
                 ->everyFiveMinutes()
                 ->withoutOverlapping();
 

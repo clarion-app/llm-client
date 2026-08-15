@@ -624,13 +624,17 @@ class DelegationQueryControllerTest extends TestCase
      * The exact key order delegationRows() is expected to produce once
      * Phase 3's T020 lands: the six new result_* keys inserted after
      * outcome_summary, before started_at (Grounding note item 7),
-     * every existing key otherwise unchanged.
+     * every existing key otherwise unchanged. 101-parallel-subagent-execution
+     * (T019, contracts §2) additively inserts one further key, `batch_id`,
+     * immediately after `status` -- the single place delegationRows()
+     * assembles the wire shape for both forRun()/show(), so both endpoints
+     * gain it identically.
      */
     private function expectedDelegationRowKeyOrder(): array
     {
         return [
             'id', 'parent_conversation_id', 'helper_agent_id', 'helper_agent_name',
-            'helper_conversation_id', 'depth', 'status', 'task', 'context',
+            'helper_conversation_id', 'depth', 'status', 'batch_id', 'task', 'context',
             'parent_run_id', 'parent_action_id', 'helper_run_id', 'outcome_summary',
             'result_status', 'result_reason', 'result_summary', 'result_output',
             'result_undone', 'result_truncated',
