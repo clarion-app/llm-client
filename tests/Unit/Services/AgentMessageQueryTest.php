@@ -7,9 +7,13 @@ use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentMessage;
 use ClarionApp\LlmClient\Services\AgentMessageQuery;
 use ClarionApp\LlmClient\Services\AgentMessageService;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageContentPart;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageEnvelope;
+use ClarionApp\LlmClient\ValueObjects\RunKind;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
@@ -67,7 +71,16 @@ class AgentMessageQueryTest extends TestCase
 
     protected function tearDown(): void
     {
+        Context::forget('run_id');
+
         DB::table('agent_messages')->delete();
+
+        foreach (['agent_run_messages', 'agent_run_steps', 'agent_runs'] as $table) {
+            if (Schema::hasTable($table)) {
+                DB::table($table)->delete();
+            }
+        }
+
         DB::table('agents')->delete();
         DB::table('users')->delete();
 
@@ -82,6 +95,11 @@ class AgentMessageQueryTest extends TestCase
     private function query(): AgentMessageQuery
     {
         return app(AgentMessageQuery::class);
+    }
+
+    private function recorder(): RunTraceRecorder
+    {
+        return app(RunTraceRecorder::class);
     }
 
     #[Test]
@@ -247,6 +265,105 @@ class AgentMessageQueryTest extends TestCase
     public function messages_for_owner_returns_empty_array_never_null_when_there_are_none(): void
     {
         $messages = $this->query()->messagesForOwner($this->user->id);
+
+        $this->assertIsArray($messages);
+        $this->assertSame([], $messages);
+    }
+
+    // ==================== messagesForRun() (Phase 4, US2, T019) ====================
+
+    #[Test]
+    public function messages_for_run_returns_correct_rows_for_the_owning_caller_scoped_to_a_run(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+        Context::forget('run_id');
+
+        $runId = $this->recorder()->openRun(RunKind::Interactive, $this->user->id);
+        $this->assertNotNull($runId);
+
+        $envelope1 = new MessageEnvelope(
+            fromAgentId: $this->agentA->id,
+            toAgentId: $this->agentB->id,
+            content: [new MessageContentPart('hop one')],
+            context: [],
+            expectedResponse: 'ack',
+            ownerUserId: $this->user->id,
+            conversationId: null,
+        );
+
+        $envelope2 = new MessageEnvelope(
+            fromAgentId: $this->agentB->id,
+            toAgentId: $this->agentA->id,
+            content: [new MessageContentPart('hop two')],
+            context: [],
+            expectedResponse: 'ack',
+            ownerUserId: $this->user->id,
+            conversationId: null,
+        );
+
+        $outcome1 = $this->service()->send($envelope1);
+        $outcome2 = $this->service()->send($envelope2);
+
+        Context::forget('run_id');
+
+        // A message sent with no run open must not show up under the run.
+        $unrelatedOutcome = $this->service()->send(new MessageEnvelope(
+            fromAgentId: $this->agentA->id,
+            toAgentId: $this->agentB->id,
+            content: [new MessageContentPart('no run open')],
+            context: [],
+            expectedResponse: 'ack',
+            ownerUserId: $this->user->id,
+            conversationId: null,
+        ));
+
+        $messages = $this->query()->messagesForRun($this->user->id, $runId);
+
+        $this->assertCount(2, $messages);
+        $ids = array_map(fn ($message) => $message->id, $messages);
+        $this->assertContains($outcome1->agentMessageId, $ids);
+        $this->assertContains($outcome2->agentMessageId, $ids);
+        $this->assertNotContains($unrelatedOutcome->agentMessageId, $ids);
+    }
+
+    #[Test]
+    public function messages_for_run_returns_empty_array_never_null_for_a_run_with_no_messages(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+        Context::forget('run_id');
+
+        $runId = $this->recorder()->openRun(RunKind::Interactive, $this->user->id);
+        $this->assertNotNull($runId);
+        Context::forget('run_id');
+
+        $messages = $this->query()->messagesForRun($this->user->id, $runId);
+
+        $this->assertIsArray($messages);
+        $this->assertSame([], $messages);
+    }
+
+    #[Test]
+    public function messages_for_run_returns_empty_array_for_another_users_run_id(): void
+    {
+        $this->app['config']->set('llm-client.run_trace.enabled', true);
+        Context::forget('run_id');
+
+        $runId = $this->recorder()->openRun(RunKind::Interactive, $this->user->id);
+        $this->assertNotNull($runId);
+
+        $envelope = new MessageEnvelope(
+            fromAgentId: $this->agentA->id,
+            toAgentId: $this->agentB->id,
+            content: [new MessageContentPart('owned by user')],
+            context: [],
+            expectedResponse: 'ack',
+            ownerUserId: $this->user->id,
+            conversationId: null,
+        );
+
+        $this->service()->send($envelope);
+
+        $messages = $this->query()->messagesForRun($this->otherUser->id, $runId);
 
         $this->assertIsArray($messages);
         $this->assertSame([], $messages);

@@ -35,4 +35,24 @@ class AgentMessageQuery
             ->get()
             ->all();
     }
+
+    /**
+     * Every message attributed to a run the caller owns, oldest first —
+     * mirrors RunTraceQuery::messagesForRun()'s own name and ownership-check
+     * shape (069, data-model.md §3): scoped directly by owner_user_id (every
+     * message this feature persists is already owned by exactly one user
+     * regardless of which side of it they're on), so there is no separate
+     * "does this run belong to the caller" lookup to short-circuit.
+     *
+     * @return AgentMessage[] Empty array, never null, when the run produced
+     *                        no messages or is not owned by the caller.
+     */
+    public function messagesForRun(string $callerUserId, string $runId): array
+    {
+        return AgentMessage::where('run_id', $runId)
+            ->where('owner_user_id', $callerUserId)
+            ->orderBy('created_at')
+            ->get()
+            ->all();
+    }
 }
