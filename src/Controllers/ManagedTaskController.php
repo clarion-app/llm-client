@@ -122,6 +122,26 @@ class ManagedTaskController extends Controller
     }
 
     /**
+     * GET /managed-tasks/{id}/cost -- tree-wide cost attribution (contracts
+     * §4, US7, SC-010/SC-011). ManagedTaskQuery::costForTask() itself
+     * ownership-checks via findManagedTask() first, so a task not owned
+     * by the caller and an unknown task id both collapse to the same
+     * uniform 404 as show()'s/parts()'s own. Available while the task is
+     * still in progress -- the same query either way.
+     */
+    public function cost(Request $request, string $id): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $cost = $this->managedTaskQuery->costForTask($callerUserId, $id);
+        if ($cost === null) {
+            return $this->notFoundResponse('Managed task not found', 'managed_task_not_found');
+        }
+
+        return response()->json($cost);
+    }
+
+    /**
      * The uniform "not found" body shape (matches DelegationController's
      * own precedent) -- every controller in this package declares its own
      * private copy, there is no shared base-class helper (Grounding note

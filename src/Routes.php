@@ -330,6 +330,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('managed-tasks', [ManagedTaskController::class, "store"]);
     Route::get('managed-tasks/{id}', [ManagedTaskController::class, "show"]);
     Route::get('managed-tasks/{id}/parts', [ManagedTaskController::class, "parts"]);
+    Route::get('managed-tasks/{id}/cost', [ManagedTaskController::class, "cost"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

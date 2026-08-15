@@ -83,6 +83,15 @@ class DelegationService
             return $resolved;
         }
 
+        // 103-manager-agent (T067, Grounding note item 2, research.md
+        // D2/D10): an explicitly-passed managedTaskId (assign_part's own
+        // direct call) always wins; otherwise inherit whatever
+        // resolveAndValidate() found via the SAME enclosing-delegation
+        // lookup depth already uses -- propagated unconditionally, for
+        // every delegation everywhere, not only ones built from a
+        // channel='managed-task' conversation directly.
+        $effectiveManagedTaskId = $managedTaskId ?? $resolved['inheritedManagedTaskId'];
+
         $delegation = $this->createDelegationRow(
             $parentConversation,
             $resolved['helperAgent'],
@@ -91,7 +100,7 @@ class DelegationService
             $context,
             'in_progress',
             null,
-            $managedTaskId,
+            $effectiveManagedTaskId,
             $partId,
         );
 
@@ -145,6 +154,13 @@ class DelegationService
                 $batchId = (string) Str::uuid();
             }
 
+            // 103-manager-agent (T067): identical inheritance fallback as
+            // delegate()'s own solo path -- an explicit managed_task_id on
+            // the call entry (assign_part) always wins; otherwise inherit
+            // via the same enclosing-delegation lookup resolveAndValidate()
+            // already computed for this call above.
+            $effectiveManagedTaskId = ($call['managed_task_id'] ?? null) ?? $resolved['inheritedManagedTaskId'];
+
             $validRows[$toolCallId] = $this->createDelegationRow(
                 $parentConversation,
                 $resolved['helperAgent'],
@@ -153,7 +169,7 @@ class DelegationService
                 $call['context'] ?? null,
                 'queued',
                 $batchId,
-                $call['managed_task_id'] ?? null,
+                $effectiveManagedTaskId,
                 $call['part_id'] ?? null,
             );
         }
@@ -314,7 +330,13 @@ class DelegationService
      * depth computation shared by delegate() and delegateBatch() -- the
      * original delegate()'s own L52-99, unchanged in behavior.
      *
-     * @return array{error: string, message: string}|array{helperAgent: Agent, depth: int}
+     * 103-manager-agent (T067, Grounding note item 2): also resolves
+     * inheritedManagedTaskId -- the SAME enclosing-delegation lookup used
+     * for depth, immediately below -- so managed_task_id propagates
+     * exactly the way depth already does, with no second, independently-
+     * maintained lookup.
+     *
+     * @return array{error: string, message: string}|array{helperAgent: Agent, depth: int, inheritedManagedTaskId: ?string}
      */
     private function resolveAndValidate(Conversation $parentConversation, string $helperAgentId): array
     {
@@ -367,7 +389,11 @@ class DelegationService
             ];
         }
 
-        return ['helperAgent' => $helperAgent, 'depth' => $depth];
+        return [
+            'helperAgent' => $helperAgent,
+            'depth' => $depth,
+            'inheritedManagedTaskId' => $enclosingDelegation?->managed_task_id,
+        ];
     }
 
     /**
