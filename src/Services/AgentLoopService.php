@@ -2622,6 +2622,26 @@ class AgentLoopService
                     ],
                 ],
             ];
+
+            // 103-manager-agent (US2, contracts/manager-agent-meta-tools.md
+            // §3): verbatim schema, gated identically to plan_parts/
+            // assign_part above.
+            $tools[] = [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'accept_part',
+                    'description' => 'Mark a part done because its most recent result actually satisfies what was asked. Only call this after reviewing the result — do not accept a part that is incomplete, incorrect, or off-task; use assign_part again instead to request a correction.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'part_id' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                        'required' => ['part_id'],
+                    ],
+                ],
+            ];
         }
 
         if (empty($withheld)) {
@@ -2786,6 +2806,7 @@ class AgentLoopService
             'delegate_to_helper' => $this->handleDelegateToHelper($arguments, $conversation),
             'plan_parts' => $this->handlePlanParts($arguments, $conversation),
             'assign_part' => $this->handleAssignPart($arguments, $conversation),
+            'accept_part' => $this->handleAcceptPart($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -3867,6 +3888,40 @@ class AgentLoopService
         $result = app(ManagerService::class)->assignPart($managedTask, $part, $helperAgentId, $task, $context);
 
         return json_encode($result);
+    }
+
+    /**
+     * 103-manager-agent (US2, contracts/manager-agent-meta-tools.md §3).
+     * Pulls the required arg exactly as handlePlanParts()/handleAssignPart()
+     * do, then surfaces ManagerService::acceptPartRefusal()'s own
+     * structured refusal reason directly (the same guard acceptPart()
+     * itself consults) before ever calling the void acceptPart() write.
+     */
+    private function handleAcceptPart(array $arguments, Conversation $conversation): string
+    {
+        $managedTask = ManagedTask::where('conversation_id', $conversation->id)->first();
+        if ($managedTask === null) {
+            return json_encode(['error' => 'not_a_managed_task', 'message' => 'accept_part is only usable inside a managed task.']);
+        }
+
+        $partId = $arguments['part_id'] ?? null;
+        if (empty($partId)) {
+            return json_encode(['error' => 'part_id is required']);
+        }
+
+        $part = ManagedTaskPart::where('managed_task_id', $managedTask->id)->where('id', $partId)->first();
+        if ($part === null) {
+            return json_encode(['error' => 'unknown_part', 'message' => 'The named part could not be found for this managed task.']);
+        }
+
+        $refusal = app(ManagerService::class)->acceptPartRefusal($part);
+        if ($refusal !== null) {
+            return json_encode($refusal);
+        }
+
+        app(ManagerService::class)->acceptPart($managedTask, $part);
+
+        return json_encode(['part_id' => $part->id, 'state' => 'accepted']);
     }
 
     /**

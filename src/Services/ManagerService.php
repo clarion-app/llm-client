@@ -18,8 +18,10 @@ use Illuminate\Support\Facades\Log;
  *
  * Phase 3 (US1) implements createManagedTask()/planParts()/assignPart()/
  * assignParts() -- the decomposition and suitability-based assignment
- * half of the feature. acceptPart()/reportShortfall()/finalize()/
- * finalizeWithShortfall() are added by later phases (US2/US3/US4/US5).
+ * half of the feature. Phase 4 (US2) adds acceptPart()/
+ * acceptPartRefusal() -- judging a part's outstanding result.
+ * reportShortfall()/finalize()/finalizeWithShortfall() are added by later
+ * phases (US3/US4/US5).
  *
  * assignPart()'s transactional guard (research.md D4) ships complete in
  * this phase, not split across the phases that later add dedicated proof
@@ -328,6 +330,76 @@ class ManagerService
         $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
 
         return null;
+    }
+
+    /**
+     * research.md D3, contracts/manager-agent-meta-tools.md §3. The ONE
+     * decision point for whether accept_part may proceed -- exposed
+     * publicly (mirrors admitAssignmentRound()'s own "one shared guard"
+     * shape) so AgentLoopService::handleAcceptPart() can surface the
+     * SAME structured refusal reason contracts §3 specifies without
+     * duplicating this method's own logic; acceptPart() itself calls
+     * this first and simply writes nothing when it returns non-null.
+     *
+     * `no_outstanding_result`: the part's own state is not
+     * out_for_assignment/out_for_correction -- including a part that is
+     * already accepted/reported_as_shortfall, re-exercising
+     * admitAssignmentRound()'s own "already finalized" guard so the two
+     * methods agree on what that means (tasks.md T030's own terminal
+     * check).
+     *
+     * `cannot_accept_failed_result`: a structural backstop (FR-013)
+     * against a model that miscalls accept_part on a delegation whose
+     * own result_status already says failure -- reassignment
+     * (assign_part again) or, later, report_shortfall are the only
+     * correct responses to a failure.
+     *
+     * @return array{error: string, message: string}|null Null means the
+     *   part's outstanding delegation may be accepted.
+     */
+    public function acceptPartRefusal(ManagedTaskPart $part): ?array
+    {
+        if (!in_array($part->state, ['out_for_assignment', 'out_for_correction'], true)) {
+            return ['error' => 'no_outstanding_result', 'message' => 'This part has no outstanding result to judge.'];
+        }
+
+        $delegation = $part->current_delegation_id !== null
+            ? Delegation::find($part->current_delegation_id)
+            : null;
+
+        if ($delegation === null || $delegation->result_status === 'failure') {
+            return ['error' => 'cannot_accept_failed_result', 'message' => 'This result reports failure — accept only a success or an adequate partial result, or use assign_part/report_shortfall instead.'];
+        }
+
+        return null;
+    }
+
+    /**
+     * research.md D3, contracts/manager-agent-meta-tools.md §3, tasks.md
+     * T032. On success (acceptPartRefusal() returns null): state =
+     * 'accepted', accepted_delegation_id/accepted_summary stamped from
+     * the outstanding delegation's own result_status ('success'/
+     * 'partial')/result_summary. Terminal -- a later assignPart() on
+     * this part_id is refused by admitAssignmentRound()'s own "already
+     * finalized" check.
+     */
+    public function acceptPart(ManagedTask $task, ManagedTaskPart $part): void
+    {
+        if ($this->acceptPartRefusal($part) !== null) {
+            return;
+        }
+
+        $delegation = Delegation::find($part->current_delegation_id);
+
+        $part->state = 'accepted';
+        $part->accepted_delegation_id = $delegation->id;
+        $part->accepted_summary = $delegation->result_summary;
+        $part->save();
+
+        $task->last_progress_at = now();
+        $task->save();
+
+        $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
     }
 
     /**
