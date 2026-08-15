@@ -69,7 +69,13 @@ class SequenceQuery
                 'position' => $stage->position,
                 'name' => $stage->name,
                 'status' => $result?->status ?? 'pending',
-                'output' => $result?->output,
+                // 105-stage-pipeline Phase 3: output is stored as a
+                // json_encode()'d longtext column (ContentSanitizer::
+                // truncate()'d) -- decoded here so contracts §4's `stages`
+                // array carries a genuine JSON value, never the raw
+                // string, matching the response shape's own worked
+                // example.
+                'output' => $result?->output !== null ? json_decode($result->output, true) : null,
                 'failure_reason' => $result?->failure_reason,
             ];
         })->all();
