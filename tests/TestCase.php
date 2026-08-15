@@ -294,6 +294,10 @@ abstract class TestCase extends BaseTestCase
         $this->defineManagedTaskSchema();
         $this->defineManagedTaskPartSchema();
         $this->defineConsensusRequestSchema();
+        $this->defineStageSequenceDefinitionSchema();
+        $this->defineStageSchema();
+        $this->defineSequenceRunSchema();
+        $this->defineStageResultSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -1143,6 +1147,125 @@ abstract class TestCase extends BaseTestCase
                 $table->index('managed_task_id');
                 $table->index(['managed_task_id', 'state']);
                 $table->index('current_delegation_id');
+            });
+        }
+    }
+
+    /**
+     * stage_sequence_definitions — the named, reusable "run this again"
+     * definition (105-stage-pipeline, data-model.md §1). Schema::hasTable()
+     * guarded, hand-declared here since no test in this package ever runs
+     * real migrations (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000003_create_stage_sequence_definitions_table.php
+     * exactly.
+     */
+    protected function defineStageSequenceDefinitionSchema(): void
+    {
+        if (!Schema::hasTable('stage_sequence_definitions')) {
+            Schema::create('stage_sequence_definitions', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('owner_user_id');
+                $table->uuid('coordinator_agent_id');
+                $table->string('name', 255);
+                $table->text('description')->nullable();
+                $table->timestamps(6);
+
+                $table->index('owner_user_id');
+                $table->index('coordinator_agent_id');
+            });
+        }
+    }
+
+    /**
+     * stages — one named unit of work within a stage_sequence_definitions
+     * row (105-stage-pipeline, data-model.md §2). Schema::hasTable()
+     * guarded, hand-declared here since no test in this package ever runs
+     * real migrations (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000004_create_stages_table.php exactly.
+     */
+    protected function defineStageSchema(): void
+    {
+        if (!Schema::hasTable('stages')) {
+            Schema::create('stages', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('sequence_definition_id');
+                $table->unsignedInteger('position');
+                $table->string('name', 255);
+                $table->uuid('helper_agent_id');
+                $table->json('input_schema')->nullable();
+                $table->json('output_schema')->nullable();
+                $table->boolean('is_idempotent')->default(false);
+                $table->timestamps(6);
+
+                $table->index('sequence_definition_id');
+                $table->unique(['sequence_definition_id', 'position']);
+                $table->index('helper_agent_id');
+            });
+        }
+    }
+
+    /**
+     * sequence_runs — one execution of a stage_sequence_definitions row
+     * (105-stage-pipeline, data-model.md §3). Schema::hasTable() guarded,
+     * hand-declared here since no test in this package ever runs real
+     * migrations (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000005_create_sequence_runs_table.php
+     * exactly.
+     */
+    protected function defineSequenceRunSchema(): void
+    {
+        if (!Schema::hasTable('sequence_runs')) {
+            Schema::create('sequence_runs', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('sequence_definition_id');
+                $table->uuid('owner_user_id');
+                $table->uuid('conversation_id');
+                $table->enum('status', ['in_progress', 'resumed', 'completed', 'failed']);
+                $table->longText('starting_input')->nullable();
+                $table->unsignedInteger('current_stage_position')->nullable();
+                $table->timestamp('last_progress_at', 6);
+                $table->text('failure_reason')->nullable();
+                $table->timestamp('resumed_at', 6)->nullable();
+                $table->unsignedInteger('resume_count')->default(0);
+                $table->timestamp('started_at', 6);
+                $table->timestamp('completed_at', 6)->nullable();
+
+                $table->index('sequence_definition_id');
+                $table->index('owner_user_id');
+                $table->index('status');
+                $table->index('last_progress_at');
+                $table->index('conversation_id');
+            });
+        }
+    }
+
+    /**
+     * stage_results — the recorded outcome of one stage within one run
+     * (105-stage-pipeline, data-model.md §4). Schema::hasTable() guarded,
+     * hand-declared here since no test in this package ever runs real
+     * migrations (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000006_create_stage_results_table.php
+     * exactly.
+     */
+    protected function defineStageResultSchema(): void
+    {
+        if (!Schema::hasTable('stage_results')) {
+            Schema::create('stage_results', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('sequence_run_id');
+                $table->uuid('stage_id');
+                $table->enum('status', ['pending', 'running', 'completed', 'failed', 'handoff_rejected'])->default('pending');
+                $table->uuid('delegation_id')->nullable();
+                $table->longText('input')->nullable();
+                $table->longText('output')->nullable();
+                $table->text('failure_reason')->nullable();
+                $table->timestamp('started_at', 6)->nullable();
+                $table->timestamp('completed_at', 6)->nullable();
+
+                $table->index('sequence_run_id');
+                $table->index('stage_id');
+                $table->unique(['sequence_run_id', 'stage_id']);
+                $table->index(['sequence_run_id', 'status']);
             });
         }
     }

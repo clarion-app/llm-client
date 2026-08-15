@@ -841,5 +841,18 @@ return [
         'min_contributor_count' => (int) env('LLM_CLIENT_CONSENSUS_MIN_CONTRIBUTOR_COUNT', 2),
         'quorum_fraction' => (float) env('LLM_CLIENT_CONSENSUS_QUORUM_FRACTION', 0.5),
     ],
+
+    // Stage Pipeline (105-stage-pipeline) — the queue RunSequenceStageJob
+    // is dispatched onto (mirrors manager.queue's own separate-queue
+    // lever), and how long a run's own last_progress_at may go stale
+    // before ResolveStalledSequenceRunsCommand treats it as crashed
+    // (research.md D6). No round/wall-clock ceiling analogous to
+    // manager.max_rounds/max_seconds is needed — a SequenceRun's length is
+    // bounded structurally by its fixed, finite stage count (data-model.md
+    // §6).
+    'pipeline' => [
+        'queue' => env('LLM_CLIENT_PIPELINE_QUEUE', 'sequence-runs'),
+        'stale_after_minutes' => (int) env('LLM_CLIENT_PIPELINE_STALE_AFTER_MINUTES', 10),
+    ],
 ];
 

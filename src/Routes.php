@@ -42,6 +42,7 @@ use ClarionApp\LlmClient\Controllers\AgentHelperController;
 use ClarionApp\LlmClient\Controllers\DelegationController;
 use ClarionApp\LlmClient\Controllers\ManagedTaskController;
 use ClarionApp\LlmClient\Controllers\ConsensusController;
+use ClarionApp\LlmClient\Controllers\SequenceController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -346,6 +347,22 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // Individual contributor answers, for every terminal status (Phase
     // 6/US4, contracts/consensus-api.md §3, FR-008).
     Route::get('consensus-requests/{id}/contributors', [ConsensusController::class, "contributors"]);
+
+    // Stage Pipeline -- define a sequence once, run it repeatedly
+    // (105-stage-pipeline, contracts/stage-pipeline-api.md §1-§5). store()
+    // is the only endpoint that creates a StageSequenceDefinition;
+    // storeRun() is the only endpoint that creates a SequenceRun. Every
+    // write here is thin -- it creates/updates the durable row(s),
+    // dispatches exactly one RunSequenceStageJob, and returns immediately
+    // (research.md D8) -- it never holds the HTTP request open for a
+    // stage's own execution. Phase 2 (Foundational): every method below
+    // is still a 501 stub, filled in across Phases 3 (US1) and 6 (US4).
+    Route::post('sequence-definitions', [SequenceController::class, "store"]);
+    Route::get('sequence-definitions', [SequenceController::class, "index"]);
+    Route::get('sequence-definitions/{id}', [SequenceController::class, "show"]);
+    Route::post('sequence-definitions/{id}/runs', [SequenceController::class, "storeRun"]);
+    Route::get('sequence-runs/{id}', [SequenceController::class, "showRun"]);
+    Route::post('sequence-runs/{id}/resume', [SequenceController::class, "resume"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
