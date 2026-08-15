@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\ValueObjects\Messaging\MessageEnvelope;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageOutcome;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageRefusal;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageRejection;
+use ClarionApp\LlmClient\ValueObjects\Messaging\MessageUnavailabilityReport;
 use Illuminate\Support\Facades\Context;
 
 /**
@@ -39,9 +40,23 @@ use Illuminate\Support\Facades\Context;
  * the moment of sending — never a send() parameter, never a second ambient
  * slot for owner_user_id/conversation_id (research.md D3, standing rule 6).
  * It is stamped identically on a refused row as on a delivered one.
+ *
+ * Phase 8 (US6) adds the THIRD check in that fixed order: recipient
+ * resolution (contracts §1 step 3) — the only one of the four requiring a
+ * database read (research.md D6). Reuses AgentQuery::findAgent() UNCHANGED
+ * (research.md D8, standing rule 5 — no new identifier-comparison code):
+ * null (not found, or found but owned by a different user — findAgent()
+ * makes no distinction) refuses with 'not_found'; found but
+ * is_active === false refuses with 'inactive'. Either way the row stores
+ * the message's full content/context/expected_response, since only the
+ * destination is unreachable, not the message itself.
  */
 class AgentMessageService
 {
+    public function __construct(
+        private readonly AgentQuery $agentQuery,
+    ) {}
+
     public function send(MessageEnvelope $envelope): MessageOutcome
     {
         $contentArray = array_map(fn ($part) => $part->toArray(), $envelope->content);
@@ -93,6 +108,28 @@ class AgentMessageService
             ]);
 
             return new MessageRejection($message->id, $sizeBytes);
+        }
+
+        $recipient = $this->agentQuery->findAgent($envelope->ownerUserId, $envelope->toAgentId);
+
+        if ($recipient === null || $recipient->is_active === false) {
+            $unavailabilityReason = $recipient === null ? 'not_found' : 'inactive';
+
+            $message = AgentMessage::create([
+                'from_agent_id' => $envelope->fromAgentId,
+                'to_agent_id' => $envelope->toAgentId,
+                'owner_user_id' => $envelope->ownerUserId,
+                'conversation_id' => $envelope->conversationId,
+                'run_id' => $runId,
+                'content' => $contentArray,
+                'context' => $contextArray,
+                'expected_response' => $envelope->expectedResponse,
+                'status' => 'unavailable',
+                'refusal_reason' => $unavailabilityReason,
+                'size_bytes' => $sizeBytes,
+            ]);
+
+            return new MessageUnavailabilityReport($message->id, $unavailabilityReason);
         }
 
         $message = AgentMessage::create([
