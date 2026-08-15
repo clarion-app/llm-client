@@ -159,7 +159,7 @@ class DelegationQuery
      * @param Delegation[] $directDelegations
      * @return Delegation[]
      */
-    private function collectTransitiveDelegations(string $callerUserId, array $directDelegations): array
+    protected function collectTransitiveDelegations(string $callerUserId, array $directDelegations): array
     {
         $all = $directDelegations;
         $visitedRunIds = [];
