@@ -298,6 +298,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineStageSchema();
         $this->defineSequenceRunSchema();
         $this->defineStageResultSchema();
+        $this->defineAgentMessageSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -1266,6 +1267,42 @@ abstract class TestCase extends BaseTestCase
                 $table->index('stage_id');
                 $table->unique(['sequence_run_id', 'stage_id']);
                 $table->index(['sequence_run_id', 'status']);
+            });
+        }
+    }
+
+    /**
+     * agent_messages — the persisted record of every attempted inter-agent
+     * message send, delivered or not (107-agent-message-protocol,
+     * data-model.md §1). Schema::hasTable() guarded, hand-declared here
+     * since no test in this package ever runs real migrations
+     * (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000007_create_agent_messages_table.php
+     * exactly.
+     */
+    protected function defineAgentMessageSchema(): void
+    {
+        if (!Schema::hasTable('agent_messages')) {
+            Schema::create('agent_messages', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('from_agent_id')->nullable();
+                $table->uuid('to_agent_id')->nullable();
+                $table->uuid('owner_user_id');
+                $table->uuid('conversation_id')->nullable();
+                $table->uuid('run_id')->nullable();
+                $table->json('content')->nullable();
+                $table->json('context')->nullable();
+                $table->text('expected_response')->nullable();
+                $table->enum('status', ['delivered', 'refused', 'rejected_oversized', 'unavailable']);
+                $table->string('refusal_reason')->nullable();
+                $table->unsignedInteger('size_bytes');
+                $table->timestamps();
+
+                $table->index('owner_user_id');
+                $table->index('conversation_id');
+                $table->index('run_id');
+                $table->index('from_agent_id');
+                $table->index('to_agent_id');
             });
         }
     }

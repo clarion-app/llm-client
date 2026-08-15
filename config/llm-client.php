@@ -864,5 +864,15 @@ return [
         'queue' => env('LLM_CLIENT_PIPELINE_QUEUE', 'sequence-runs'),
         'stale_after_minutes' => (int) env('LLM_CLIENT_PIPELINE_STALE_AFTER_MINUTES', 10),
     ],
+
+    // Agent Message Protocol (107-agent-message-protocol) — the size bound
+    // AgentMessageService::send() measures the JSON-encoded
+    // content/context/expected_response payload against, before any
+    // recipient-availability check (research.md D5). A configuration
+    // default, not a business requirement — the exact maximum message size
+    // is left to planning per spec.md's own Assumptions.
+    'messaging' => [
+        'max_message_bytes' => (int) env('LLM_CLIENT_MESSAGING_MAX_MESSAGE_BYTES', 65536),
+    ],
 ];
 
