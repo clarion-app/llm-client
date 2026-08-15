@@ -108,6 +108,7 @@ class ConversationController extends Controller
             }
             $validatedData['agent_id'] = $agent->id;
             $validatedData['agent_version_id'] = $agent->current_version_id;
+            $validatedData['routing_reason'] = 'explicit';
         }
 
         // Use validated server_id/model if provided, otherwise resolve via RoleResolver

@@ -333,6 +333,15 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             $degradationBlock = $degradationDecision->toDisclosureArray();
         }
 
+        // A routing decision, if any is still undisclosed, is announced
+        // here — after the degradation block and before the handoff
+        // block, mirroring run()'s/resumeSync()'s own insertion verbatim
+        // (102-router-pattern, US2, contracts §6's ordering).
+        $routingDisclosure = app(AgentLoopService::class)->composeRoutingDisclosure($conversation);
+        if ($routingDisclosure !== null) {
+            $this->reply = $routingDisclosure.' '.$this->reply;
+        }
+
         // A handoff, if any is still undisclosed, is announced here —
         // after the degradation block so it prepends last, landing first
         // in the final string (093-agent-handoff, US2, contracts §2's own

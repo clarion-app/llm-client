@@ -523,7 +523,15 @@ class AgentActivationJourneyTest extends TestCase
         $handler->finish($data, 1);
 
         $handler->message->refresh();
-        $this->assertSame(
+        // Ends with (not assertSame): the conversation was created with an
+        // explicit agent_id, so ConversationController::store() now stamps
+        // routing_reason = 'explicit' (102-router-pattern, US2), and
+        // finish() correctly prepends that conversation's own one-time
+        // routing disclosure ahead of the reply text. This test's own
+        // concern is unrelated — that the queued turn reaches an ordinary
+        // terminal state, not hang or silently drop — so only the reply's
+        // own tail is asserted here.
+        $this->assertStringEndsWith(
             'A reply produced after my agent was deactivated.',
             $handler->message->content,
             'the queued turn must reach an ordinary terminal state, not hang or silently drop'

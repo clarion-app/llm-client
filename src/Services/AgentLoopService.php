@@ -1053,6 +1053,17 @@ class AgentLoopService
                         $degradationBlock = $decision->toDisclosureArray();
                     }
 
+                    // A routing decision, if any is still undisclosed, is
+                    // announced here — after the degradation block and
+                    // before the handoff block, so its own prepend happens
+                    // first, leaving the handoff prepend (a more recent
+                    // event, if any) landing first in the final string
+                    // (102-router-pattern, US2, contracts §6's ordering).
+                    $routingDisclosure = $this->composeRoutingDisclosure($conversation);
+                    if ($routingDisclosure !== null) {
+                        $content = $routingDisclosure.' '.$content;
+                    }
+
                     // A handoff, if any is still undisclosed, is announced
                     // here — after the degradation block so it prepends
                     // last, landing first in the final string (093-agent-
@@ -1714,6 +1725,16 @@ class AgentLoopService
                         $content = $disclosure.' '.$content;
                     }
                     $degradationBlock = $decision->toDisclosureArray();
+                }
+
+                // A routing decision, if any is still undisclosed, is
+                // announced here — after the degradation block and before
+                // the handoff block, mirroring run()'s own insertion
+                // verbatim (102-router-pattern, US2, contracts §6's
+                // ordering).
+                $routingDisclosure = $this->composeRoutingDisclosure($conversation);
+                if ($routingDisclosure !== null) {
+                    $content = $routingDisclosure.' '.$content;
                 }
 
                 // A handoff, if any is still undisclosed, is announced
@@ -3535,6 +3556,39 @@ class AgentLoopService
         }, $delegateCalls);
 
         return app(DelegationService::class)->delegateBatch($conversation, $calls);
+    }
+
+    /**
+     * Compose the user-facing disclosure sentence for a routing decision on
+     * this conversation, and mark it disclosed in the same call
+     * (102-router-pattern, US2, contracts §6). Returns null when there is
+     * nothing to disclose — a conversation whose routing_reason is null
+     * (never routed, or pre-feature), or whose routing decision has already
+     * been disclosed on an earlier turn.
+     *
+     * Resolves the handling agent via Agent::withTrashed()->find() plus the
+     * null-safe ?-> operator, mirroring composeHandoffDisclosure()'s own
+     * posture — the agent may have since been soft-deleted, and this must
+     * never throw and crash the entire turn's response.
+     */
+    public function composeRoutingDisclosure(Conversation $conversation): ?string
+    {
+        if ($conversation->routing_reason === null || $conversation->routing_disclosed_at !== null) {
+            return null;
+        }
+
+        $agentName = Agent::withTrashed()->find($conversation->agent_id)?->name ?? 'a retired agent';
+
+        $sentence = match ($conversation->routing_reason) {
+            'automatic' => "This conversation is being handled by \"{$agentName}\", automatically matched to your request.",
+            'default' => "This conversation is being handled by \"{$agentName}\", the default handler — no specialist was a clear match.",
+            'explicit' => "This conversation is being handled by \"{$agentName}\", as you requested.",
+            default => "This conversation is being handled by \"{$agentName}\".",
+        };
+
+        $conversation->update(['routing_disclosed_at' => now()]);
+
+        return $sentence;
     }
 
     /**
