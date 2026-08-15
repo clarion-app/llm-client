@@ -11,6 +11,8 @@ use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\Delegation;
+use ClarionApp\LlmClient\Models\ManagedTask;
+use ClarionApp\LlmClient\Models\ManagedTaskPart;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
@@ -310,7 +312,7 @@ class AgentLoopService
         // so the whole response uses one frozen decision (FR-006/SC-003).
         $decision = app(DegradationGate::class)->forRun($runId);
 
-        $tools = $this->buildToolsPayload($decision->withheldTools);
+        $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation, $runId);
 
@@ -492,7 +494,7 @@ class AgentLoopService
         // back whatever the original start()/run() dispatch decided.
         $decision = app(DegradationGate::class)->forRun($runId);
 
-        $tools = $this->buildToolsPayload($decision->withheldTools);
+        $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
         $rawMessages = $this->buildMessagesPayload($conversation, $runId);
 
@@ -944,7 +946,7 @@ class AgentLoopService
 
         $maxIterations = $options['max_iterations'] ?? config('llm-client.agent_loop.max_iterations', 20);
         $deadlineAt = $options['deadline_at'] ?? null;
-        $tools = $this->buildToolsPayload($decision->withheldTools);
+        $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
 
         $shouldValidate = $this->schemaValidator->shouldValidate($options);
@@ -1315,7 +1317,7 @@ class AgentLoopService
                     // delegateBatch() call above -- never re-executed
                     // inline through executeMetaTool()/delegate() a second
                     // time.
-                    if ($toolName === 'delegate_to_helper' && $batchDelegationResults !== null && array_key_exists($toolCallId, $batchDelegationResults)) {
+                    if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCallId, $batchDelegationResults)) {
                         $result = json_encode($batchDelegationResults[$toolCallId]);
                     } else {
                         $result = $this->executeMetaTool($toolName, $arguments, $conversation);
@@ -1731,7 +1733,7 @@ class AgentLoopService
         $decision = app(DegradationGate::class)->forRun($runId);
 
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
-        $tools = $this->buildToolsPayload($decision->withheldTools);
+        $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
@@ -1942,7 +1944,7 @@ class AgentLoopService
 
                 // 101-parallel-subagent-execution (US1, contracts §1): see
                 // the identical check in run()'s own tool-call loop above.
-                if ($toolName === 'delegate_to_helper' && $batchDelegationResults !== null && array_key_exists($toolCall['id'] ?? '', $batchDelegationResults)) {
+                if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCall['id'] ?? '', $batchDelegationResults)) {
                     $result = json_encode($batchDelegationResults[$toolCall['id'] ?? '']);
                 } else {
                     $result = $this->executeMetaTool($toolName, $arguments, $conversation);
@@ -2339,8 +2341,16 @@ class AgentLoopService
      *        (085-graceful-degradation, research.md D6). Additive, default
      *        [] — every existing call site continues to receive the full,
      *        unfiltered tool set when no reduction applies.
+     * @param ?Conversation $conversation 103-manager-agent (Grounding note
+     *        item 6, research.md D1/D2): when given and
+     *        $conversation->channel === 'managed-task', plan_parts/
+     *        assign_part are appended -- a manager's own helper
+     *        conversations (channel = 'agent-delegation') and every
+     *        ordinary interactive conversation never see them. Optional
+     *        and defaulted to null so call sites outside the four
+     *        run()/resumeSync() entry points remain unaffected.
      */
-    public function buildToolsPayload(array $withheld = []): array
+    public function buildToolsPayload(array $withheld = [], ?Conversation $conversation = null): array
     {
         $tools = [
             [
@@ -2550,6 +2560,70 @@ class AgentLoopService
             ],
         ];
 
+        // 103-manager-agent (US1, contracts/manager-agent-meta-tools.md
+        // §1/§2, research.md D1): only inside the manager's own dedicated
+        // conversation -- never inside a helper's own conversation, and
+        // never in an ordinary interactive conversation.
+        if ($conversation !== null && $conversation->channel === 'managed-task') {
+            $tools[] = [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'plan_parts',
+                    'description' => 'Break the task into one or more distinct, self-contained parts, each assignable to a single helper. If the task genuinely does not need splitting, call this with exactly one part covering the whole task rather than inventing an artificial subdivision. May be called again later if you discover the task needs further breakdown — new parts are added, existing parts are never removed or renumbered.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'parts' => [
+                                'type' => 'array',
+                                'items' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'description' => [
+                                            'type' => 'string',
+                                            'description' => 'What is needed for this part — self-contained enough to hand to a helper as its task.',
+                                        ],
+                                    ],
+                                    'required' => ['description'],
+                                ],
+                                'minItems' => 1,
+                            ],
+                        ],
+                        'required' => ['parts'],
+                    ],
+                ],
+            ];
+
+            $tools[] = [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'assign_part',
+                    'description' => 'Assign one part of the task to one of your assigned helpers — for a first attempt, a correction (send back to the same helper stating what was wrong), or a reassignment (send to a different helper after the first could not complete it). State exactly what is needed and what context applies, same as delegating any bounded task — the helper sees only what you state here. Refused if this part is already accepted, or already has an assignment outstanding.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'part_id' => [
+                                'type' => 'string',
+                                'description' => 'The part being assigned (from plan_parts).',
+                            ],
+                            'helper_agent_id' => [
+                                'type' => 'string',
+                                'description' => 'The id of one of your own assigned helpers.',
+                            ],
+                            'task' => [
+                                'type' => 'string',
+                                'description' => 'What is needed. For a correction, state specifically what was wrong with the prior attempt.',
+                            ],
+                            'context' => [
+                                'type' => 'string',
+                                'description' => 'Optional. For a correction, include the prior attempt\'s own output so the helper can see what to fix — nothing carries over automatically.',
+                            ],
+                        ],
+                        'required' => ['part_id', 'helper_agent_id', 'task'],
+                    ],
+                ],
+            ];
+        }
+
         if (empty($withheld)) {
             return $tools;
         }
@@ -2710,6 +2784,8 @@ class AgentLoopService
             'propose_declarative_memory' => $this->handleProposeDeclarativeMemory($arguments, $conversation),
             'handoff_to_agent' => $this->handleHandoffToAgent($arguments, $conversation),
             'delegate_to_helper' => $this->handleDelegateToHelper($arguments, $conversation),
+            'plan_parts' => $this->handlePlanParts($arguments, $conversation),
+            'assign_part' => $this->handleAssignPart($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -3717,6 +3793,83 @@ class AgentLoopService
     }
 
     /**
+     * 103-manager-agent (US1, contracts/manager-agent-meta-tools.md §1).
+     * Only ever reached inside a channel === 'managed-task' conversation
+     * (buildToolsPayload() gates plan_parts on exactly that), so a missing
+     * ManagedTask row here means something has gone wrong with that gate
+     * rather than an ordinary refusal a model is expected to see routinely.
+     */
+    private function handlePlanParts(array $arguments, Conversation $conversation): string
+    {
+        $managedTask = ManagedTask::where('conversation_id', $conversation->id)->first();
+        if ($managedTask === null) {
+            return json_encode(['error' => 'not_a_managed_task', 'message' => 'plan_parts is only usable inside a managed task.']);
+        }
+
+        $parts = $arguments['parts'] ?? null;
+        if (empty($parts) || !is_array($parts)) {
+            return json_encode(['error' => 'parts is required']);
+        }
+
+        $descriptions = [];
+        foreach ($parts as $part) {
+            $description = is_array($part) ? ($part['description'] ?? null) : null;
+            if (empty($description)) {
+                return json_encode(['error' => 'each part requires a description']);
+            }
+            $descriptions[] = $description;
+        }
+
+        $created = app(ManagerService::class)->planParts($managedTask, $descriptions);
+
+        return json_encode(array_map(fn (ManagedTaskPart $p) => [
+            'part_id' => $p->id,
+            'sequence' => $p->sequence,
+            'description' => $p->description,
+        ], $created));
+    }
+
+    /**
+     * 103-manager-agent (US1, contracts/manager-agent-meta-tools.md §2).
+     * Pulls required args exactly as handleDelegateToHelper() does, then
+     * delegates the real work -- including the full FR-014/FR-009
+     * transactional guard -- to ManagerService::assignPart().
+     */
+    private function handleAssignPart(array $arguments, Conversation $conversation): string
+    {
+        $managedTask = ManagedTask::where('conversation_id', $conversation->id)->first();
+        if ($managedTask === null) {
+            return json_encode(['error' => 'not_a_managed_task', 'message' => 'assign_part is only usable inside a managed task.']);
+        }
+
+        $partId = $arguments['part_id'] ?? null;
+        if (empty($partId)) {
+            return json_encode(['error' => 'part_id is required']);
+        }
+
+        $helperAgentId = $arguments['helper_agent_id'] ?? null;
+        if (empty($helperAgentId)) {
+            return json_encode(['error' => 'helper_agent_id is required']);
+        }
+
+        $task = $arguments['task'] ?? null;
+        if (empty($task)) {
+            return json_encode(['error' => 'task is required']);
+        }
+
+        $context = $arguments['context'] ?? null;
+
+        $part = ManagedTaskPart::where('managed_task_id', $managedTask->id)->where('id', $partId)->first();
+        if ($part === null) {
+            return json_encode(['error' => 'unknown_part', 'message' => 'The named part could not be found for this managed task.']);
+        }
+
+        $result = app(ManagerService::class)->assignPart($managedTask, $part, $helperAgentId, $task, $context);
+
+        return json_encode($result);
+    }
+
+    /**
      * 101-parallel-subagent-execution (US1, contracts §1, Grounding note
      * item 6): scans one iteration's own tool_calls for delegate_to_helper
      * entries ahead of either of run()'s/resumeSync()'s per-tool-call
@@ -3730,32 +3883,102 @@ class AgentLoopService
      * by the caller -- every other tool call in the same iteration still
      * executes through the unmodified loop body, unaffected.
      *
+     * 103-manager-agent (research.md D2, Grounding note item 6): widened
+     * to count assign_part calls alongside delegate_to_helper ones -- both
+     * feed the SAME DelegationService::delegateBatch() call, so a turn
+     * mixing the two types (in any combination, 2+ total) is dispatched
+     * together in exactly one delegateBatch() call, never two. An
+     * assign_part entry is admitted through ManagerService::
+     * admitAssignmentRound() (the identical guard assignPart()'s own solo
+     * path uses) BEFORE being added to the merged calls array -- a call
+     * refused at that stage never reaches delegateBatch() at all, and its
+     * refusal is returned directly, keyed by its own tool_call_id, exactly
+     * as an out-of-band delegate_to_helper refusal already is via
+     * resolveAndValidate(). Every admitted assign_part call carries its
+     * own managed_task_id/part_id so createDelegationRow() stamps them.
+     *
      * @param array<int, array<string, mixed>> $toolCalls
      * @return array<string, array<string, mixed>>|null
      */
     private function resolveDelegateToHelperBatchResults(array $toolCalls, Conversation $conversation): ?array
     {
-        $delegateCalls = array_values(array_filter(
+        $relevantCalls = array_values(array_filter(
             $toolCalls,
-            fn (array $toolCall) => ($toolCall['function']['name'] ?? '') === 'delegate_to_helper',
+            fn (array $toolCall) => in_array($toolCall['function']['name'] ?? '', ['delegate_to_helper', 'assign_part'], true),
         ));
 
-        if (count($delegateCalls) < 2) {
+        if (count($relevantCalls) < 2) {
             return null;
         }
 
-        $calls = array_map(function (array $toolCall) {
+        $managedTask = $conversation->channel === 'managed-task'
+            ? ManagedTask::where('conversation_id', $conversation->id)->first()
+            : null;
+
+        $results = [];
+        $calls = [];
+        $partIdByToolCallId = [];
+
+        foreach ($relevantCalls as $toolCall) {
+            $name = $toolCall['function']['name'] ?? '';
             $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+            $toolCallId = $toolCall['id'] ?? '';
 
-            return [
-                'tool_call_id' => $toolCall['id'] ?? '',
-                'helper_agent_id' => $arguments['helper_agent_id'] ?? null,
-                'task' => $arguments['task'] ?? null,
-                'context' => $arguments['context'] ?? null,
-            ];
-        }, $delegateCalls);
+            if ($name === 'assign_part') {
+                if ($managedTask === null) {
+                    $results[$toolCallId] = ['error' => 'not_a_managed_task', 'message' => 'assign_part is only usable inside a managed task.'];
+                    continue;
+                }
 
-        return app(DelegationService::class)->delegateBatch($conversation, $calls);
+                $part = ManagedTaskPart::where('managed_task_id', $managedTask->id)
+                    ->where('id', $arguments['part_id'] ?? null)
+                    ->first();
+
+                if ($part === null) {
+                    $results[$toolCallId] = ['error' => 'unknown_part', 'message' => 'The named part could not be found for this managed task.'];
+                    continue;
+                }
+
+                $refusal = app(ManagerService::class)->admitAssignmentRound($managedTask, $part);
+                if ($refusal !== null) {
+                    $results[$toolCallId] = $refusal;
+                    continue;
+                }
+
+                $partIdByToolCallId[$toolCallId] = $part->id;
+
+                $calls[] = [
+                    'tool_call_id' => $toolCallId,
+                    'helper_agent_id' => $arguments['helper_agent_id'] ?? null,
+                    'task' => $arguments['task'] ?? null,
+                    'context' => $arguments['context'] ?? null,
+                    'managed_task_id' => $managedTask->id,
+                    'part_id' => $part->id,
+                ];
+            } else {
+                $calls[] = [
+                    'tool_call_id' => $toolCallId,
+                    'helper_agent_id' => $arguments['helper_agent_id'] ?? null,
+                    'task' => $arguments['task'] ?? null,
+                    'context' => $arguments['context'] ?? null,
+                ];
+            }
+        }
+
+        if (!empty($calls)) {
+            $batchResults = app(DelegationService::class)->delegateBatch($conversation, $calls);
+
+            foreach ($batchResults as $toolCallId => $result) {
+                $results[$toolCallId] = $result;
+
+                if (isset($result['delegation_id'], $partIdByToolCallId[$toolCallId])) {
+                    ManagedTaskPart::where('id', $partIdByToolCallId[$toolCallId])
+                        ->update(['current_delegation_id' => $result['delegation_id']]);
+                }
+            }
+        }
+
+        return $results;
     }
 
     /**

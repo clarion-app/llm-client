@@ -40,6 +40,7 @@ use ClarionApp\LlmClient\Controllers\AgentVersionComparisonController;
 use ClarionApp\LlmClient\Controllers\AgentShareController;
 use ClarionApp\LlmClient\Controllers\AgentHelperController;
 use ClarionApp\LlmClient\Controllers\DelegationController;
+use ClarionApp\LlmClient\Controllers\ManagedTaskController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -320,6 +321,14 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // `agents/{id}/...` routes above (see contracts §5's own segment-count
     // argument).
     Route::get('agents/versions/compare', [AgentVersionComparisonController::class, "compare"]);
+
+    // Manager agent -- start a managed task, and read its status/outcome
+    // (103-manager-agent, US1, contracts/manager-agent-api.md §1/§2).
+    // Every subsequent write happens through the manager's own meta-tools,
+    // reached only from inside its agent loop, never directly over HTTP
+    // (research.md D6).
+    Route::post('managed-tasks', [ManagedTaskController::class, "store"]);
+    Route::get('managed-tasks/{id}', [ManagedTaskController::class, "show"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

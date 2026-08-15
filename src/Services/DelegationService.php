@@ -65,12 +65,18 @@ class DelegationService
     }
 
     /**
+     * $managedTaskId/$partId (103-manager-agent, Grounding note item 1):
+     * optional, stamped onto the created Delegation row unchanged. Every
+     * pre-existing caller passes neither (both null) -- only
+     * ManagerService::assignPart() passes non-null values, for the
+     * assign_part meta-tool's own solo path.
+     *
      * @return array<string, mixed> JSON-encodable -- either a refusal
      *   (`{"error": ..., "message": ...}`, nothing written) or the
      *   completed-delegation result shape (contracts/
      *   delegation-protocol-meta-tool.md).
      */
-    public function delegate(Conversation $parentConversation, string $helperAgentId, string $task, ?string $context): array
+    public function delegate(Conversation $parentConversation, string $helperAgentId, string $task, ?string $context, ?string $managedTaskId = null, ?string $partId = null): array
     {
         $resolved = $this->resolveAndValidate($parentConversation, $helperAgentId);
         if (isset($resolved['error'])) {
@@ -85,6 +91,8 @@ class DelegationService
             $context,
             'in_progress',
             null,
+            $managedTaskId,
+            $partId,
         );
 
         $helperConversation = Conversation::find($delegation->helper_conversation_id);
@@ -107,7 +115,13 @@ class DelegationService
      * the jobs dispatched, so the per-batch ceiling is always evaluated
      * against the batch's true final size.
      *
-     * @param array<int, array{tool_call_id: string, helper_agent_id: string, task: string, context: ?string}> $calls
+     * @param array<int, array{tool_call_id: string, helper_agent_id: string, task: string, context: ?string, managed_task_id?: ?string, part_id?: ?string}> $calls
+     *   103-manager-agent (Grounding note item 1): a call entry may
+     *   optionally carry managed_task_id/part_id -- present for a call
+     *   built from an assign_part tool call (AgentLoopService's own
+     *   widened batch filter, research.md D2), absent (null) for an
+     *   ordinary delegate_to_helper call, threaded through unchanged to
+     *   createDelegationRow().
      * @return array<string, array<string, mixed>> keyed by, and in, the
      *   original $calls order (contracts §1's ordering guarantee) --
      *   regardless of which member actually finished first.
@@ -139,6 +153,8 @@ class DelegationService
                 $call['context'] ?? null,
                 'queued',
                 $batchId,
+                $call['managed_task_id'] ?? null,
+                $call['part_id'] ?? null,
             );
         }
 
@@ -373,6 +389,8 @@ class DelegationService
         ?string $context,
         string $status,
         ?string $batchId,
+        ?string $managedTaskId = null,
+        ?string $partId = null,
     ): Delegation {
         $ownerUserId = (string) $parentConversation->user_id;
 
@@ -410,6 +428,12 @@ class DelegationService
             'batch_id' => $batchId,
             'parent_run_id' => $parentRunId,
             'started_at' => now(),
+            // 103-manager-agent (Grounding note item 1): null for every
+            // pre-existing call site (delegate()/delegateBatch()'s own
+            // ordinary delegate_to_helper path) -- only ManagerService's
+            // assign_part handling ever passes non-null here.
+            'managed_task_id' => $managedTaskId,
+            'part_id' => $partId,
         ]);
 
         $actionId = $this->runTraceRecorder->openAction(
