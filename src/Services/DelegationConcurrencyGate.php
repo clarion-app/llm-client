@@ -52,11 +52,31 @@ class DelegationConcurrencyGate
             $maxPerBatch = (int) config('llm-client.delegation.concurrency.max_concurrent_per_batch', 5);
             $maxInstallation = (int) config('llm-client.delegation.concurrency.max_concurrent_per_installation', 20);
 
+            // These three reads MUST be locking reads (lockForUpdate()), not
+            // plain SELECTs -- found the hard way (tasks.md T030, Phase 5):
+            // a plain SELECT COUNT(*) inside DB::transaction() is still an
+            // ordinary MVCC snapshot read under InnoDB's default REPEATABLE
+            // READ, so two genuinely concurrent transactions can each read
+            // "under ceiling" from their own snapshot before either commits
+            // its own admission write -- the exact check-then-act race
+            // mutation-checklist row 4 describes. Being inside "the same
+            // transaction" as the write does not by itself confer
+            // atomicity against OTHER transactions; only a locking read
+            // does, by taking real row/gap locks that force a concurrent
+            // writer to wait rather than proceed on stale data. This was
+            // invisible to the fast suite (a single SQLite connection has
+            // no concurrent snapshot to race against) and only surfaced
+            // against real MariaDB in tests/RealDatabase/
+            // DelegationConcurrencyTest.php (T029): before this fix, 24
+            // processes racing a per-batch ceiling of 9 admitted 22, and
+            // similarly over-admitted the installation-wide axis.
+
             // FR-006: how many of THIS batch's own members are currently
             // in_progress.
             $perBatchInProgress = DB::table('agent_delegations')
                 ->where('batch_id', $batchId)
                 ->where('status', 'in_progress')
+                ->lockForUpdate()
                 ->count();
 
             // FR-007: how many batch members, across every batch and every
@@ -65,13 +85,16 @@ class DelegationConcurrencyGate
             $installationInProgress = DB::table('agent_delegations')
                 ->whereNotNull('batch_id')
                 ->where('status', 'in_progress')
+                ->lockForUpdate()
                 ->count();
 
             // Redelivery guard: only a row still genuinely 'queued' may be
             // admitted -- a redelivered job whose row already moved on must
-            // never be re-admitted or double-counted.
+            // never be re-admitted or double-counted. Also a locking read,
+            // for the same reason as the two counts above.
             $currentStatus = DB::table('agent_delegations')
                 ->where('id', $delegationId)
+                ->lockForUpdate()
                 ->value('status');
 
             if ($currentStatus !== 'queued' || $perBatchInProgress >= $maxPerBatch || $installationInProgress >= $maxInstallation) {
