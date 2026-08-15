@@ -23,6 +23,7 @@ class Delegation extends Model
         'context',
         'depth',
         'status',
+        'batch_id',
         'parent_run_id',
         'parent_action_id',
         'helper_run_id',

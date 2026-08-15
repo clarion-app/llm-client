@@ -1037,7 +1037,8 @@ abstract class TestCase extends BaseTestCase
                 $table->text('task');
                 $table->longText('context')->nullable();
                 $table->unsignedInteger('depth');
-                $table->enum('status', ['in_progress', 'completed', 'exhausted', 'failed']);
+                $table->enum('status', ['queued', 'in_progress', 'completed', 'exhausted', 'failed']);
+                $table->uuid('batch_id')->nullable()->index();
                 $table->uuid('parent_run_id')->nullable();
                 $table->uuid('parent_action_id')->nullable();
                 $table->uuid('helper_run_id')->nullable();

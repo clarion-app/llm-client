@@ -774,6 +774,40 @@ return [
         'max_result_schema_retries' => (int) env('LLM_CLIENT_DELEGATION_MAX_RESULT_SCHEMA_RETRIES', 2),
         'result_output_cap_bytes' => (int) env('LLM_CLIENT_DELEGATION_RESULT_OUTPUT_CAP_BYTES', 8192),
         'combined_output_cap_bytes' => (int) env('LLM_CLIENT_DELEGATION_COMBINED_OUTPUT_CAP_BYTES', 16384),
+
+        // 101-parallel-subagent-execution: concurrent batch dispatch —
+        // ceilings, queue routing, and timing knobs for
+        // DelegationConcurrencyGate/RunDelegationBatchMemberJob/
+        // delegateBatch()'s own join-wait and stale-batch sweep.
+        'concurrency' => [
+            // FR-006: the per-batch ceiling — how many of one batch's own
+            // members may be `in_progress` at the same time.
+            'max_concurrent_per_batch' => (int) env('LLM_CLIENT_DELEGATION_MAX_CONCURRENT_PER_BATCH', 5),
+
+            // FR-007: the installation-wide ceiling — how many batch
+            // members, across every batch and every user, may be
+            // `in_progress` at the same time, so one oversized request
+            // cannot consume the whole installation's concurrent capacity.
+            'max_concurrent_per_installation' => (int) env('LLM_CLIENT_DELEGATION_MAX_CONCURRENT_PER_INSTALLATION', 20),
+
+            // The queue RunDelegationBatchMemberJob is dispatched onto —
+            // mirrors eval_runs.queue's own separate-queue lever, so an
+            // operator can size delegation-batch workers independently of
+            // interactive/eval traffic.
+            'queue' => env('LLM_CLIENT_DELEGATION_BATCH_QUEUE', 'delegation-batches'),
+
+            // How long a member that lost the admission race waits before
+            // retrying (job release() delay), jittered by the job itself.
+            'admission_retry_delay_seconds' => (int) env('LLM_CLIENT_DELEGATION_ADMISSION_RETRY_DELAY_SECONDS', 2),
+
+            // The parent's own join-wait poll interval.
+            'join_poll_interval_ms' => (int) env('LLM_CLIENT_DELEGATION_JOIN_POLL_INTERVAL_MS', 200),
+
+            // How long a queued/in_progress batch member may sit with no
+            // terminal status before resolve-stalled-delegation-batches
+            // treats it as abandoned (research.md D4, layer 3).
+            'stale_after_minutes' => (int) env('LLM_CLIENT_DELEGATION_STALE_AFTER_MINUTES', 10),
+        ],
     ],
 ];
 
