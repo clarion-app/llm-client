@@ -125,6 +125,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledDelegationBatchesCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledManagedTasksCommand::class,
+                \ClarionApp\LlmClient\Commands\ResolveStalledSequenceRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentCreateCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentKindsCommand::class,
@@ -199,6 +200,17 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // bound has already passed -- so a stalled task is never
             // resumed forever.
             $schedule->command('llm-client:resolve-stalled-managed-tasks')
+                ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Crash-recovery sweep for sequence pipeline runs
+            // (105-stage-pipeline, US4, research.md D6): re-dispatches a
+            // fresh RunSequenceStageJob for a stale run blocked on a
+            // safely-repeatable (idempotent) stage, or force-fails a run
+            // blocked on a non-idempotent one -- the automatic counterpart
+            // to SequenceController::resume(), sharing the identical
+            // SequenceService::resumeSafety() idempotency check.
+            $schedule->command('llm-client:resolve-stalled-sequence-runs')
                 ->everyFiveMinutes()
                 ->withoutOverlapping();
 

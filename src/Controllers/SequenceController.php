@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use Auth;
 use ClarionApp\LlmClient\Exceptions\SequenceDefinitionValidationException;
+use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
 use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageSequenceDefinition;
 use ClarionApp\LlmClient\Services\SequenceQuery;
@@ -13,9 +14,8 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 /**
- * 105-stage-pipeline (contracts/stage-pipeline-api.md §1-§5). Skeleton
- * only in Phase 2 (Foundational) — every method is a 501 placeholder,
- * filled in across Phases 3-6:
+ * 105-stage-pipeline (contracts/stage-pipeline-api.md §1-§5). Every method
+ * is now implemented:
  *   - store()/index()/show()   -> Phase 3 (US1), definitions
  *   - storeRun()/showRun()     -> Phase 3 (US1), runs
  *   - resume()                 -> Phase 6 (US4)
@@ -197,17 +197,63 @@ class SequenceController extends Controller
 
     /**
      * POST /sequence-runs/{id}/resume (contracts §5). Phase 6 (US4).
+     * Owner-scoped 404; 409 run_not_failed unless status === 'failed';
+     * applies SequenceService::resumeSafety()'s D5 derivation -- 409
+     * unsafe_to_resume if refused, naming the blocking stage; otherwise
+     * admits the resume (status -> 'resumed', resumed_at, resume_count++),
+     * broadcasts (Phase 4's helper -- the fifth and final of research.md
+     * D8's five named broadcast points), and dispatches a fresh
+     * RunSequenceStageJob -- its own resume-point logic (T059) picks up
+     * exactly the stage resumeSafety() found.
      */
     public function resume(Request $request, string $id): JsonResponse
     {
-        return $this->notImplementedResponse();
-    }
+        $callerUserId = Auth::user()->id;
 
-    private function notImplementedResponse(): JsonResponse
-    {
+        $run = $this->sequenceQuery->findRun($callerUserId, $id);
+        if ($run === null) {
+            return $this->notFoundResponse('Sequence run not found', 'sequence_run_not_found');
+        }
+
+        if ($run->status !== 'failed') {
+            return response()->json([
+                'error' => 'run_not_failed',
+                'message' => 'Only a failed run can be resumed.',
+                'current_status' => $run->status,
+            ], 409);
+        }
+
+        $safety = $this->sequenceService->resumeSafety($run);
+
+        if (!$safety['resumable']) {
+            $blockingStage = $safety['blocking_stage'];
+
+            return response()->json([
+                'error' => 'unsafe_to_resume',
+                'message' => $safety['reason'],
+                'blocking_stage_id' => $blockingStage->id,
+                'blocking_stage_position' => $blockingStage->position,
+            ], 409);
+        }
+
+        $resumingFromPosition = $safety['resume_from']?->stage?->position;
+
+        $run->status = 'resumed';
+        $run->resumed_at = now();
+        $run->resume_count = $run->resume_count + 1;
+        $run->last_progress_at = now();
+        $run->save();
+
+        $this->sequenceService->broadcastRunUpdated($run->id);
+
+        RunSequenceStageJob::dispatch($run->id)->onQueue(config('llm-client.pipeline.queue', 'sequence-runs'));
+
         return response()->json([
-            'error' => 'not_implemented',
-        ], 501);
+            'sequence_run_id' => $run->id,
+            'status' => 'resumed',
+            'resume_count' => $run->resume_count,
+            'resuming_from_stage_position' => $resumingFromPosition,
+        ], 202);
     }
 
     /**

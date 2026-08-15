@@ -55,12 +55,22 @@ use Illuminate\Queue\SerializesModels;
  * later stage is left untouched at its pre-created 'pending' default
  * (FR-009).
  *
- * Resuming from an arbitrary stage (rather than always the first
- * pending one) is Phase 6/US4's own addition (T059) -- this phase's
- * "find the next pending stage by position" logic already produces the
- * correct starting point for a brand-new run (position 1 is the only
- * pending stage at that point), so no separate code path is needed for
- * that case specifically.
+ * Phase 6 (US4, T059, data-model.md §5) generalizes the "find the next
+ * stage" query from "the next 'pending' one" to "the first StageResult
+ * (by Stage.position) that is NOT 'completed'" -- the exact same
+ * derivation SequenceService::resumeSafety() uses to decide whether a
+ * resume is even admitted. For a brand-new run this produces the
+ * identical result the old query did (position 1 is the only
+ * not-completed row). For a resumed run (explicit resume, or the
+ * ResolveStalledSequenceRunsCommand sweep re-dispatching for an
+ * idempotent crashed stage), the row this finds may be 'failed',
+ * 'handoff_rejected', or 'running' rather than 'pending' -- in every
+ * such case its own row is reset and re-invoked from scratch here
+ * (never a new StageResult row, keeping the
+ * unique(sequence_run_id, stage_id) constraint intact). Both callers
+ * have already applied resumeSafety()'s own idempotency check before
+ * ever dispatching this job for a 'running' stage, so reaching that case
+ * here is itself proof it was judged safe.
  */
 class RunSequenceStageJob implements ShouldQueue
 {
@@ -83,7 +93,7 @@ class RunSequenceStageJob implements ShouldQueue
 
         $stageResult = StageResult::with('stage')
             ->where('sequence_run_id', $run->id)
-            ->where('status', 'pending')
+            ->where('status', '!=', 'completed')
             ->get()
             ->sortBy(fn (StageResult $r) => $r->stage->position)
             ->first();
@@ -93,6 +103,21 @@ class RunSequenceStageJob implements ShouldQueue
         }
 
         $stage = $stageResult->stage;
+
+        // Phase 6 (US4, T059): a resume point that is not 'pending' --
+        // 'failed'/'handoff_rejected' (an ordinary resume past a stopped
+        // run) or 'running' (a crashed, idempotent stage) -- is reset to a
+        // fresh unstarted state and re-invoked from scratch below, reusing
+        // this SAME row rather than creating a new one.
+        if ($stageResult->status !== 'pending') {
+            $stageResult->status = 'pending';
+            $stageResult->output = null;
+            $stageResult->delegation_id = null;
+            $stageResult->failure_reason = null;
+            $stageResult->started_at = null;
+            $stageResult->completed_at = null;
+            $stageResult->save();
+        }
 
         $inputPayload = $this->inputPayloadFor($run, $stage);
 

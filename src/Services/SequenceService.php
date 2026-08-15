@@ -218,6 +218,58 @@ class SequenceService
     }
 
     /**
+     * data-model.md §5 (Phase 6, US4). Pure derivation, no side effects --
+     * both SequenceController::resume() (explicit, user-initiated) and
+     * ResolveStalledSequenceRunsCommand (the automatic sweep) share this
+     * exact same idempotency check, so the two callers can never disagree
+     * about what is safe.
+     *
+     * Finds the first StageResult (by Stage.position) that is NOT
+     * 'completed'. failed/handoff_rejected/pending are structurally
+     * identical here -- nothing to unwind -- resumable, continue execution
+     * AT that stage; every earlier StageResult is, by construction, already
+     * 'completed', so its stored output is read and passed forward
+     * unchanged, never re-invoked (FR-011/FR-012). 'running' is the
+     * crash-mid-stage case: resumable only when that stage's own
+     * Stage.is_idempotent is true (re-invoked from scratch); otherwise
+     * refused, naming the blocking stage (FR-013/SC-008).
+     *
+     * @return array{resumable: true, resume_from: ?StageResult}|array{resumable: false, reason: string, blocking_stage: Stage}
+     */
+    public function resumeSafety(SequenceRun $run): array
+    {
+        $blockingResult = StageResult::with('stage')
+            ->where('sequence_run_id', $run->id)
+            ->where('status', '!=', 'completed')
+            ->get()
+            ->sortBy(fn (StageResult $r) => $r->stage->position)
+            ->first();
+
+        if ($blockingResult === null) {
+            // Every stage is already completed -- nothing left to resume.
+            // Not normally reachable (a run whose every stage is completed
+            // has SequenceRun.status = 'completed', never 'failed'), but
+            // treated as vacuously resumable rather than throwing.
+            return ['resumable' => true, 'resume_from' => null];
+        }
+
+        if ($blockingResult->status === 'running') {
+            if ($blockingResult->stage->is_idempotent) {
+                return ['resumable' => true, 'resume_from' => $blockingResult];
+            }
+
+            return [
+                'resumable' => false,
+                'reason' => "Stage '{$blockingResult->stage->name}' was interrupted mid-execution and is not marked safe to repeat.",
+                'blocking_stage' => $blockingResult->stage,
+            ];
+        }
+
+        // failed / handoff_rejected / pending.
+        return ['resumable' => true, 'resume_from' => $blockingResult];
+    }
+
+    /**
      * research.md D8/contracts §6 (Phase 4, US2). Fires SequenceRunUpdated
      * for the given run id, wrapped in the private broadcast() try/catch
      * helper below so a broadcast failure can never turn an already-
