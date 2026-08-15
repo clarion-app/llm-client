@@ -425,6 +425,49 @@ class MidConversationReassignmentJourneyTest extends TestCase
     }
 
     // =================================================================
+    // 2b. Reconciliation finding: after a handoff has occurred, the Known
+    //     Specialists section must exclude the CURRENT effective agent
+    //     (ConversationHandoff::currentAgentIdentityFor()), never the
+    //     conversation's original, immutable agent_id column -- which a
+    //     handoff never updates (093's append-only design). Before this
+    //     fix, every turn after any handoff showed the acting specialist
+    //     a section that (wrongly) listed itself as a possible handoff
+    //     target and (wrongly) hid the original agent as an option.
+    // =================================================================
+
+    #[Test]
+    public function after_a_handoff_the_known_specialists_section_excludes_the_new_current_agent_not_the_stale_original(): void
+    {
+        $agentA = $this->makeAgent('agent-a', 'Handles general questions.');
+        $agentB = $this->makeAgent('billing-agent', 'Handles billing invoices and payment disputes.');
+        $agentC = $this->makeAgent('shipping-agent', 'Handles shipping and delivery tracking.');
+
+        $conversation = $this->makeConversation($agentA, $this->user->id);
+
+        // A -> B, via the ordinary agent-initiated handoff mechanism (093,
+        // unchanged) -- $conversation->agent_id itself stays agentA's id
+        // forever; only a new conversation_handoffs row records the move.
+        $handoffResult = $this->handoff($conversation, $agentB->id);
+        $this->assertTrue($handoffResult['success'] ?? false, 'fixture sanity: the A -> B handoff must succeed');
+
+        $section = $this->invokeBuildKnownSpecialistsSection(app(AgentLoopService::class), $conversation->fresh());
+
+        $this->assertNotNull($section, 'fixture sanity: agent A and agent C both remain candidates');
+
+        $this->assertStringNotContainsString(
+            "**{$agentB->id}** — billing-agent",
+            $section,
+            'the CURRENTLY-acting specialist (B, post-handoff) must never be listed as one of its own Known Specialists',
+        );
+        $this->assertStringContainsString(
+            "**{$agentA->id}** — agent-a",
+            $section,
+            'the original specialist (A, no longer the acting agent after the handoff) must now be offered as a legitimate hand-back target, not hidden forever behind the stale agent_id column',
+        );
+        $this->assertStringContainsString("**{$agentC->id}** — shipping-agent", $section);
+    }
+
+    // =================================================================
     // 3. A user-correction-shaped follow-up, with the acting agent's own
     //    tool-call response naming a target id, reassigns the conversation
     //    via handoff_to_agent -- history intact, disclosed in the same

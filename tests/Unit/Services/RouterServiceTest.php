@@ -308,6 +308,87 @@ class RouterServiceTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // Reconciliation (102-router-pattern): the "never throws" contract
+    // (contracts §1) is documented but was never exercised by a test that
+    // actually forces a candidate's scoring to fail — every existing
+    // fixture here is created through AgentService::create(), which
+    // validates parseability at write time, so scoreCandidate()'s own
+    // catch blocks were never hit by any prior test in this file.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_candidate_with_an_unresolvable_current_version_degrades_to_name_only_scoring_rather_than_throwing(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+
+        $orphaned = $this->service()->create(
+            $user->id,
+            "name: orphan-candidate\ninstructions: billing invoice payment specialist.",
+        );
+        // Point current_version_id at a row that does not exist — the
+        // "AgentVersion relation is null" malformed-candidate scenario:
+        // $candidate->currentVersion resolves to null via the belongsTo
+        // relation, never an exception, but scoreCandidate() must still
+        // handle it without crashing the whole call for every other
+        // candidate.
+        DB::table('agents')->where('id', $orphaned->id)->update([
+            'current_version_id' => (string) \Illuminate\Support\Str::uuid(),
+        ]);
+
+        $healthy = $this->service()->create(
+            $user->id,
+            "name: healthy-agent\ninstructions: billing invoice payment specialist.",
+        );
+
+        $decision = $this->router()->route($user->id, 'I have a billing invoice and a payment problem.');
+
+        $this->assertNotNull($decision, 'route() must return a RouterDecision, never throw, when a candidate\'s currentVersion relation is unresolvable');
+        $this->assertSame(
+            $healthy->id,
+            $decision->agentId,
+            'the orphaned candidate must degrade to name-only scoring (0, since "orphan-candidate" shares no tokens with the trigger text) rather than aborting scoring for the healthy candidate',
+        );
+    }
+
+    #[Test]
+    public function a_candidate_whose_raw_definition_fails_to_parse_degrades_to_name_only_scoring_rather_than_throwing(): void
+    {
+        $this->seedOperationCatalog();
+        $user = $this->user();
+
+        $malformed = $this->service()->create(
+            $user->id,
+            "name: malformed-candidate\ninstructions: billing invoice payment specialist.",
+        );
+        // Overwrite the stored raw_definition directly at the DB level
+        // with genuinely unparseable YAML (bypassing AgentService::
+        // create()'s own write-time validation, which never lets a
+        // malformed document land in the first place) — the second
+        // "malformed candidate" scenario contracts §1's "never throws"
+        // clause exists to guard against: AgentDefinitionParser::parse()
+        // throws AgentDefinitionParseException for this input, which
+        // scoreCandidate() explicitly catches.
+        DB::table('agent_versions')->where('id', $malformed->current_version_id)->update([
+            'raw_definition' => "name: [this is not valid yaml\n  - broken: :::",
+        ]);
+
+        $healthy = $this->service()->create(
+            $user->id,
+            "name: healthy-agent\ninstructions: billing invoice payment specialist.",
+        );
+
+        $decision = $this->router()->route($user->id, 'I have a billing invoice and a payment problem.');
+
+        $this->assertNotNull($decision, 'route() must return a RouterDecision, never throw, when a candidate\'s raw_definition fails to parse');
+        $this->assertSame(
+            $healthy->id,
+            $decision->agentId,
+            'the malformed candidate must degrade to name-only scoring (0, since "malformed-candidate" shares no tokens with the trigger text) rather than aborting scoring for the healthy candidate',
+        );
+    }
+
+    // ---------------------------------------------------------------
     // (g) $excludeAgentIds — an excluded candidate is never selectable
     // ---------------------------------------------------------------
 

@@ -12,6 +12,7 @@ use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
@@ -418,6 +419,132 @@ class AgentLoopServiceTest extends TestCase
             'resume() must re-check the live ancestor-chain bound before executing an approved confirmation, not just trust the bound that held when confirmation was first requested',
         );
         $this->assertStringContainsString('pending.operation', $resultContent['error']);
+    }
+
+    /**
+     * Reconciliation finding (102-router-pattern): ensureSpecialistAvailable()
+     * (D7/FR-011 — a specialist that goes inactive mid-conversation must
+     * trigger an automatic fallback handoff) was wired into run()/start()/
+     * resumeSync(), mirroring checkSharedAgentAccessRevoked()'s own
+     * three-site precedent — but checkSharedAgentAccessRevoked() actually
+     * has FOUR call sites in this class, not three: run(), start(),
+     * resumeSync(), AND resume(). resume() — not resumeSync() — is the
+     * method the shipped app's real confirmation-approval endpoint
+     * (ConversationController::confirmApiCall()) actually calls;
+     * resumeSync() has no caller anywhere in src/ at all. Before this fix,
+     * a conversation's bound specialist deactivated during a pending
+     * confirmation's window (up to confirmation_timeout, default 300s —
+     * the same time-window reasoning the ancestor-chain re-check just
+     * above this test already applies) would keep the conversation bound
+     * to the now-deactivated agent indefinitely: the confirmed operation
+     * would still execute, but no fallback handoff would ever be
+     * triggered anywhere in this turn, silently reproducing exactly the
+     * gap D7 was designed to close, just reached through the
+     * confirmation-resume path instead of a fresh turn.
+     */
+    #[Test]
+    public function resume_moves_the_conversation_to_a_fallback_when_its_specialist_was_deactivated_during_the_pending_confirmation_window()
+    {
+        Queue::fake();
+
+        $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
+        $prop->setAccessible(true);
+        $prop->setValue(null, ['paths' => [
+            '/api/contacts/42' => ['delete' => ['operationId' => 'destroyContact', 'summary' => 'Destroy contact']],
+        ]]);
+        $generator = Mockery::mock(Generator::class);
+        $generator->shouldReceive('__invoke')->andReturn(['paths' => [
+            '/api/contacts/42' => ['delete' => ['operationId' => 'destroyContact', 'summary' => 'Destroy contact']],
+        ]]);
+        $this->app->instance(Generator::class, $generator);
+
+        $owner = User::factory()->create();
+        $agentService = new AgentService(new AgentDefinitionParser(), new GitDefinitionFileReader());
+
+        $agentA = $agentService->create($owner->id, "name: recon-resume-agent-a\ninstructions: I am agent A, the original specialist.");
+        $agentB = $agentService->create($owner->id, "name: recon-resume-agent-b\ninstructions: I am agent B, the only other active specialist.");
+
+        $server = Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create([
+            'user_id' => $owner->id,
+            'server_id' => $server->id,
+            'is_processing' => true,
+            'agent_id' => $agentA->id,
+            'agent_version_id' => $agentA->current_version_id,
+        ]);
+
+        Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'user',
+            'user' => (string) $owner->id,
+            'content' => 'My original question.',
+            'responseTime' => 0,
+        ]);
+
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+            'tool_data' => [
+                'tool_calls' => [
+                    [
+                        'id' => 'call_def456',
+                        'type' => 'function',
+                        'function' => [
+                            'name' => 'contacts.destroy',
+                            'arguments' => '{"path":{"id": "42"}}',
+                        ],
+                    ],
+                ],
+                'tool_results' => null,
+                'iteration' => 1,
+                'pending_confirmation' => [
+                    'operationId' => 'destroyContact',
+                    'tool_name' => 'contacts.destroy',
+                    'method' => 'DELETE',
+                    'path' => '/api/contacts/42',
+                    'arguments' => ['path' => ['id' => '42']],
+                    'conversation_history_snapshot' => [],
+                    'expires_at' => now()->addMinutes(5)->toIso8601String(),
+                ],
+            ],
+        ]);
+
+        // Agent A, the conversation's bound specialist, is deactivated
+        // WHILE the confirmation sits pending.
+        $agentService->deactivate($agentA->fresh(), true);
+        $this->assertFalse($agentA->fresh()->is_active, 'fixture sanity: agent A must actually be deactivated');
+
+        $registryMock = Mockery::mock(McpToolRegistry::class);
+        $registryMock->shouldReceive('findTool')
+            ->with('contacts.destroy')
+            ->andReturn([
+                'name' => 'contacts.destroy',
+                '_meta' => ['operationId' => 'destroyContact', 'method' => 'DELETE', 'path' => '/api/contacts/{id}'],
+            ]);
+
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $executorMock->shouldReceive('extractArguments')
+            ->andReturn(['path' => '/api/contacts/42', 'query' => [], 'body' => []]);
+        $executorMock->shouldReceive('executeHttpCall')
+            ->andReturn([
+                'content' => [['type' => 'text', 'text' => '{"success": true}']],
+                'isError' => false,
+            ]);
+
+        $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
+        $service->resume($conversation->fresh(), $message, true);
+
+        $row = ConversationHandoff::where('conversation_id', $conversation->id)->orderByDesc('position')->first();
+        $this->assertNotNull(
+            $row,
+            'resume() — the actual production confirmation-continuation path ConversationController::confirmApiCall() calls, as opposed to the never-called-in-production resumeSync() — must trigger the same automatic-fallback handoff run()/start()/resumeSync() already trigger, not silently leave the conversation bound to its now-deactivated specialist',
+        );
+        $this->assertSame('unavailable', $row->reason);
+        $this->assertSame($agentB->id, $row->to_agent_id);
+        $this->assertSame($agentA->id, $row->from_agent_id);
     }
 
     #[Test]

@@ -359,6 +359,30 @@ class AgentLoopService
             return;
         }
 
+        // Automatic routing / unavailability fallback (102-router-pattern,
+        // US1/US4, research.md D2/D7) — mirrors resumeSync()'s own identical
+        // pair of calls at the same relative point. This is the *production*
+        // confirmation-continuation path (ConversationController::
+        // confirmApiCall() calls resume(), never resumeSync() — confirmed no
+        // controller/job calls resumeSync() at all); omitting these calls
+        // here would let a confirmation approved after its bound specialist
+        // was deactivated during the pending window (up to
+        // confirmation_timeout, default 300s — the same time-window
+        // reasoning the ancestor-chain re-check just above already applies)
+        // execute and keep answering under the deactivated agent's identity
+        // indefinitely, since no other call site in this turn would ever
+        // trigger the fallback handoff. attemptInitialRouting() is a no-op
+        // here in the overwhelming majority of cases (a pending confirmation
+        // implies a prior turn already bound the conversation), but is
+        // included for the same defensive-symmetry reason
+        // checkSharedAgentAccessRevoked() is present at every entry point
+        // regardless of whether it is expected to fire.
+        $this->attemptInitialRouting(
+            $conversation,
+            Message::where('conversation_id', $conversation->id)->where('role', 'user')->first()?->content ?? '',
+        );
+        $this->ensureSpecialistAvailable($conversation);
+
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
         }
@@ -3136,7 +3160,7 @@ class AgentLoopService
      * (102-router-pattern, Phase 5/US3, contracts/routing-mechanism.md §7)
      * -- mirrors buildKnownHelpersSection()'s exact shape. Returns null
      * when the conversation has no bound agent, no user, or the caller
-     * owns no other active agent besides the one already assigned.
+     * owns no other active agent besides the one currently assigned.
      *
      * Lets the currently-assigned specialist's own turn-time reasoning
      * discover every other real candidate id/name so it can call the
@@ -3147,6 +3171,22 @@ class AgentLoopService
      * ConversationAgentDefinitionResolver resolves a bound definition; a
      * candidate whose current version is missing or fails to parse is
      * skipped rather than aborting the whole section.
+     *
+     * Reconciliation finding (102-router-pattern): the excluded agent must
+     * be the conversation's CURRENT effective identity
+     * (ConversationHandoff::currentAgentIdentityFor(), the same helper
+     * ensureSpecialistAvailable() and Message's own attribution listener
+     * already use), never the raw, immutable $conversation->agent_id --
+     * that column records only the *original* binding and is never
+     * updated by a handoff (093's append-only design, data-model.md §3).
+     * Using it here meant that after any handoff (a user correction, a
+     * topic-change reassignment, or D7's automatic unavailability
+     * fallback), every subsequent turn's system prompt excluded the
+     * WRONG agent: the original (no-longer-acting) agent stayed hidden
+     * from the list forever, while the actually-acting specialist saw
+     * itself listed as one of its own "Known Specialists" -- a target
+     * handleHandoffToAgent()'s own cycle check happens to reject if ever
+     * actually called, but confusing and wrong to present at all.
      */
     private function buildKnownSpecialistsSection(Conversation $conversation): ?string
     {
@@ -3154,8 +3194,10 @@ class AgentLoopService
             return null;
         }
 
+        $currentAgentId = ConversationHandoff::currentAgentIdentityFor($conversation)['agent_id'];
+
         $others = app(AgentQuery::class)->listActiveForUser((string) $conversation->user_id)
-            ->reject(fn ($a) => $a->id === $conversation->agent_id);
+            ->reject(fn ($a) => $a->id === $currentAgentId);
 
         if ($others->isEmpty()) {
             return null;

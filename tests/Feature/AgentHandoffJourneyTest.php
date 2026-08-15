@@ -407,15 +407,26 @@ class AgentHandoffJourneyTest extends TestCase
             }
         }
 
-        $this->assertStringContainsString(
+        // 102-router-pattern reconciliation: since buildKnownSpecialistsSection()
+        // was fixed to exclude the CURRENT effective agent (B) rather than
+        // the stale, immutable conversation.agent_id (A), agent A now
+        // correctly reappears as a legitimate hand-back candidate in the
+        // "## Known Specialists" section -- quoting A's own declared
+        // instructions verbatim as its "Focus" blurb, somewhere in the
+        // MIDDLE of the system content. That is a distinct, correct
+        // concern from this test's own: this test is about which agent's
+        // instructions GOVERN the turn, not what a "Known Specialists"
+        // listing may separately quote. appendBoundInstructions()
+        // (formatMessages(), above) always appends the bound agent's own
+        // instructions as the LAST thing in the system message's content
+        // -- so asserting the content ENDS WITH B's instructions verbatim
+        // proves both that B governs and that A's text is not what
+        // governs, in one unambiguous assertion, immune to A's text
+        // legitimately reappearing earlier as a Known Specialists blurb.
+        $this->assertStringEndsWith(
             'Always respond in English.',
             $systemContent,
-            'formatMessages() must use the RECEIVING agent (B)\'s instructions on the very next turn after a handoff',
-        );
-        $this->assertStringNotContainsString(
-            'Always respond in French.',
-            $systemContent,
-            'formatMessages() must never fall back to the ORIGINAL agent (A)\'s instructions once a handoff has occurred',
+            'formatMessages() must append the RECEIVING agent (B)\'s instructions, as the GOVERNING instructions, on the very next turn after a handoff',
         );
     }
 
