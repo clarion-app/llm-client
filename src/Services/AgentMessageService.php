@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\ValueObjects\Messaging\MessageDelivered;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageEnvelope;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageOutcome;
 use ClarionApp\LlmClient\ValueObjects\Messaging\MessageRefusal;
+use ClarionApp\LlmClient\ValueObjects\Messaging\MessageRejection;
 use Illuminate\Support\Facades\Context;
 
 /**
@@ -26,6 +27,12 @@ use Illuminate\Support\Facades\Context;
  * content, or a blank expectedResponse are refused before any size or
  * availability check is ever reached (research.md D6). An empty context
  * array is deliberately NOT a violation (FR-005 — explicitly no context).
+ *
+ * Phase 7 (US5) adds the SECOND check in that fixed order: the size bound
+ * (contracts §1 step 2) — an envelope whose content/context/expected
+ * response combined exceed config('llm-client.messaging.max_message_bytes')
+ * is rejected outright, never truncated-and-stored, once structural
+ * validation has already passed.
  *
  * `run_id` stamping (Phase 4, US2) reads the single ambient carrier
  * `Context::get('run_id')` (069's existing mechanism, reused unchanged) at
@@ -66,6 +73,26 @@ class AgentMessageService
             ]);
 
             return new MessageRefusal($message->id, $refusalReason);
+        }
+
+        $maxBytes = (int) config('llm-client.messaging.max_message_bytes');
+
+        if ($sizeBytes > $maxBytes) {
+            $message = AgentMessage::create([
+                'from_agent_id' => $envelope->fromAgentId,
+                'to_agent_id' => $envelope->toAgentId,
+                'owner_user_id' => $envelope->ownerUserId,
+                'conversation_id' => $envelope->conversationId,
+                'run_id' => $runId,
+                'content' => null,
+                'context' => null,
+                'expected_response' => null,
+                'status' => 'rejected_oversized',
+                'refusal_reason' => 'oversized',
+                'size_bytes' => $sizeBytes,
+            ]);
+
+            return new MessageRejection($message->id, $sizeBytes);
         }
 
         $message = AgentMessage::create([
