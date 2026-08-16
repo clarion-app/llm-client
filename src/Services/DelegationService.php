@@ -204,7 +204,21 @@ class DelegationService
 
         $helperConversation = Conversation::find($delegation->helper_conversation_id);
 
-        $sixFieldResult = $this->runDelegatedTask($delegation, $offeredAgent, $helperConversation);
+        // 109-agent-as-capability (Phase 6/US4, data-model.md §8,
+        // research.md D4): a capability-agent call is bounded by its OWN,
+        // independently-tunable capability_agent.max_iterations/max_seconds
+        // -- never delegation.max_iterations/max_seconds, which bounds only
+        // an ordinary delegate_to_helper hop. Passed through
+        // runDelegatedTask()'s own $boundOptions override, mirroring
+        // delegate()'s default-config-derived $delegationOptions shape
+        // exactly (same two keys, same override mechanism, different
+        // config source).
+        $capabilityAgentOptions = [
+            'max_iterations' => config('llm-client.capability_agent.max_iterations', 15),
+            'deadline_at' => now()->addSeconds(config('llm-client.capability_agent.max_seconds', 180)),
+        ];
+
+        $sixFieldResult = $this->runDelegatedTask($delegation, $offeredAgent, $helperConversation, $capabilityAgentOptions);
 
         return $this->translateCapabilityResult($sixFieldResult);
     }
@@ -725,7 +739,7 @@ class DelegationService
      *
      * @return array<string, mixed>
      */
-    private function runDelegatedTask(Delegation $delegation, Agent $helperAgent, Conversation $helperConversation): array
+    private function runDelegatedTask(Delegation $delegation, Agent $helperAgent, Conversation $helperConversation, ?array $boundOptions = null): array
     {
         $actionId = $delegation->parent_action_id;
 
@@ -739,8 +753,14 @@ class DelegationService
 
         // D3: the delegation-specific bounds -- an $options override on the
         // nested run() call only, never mutating the shared config the
-        // parent's own outer loop reads.
-        $delegationOptions = [
+        // parent's own outer loop reads. 109-agent-as-capability (Phase 6/
+        // US4, research.md D4): $boundOptions lets a caller other than a
+        // plain delegate_to_helper hop (i.e. invokeAsCapability()) supply
+        // its own max_iterations/deadline_at pair -- derived from
+        // capability_agent.* rather than delegation.* -- through the exact
+        // same override mechanism, so the two entry points' bounds can
+        // differ without either mutating the other's config reads.
+        $delegationOptions = array_merge([
             'max_iterations' => config('llm-client.delegation.max_iterations', 10),
             'deadline_at' => now()->addSeconds(config('llm-client.delegation.max_seconds', 120)),
             // 099-result-aggregation (research.md D1): every delegated
@@ -750,7 +770,7 @@ class DelegationService
             'preset' => 'delegation_result',
             'retry_on_validation_failure' => true,
             'max_schema_retries' => config('llm-client.delegation.max_result_schema_retries', 2),
-        ];
+        ], $boundOptions ?? []);
 
         try {
             $rawResult = $this->agentLoopService->run($helperConversation, $composedMessage, $delegationOptions);
