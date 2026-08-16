@@ -38,6 +38,7 @@ class Delegation extends Model
         'result_truncated',
         'managed_task_id',
         'part_id',
+        'origin',
     ];
 
     protected $casts = [

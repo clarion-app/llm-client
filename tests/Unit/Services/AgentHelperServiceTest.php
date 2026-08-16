@@ -4,9 +4,11 @@ namespace ClarionApp\LlmClient\Tests\Unit\Services;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Exceptions\HelperAssignmentCycleException;
 use ClarionApp\LlmClient\Exceptions\HelperExceedsParentPermissionsException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
+use ClarionApp\LlmClient\Models\CapabilityOffering;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
 use ClarionApp\LlmClient\Services\AgentHelperService;
 use ClarionApp\LlmClient\Services\AgentService;
@@ -53,6 +55,7 @@ class AgentHelperServiceTest extends TestCase
         Mockery::close();
 
         DB::table('agent_helper_assignments')->delete();
+        DB::table('agent_capability_offerings')->delete();
         DB::table('agent_versions')->delete();
         DB::table('agents')->delete();
         DB::table('users')->delete();
@@ -529,6 +532,60 @@ YAML;
                 ->where('helper_agent_id', $helper->id)
                 ->count(),
             'exactly one lifetime row must exist for this pair, never a duplicate',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // assign() -- 109-agent-as-capability, Phase 2/Foundational, tasks.md
+    // T014 (research.md D3's own "enforced from both edge-creating entry
+    // points, or the same asymmetric gap reopens from the other side").
+    //
+    // Proves AgentHelperQuery::activeHelperIdsOf()'s widening (T012) is
+    // genuinely shared by both wouldCreateCycle() and
+    // wouldOfferingCreateCycle() -- an AgentHelperService::assign() call
+    // that would close a cycle purely through an EXISTING CapabilityOffering
+    // edge (no prior helper-assignment edge in the path at all) must be
+    // refused too, not only the reverse (CapabilityOfferingServiceTest's
+    // own union-graph cycle test, which spans one helper edge + one
+    // offering edge).
+    //
+    // Written first, confirmed RED: AgentHelperQuery::activeHelperIdsOf()
+    // does not yet union in CapabilityOffering rows before T012 lands.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function assign_refuses_a_cycle_that_would_close_through_an_existing_capability_offering_edge(): void
+    {
+        // A is offered as a capability to caller B -- CapabilityOffering
+        // edge B -> A ("B can reach A"). Attempting to assign A as B's
+        // helper (parent=A, helper=B) would add edge A -> B, closing the
+        // 2-node loop A -> B -> A.
+        $owner = $this->user();
+        $this->seedThreeOperationCatalog();
+        $agentA = $this->agent($owner, 'offering-cycle-agent-a', '"*"');
+        $agentB = $this->agent($owner, 'offering-cycle-agent-b', '"*"');
+
+        CapabilityOffering::create([
+            'offered_agent_id' => $agentA->id,
+            'caller_agent_id' => $agentB->id,
+            'owner_user_id' => $owner->id,
+            'capability_name' => 'b-calls-a',
+            'capability_description' => 'B calls A.',
+            'input_description' => 'Input for A.',
+        ]);
+
+        try {
+            $this->service()->assign($owner->id, $agentA->id, $agentB->id);
+            $this->fail('assign() must refuse a helper assignment that closes a cycle through an existing CapabilityOffering edge');
+        } catch (HelperAssignmentCycleException $e) {
+            $this->assertContains($agentA->id, $e->cyclePath);
+            $this->assertContains($agentB->id, $e->cyclePath);
+        }
+
+        $this->assertSame(
+            0,
+            AgentHelperAssignment::where('parent_agent_id', $agentA->id)->where('helper_agent_id', $agentB->id)->count(),
+            'a rejected assign() attempt must not create a row',
         );
     }
 }

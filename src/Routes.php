@@ -39,6 +39,7 @@ use ClarionApp\LlmClient\Controllers\StoredAgentController;
 use ClarionApp\LlmClient\Controllers\AgentVersionComparisonController;
 use ClarionApp\LlmClient\Controllers\AgentShareController;
 use ClarionApp\LlmClient\Controllers\AgentHelperController;
+use ClarionApp\LlmClient\Controllers\CapabilityOfferingController;
 use ClarionApp\LlmClient\Controllers\DelegationController;
 use ClarionApp\LlmClient\Controllers\ManagedTaskController;
 use ClarionApp\LlmClient\Controllers\ConsensusController;
@@ -318,6 +319,17 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // contracts/subagent-model-api.md §4). Owner-only for the parent side;
     // idempotent — always 204 whether an active assignment existed or not.
     Route::delete('agents/{id}/helpers/{helperAgentId}', [AgentHelperController::class, "remove"]);
+
+    // Offer an agent as a capability to another, list what an agent
+    // currently offers, and withdraw an offering (109-agent-as-capability,
+    // Phase 2/Foundational, contracts/capability-offering-api.md). All
+    // owner-only for the offered-agent side, mirroring the helper-
+    // assignment routes above exactly. Idempotent DELETE — 200
+    // {"removed": bool}, never a bare 204 (distinct from the helper-
+    // removal route's own posture, per this feature's own contract).
+    Route::post('agents/{offeredAgentId}/capability-offerings', [CapabilityOfferingController::class, "offer"]);
+    Route::get('agents/{offeredAgentId}/capability-offerings', [CapabilityOfferingController::class, "list"]);
+    Route::delete('agents/{offeredAgentId}/capability-offerings/{callerAgentId}', [CapabilityOfferingController::class, "withdraw"]);
 
     // Compare two agent versions (090-agent-version-binding, Phase 5/US3,
     // contracts §4/§5). Named independently by two version ids, not nested

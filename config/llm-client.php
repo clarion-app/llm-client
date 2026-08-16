@@ -820,6 +820,20 @@ return [
         ],
     ],
 
+    // Agent as Capability (109-agent-as-capability) — the per-capability-
+    // agent-call effort/time ceilings (FR-012/FR-013), independently tunable
+    // from delegation.max_iterations/max_seconds above (research.md D4) since
+    // a capability-agent call is expected to run longer than an ordinary
+    // operation but not necessarily as long as an explicit, deliberate
+    // delegation. max_chain_depth is deliberately NOT duplicated here — a live
+    // call chain now mixes delegate_to_helper and capability-offering hops
+    // interchangeably (research.md D3), so depth is bounded once, chain-wide,
+    // by the existing delegation.max_chain_depth.
+    'capability_agent' => [
+        'max_iterations' => (int) env('LLM_CLIENT_CAPABILITY_AGENT_MAX_ITERATIONS', 15),
+        'max_seconds' => (int) env('LLM_CLIENT_CAPABILITY_AGENT_MAX_SECONDS', 180),
+    ],
+
     // Manager Agent (103-manager-agent) — the whole-task round/wall-clock
     // ceilings (FR-009/FR-017, research.md D5), the per-step-job bound on how
     // many manager-loop iterations one RunManagedTaskStepJob invocation may

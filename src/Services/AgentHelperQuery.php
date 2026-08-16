@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\AgentDefinitionParseException;
 use ClarionApp\LlmClient\Exceptions\AgentDefinitionResolutionException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
+use ClarionApp\LlmClient\Models\CapabilityOffering;
 use Illuminate\Support\Collection;
 
 /**
@@ -179,6 +180,59 @@ class AgentHelperQuery
         $visited = [];
 
         if ($this->dfsForTarget($helperAgentId, $parentAgentId, $path, $visited)) {
+            return $path;
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether offering the candidate agent as a capability to the given
+     * caller would close a cycle, direct or transitive, in the union of
+     * active `agent_helper_assignments` ("parent can reach helper") and
+     * active `agent_capability_offerings` ("caller can reach offered")
+     * edges (109-agent-as-capability, data-model.md §4, research.md D3).
+     *
+     * The new edge being tested is `callerAgentId -> offeredAgentId`
+     * ("caller can reach offered", the same directed sense a helper
+     * assignment's `parentAgentId -> helperAgentId` edge already is). A new
+     * edge Y -> Z closes a cycle iff Z can already reach Y through the
+     * existing graph -- exactly the property wouldCreateCycle() above
+     * checks via `dfsForTarget($helperAgentId, $parentAgentId, ...)` (Z =
+     * helperAgentId, Y = parentAgentId). Here Z = offeredAgentId and
+     * Y = callerAgentId, so the equivalent, provably-correct call is
+     * `dfsForTarget($offeredAgentId, $callerAgentId, ...)` — the two
+     * wouldOfferingCreateCycle() parameters passed straight through in
+     * their declared order.
+     *
+     * NOTE: data-model.md §4 / tasks.md's own Grounding note 5 describe
+     * this call as `dfsForTarget($callerAgentId, $offeredAgentId, ...)`
+     * ("reversed argument order"). That direction was verified (by hand,
+     * against this exact method's own required union-graph test case --
+     * an A -helper-> B, B -offering-> C chain, testing whether offering A
+     * to caller C would close it) to never detect the cycle:
+     * `activeHelperIdsOf($callerAgentId)` at check time has no outgoing
+     * edges yet (C has offered nothing), so the DFS returns false
+     * immediately regardless of the rest of the graph. The direction
+     * implemented below was hand-verified against the same fixture to
+     * correctly return the ordered path). Recorded as a discrepancy per
+     * this task-generation run's own "record any discrepancy found rather
+     * than silently adapting" instruction, not silently changed.
+     *
+     * Shares the same widened activeHelperIdsOf() as wouldCreateCycle()
+     * above, not a second copy, so the two checks can never independently
+     * drift out of agreement about what the combined graph looks like.
+     *
+     * @return list<string>|null the ordered cycle path, starting at the
+     *   candidate offered agent and ending at the would-be caller, or null
+     *   if no cycle would form.
+     */
+    public function wouldOfferingCreateCycle(string $offeredAgentId, string $callerAgentId): ?array
+    {
+        $path = [];
+        $visited = [];
+
+        if ($this->dfsForTarget($offeredAgentId, $callerAgentId, $path, $visited)) {
             return $path;
         }
 
@@ -373,13 +427,30 @@ class AgentHelperQuery
     }
 
     /**
+     * The union-graph adjacency this feature's whole cycle-prevention story
+     * rests on (109-agent-as-capability, data-model.md §4): every agent
+     * reachable one hop outward from $parentAgentId via either an active
+     * `agent_helper_assignments` edge ("parent can reach helper") or an
+     * active `agent_capability_offerings` edge ("caller can reach
+     * offered") — the two edge types are treated as one combined directed
+     * graph for cycle-detection purposes. Both wouldCreateCycle() and
+     * wouldOfferingCreateCycle() walk this same widened method via
+     * dfsForTarget(), so the two checks can never independently drift out
+     * of agreement about what the combined graph looks like.
+     *
      * @return list<string>
      */
     private function activeHelperIdsOf(string $parentAgentId): array
     {
-        return AgentHelperAssignment::where('parent_agent_id', $parentAgentId)
+        $helperIds = AgentHelperAssignment::where('parent_agent_id', $parentAgentId)
             ->pluck('helper_agent_id')
             ->all();
+
+        $offeredIds = CapabilityOffering::where('caller_agent_id', $parentAgentId)
+            ->pluck('offered_agent_id')
+            ->all();
+
+        return array_values(array_unique([...$helperIds, ...$offeredIds]));
     }
 
     /**

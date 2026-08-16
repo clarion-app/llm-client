@@ -291,6 +291,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineAgentShareGrantSchema();
         $this->defineAgentHelperAssignmentSchema();
         $this->defineAgentDelegationSchema();
+        $this->defineCapabilityOfferingSchema();
         $this->defineManagedTaskSchema();
         $this->defineManagedTaskPartSchema();
         $this->defineConsensusRequestSchema();
@@ -1082,6 +1083,44 @@ abstract class TestCase extends BaseTestCase
             Schema::table('agent_delegations', function (Blueprint $table) {
                 $table->uuid('managed_task_id')->nullable()->index();
                 $table->uuid('part_id')->nullable()->index();
+            });
+        }
+
+        if (!Schema::hasColumn('agent_delegations', 'origin')) {
+            Schema::table('agent_delegations', function (Blueprint $table) {
+                $table->enum('origin', ['delegate_to_helper', 'capability_offering'])->default('delegate_to_helper');
+            });
+        }
+    }
+
+    /**
+     * agent_capability_offerings — one lifetime row per ordered
+     * (offered_agent_id, caller_agent_id) pair, recording that a specific
+     * agent has been offered as a capability to a specific caller agent
+     * (109-agent-as-capability, data-model.md §1). Mirrors the migration's
+     * own column set exactly. Guarded by Schema::hasTable() like every
+     * existing block here, and called from defineDatabaseMigrations()
+     * directly, immediately after defineAgentDelegationSchema(), matching
+     * this package's own established Foundational-phase precedent.
+     */
+    protected function defineCapabilityOfferingSchema(): void
+    {
+        if (!Schema::hasTable('agent_capability_offerings')) {
+            Schema::create('agent_capability_offerings', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('offered_agent_id');
+                $table->uuid('caller_agent_id');
+                $table->uuid('owner_user_id');
+                $table->string('capability_name');
+                $table->text('capability_description');
+                $table->text('input_description');
+                $table->timestamps();
+                $table->timestamp('deleted_at')->nullable();
+
+                $table->unique(['offered_agent_id', 'caller_agent_id']);
+                $table->index('offered_agent_id');
+                $table->index('caller_agent_id');
+                $table->index('owner_user_id');
             });
         }
     }
