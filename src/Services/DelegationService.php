@@ -198,8 +198,11 @@ class DelegationService
         // depth-based). The primary defense is the config-time union-graph
         // DFS (AgentHelperQuery::wouldOfferingCreateCycle()); this is the
         // runtime backstop for a data anomaly or race that bypasses it.
-        if (in_array($fresh->offered_agent_id, $this->ancestorAgentIds($callerConversation), true)) {
-            return ['error' => 'This capability is already active earlier in this call chain and cannot be invoked again.'];
+        $ancestorAgentIds = $this->ancestorAgentIds($callerConversation);
+        if (in_array($fresh->offered_agent_id, $ancestorAgentIds, true)) {
+            $cyclePath = $this->describeCyclePath($ancestorAgentIds, $callerConversation->agent_id, $offeredAgent);
+
+            return ['error' => "This capability is already active earlier in this call chain and cannot be invoked again ({$cyclePath})."];
         }
 
         $delegation = $this->createDelegationRow(
@@ -561,9 +564,24 @@ class DelegationService
                 ->value('content') ?? '')
             : '';
 
+        // 110-delegation-deadlock-timeout (Phase 6/US4, tasks.md T040b,
+        // spec.md User Story 4 AC2): when there is no partial assistant
+        // content to fall back on, the placeholder itself now names both
+        // participants -- the helper agent that was running, and the
+        // parent agent it was working for -- rather than a generic
+        // message naming neither. withTrashed() mirrors runBatchMember()'s
+        // own lookup: an agent deactivated/deleted between the delegation
+        // starting and the sweep finding it stalled must still be
+        // nameable in the report. Falls back to the raw id (never null)
+        // if even a withTrashed() lookup misses, mirroring
+        // resolveAndValidate()'s own `$helperAgent?->name ?? $helperAgentId`
+        // precedent.
+        $helperAgentName = Agent::withTrashed()->find($delegation->helper_agent_id)?->name ?? $delegation->helper_agent_id;
+        $parentAgentName = Agent::withTrashed()->find($delegation->parent_agent_id)?->name ?? $delegation->parent_agent_id;
+
         $resultSummary = $partialResult !== ''
             ? Str::limit($partialResult, 500)
-            : 'The delegation chain was force-finalized as stalled.';
+            : "The delegation from \"{$parentAgentName}\" to \"{$helperAgentName}\" was force-finalized as stalled.";
         $resultUndone = 'Everything -- the task could not be completed.';
 
         $delegation->status = 'exhausted';
@@ -747,10 +765,13 @@ class DelegationService
         // configured ceiling (identity-based, not depth-based). Mirrors
         // EffectiveBoundResolver::check()'s own identical backstop for
         // the permission-bound walk.
-        if (in_array($helperAgentId, $this->ancestorAgentIds($parentConversation), true)) {
+        $ancestorAgentIds = $this->ancestorAgentIds($parentConversation);
+        if (in_array($helperAgentId, $ancestorAgentIds, true)) {
+            $cyclePath = $this->describeCyclePath($ancestorAgentIds, $currentAgentId, $helperAgent);
+
             return [
                 'error' => 'agent_already_active_in_chain',
-                'message' => "\"{$helperAgent->name}\" is already active earlier in this delegation chain and cannot be invoked again.",
+                'message' => "\"{$helperAgent->name}\" is already active earlier in this delegation chain and cannot be invoked again ({$cyclePath}).",
             ];
         }
 
@@ -844,6 +865,34 @@ class DelegationService
         }
 
         return $agentIds;
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 6/US4, tasks.md T040a,
+     * research.md D4, spec.md User Story 4 AC1): renders the full cycle
+     * path for the `agent_already_active_in_chain` refusal message --
+     * shared by resolveAndValidate()'s and invokeAsCapability()'s own
+     * identical identity-cycle backstops, so the two never drift apart.
+     *
+     * $ancestorAgentIds is ancestorAgentIds()'s own innermost-to-outermost
+     * order (closest ancestor first, chain root last); reversed here to
+     * read root-first, then the current (attempting) agent appended, then
+     * the already-active agent's own name pushed on last -- so the
+     * rendered path reads as "the order the loop would have formed"
+     * (US4 AC1), e.g. "A -> B -> C -> A" for an indirect A->B->C->A cycle
+     * refused at C's attempt to re-invoke A.
+     */
+    private function describeCyclePath(array $ancestorAgentIds, string $currentAgentId, Agent $reInvokedAgent): string
+    {
+        $pathAgentIds = array_reverse($ancestorAgentIds);
+        $pathAgentIds[] = $currentAgentId;
+
+        $names = Agent::whereIn('id', array_unique($pathAgentIds))->pluck('name', 'id');
+
+        $pathNames = array_map(fn ($id) => $names[$id] ?? $id, $pathAgentIds);
+        $pathNames[] = $reInvokedAgent->name;
+
+        return implode(' -> ', $pathNames);
     }
 
     /**
