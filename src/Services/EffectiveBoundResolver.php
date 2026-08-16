@@ -29,6 +29,21 @@ use ClarionApp\LlmClient\Models\Delegation;
  * and should never actually contain one, but this walk does not trust that
  * blindly (mirroring AgentHelperQuery::structuralEffectiveBound()'s own
  * cycle-safety posture, research.md D2/D3).
+ *
+ * 109-agent-as-capability (Phase 5/US3, data-model.md §7, research.md D3):
+ * a SECOND, independent visited-set additionally tracks visited AGENT ids
+ * (`$delegation->parent_agent_id` at each hop) — not merely conversation
+ * ids. Introducing a second edge type (capability offerings) that a live
+ * chain can traverse interchangeably with helper-assignment hops means the
+ * config-time union-graph DFS (AgentHelperQuery::wouldCreateCycle()/
+ * wouldOfferingCreateCycle()) is the PRIMARY defense, not the only one — a
+ * data anomaly or race bypassing it must still be caught here, at the
+ * moment it would actually matter, rather than merely capped by depth. If
+ * the specific agent about to be checked as an ancestor has already
+ * appeared earlier in this same walk, the walk stops and reports that
+ * agent as the blocker using the SAME return shape a permission-bound
+ * rejection already uses — no new result shape is introduced for a
+ * cycle-shaped refusal at this layer.
  */
 final class EffectiveBoundResolver
 {
@@ -43,6 +58,7 @@ final class EffectiveBoundResolver
 
         $catalog = null;
         $visited = [];
+        $visitedAgentIds = [];
         $currentConversationId = $conversation->id;
         $levelsUp = 0;
 
@@ -66,9 +82,28 @@ final class EffectiveBoundResolver
                 break;
             }
 
+            // 109-agent-as-capability (Phase 5/US3, data-model.md §7):
+            // the agent-identity backstop — checked BEFORE the permission
+            // bound below, so a revisited agent is refused as a cycle
+            // even when its own current bound would otherwise permit the
+            // operation (proving this is genuinely identity-based, not a
+            // side effect of the permission check).
+            $ancestorAgentId = $delegation->parent_agent_id;
+            if (isset($visitedAgentIds[$ancestorAgentId])) {
+                $ancestorAgent = Agent::find($ancestorAgentId);
+
+                return [
+                    'allowed' => false,
+                    'blocking_agent_id' => $ancestorAgentId,
+                    'blocking_agent_name' => $ancestorAgent?->name,
+                    'levels_up' => $levelsUp,
+                ];
+            }
+            $visitedAgentIds[$ancestorAgentId] = true;
+
             $catalog ??= $this->helperQuery->catalog();
 
-            $ancestorAgent = Agent::find($delegation->parent_agent_id);
+            $ancestorAgent = Agent::find($ancestorAgentId);
             if ($ancestorAgent !== null) {
                 $permitted = $this->helperQuery->permittedOperationIds($ancestorAgent, $catalog);
                 if (!in_array($operationId, $permitted, true)) {

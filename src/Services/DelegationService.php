@@ -176,6 +176,19 @@ class DelegationService
             return ['error' => 'This delegation chain has reached its maximum depth and cannot delegate any further.'];
         }
 
+        // 109-agent-as-capability (Phase 5/US3, data-model.md §7): the
+        // agent-identity backstop -- refuses re-invoking $offeredAgent if
+        // it is already active earlier in this SAME live chain, regardless
+        // of whether every hop so far came from delegate_to_helper or a
+        // capability offering, and regardless of how far under
+        // max_chain_depth the chain currently is (identity-based, not
+        // depth-based). The primary defense is the config-time union-graph
+        // DFS (AgentHelperQuery::wouldOfferingCreateCycle()); this is the
+        // runtime backstop for a data anomaly or race that bypasses it.
+        if (in_array($fresh->offered_agent_id, $this->ancestorAgentIds($callerConversation), true)) {
+            return ['error' => 'This capability is already active earlier in this call chain and cannot be invoked again.'];
+        }
+
         $delegation = $this->createDelegationRow(
             $callerConversation,
             $offeredAgent,
@@ -541,11 +554,69 @@ class DelegationService
             ];
         }
 
+        // 109-agent-as-capability (Phase 5/US3, data-model.md §7): the
+        // agent-identity backstop -- a NEW, full ancestor walk (distinct
+        // from the single-hop enclosing-delegation lookup above, which
+        // only computes depth), collecting every parent_agent_id seen
+        // while walking helper_conversation_id backward from
+        // $parentConversation. If $helperAgentId is already active
+        // earlier in this SAME live chain, the call is refused with its
+        // own distinct error code -- never delegation_depth_exceeded,
+        // even when (as here) the chain's own depth is well under the
+        // configured ceiling (identity-based, not depth-based). Mirrors
+        // EffectiveBoundResolver::check()'s own identical backstop for
+        // the permission-bound walk.
+        if (in_array($helperAgentId, $this->ancestorAgentIds($parentConversation), true)) {
+            return [
+                'error' => 'agent_already_active_in_chain',
+                'message' => "\"{$helperAgent->name}\" is already active earlier in this delegation chain and cannot be invoked again.",
+            ];
+        }
+
         return [
             'helperAgent' => $helperAgent,
             'depth' => $depth,
             'inheritedManagedTaskId' => $enclosingDelegation?->managed_task_id,
         ];
+    }
+
+    /**
+     * 109-agent-as-capability (Phase 5/US3, data-model.md §7, Grounding
+     * note 8): the full ancestor-AGENT-id walk shared by
+     * resolveAndValidate() (delegate()'s own eligibility path) and
+     * invokeAsCapability() -- analogous to EffectiveBoundResolver::
+     * check()'s own `while (true)` loop, but collecting agent ids rather
+     * than evaluating permission bounds. Genuinely new code, not an
+     * extension of resolveAndValidate()'s own single-hop enclosing-
+     * delegation lookup (which only ever looks at ONE row, for depth).
+     * Bounded by the same conversation-id visited-set guard
+     * EffectiveBoundResolver::check() uses, against a data-level cycle in
+     * agent_delegations.
+     *
+     * @return list<string>
+     */
+    private function ancestorAgentIds(Conversation $conversation): array
+    {
+        $agentIds = [];
+        $visitedConversationIds = [];
+        $currentConversationId = $conversation->id;
+
+        while (true) {
+            if (isset($visitedConversationIds[$currentConversationId])) {
+                break;
+            }
+            $visitedConversationIds[$currentConversationId] = true;
+
+            $delegation = Delegation::where('helper_conversation_id', $currentConversationId)->first();
+            if ($delegation === null) {
+                break;
+            }
+
+            $agentIds[] = $delegation->parent_agent_id;
+            $currentConversationId = $delegation->parent_conversation_id;
+        }
+
+        return $agentIds;
     }
 
     /**
