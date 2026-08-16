@@ -315,6 +315,86 @@ class TaskWorkspaceServiceTest extends TestCase
         }
     }
 
+    // =================================================================
+    // US6 (Phase 8, T040): trimToCap() -- oldest-first eviction, uniform
+    // regardless of content (never favors one side of a contradictory
+    // pair), keeping only the most recently written entries.
+    // =================================================================
+
+    #[Test]
+    public function trims_to_the_cap_keeping_the_most_recent_entries_and_evicting_a_contradictory_pair_by_age_alone(): void
+    {
+        config(['llm-client.task_workspace.max_entries' => 5]);
+
+        $task = $this->makeManagedTask();
+        $service = app(TaskWorkspaceService::class);
+
+        // Entries 1-2 are a plainly contradictory pair (quickstart scenario
+        // 6's own shape) seeded first -- the oldest of the 12 -- so the cap
+        // must evict both of them purely because they are old, never
+        // because trimToCap() weighed which one "won" the disagreement.
+        $contents = [
+            1 => 'The API requires auth.',
+            2 => 'The API is unauthenticated.',
+        ];
+        for ($i = 3; $i <= 12; $i++) {
+            $contents[$i] = "Entry number {$i}.";
+        }
+
+        $entries = [];
+        foreach ($contents as $i => $content) {
+            $entries[$i] = $service->recordEntry($task, (string) Str::uuid(), $content);
+            $this->assertNotNull($entries[$i], "entry {$i} must be recorded");
+
+            $countAfterWrite = TaskWorkspaceEntry::where('managed_task_id', $task->id)->count();
+            $this->assertLessThanOrEqual(5, $countAfterWrite, "count must never exceed the cap of 5, checked immediately after writing entry {$i}");
+
+            // Distinct created_at ordering for every entry -- without this,
+            // several entries could share one timestamp and the
+            // oldest-first eviction/read ordering would be ambiguous.
+            usleep(1000);
+        }
+
+        $this->assertSame(5, TaskWorkspaceEntry::where('managed_task_id', $task->id)->count(), 'exactly 5 entries survive the cap');
+
+        // Entries 1-7 -- including BOTH sides of the contradictory pair
+        // (1 and 2) -- are gone with no way to recover them.
+        foreach (range(1, 7) as $i) {
+            $this->assertDatabaseMissing('task_workspace_entries', ['id' => $entries[$i]->id]);
+        }
+
+        // The 5 remaining are exactly the 5 most recently written
+        // (entries 8-12), in their original write order.
+        $remaining = TaskWorkspaceEntry::where('managed_task_id', $task->id)->orderBy('created_at')->pluck('content')->all();
+        $expected = array_map(fn ($i) => $contents[$i], range(8, 12));
+        $this->assertSame($expected, $remaining, 'the 5 remaining entries must be exactly the 5 most recently written (8-12)');
+    }
+
+    // =================================================================
+    // US6 (Phase 8, T043): a write attempted after conclusion is refused
+    // and never orphans a row.
+    // =================================================================
+
+    #[Test]
+    public function refuses_a_write_against_a_concluded_task_and_leaves_no_orphaned_row(): void
+    {
+        $task = $this->makeManagedTask();
+        $service = app(TaskWorkspaceService::class);
+
+        // Conclude the task via ManagerService::finalize() -- the
+        // completion sub-case of T042, the simplest of the three
+        // termination paths to set up directly in this file.
+        $this->assertNull(app(ManagerService::class)->finalizeRefusal($task, null), 'fixture sanity -- no parts exist, finalize must be admitted');
+        app(ManagerService::class)->finalize($task, 'Concluded before this write attempt.', null);
+        $task->refresh();
+        $this->assertNotSame('in_progress', $task->status, 'fixture sanity -- the task must now be terminal');
+
+        $entry = $service->recordEntry($task, (string) Str::uuid(), 'A write attempted directly against the now-terminal task.');
+
+        $this->assertNull($entry, 'recordEntry() must refuse a write against a concluded task');
+        $this->assertSame(0, TaskWorkspaceEntry::where('managed_task_id', $task->id)->count(), 'no row may be written and then orphaned by the discard');
+    }
+
     private function methodSource(\ReflectionMethod $method): string
     {
         $filename = $method->getDeclaringClass()->getFileName();

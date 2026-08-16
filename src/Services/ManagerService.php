@@ -55,6 +55,7 @@ class ManagerService
     public function __construct(
         private readonly AgentQuery $agentQuery,
         private readonly ResultAggregationService $resultAggregationService,
+        private readonly TaskWorkspaceService $taskWorkspaceService,
     ) {}
 
     /**
@@ -489,6 +490,8 @@ class ManagerService
         $task->last_progress_at = now();
         $task->save();
 
+        $this->taskWorkspaceService->discardForTask($task->id);
+
         $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
     }
 
@@ -573,6 +576,8 @@ class ManagerService
         $task->completed_at = now();
         $task->last_progress_at = now();
         $task->save();
+
+        $this->taskWorkspaceService->discardForTask($task->id);
 
         $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
     }
