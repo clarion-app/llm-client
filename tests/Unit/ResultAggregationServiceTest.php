@@ -775,4 +775,127 @@ class ResultAggregationServiceTest extends TestCase
         ]);
         $this->assertLessThanOrEqual(600, strlen($assembled));
     }
+
+    // =================================================================
+    // 109-agent-as-capability (post-implementation reconciliation): a
+    // capability-offering-originated Delegation row must never be named
+    // back into the CALLING agent's own system prompt via
+    // AgentLoopService::buildCombinedHelperResultsSection() (FR-003) --
+    // the exact "no indication of agent-backing" property Phase 3's
+    // composeDelegationDisclosure() fix already protects for the
+    // end-of-run disclosure sentence, but this method (099-result-
+    // aggregation, entirely predating and untouched by 109's own phases)
+    // was never updated to match. $callerFacing defaults to false so the
+    // existing human-facing DelegationController::combinedResults()
+    // endpoint (FR-020's own "reconstructible for a human reviewing the
+    // run later" surface) keeps seeing every origin, unchanged.
+    // =================================================================
+
+    #[Test]
+    public function default_callerFacing_false_still_includes_a_capability_offering_originated_contributor_preserving_FR020_human_reconstruction(): void
+    {
+        $runId = (string) Str::uuid();
+        $helperOrigin = $this->makeAgent('helper-delegate-to-helper-origin');
+        $offeredAgent = $this->makeAgent('offered-agent-capability-origin');
+
+        $this->makeDelegationRow($runId, $helperOrigin, [
+            'result_status' => 'success',
+            'result_summary' => 'Did the delegated thing.',
+            'result_output' => json_encode(['field_a' => 'value-a']),
+            'result_undone' => '',
+            'origin' => 'delegate_to_helper',
+        ]);
+        $this->makeDelegationRow($runId, $offeredAgent, [
+            'result_status' => 'success',
+            'result_summary' => 'Did the capability thing.',
+            'result_output' => json_encode(['field_b' => 'value-b']),
+            'result_undone' => '',
+            'origin' => 'capability_offering',
+        ]);
+
+        $combined = $this->service()->combineForRun($runId);
+
+        $this->assertNotNull($combined);
+        $this->assertCount(2, $combined['contributors']);
+        $names = collect($combined['contributors'])->pluck('helper_agent_name')->all();
+        $this->assertContains('offered-agent-capability-origin', $names, 'the default, human-facing view must still name every origin -- FR-020 reconstruction is unaffected by this fix');
+    }
+
+    #[Test]
+    public function callerFacing_true_excludes_a_capability_offering_originated_contributor_and_its_agent_name_never_appears(): void
+    {
+        $runId = (string) Str::uuid();
+        $helperOne = $this->makeAgent('helper-one-delegate-to-helper');
+        $helperTwo = $this->makeAgent('helper-two-delegate-to-helper');
+        $offeredAgent = $this->makeAgent('offered-agent-must-not-leak');
+
+        $this->makeDelegationRow($runId, $helperOne, [
+            'result_status' => 'success',
+            'result_summary' => 'First delegated thing.',
+            'result_output' => json_encode(['field_a' => 'value-a']),
+            'result_undone' => '',
+            'origin' => 'delegate_to_helper',
+        ]);
+        $this->makeDelegationRow($runId, $helperTwo, [
+            'result_status' => 'success',
+            'result_summary' => 'Second delegated thing.',
+            'result_output' => json_encode(['field_c' => 'value-c']),
+            'result_undone' => '',
+            'origin' => 'delegate_to_helper',
+        ]);
+        $this->makeDelegationRow($runId, $offeredAgent, [
+            'result_status' => 'success',
+            'result_summary' => 'Capability thing that must not surface to the caller.',
+            'result_output' => json_encode(['field_b' => 'value-b']),
+            'result_undone' => '',
+            'origin' => 'capability_offering',
+        ]);
+
+        $combined = $this->service()->combineForRun($runId, callerFacing: true);
+
+        $this->assertNotNull($combined);
+        $this->assertCount(2, $combined['contributors'], 'only the two delegate_to_helper-origin contributors may appear when callerFacing is true');
+        $names = collect($combined['contributors'])->pluck('helper_agent_name')->all();
+        $this->assertNotContains('offered-agent-must-not-leak', $names, 'FR-003: a capability-offering-backed agent name must never surface into the caller-facing combined view');
+        $this->assertArrayNotHasKey('field_b', $combined['combined_output'], 'the excluded contributor\'s own output key must not leak into combined_output either');
+    }
+
+    #[Test]
+    public function callerFacing_true_returns_null_when_fewer_than_two_delegate_to_helper_origin_delegations_remain_after_exclusion(): void
+    {
+        $runId = (string) Str::uuid();
+        $helperOrigin = $this->makeAgent('helper-only-one-delegate-to-helper');
+        $offeredAgentOne = $this->makeAgent('offered-agent-one');
+        $offeredAgentTwo = $this->makeAgent('offered-agent-two');
+
+        $this->makeDelegationRow($runId, $helperOrigin, [
+            'result_status' => 'success',
+            'result_summary' => 'The only delegate_to_helper contributor.',
+            'result_output' => json_encode(['field_a' => 'value-a']),
+            'result_undone' => '',
+            'origin' => 'delegate_to_helper',
+        ]);
+        $this->makeDelegationRow($runId, $offeredAgentOne, [
+            'result_status' => 'success',
+            'result_summary' => 'A capability contributor.',
+            'result_output' => json_encode(['field_b' => 'value-b']),
+            'result_undone' => '',
+            'origin' => 'capability_offering',
+        ]);
+        $this->makeDelegationRow($runId, $offeredAgentTwo, [
+            'result_status' => 'success',
+            'result_summary' => 'Another capability contributor.',
+            'result_output' => json_encode(['field_c' => 'value-c']),
+            'result_undone' => '',
+            'origin' => 'capability_offering',
+        ]);
+
+        // Sanity check: the default, human-facing view sees all three (>=2), proving this run would otherwise qualify.
+        $this->assertNotNull($this->service()->combineForRun($runId));
+
+        $this->assertNull(
+            $this->service()->combineForRun($runId, callerFacing: true),
+            'two capability-agent calls completing on the same run, with only ONE delegate_to_helper call, must not surface a combined section to the caller at all -- exactly the scenario that would otherwise leak two offered agents\' names with no delegate_to_helper call in the mix',
+        );
+    }
 }

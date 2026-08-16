@@ -47,14 +47,39 @@ class ResultAggregationService
      * still-in-progress ones (`result_status IS NULL` never counts,
      * regardless of how many exist).
      *
+     * $callerFacing (109-agent-as-capability, FR-003): when true, excludes
+     * `origin: 'capability_offering'` rows before combining. This view is
+     * reused by two structurally different consumers -- a human reviewing
+     * a run after the fact via `DelegationController::combinedResults()`
+     * (FR-020 explicitly preserves full origin visibility there, exactly
+     * like `DelegationQuery`/`RunDiagram`), and
+     * `AgentLoopService::buildCombinedHelperResultsSection()`, which
+     * injects this method's own output directly into the CALLING agent's
+     * own system prompt for its next turn -- i.e. squarely inside "the
+     * calling agent's ordinary discovery or invocation flow" FR-003
+     * governs. Without this exclusion, two or more capability-agent calls
+     * completing on the same run (no delegate_to_helper call needed at
+     * all) would name the offered agent(s) via `helper_agent_name` right
+     * back into the caller's own "## Combined Helper Results" section --
+     * the same class of leak `AgentLoopService::composeDelegationDisclosure()`
+     * was fixed against in Phase 3, but through this entirely separate,
+     * 099-result-aggregation-owned code path that this feature's own
+     * phases never touched. Defaults to false so every pre-existing
+     * caller (`DelegationController`, every test in this file written
+     * before 109) is unaffected.
+     *
      * @return array{contributors: array<int, array<string, mixed>>, combined_output: array<string, mixed>, conflicts: array<int, array<string, mixed>>, truncated: bool}|null
      */
-    public function combineForRun(string $runId): ?array
+    public function combineForRun(string $runId, bool $callerFacing = false): ?array
     {
-        $delegations = Delegation::where('parent_run_id', $runId)
-            ->whereNotNull('result_status')
-            ->orderBy('started_at')
-            ->get();
+        $query = Delegation::where('parent_run_id', $runId)
+            ->whereNotNull('result_status');
+
+        if ($callerFacing) {
+            $query->where('origin', 'delegate_to_helper');
+        }
+
+        $delegations = $query->orderBy('started_at')->get();
 
         if ($delegations->count() < 2) {
             return null;

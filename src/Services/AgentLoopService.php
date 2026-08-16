@@ -3496,6 +3496,16 @@ class AgentLoopService
      * this run have reported a structured result). Recomputed fresh on
      * every call -- never cached -- so a delegation completed mid-turn is
      * reflected on the very next call within the same run.
+     *
+     * 109-agent-as-capability (FR-003): calls combineForRun() with
+     * $callerFacing = true -- this section is injected directly into the
+     * CALLING agent's own system prompt, so a capability-offering-
+     * originated delegation must never contribute a `helper_agent_name`
+     * here, exactly like composeDelegationDisclosure()'s own origin
+     * filter (Phase 3). Two or more capability-agent calls completing on
+     * the same run, with no delegate_to_helper call involved at all,
+     * would otherwise still leak the offered agent's name into this
+     * section.
      */
     private function buildCombinedHelperResultsSection(?string $runId): ?string
     {
@@ -3503,7 +3513,7 @@ class AgentLoopService
             return null;
         }
 
-        $combined = app(ResultAggregationService::class)->combineForRun($runId);
+        $combined = app(ResultAggregationService::class)->combineForRun($runId, callerFacing: true);
 
         if ($combined === null) {
             return null;

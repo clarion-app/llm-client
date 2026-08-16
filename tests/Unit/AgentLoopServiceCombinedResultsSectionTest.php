@@ -74,12 +74,20 @@ class AgentLoopServiceCombinedResultsSectionTest extends TestCase
         return $method->invoke($service, $runId);
     }
 
+    /**
+     * 109-agent-as-capability: buildCombinedHelperResultsSection() now
+     * calls combineForRun($runId, callerFacing: true) -- the mock
+     * expectation is updated to match this exact two-argument call shape
+     * (not merely the run id), so this helper stays non-vacuous about
+     * *how* the section builder calls the service, not only *that* it
+     * does.
+     */
     private function mockCombineForRun(?array $return, ?string $expectedRunId = null): void
     {
         $mock = Mockery::mock(ResultAggregationService::class);
         $expectation = $mock->shouldReceive('combineForRun')->once();
         if ($expectedRunId !== null) {
-            $expectation->with($expectedRunId);
+            $expectation->with($expectedRunId, true);
         }
         $expectation->andReturn($return);
         $this->app->instance(ResultAggregationService::class, $mock);
