@@ -12,7 +12,7 @@ use Tests\TestCase;
 /**
  * 101-parallel-subagent-execution, Phase 3 (US3), tasks.md T014.
  *
- * Unit tests for the not-yet-built `llm-client:resolve-stalled-delegation-batches
+ * Batch-member coverage for `llm-client:resolve-stalled-delegations
  * {--dry-run}` (contracts §6, research.md D4 layer 3), mirroring
  * `src/Commands/ResolveStalledEvalRunsCommand.php`'s exact shape --
  * Grounding note item 9 -- and `tests/Unit/Commands/ResolveAbandonedRunsCommandTest.php`'s
@@ -22,11 +22,15 @@ use Tests\TestCase;
  * (this command reads/writes nothing but that one table, data-model.md
  * §1) -- no DelegationService/AgentLoopService scaffolding needed.
  *
- * Written before `ResolveStalledDelegationBatchesCommand` exists -- every
- * test below is expected to FAIL red (command not found / non-zero exit
- * with an "unknown command" error) until T021 creates it.
+ * 110-delegation-deadlock-timeout (Phase 4, tasks.md T026): the command
+ * and its class were renamed from `ResolveStalledDelegationBatchesCommand`
+ * / `llm-client:resolve-stalled-delegation-batches` when the solo-delegation
+ * sweep branch was added alongside this file's own, unchanged batch-member
+ * branch -- this file (renamed to match) covers ONLY that batch-member
+ * branch; solo-delegation coverage lives in
+ * `tests/Feature/ResolveStalledDelegationsCommandTest.php`.
  */
-class ResolveStalledDelegationBatchesCommandTest extends TestCase
+class ResolveStalledDelegationsCommandTest extends TestCase
 {
     protected function setUp(): void
     {
@@ -90,7 +94,7 @@ class ResolveStalledDelegationBatchesCommandTest extends TestCase
         $batchId = (string) Str::uuid();
         $delegation = $this->makeDelegation('queued', $batchId, $this->staleTimestamp());
 
-        $exitCode = Artisan::call('llm-client:resolve-stalled-delegation-batches');
+        $exitCode = Artisan::call('llm-client:resolve-stalled-delegations');
 
         $this->assertSame(0, $exitCode);
 
@@ -107,7 +111,7 @@ class ResolveStalledDelegationBatchesCommandTest extends TestCase
         $batchId = (string) Str::uuid();
         $delegation = $this->makeDelegation('in_progress', $batchId, $this->staleTimestamp());
 
-        $exitCode = Artisan::call('llm-client:resolve-stalled-delegation-batches');
+        $exitCode = Artisan::call('llm-client:resolve-stalled-delegations');
 
         $this->assertSame(0, $exitCode);
 
@@ -127,7 +131,7 @@ class ResolveStalledDelegationBatchesCommandTest extends TestCase
         $batchId = (string) Str::uuid();
         $delegation = $this->makeDelegation('queued', $batchId, $this->freshTimestamp());
 
-        Artisan::call('llm-client:resolve-stalled-delegation-batches');
+        Artisan::call('llm-client:resolve-stalled-delegations');
 
         $row = $this->fresh($delegation);
         $this->assertSame('queued', $row->status, 'a row well inside the configured stale window must never be swept');
@@ -140,7 +144,7 @@ class ResolveStalledDelegationBatchesCommandTest extends TestCase
         $batchId = (string) Str::uuid();
         $delegation = $this->makeDelegation('in_progress', $batchId, $this->freshTimestamp());
 
-        Artisan::call('llm-client:resolve-stalled-delegation-batches');
+        Artisan::call('llm-client:resolve-stalled-delegations');
 
         $row = $this->fresh($delegation);
         $this->assertSame('in_progress', $row->status);
@@ -148,23 +152,18 @@ class ResolveStalledDelegationBatchesCommandTest extends TestCase
     }
 
     // -----------------------------------------------------------------
-    // A solo (non-batch) delegation is never in scope, however stale
+    // 110-delegation-deadlock-timeout (Phase 4, research.md D3): a solo
+    // (non-batch) delegation is NO LONGER out of scope for this command --
+    // this file's own prior assumption ("this command is scoped to
+    // batch_id IS NOT NULL rows only") is exactly what that feature's
+    // generalized sweep overturns by design (contracts/
+    // delegation-chain-bounds.md §2). Solo-delegation eligibility
+    // (stale AND idle, via DelegationService::isIdle()) and its
+    // stale-but-active/idle-but-young survival cases are covered by
+    // tests/Feature/ResolveStalledDelegationsCommandTest.php (T020-T022),
+    // not duplicated here -- this file stays scoped to the batch-member
+    // branch alone, per its own header doc.
     // -----------------------------------------------------------------
-
-    #[Test]
-    public function a_stale_solo_delegation_with_no_batch_id_is_never_swept(): void
-    {
-        $delegation = $this->makeDelegation('in_progress', null, $this->staleTimestamp());
-
-        Artisan::call('llm-client:resolve-stalled-delegation-batches');
-
-        $row = $this->fresh($delegation);
-        $this->assertSame(
-            'in_progress',
-            $row->status,
-            'this command is scoped to batch_id IS NOT NULL rows only -- a solo delegation stalling is resolve-abandoned-runs\' own concern, not this one\'s',
-        );
-    }
 
     // -----------------------------------------------------------------
     // --dry-run reports without writing
@@ -176,7 +175,7 @@ class ResolveStalledDelegationBatchesCommandTest extends TestCase
         $batchId = (string) Str::uuid();
         $delegation = $this->makeDelegation('in_progress', $batchId, $this->staleTimestamp());
 
-        $exitCode = Artisan::call('llm-client:resolve-stalled-delegation-batches', ['--dry-run' => true]);
+        $exitCode = Artisan::call('llm-client:resolve-stalled-delegations', ['--dry-run' => true]);
 
         $this->assertSame(0, $exitCode);
 
@@ -199,12 +198,12 @@ class ResolveStalledDelegationBatchesCommandTest extends TestCase
         $batchId = (string) Str::uuid();
         $delegation = $this->makeDelegation('in_progress', $batchId, $this->staleTimestamp());
 
-        Artisan::call('llm-client:resolve-stalled-delegation-batches');
+        Artisan::call('llm-client:resolve-stalled-delegations');
         $firstPassRow = $this->fresh($delegation);
         $this->assertSame('exhausted', $firstPassRow->status, 'fixture sanity: the first sweep must have force-finalized the row');
         $completedAtAfterFirstPass = $firstPassRow->completed_at;
 
-        $exitCode = Artisan::call('llm-client:resolve-stalled-delegation-batches');
+        $exitCode = Artisan::call('llm-client:resolve-stalled-delegations');
 
         $this->assertSame(0, $exitCode, 'a second run must exit cleanly, never erroring against an already-terminal row');
 

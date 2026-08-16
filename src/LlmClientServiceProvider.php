@@ -123,7 +123,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\ForwardRunTracesCommand::class,
                 \ClarionApp\LlmClient\Commands\MigrateUserSettingsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledEvalRunsCommand::class,
-                \ClarionApp\LlmClient\Commands\ResolveStalledDelegationBatchesCommand::class,
+                \ClarionApp\LlmClient\Commands\ResolveStalledDelegationsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledManagedTasksCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveStalledSequenceRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
@@ -183,13 +183,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 ->everyFiveMinutes()
                 ->withoutOverlapping();
 
-            // Force-finalize stalled concurrent delegation batch members
-            // every five minutes (101-parallel-subagent-execution, US3,
-            // research.md D4 layer 3) — the crash-recovery backstop for
-            // the case delegateBatch()'s own join-wait deadline cannot
-            // cover: the parent's own process dying before that check
-            // ever runs.
-            $schedule->command('llm-client:resolve-stalled-delegation-batches')
+            // Force-finalize stalled concurrent delegation batch members,
+            // and (110-delegation-deadlock-timeout, US2/US3, research.md
+            // D3) stalled solo (non-batch) delegations whose owning
+            // process died mid-chain, every five minutes
+            // (101-parallel-subagent-execution, US3, research.md D4 layer
+            // 3) — the crash-recovery backstop for the case
+            // delegateBatch()'s own join-wait deadline cannot cover: the
+            // parent's own process dying before that check ever runs.
+            $schedule->command('llm-client:resolve-stalled-delegations')
                 ->everyFiveMinutes()
                 ->withoutOverlapping();
 

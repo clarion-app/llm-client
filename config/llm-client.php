@@ -1,5 +1,11 @@
 <?php
 
+// Read once so both the legacy nested delegation.concurrency.stale_after_minutes
+// key and the hoisted top-level delegation.stale_after_minutes key below resolve
+// to the same value by construction, without one reading the other via the
+// config() helper (which is not yet available while this file itself loads).
+$delegationStaleAfterMinutesDefault = (int) env('LLM_CLIENT_DELEGATION_STALE_AFTER_MINUTES', 10);
+
 return [
     // Routes blocked from LLM execution (matched with fnmatch())
     'api_denylist' => [
@@ -766,6 +772,11 @@ return [
         'max_iterations' => (int) env('LLM_CLIENT_DELEGATION_MAX_ITERATIONS', 10),
         'max_seconds' => (int) env('LLM_CLIENT_DELEGATION_MAX_SECONDS', 120),
         'max_chain_depth' => (int) env('LLM_CLIENT_DELEGATION_MAX_CHAIN_DEPTH', 5),
+        // Cumulative wall-clock ceiling across an entire delegation chain
+        // (root hop's own started_at to now), checked alongside
+        // max_chain_depth so a chain cannot run away in time even while
+        // staying under the depth ceiling.
+        'max_chain_seconds' => (int) env('LLM_CLIENT_DELEGATION_MAX_CHAIN_SECONDS', 900),
         // 099-result-aggregation: schema-retry ceiling for the mandatory
         // delegation_result shape (research.md D1), and the two independent
         // size bounds a returned result and a combined view are held to
@@ -804,9 +815,9 @@ return [
             'join_poll_interval_ms' => (int) env('LLM_CLIENT_DELEGATION_JOIN_POLL_INTERVAL_MS', 200),
 
             // How long a queued/in_progress batch member may sit with no
-            // terminal status before resolve-stalled-delegation-batches
+            // terminal status before resolve-stalled-delegations
             // treats it as abandoned (research.md D4, layer 3).
-            'stale_after_minutes' => (int) env('LLM_CLIENT_DELEGATION_STALE_AFTER_MINUTES', 10),
+            'stale_after_minutes' => $delegationStaleAfterMinutesDefault,
         ],
 
         // 106-multi-agent-run-view: the defensive cap on how many delegation
@@ -818,6 +829,20 @@ return [
         'arrangement' => [
             'max_nodes' => (int) env('LLM_CLIENT_DELEGATION_ARRANGEMENT_MAX_NODES', 200),
         ],
+
+        // How long a solo (non-batch) delegation may sit idle — no run-trace
+        // activity on its helper — before it is considered part of a stalled
+        // chain, independent of concurrency.stale_after_minutes above (which
+        // still bounds batch-member staleness alone, unchanged).
+        'idle_after_minutes' => (int) env('LLM_CLIENT_DELEGATION_IDLE_AFTER_MINUTES', 15),
+
+        // How long a solo delegation may sit in_progress before it is
+        // eligible for the stalled-chain sweep. Hoisted here from
+        // concurrency.stale_after_minutes so the same setting now bounds
+        // solo delegations too, not only batch members; falls back to that
+        // existing nested value when this key's own env var is unset, so an
+        // installation with an existing override keeps working unchanged.
+        'stale_after_minutes' => $delegationStaleAfterMinutesDefault,
     ],
 
     // Agent as Capability (109-agent-as-capability) — the per-capability-

@@ -176,6 +176,19 @@ class DelegationService
             return ['error' => 'This delegation chain has reached its maximum depth and cannot delegate any further.'];
         }
 
+        // 110-delegation-deadlock-timeout (Phase 4/US2, research.md D1,
+        // contracts/delegation-chain-bounds.md §1): the identical
+        // chain-time bound resolveAndValidate() enforces, applied to
+        // invokeAsCapability()'s own caller conversation -- checked after
+        // depth, before the identity-cycle backstop below, mirroring the
+        // same ordering (data-model.md "Validation rules"). Returns before
+        // createDelegationRow() is ever reached, exactly like the depth
+        // and identity refusals in this method already do.
+        $chainRootStartedAt = $this->chainRootStartedAt($callerConversation);
+        if ($chainRootStartedAt !== null && $chainRootStartedAt->diffInSeconds(now()) > config('llm-client.delegation.max_chain_seconds', 900)) {
+            return ['error' => 'This delegation chain has been running too long and cannot delegate any further.'];
+        }
+
         // 109-agent-as-capability (Phase 5/US3, data-model.md §7): the
         // agent-identity backstop -- refuses re-invoking $offeredAgent if
         // it is already active earlier in this SAME live chain, regardless
@@ -185,8 +198,11 @@ class DelegationService
         // depth-based). The primary defense is the config-time union-graph
         // DFS (AgentHelperQuery::wouldOfferingCreateCycle()); this is the
         // runtime backstop for a data anomaly or race that bypasses it.
-        if (in_array($fresh->offered_agent_id, $this->ancestorAgentIds($callerConversation), true)) {
-            return ['error' => 'This capability is already active earlier in this call chain and cannot be invoked again.'];
+        $ancestorAgentIds = $this->ancestorAgentIds($callerConversation);
+        if (in_array($fresh->offered_agent_id, $ancestorAgentIds, true)) {
+            $cyclePath = $this->describeCyclePath($ancestorAgentIds, $callerConversation->agent_id, $offeredAgent);
+
+            return ['error' => "This capability is already active earlier in this call chain and cannot be invoked again ({$cyclePath})."];
         }
 
         $delegation = $this->createDelegationRow(
@@ -458,7 +474,7 @@ class DelegationService
      * 101-parallel-subagent-execution (research.md D4 layer 2, contracts
      * §1): force-finalizes a batch member that never reached a terminal
      * status within delegateBatch()'s own join-wait bound, or that
-     * llm-client:resolve-stalled-delegation-batches finds still stale.
+     * llm-client:resolve-stalled-delegations finds still stale.
      * Idempotent against a row that is already terminal by the time either
      * caller reaches it (the parent's own join-wait deadline check and the
      * sweep can both race to finalize the same row).
@@ -501,6 +517,178 @@ class DelegationService
                 null,
                 json_encode($sixFieldResult),
             );
+        }
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 2, contracts/
+     * delegation-chain-bounds.md §2): force-finalizes a delegation whose
+     * chain has been detected as stalled -- either a solo delegation whose
+     * owning process died (the generalized sweep, D3) or another future
+     * caller with its own reason to give up on a chain. Mirrors
+     * forceFinalizeBatchJoinTimeout()'s exact shape (terminal-status guard,
+     * status = 'exhausted', broadcast, run-trace action close); the one
+     * difference is $reason, which becomes result_reason directly instead
+     * of the hardcoded 'batch_join_timeout'.
+     *
+     * 110-delegation-deadlock-timeout (Phase 5, tasks.md T035, research.md
+     * D4, data-model.md "Stop Record"): result_summary/outcome_summary name
+     * both participants (Phase 6, T040) AND carry the delegation's own
+     * helper conversation's last persisted assistant Message when there is
+     * one -- read exactly as runDelegatedTask()'s own $exhaustionReasons
+     * branch reads it (same
+     * `->messages()->where('role', 'assistant')->orderByDesc('created_at')
+     * ->value('content')` query, same `Str::limit(..., 500)` cap) -- so
+     * whatever partial, useful work the helper had already produced before
+     * its owning process died is preserved in what is reported back
+     * (FR-006) without costing the account of what was waiting on what
+     * (FR-008/US4 AC2). That content already lives in the database by the
+     * time the sweep runs; nothing about the dead process needs to still be
+     * alive to report it.
+     *
+     * Idempotent against a row that is already terminal by the time the
+     * caller reaches it, exactly like forceFinalizeBatchJoinTimeout().
+     */
+    public function forceFinalizeStalledDelegation(Delegation $delegation, string $reason = 'chain_stalled'): void
+    {
+        if (in_array($delegation->status, ['completed', 'exhausted', 'failed'], true)) {
+            return;
+        }
+
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+
+        $partialResult = $helperConversation !== null
+            ? (string) ($helperConversation->messages()
+                ->where('role', 'assistant')
+                ->orderByDesc('created_at')
+                ->value('content') ?? '')
+            : '';
+
+        // 110-delegation-deadlock-timeout (Phase 6/US4, tasks.md T040b,
+        // spec.md User Story 4 AC2): when there is no partial assistant
+        // content to fall back on, the placeholder itself now names both
+        // participants -- the helper agent that was running, and the
+        // parent agent it was working for -- rather than a generic
+        // message naming neither. withTrashed() mirrors runBatchMember()'s
+        // own lookup: an agent deactivated/deleted between the delegation
+        // starting and the sweep finding it stalled must still be
+        // nameable in the report. Falls back to the raw id (never null)
+        // if even a withTrashed() lookup misses, mirroring
+        // resolveAndValidate()'s own `$helperAgent?->name ?? $helperAgentId`
+        // precedent.
+        $helperAgentName = Agent::withTrashed()->find($delegation->helper_agent_id)?->name ?? $delegation->helper_agent_id;
+        $parentAgentName = Agent::withTrashed()->find($delegation->parent_agent_id)?->name ?? $delegation->parent_agent_id;
+
+        // 110-delegation-deadlock-timeout (reconciliation of Phase 5's
+        // T035 against Phase 6's T040, data-model.md "Stop Record"): the
+        // participant account and the preserved partial output are NOT
+        // alternatives -- data-model.md composes a Stop Record from "the
+        // helper agent's name, the parent agent's name, the reason, and --
+        // when the finalized row's own last-known helper conversation
+        // content is non-empty -- the partial output already produced".
+        // Composing them as an either/or (T035's partial-only summary,
+        // T040's names-only placeholder) satisfied FR-006 and US4 AC2 only
+        // in mutually exclusive branches: a stop that HAD preserved partial
+        // work named no participants at all, which is precisely the case
+        // US4 AC2 asks the account for. The account is stated first so it
+        // survives any downstream truncation, with the partial content
+        // appended under the same "Partial: " label
+        // translateCapabilityResult() already uses for a bound-exceeded
+        // helper's own partial output.
+        $stopAccount = "The delegation from \"{$parentAgentName}\" to \"{$helperAgentName}\" was force-finalized as stalled.";
+
+        $resultSummary = $partialResult !== ''
+            ? $stopAccount.' Partial: '.Str::limit($partialResult, 500)
+            : $stopAccount;
+        $resultUndone = 'Everything -- the task could not be completed.';
+
+        $delegation->status = 'exhausted';
+        $delegation->completed_at = now();
+        $delegation->outcome_summary = $resultSummary;
+        $delegation->result_status = 'failure';
+        $delegation->result_reason = $reason;
+        $delegation->result_summary = $resultSummary;
+        $delegation->result_output = null;
+        $delegation->result_undone = $resultUndone;
+        $delegation->result_truncated = false;
+        $delegation->save();
+
+        $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
+
+        if ($delegation->parent_action_id !== null) {
+            $sixFieldResult = [
+                'status' => 'failure',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => $reason,
+            ];
+
+            $this->runTraceRecorder->closeAction(
+                $delegation->parent_action_id,
+                ActionOutcome::Unfinished,
+                null,
+                json_encode($sixFieldResult),
+            );
+        }
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 5/US3, tasks.md T034,
+     * research.md D3, contracts/delegation-chain-bounds.md §2
+     * "Whole-subtree finalization (new)"): the entry point
+     * ResolveStalledDelegationsCommand's solo-delegation branch calls for
+     * each row its own flat stale+idle query directly matches (the
+     * "trigger" row) -- finalizes that row via forceFinalizeStalledDelegation()
+     * and then walks the trigger row's OWN parent_conversation_id chain
+     * backward, the identical `Delegation::where('helper_conversation_id',
+     * ...)->first()` traversal ancestorAgentIds() already performs (same
+     * loop shape, same visited-conversation-id guard against a data-level
+     * cycle), finalizing every ancestor Delegation row found along the way
+     * that is STILL 'in_progress'.
+     *
+     * Deliberately does NOT re-check staleness/idleness on an ancestor: a
+     * dead process leaves every Delegation row from the point of failure up
+     * to the chain's root simultaneously 'in_progress' (they were all
+     * synchronously blocked waiting on each other inside the SAME OS
+     * process), so an ancestor whose own row happens to look "recently
+     * active" in isolation (its helper run produced a run-trace action
+     * shortly before the process died) is still just as stuck as the
+     * trigger row that proved the process is gone -- only the trigger row
+     * itself, found by the sweep's own flat query, is required to pass the
+     * ordinary stale+idle eligibility check (data-model.md "Validation
+     * rules"). A row already terminal by the time the walk reaches it (won
+     * a race against an earlier sweep run, or completed normally moments
+     * before its process died) is left untouched, both by this method's own
+     * explicit status check below and by forceFinalizeStalledDelegation()'s
+     * own internal terminal-status guard -- the walk still continues past
+     * it toward the root regardless, since a terminal ancestor does not
+     * prove anything about whether ITS OWN parent is also stuck.
+     */
+    public function finalizeStalledChain(Delegation $delegation): void
+    {
+        $this->forceFinalizeStalledDelegation($delegation);
+
+        $visitedConversationIds = [];
+        $currentConversationId = $delegation->parent_conversation_id;
+
+        while (true) {
+            if (isset($visitedConversationIds[$currentConversationId])) {
+                break;
+            }
+            $visitedConversationIds[$currentConversationId] = true;
+
+            $ancestor = Delegation::where('helper_conversation_id', $currentConversationId)->first();
+            if ($ancestor === null) {
+                break;
+            }
+
+            if ($ancestor->status === 'in_progress') {
+                $this->forceFinalizeStalledDelegation($ancestor);
+            }
+
+            $currentConversationId = $ancestor->parent_conversation_id;
         }
     }
 
@@ -568,6 +756,21 @@ class DelegationService
             ];
         }
 
+        // 110-delegation-deadlock-timeout (Phase 4/US2, research.md D1,
+        // contracts/delegation-chain-bounds.md §1): the cumulative
+        // chain-wide elapsed-time bound -- checked AFTER depth (the
+        // cheaper, O(1) check) but BEFORE the O(depth) identity-cycle
+        // backstop below (data-model.md "Validation rules"). Refuses
+        // before a new Delegation row is ever written, identical to the
+        // depth refusal's own all-or-nothing contract.
+        $chainRootStartedAt = $this->chainRootStartedAt($parentConversation);
+        if ($chainRootStartedAt !== null && $chainRootStartedAt->diffInSeconds(now()) > config('llm-client.delegation.max_chain_seconds', 900)) {
+            return [
+                'error' => 'delegation_chain_time_exceeded',
+                'message' => 'This delegation chain has been running too long and cannot delegate any further.',
+            ];
+        }
+
         // 109-agent-as-capability (Phase 5/US3, data-model.md §7): the
         // agent-identity backstop -- a NEW, full ancestor walk (distinct
         // from the single-hop enclosing-delegation lookup above, which
@@ -580,10 +783,13 @@ class DelegationService
         // configured ceiling (identity-based, not depth-based). Mirrors
         // EffectiveBoundResolver::check()'s own identical backstop for
         // the permission-bound walk.
-        if (in_array($helperAgentId, $this->ancestorAgentIds($parentConversation), true)) {
+        $ancestorAgentIds = $this->ancestorAgentIds($parentConversation);
+        if (in_array($helperAgentId, $ancestorAgentIds, true)) {
+            $cyclePath = $this->describeCyclePath($ancestorAgentIds, $currentAgentId, $helperAgent);
+
             return [
                 'error' => 'agent_already_active_in_chain',
-                'message' => "\"{$helperAgent->name}\" is already active earlier in this delegation chain and cannot be invoked again.",
+                'message' => "\"{$helperAgent->name}\" is already active earlier in this delegation chain and cannot be invoked again ({$cyclePath}).",
             ];
         }
 
@@ -592,6 +798,48 @@ class DelegationService
             'depth' => $depth,
             'inheritedManagedTaskId' => $enclosingDelegation?->managed_task_id,
         ];
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 2, research.md D1,
+     * data-model.md "Chain root start time"): mirrors ancestorAgentIds()'s
+     * own backward walk exactly in structure (same `while (true)` loop,
+     * same visited-conversation-id guard against a data-level cycle, same
+     * `Delegation::where('helper_conversation_id', ...)` lookup pattern) --
+     * but tracks and returns the EARLIEST started_at seen across the walk
+     * (the last delegation row found before the walk terminates, since the
+     * walk goes from $conversation backward toward the chain's root)
+     * instead of collecting agent ids. Ordered explicitly by started_at,
+     * never a bare latest() (see resolveAndValidate()'s own comment on
+     * why -- agent_delegations has no created_at column).
+     *
+     * Returns null when $conversation is not part of any chain at all (no
+     * Delegation row anywhere names it as a helper).
+     */
+    private function chainRootStartedAt(Conversation $conversation): ?\Carbon\Carbon
+    {
+        $rootStartedAt = null;
+        $visitedConversationIds = [];
+        $currentConversationId = $conversation->id;
+
+        while (true) {
+            if (isset($visitedConversationIds[$currentConversationId])) {
+                break;
+            }
+            $visitedConversationIds[$currentConversationId] = true;
+
+            $delegation = Delegation::where('helper_conversation_id', $currentConversationId)
+                ->latest('started_at')
+                ->first();
+            if ($delegation === null) {
+                break;
+            }
+
+            $rootStartedAt = $delegation->started_at;
+            $currentConversationId = $delegation->parent_conversation_id;
+        }
+
+        return $rootStartedAt;
     }
 
     /**
@@ -606,6 +854,10 @@ class DelegationService
      * Bounded by the same conversation-id visited-set guard
      * EffectiveBoundResolver::check() uses, against a data-level cycle in
      * agent_delegations.
+     *
+     * Read (not modified) by 110-delegation-deadlock-timeout's new
+     * chain-time-bound check, which reuses this same backward-walk
+     * pattern in a sibling method (chainRootStartedAt()).
      *
      * @return list<string>
      */
@@ -631,6 +883,34 @@ class DelegationService
         }
 
         return $agentIds;
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 6/US4, tasks.md T040a,
+     * research.md D4, spec.md User Story 4 AC1): renders the full cycle
+     * path for the `agent_already_active_in_chain` refusal message --
+     * shared by resolveAndValidate()'s and invokeAsCapability()'s own
+     * identical identity-cycle backstops, so the two never drift apart.
+     *
+     * $ancestorAgentIds is ancestorAgentIds()'s own innermost-to-outermost
+     * order (closest ancestor first, chain root last); reversed here to
+     * read root-first, then the current (attempting) agent appended, then
+     * the already-active agent's own name pushed on last -- so the
+     * rendered path reads as "the order the loop would have formed"
+     * (US4 AC1), e.g. "A -> B -> C -> A" for an indirect A->B->C->A cycle
+     * refused at C's attempt to re-invoke A.
+     */
+    private function describeCyclePath(array $ancestorAgentIds, string $currentAgentId, Agent $reInvokedAgent): string
+    {
+        $pathAgentIds = array_reverse($ancestorAgentIds);
+        $pathAgentIds[] = $currentAgentId;
+
+        $names = Agent::whereIn('id', array_unique($pathAgentIds))->pluck('name', 'id');
+
+        $pathNames = array_map(fn ($id) => $names[$id] ?? $id, $pathAgentIds);
+        $pathNames[] = $reInvokedAgent->name;
+
+        return implode(' -> ', $pathNames);
     }
 
     /**
@@ -775,6 +1055,15 @@ class DelegationService
         try {
             $rawResult = $this->agentLoopService->run($helperConversation, $composedMessage, $delegationOptions);
         } catch (\Throwable $e) {
+            // 110-delegation-deadlock-timeout (FR-013): if the chain was
+            // stopped while this hop was still running, the outcome this
+            // hop is about to report is a LATE result and must be
+            // discarded rather than written over the already-resolved row.
+            $lateResult = $this->discardedLateResult($delegation);
+            if ($lateResult !== null) {
+                return $lateResult;
+            }
+
             // D5: a thrown exception from the nested run() call must never
             // propagate to the parent's own loop -- caught here and mapped
             // to a terminal 'failed' Delegation, matching the ordinary
@@ -841,6 +1130,16 @@ class DelegationService
             if ($enclosingRunId !== null) {
                 Context::add('run_id', $enclosingRunId);
             }
+        }
+
+        // 110-delegation-deadlock-timeout (FR-013): the same late-result
+        // check the catch branch above applies, covering every one of the
+        // terminal writes below (completed / bound-exceeded / confirmation
+        // required / no-output) in one place, since all four are reached
+        // only through this single point after the nested run() returns.
+        $lateResult = $this->discardedLateResult($delegation);
+        if ($lateResult !== null) {
+            return $lateResult;
         }
 
         $content = $rawResult['content'] ?? '';
@@ -1098,7 +1397,7 @@ class DelegationService
      * genuinely down" from "nothing has looked at this batch yet". That
      * distinction is real, but it does not justify skipping
      * force-finalization -- doing so left every row 'queued' indefinitely
-     * (until the scheduled resolve-stalled-delegation-batches sweep,
+     * (until the scheduled resolve-stalled-delegations sweep,
      * layer 3, eventually got to it, up to stale_after_minutes later) while
      * delegateBatch() itself still returned immediately once its own
      * bounded deadline passed, reconstructing a six-field result from a
@@ -1214,6 +1513,53 @@ class DelegationService
     }
 
     /**
+     * 110-delegation-deadlock-timeout (FR-013, spec.md Edge Cases: "a late
+     * result arriving from a participant after its chain has already been
+     * stopped MUST be discarded rather than applied to a chain that has
+     * already reached a resolved state").
+     *
+     * The generalized stalled-chain sweep (ResolveStalledDelegationsCommand,
+     * research.md D3) can now force-finalize a SOLO delegation's row while
+     * the process that owns it is in fact still alive -- staleness plus
+     * idleness is strong evidence a process is gone, never proof of it, and
+     * finalizeStalledChain() deliberately finalizes a trigger row's
+     * ancestors without re-checking their own idleness at all. When such a
+     * still-alive process finally returns, runDelegatedTask()'s own terminal
+     * write would otherwise overwrite the already-resolved row (flipping
+     * 'exhausted'/'chain_stalled' back to 'completed'), fire a second
+     * DelegationUpdated for the same row, and re-close an already-closed
+     * run-trace action -- three contradictory accounts of one stop.
+     *
+     * Re-reading the persisted status immediately before that write -- the
+     * same terminal-status guard forceFinalizeBatchJoinTimeout()/
+     * forceFinalizeStalledDelegation()/recordBatchMemberTimeoutOrFailure()
+     * already apply to their own writes, just applied on the completion path
+     * that had none -- discards the late result instead and hands the caller
+     * back whatever the chain actually resolved to, reconstructed by the
+     * existing sixFieldResultFromRow(). One extra O(1) read per delegation,
+     * on a path that has just made at least one model call.
+     *
+     * Returns null (the ordinary case) whenever the row is still
+     * non-terminal, leaving every existing write path untouched.
+     */
+    private function discardedLateResult(Delegation $delegation): ?array
+    {
+        $persisted = Delegation::find($delegation->id);
+
+        if ($persisted === null || !in_array($persisted->status, ['completed', 'exhausted', 'failed'], true)) {
+            return null;
+        }
+
+        Log::warning('DelegationService: discarding a late delegation result against an already-resolved row', [
+            'delegation_id' => $delegation->id,
+            'resolved_status' => $persisted->status,
+            'resolved_reason' => $persisted->result_reason,
+        ]);
+
+        return $this->sixFieldResultFromRow($persisted);
+    }
+
+    /**
      * 101-parallel-subagent-execution: converts a terminal Delegation row's
      * own result_* columns back into the six-field delegate_to_helper
      * tool-result shape (contracts §1) plus delegation_id/helper -- the
@@ -1238,6 +1584,64 @@ class DelegationService
             'truncated' => (bool) $delegation->result_truncated,
             'reason' => $delegation->result_reason,
         ];
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 4/US2, research.md D2,
+     * data-model.md "Idle duration", contracts/delegation-chain-bounds.md
+     * §2): whether $delegation has had no run-trace action activity
+     * (opened or closed) within `delegation.idle_after_minutes` -- the
+     * signal that distinguishes a genuinely stuck chain from one that is
+     * merely old but still working (used only by the generalized sweep,
+     * never to gate an in-flight hop's own execution).
+     *
+     * Resolves the helper run via the SAME helperRunIdFor() lookup already
+     * used elsewhere in this class (by helper_conversation_id, kind
+     * Interactive, oldest) -- this does not require helper_run_id to
+     * already be populated on the row, since that column is only ever
+     * written once a delegation reaches a terminal state through the
+     * normal, non-stalled path.
+     *
+     * If there is no run at all, or a run with no agent_run_actions rows
+     * at all, activity is judged against the delegation's own started_at
+     * instead -- never having produced a single action after
+     * idle_after_minutes counts as idle just as much as having gone quiet
+     * after producing some.
+     *
+     * Public (not private, despite this feature's own tasks.md phrasing
+     * it as "e.g. private"): ResolveStalledDelegationsCommand's new solo
+     * branch (T026) filters candidate rows through this exact method, so
+     * the sweep's eligibility decision and this class's own notion of
+     * idleness can never independently drift apart.
+     */
+    public function isIdle(Delegation $delegation): bool
+    {
+        $idleCutoff = now()->subMinutes((int) config('llm-client.delegation.idle_after_minutes', 15));
+
+        $runId = $this->helperRunIdFor($delegation->helper_conversation_id);
+
+        if ($runId === null) {
+            return $delegation->started_at->lt($idleCutoff);
+        }
+
+        $lastActivity = null;
+        foreach (['started_at', 'ended_at'] as $column) {
+            $value = DB::table('agent_run_actions')->where('run_id', $runId)->max($column);
+            if ($value === null) {
+                continue;
+            }
+
+            $timestamp = \Carbon\Carbon::parse($value);
+            if ($lastActivity === null || $timestamp->gt($lastActivity)) {
+                $lastActivity = $timestamp;
+            }
+        }
+
+        if ($lastActivity === null) {
+            return $delegation->started_at->lt($idleCutoff);
+        }
+
+        return $lastActivity->lt($idleCutoff);
     }
 
     /**
