@@ -505,6 +505,66 @@ class DelegationService
     }
 
     /**
+     * 110-delegation-deadlock-timeout (Phase 2, contracts/
+     * delegation-chain-bounds.md §2): force-finalizes a delegation whose
+     * chain has been detected as stalled -- either a solo delegation whose
+     * owning process died (the generalized sweep, D3) or another future
+     * caller with its own reason to give up on a chain. Mirrors
+     * forceFinalizeBatchJoinTimeout()'s exact shape (terminal-status guard,
+     * status = 'exhausted', broadcast, run-trace action close); the one
+     * difference is $reason, which becomes result_reason directly instead
+     * of the hardcoded 'batch_join_timeout'.
+     *
+     * The result_summary text here is a deliberate placeholder -- a later
+     * phase (tasks.md T035) replaces it with a richer summary composed from
+     * the helper conversation's own messages (research.md D4); this phase's
+     * version is plain and generic on purpose.
+     *
+     * Idempotent against a row that is already terminal by the time the
+     * caller reaches it, exactly like forceFinalizeBatchJoinTimeout().
+     */
+    public function forceFinalizeStalledDelegation(Delegation $delegation, string $reason = 'chain_stalled'): void
+    {
+        if (in_array($delegation->status, ['completed', 'exhausted', 'failed'], true)) {
+            return;
+        }
+
+        $resultSummary = 'The delegation chain was force-finalized as stalled.';
+        $resultUndone = 'Everything -- the task could not be completed.';
+
+        $delegation->status = 'exhausted';
+        $delegation->completed_at = now();
+        $delegation->outcome_summary = $resultSummary;
+        $delegation->result_status = 'failure';
+        $delegation->result_reason = $reason;
+        $delegation->result_summary = $resultSummary;
+        $delegation->result_output = null;
+        $delegation->result_undone = $resultUndone;
+        $delegation->result_truncated = false;
+        $delegation->save();
+
+        $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
+
+        if ($delegation->parent_action_id !== null) {
+            $sixFieldResult = [
+                'status' => 'failure',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => $reason,
+            ];
+
+            $this->runTraceRecorder->closeAction(
+                $delegation->parent_action_id,
+                ActionOutcome::Unfinished,
+                null,
+                json_encode($sixFieldResult),
+            );
+        }
+    }
+
+    /**
      * 101-parallel-subagent-execution (T018a): the refusal checks +
      * depth computation shared by delegate() and delegateBatch() -- the
      * original delegate()'s own L52-99, unchanged in behavior.
@@ -592,6 +652,48 @@ class DelegationService
             'depth' => $depth,
             'inheritedManagedTaskId' => $enclosingDelegation?->managed_task_id,
         ];
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 2, research.md D1,
+     * data-model.md "Chain root start time"): mirrors ancestorAgentIds()'s
+     * own backward walk exactly in structure (same `while (true)` loop,
+     * same visited-conversation-id guard against a data-level cycle, same
+     * `Delegation::where('helper_conversation_id', ...)` lookup pattern) --
+     * but tracks and returns the EARLIEST started_at seen across the walk
+     * (the last delegation row found before the walk terminates, since the
+     * walk goes from $conversation backward toward the chain's root)
+     * instead of collecting agent ids. Ordered explicitly by started_at,
+     * never a bare latest() (see resolveAndValidate()'s own comment on
+     * why -- agent_delegations has no created_at column).
+     *
+     * Returns null when $conversation is not part of any chain at all (no
+     * Delegation row anywhere names it as a helper).
+     */
+    private function chainRootStartedAt(Conversation $conversation): ?\Carbon\Carbon
+    {
+        $rootStartedAt = null;
+        $visitedConversationIds = [];
+        $currentConversationId = $conversation->id;
+
+        while (true) {
+            if (isset($visitedConversationIds[$currentConversationId])) {
+                break;
+            }
+            $visitedConversationIds[$currentConversationId] = true;
+
+            $delegation = Delegation::where('helper_conversation_id', $currentConversationId)
+                ->latest('started_at')
+                ->first();
+            if ($delegation === null) {
+                break;
+            }
+
+            $rootStartedAt = $delegation->started_at;
+            $currentConversationId = $delegation->parent_conversation_id;
+        }
+
+        return $rootStartedAt;
     }
 
     /**
