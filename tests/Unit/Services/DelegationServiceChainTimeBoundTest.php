@@ -285,4 +285,123 @@ class DelegationServiceChainTimeBoundTest extends TestCase
         );
         $this->assertSame($before, Delegation::count(), 'no new Delegation row may be written for a depth-refused attempt');
     }
+
+    // =================================================================
+    // T045 -- FR-010/SC-007: cycle detection and the new chain-time check
+    // together must add work proportional only to the chain's OWN depth,
+    // never to installation-wide state, so an ordinary delegation that
+    // completes normally sees no additional round trips beyond a small,
+    // fixed-per-hop number. This is a concrete proxy for that promise:
+    // build a real chain at a known depth, run the exact same
+    // resolveAndValidate() call a normal (non-refused) delegation attempt
+    // makes, and assert the query count is bounded by a small constant
+    // multiple of the chain's depth -- never by the total size of
+    // agent_delegations or any other installation-wide table.
+    //
+    // This test is EXPECTED TO ALREADY PASS against current (T023/T024
+    // already-landed) behavior: chainRootStartedAt() (Phase 2) and
+    // ancestorAgentIds() (109-agent-as-capability) were already each a
+    // single O(depth) backward walk before this feature touched either,
+    // and T023/T024 only added a comparison against the value
+    // chainRootStartedAt() already returns -- no new query was
+    // introduced by this feature's own chain-time check itself. Matching
+    // this feature's own established precedent (Phase 1-6 progress log:
+    // "already green, required coverage"), this test's purpose is
+    // LOCKING IN the property with a regression test that would catch a
+    // future change (e.g. a naive per-hop eager-load, or a query keyed
+    // off total agent_delegations size) rather than proving today's code
+    // is currently broken.
+    // =================================================================
+
+    #[Test]
+    public function resolve_and_validate_issues_no_more_queries_than_a_small_constant_multiple_of_the_chains_own_depth(): void
+    {
+        $owner = $this->user();
+        $agentA = $this->makeAgent($owner, 'query-cost-a');
+        $agentB = $this->makeAgent($owner, 'query-cost-b');
+        $agentC = $this->makeAgent($owner, 'query-cost-c');
+        $agentD = $this->makeAgent($owner, 'query-cost-d');
+        $agentE = $this->makeAgent($owner, 'query-cost-e');
+
+        // D must be eligible to delegate to E -- eligibility is checked
+        // BEFORE any of the O(depth) walks this test measures, so this
+        // fixture must clear it cleanly and let the attempt succeed
+        // (SC-007 is specifically about chains that "complete normally").
+        AgentHelperAssignment::create([
+            'parent_agent_id' => $agentD->id,
+            'helper_agent_id' => $agentE->id,
+            'owner_user_id' => $owner->id,
+        ]);
+
+        $conv0 = $this->conversation($owner, $agentA);
+        $conv1 = $this->conversation($owner, $agentB);
+        $conv2 = $this->conversation($owner, $agentC);
+        $conv3 = $this->conversation($owner, $agentD);
+
+        // A real chain, 3 hops deep: A -> B -> C -> D. The attempted next
+        // hop (D -> E, below) would be the chain's 4th hop -- well under
+        // the default max_chain_depth (5) and, with a fresh started_at
+        // below, well under the default max_chain_seconds (900) too, so
+        // the attempt is expected to SUCCEED, exercising every one of
+        // resolveAndValidate()'s O(depth) walks (chainRootStartedAt() and
+        // ancestorAgentIds()) all the way back to the chain's root.
+        $chainDepth = 3;
+
+        $this->seedDelegationRow([
+            'parent_conversation_id' => $conv0->id,
+            'parent_agent_id' => $agentA->id,
+            'helper_conversation_id' => $conv1->id,
+            'owner_user_id' => $owner->id,
+            'depth' => 1,
+            'started_at' => now()->subSeconds(3),
+        ]);
+        $this->seedDelegationRow([
+            'parent_conversation_id' => $conv1->id,
+            'parent_agent_id' => $agentB->id,
+            'helper_conversation_id' => $conv2->id,
+            'owner_user_id' => $owner->id,
+            'depth' => 2,
+            'started_at' => now()->subSeconds(2),
+        ]);
+        $this->seedDelegationRow([
+            'parent_conversation_id' => $conv2->id,
+            'parent_agent_id' => $agentC->id,
+            'helper_conversation_id' => $conv3->id,
+            'owner_user_id' => $owner->id,
+            'depth' => $chainDepth,
+            'started_at' => now()->subSeconds(1),
+        ]);
+
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+
+        $result = $this->resolveAndValidate($conv3, $agentE->id);
+
+        $log = DB::getQueryLog();
+        DB::disableQueryLog();
+
+        $this->assertArrayNotHasKey(
+            'error',
+            $result,
+            'fixture sanity: this attempt must succeed (not be refused) so every O(depth) walk actually runs all the way to the chain root -- got: '.($result['error'] ?? 'n/a'),
+        );
+
+        // A generous, still-meaningful ceiling: roughly 2 queries per
+        // level of depth (one for chainRootStartedAt()'s walk, one for
+        // ancestorAgentIds()'s walk) plus a small fixed constant for the
+        // eligibility/agent-lookup/depth-lookup queries that run exactly
+        // once regardless of depth. The point is proving the cost SCALES
+        // WITH DEPTH, not with the total size of agent_delegations or any
+        // other installation-wide state -- a query count anywhere near
+        // this bound is fine; a query count that grows with unrelated
+        // rows in the table would blow well past it.
+        $ceiling = (2 * $chainDepth) + 6;
+
+        $this->assertLessThanOrEqual(
+            $ceiling,
+            count($log),
+            "resolveAndValidate() issued ".count($log)." queries for a chain {$chainDepth} hops deep -- expected at most {$ceiling} (a small constant multiple of depth, per FR-010/SC-007), not a cost proportional to installation-wide state. Queries: "
+            .json_encode(array_map(fn ($entry) => $entry['query'], $log)),
+        );
+    }
 }

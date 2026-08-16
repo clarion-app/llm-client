@@ -44,12 +44,45 @@ use Illuminate\Queue\SerializesModels;
  * rounds past the bound (contracts/manager-agent-meta-tools.md §6). The
  * crash-recovery sweep itself (ResolveStalledManagedTasksCommand) is a
  * separate class, T051.
+ *
+ * $tries = 1 (110-delegation-deadlock-timeout, research.md D5, tasks.md
+ * T044): a worker-level failure thrown out of handle() (e.g. a nested
+ * AgentLoopService::run() call timing out mid-delegation) must fail this
+ * job PERMANENTLY on its first attempt, never be silently redelivered by
+ * Laravel's own attempts/tries bookkeeping into re-running the same step
+ * of the same managed task -- which would replay the exact delegation
+ * calls the depth/chain-time bounds (FR-003/FR-004) may have already
+ * refused once (FR-012).
+ *
+ * Deliberately NO retryUntil() override here, unlike
+ * RunDelegationBatchMemberJob's own $tries = 1 + retryUntil() pairing.
+ * That job needs retryUntil() only because it ALSO calls $this->release()
+ * itself (deliberately, for admission-race retries) and needs Laravel's
+ * attempts()/tries bookkeeping bypassed so that deliberate release() can
+ * genuinely retry admission on a real queue connection -- see that
+ * class's own docblock for the full mechanism. This job never calls
+ * release(); it only ever completes normally or re-dispatches itself
+ * once still in_progress (never itself redelivered). Adding a
+ * retryUntil() override here would be actively counterproductive:
+ * Worker::markJobAsFailedIfWillExceedMaxAttempts() only fails a job on
+ * its `attempts() >= maxTries` branch when `retryUntil()` is unset -- a
+ * future retryUntil() suppresses that branch entirely and instead lets
+ * Laravel's own exception handler silently release()-with-backoff an
+ * exception this job never wants retried (exactly the FR-012 failure
+ * mode), while a retryUntil() already in the past risks failing the job
+ * via Worker::markJobAsFailedIfAlreadyExceedsMaxAttempts() before
+ * handle() ever runs at all. Plain $tries = 1 alone -- with no
+ * retryUntil() -- gives exactly the needed "fail on first exception,
+ * never redeliver" semantics for a job with no release()-based retry
+ * path of its own.
  */
 class RunManagedTaskStepJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     private const TERMINAL_STATUSES = ['completed', 'completed_with_shortfalls', 'failed'];
+
+    public int $tries = 1;
 
     public function __construct(public readonly string $managedTaskId)
     {
