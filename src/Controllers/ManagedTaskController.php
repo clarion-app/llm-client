@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Services\ManagedTaskQuery;
 use ClarionApp\LlmClient\Services\ManagerService;
+use ClarionApp\LlmClient\Services\TaskWorkspaceQuery;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -28,6 +29,7 @@ class ManagedTaskController extends Controller
     public function __construct(
         private readonly ManagedTaskQuery $managedTaskQuery,
         private readonly ManagerService $managerService,
+        private readonly TaskWorkspaceQuery $taskWorkspaceQuery,
     ) {}
 
     /**
@@ -139,6 +141,30 @@ class ManagedTaskController extends Controller
         }
 
         return response()->json($cost);
+    }
+
+    /**
+     * GET /managed-tasks/{id}/workspace -- the task's shared working area
+     * (108-shared-task-workspace, contracts/task-workspace-api.md §1).
+     * TaskWorkspaceQuery::entriesForTask() itself ownership-checks via
+     * findManagedTask() first and additionally refuses a concluded task,
+     * so an unknown id, a task not owned by the caller, and a concluded
+     * task all collapse to the same uniform 404 -- distinct from an
+     * in_progress task with zero entries, which returns 200 {"entries": []}.
+     */
+    public function workspace(Request $request, string $id): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $entries = $this->taskWorkspaceQuery->entriesForTask($callerUserId, $id);
+        if ($entries === null) {
+            return $this->notFoundResponse('Managed task not found', 'managed_task_not_found');
+        }
+
+        return response()->json([
+            'managed_task_id' => $id,
+            'entries' => $entries,
+        ]);
     }
 
     /**

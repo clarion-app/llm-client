@@ -874,5 +874,32 @@ return [
     'messaging' => [
         'max_message_bytes' => (int) env('LLM_CLIENT_MESSAGING_MAX_MESSAGE_BYTES', 65536),
     ],
+
+    // Shared Task Workspace (108-shared-task-workspace) -- the per-task
+    // shared working area every agent cooperating on a ManagedTask can
+    // append findings to and read from (research.md D7).
+    'task_workspace' => [
+        // FR-011: hard cap on entries per task (count). Oldest-first
+        // eviction (FR-013) trims down to this bound.
+        'max_entries' => (int) env('LLM_CLIENT_TASK_WORKSPACE_MAX_ENTRIES', 50),
+
+        // Defensive per-entry cap so one oversized write cannot itself
+        // blow the context budget below regardless of count
+        // (ContentSanitizer::truncate() applied at write time, mirroring
+        // result_output_cap_bytes's own per-field cap precedent, 099).
+        'max_entry_bytes' => (int) env('LLM_CLIENT_TASK_WORKSPACE_MAX_ENTRY_BYTES', 2048),
+
+        // FR-012/US6 AC3: the byte budget the rendered "Shared Task
+        // Notes" prompt section is truncated against -- same mechanism
+        // as manager.context_budget_bytes, a separate knob since the
+        // two sections are independently sized.
+        'context_budget_bytes' => (int) env('LLM_CLIENT_TASK_WORKSPACE_CONTEXT_BUDGET_BYTES', 8192),
+
+        // D3: how long trimToCap()'s Cache::lock() will wait for the
+        // trim's own short critical section before falling through
+        // (skip the trim, keep the write) rather than blocking the
+        // caller.
+        'lock_wait' => (int) env('LLM_CLIENT_TASK_WORKSPACE_LOCK_WAIT', 3),
+    ],
 ];
 

@@ -335,6 +335,11 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('managed-tasks/{id}', [ManagedTaskController::class, "show"]);
     Route::get('managed-tasks/{id}/parts', [ManagedTaskController::class, "parts"]);
     Route::get('managed-tasks/{id}/cost', [ManagedTaskController::class, "cost"]);
+    // Shared task workspace -- read-only human/test-facing visibility
+    // into a task's shared working area (108-shared-task-workspace,
+    // contracts/task-workspace-api.md §1). Writes happen only through
+    // the record_task_note meta-tool, reached from inside an agent loop.
+    Route::get('managed-tasks/{id}/workspace', [ManagedTaskController::class, "workspace"]);
 
     // Multi-agent consensus -- ask a question with multi-opinion mode
     // enabled, and read back a past request's stored result

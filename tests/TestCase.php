@@ -299,6 +299,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineSequenceRunSchema();
         $this->defineStageResultSchema();
         $this->defineAgentMessageSchema();
+        $this->defineTaskWorkspaceEntrySchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -1303,6 +1304,35 @@ abstract class TestCase extends BaseTestCase
                 $table->index('run_id');
                 $table->index('from_agent_id');
                 $table->index('to_agent_id');
+            });
+        }
+    }
+
+    /**
+     * task_workspace_entries — a single, immutable record within a
+     * managed task's shared working area (108-shared-task-workspace,
+     * data-model.md §1). Schema::hasTable() guarded, hand-declared here
+     * since no test in this package ever runs real migrations
+     * (Constitution §V). Matches the column set in
+     * src/Migrations/2026_08_15_000008_create_task_workspace_entries_table.php
+     * exactly.
+     */
+    protected function defineTaskWorkspaceEntrySchema(): void
+    {
+        if (!Schema::hasTable('task_workspace_entries')) {
+            Schema::create('task_workspace_entries', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('managed_task_id');
+                $table->uuid('owner_user_id');
+                $table->uuid('author_agent_id');
+                $table->text('content');
+                $table->timestamp('created_at', 6);
+
+                $table->index('managed_task_id');
+                $table->index('owner_user_id');
+                $table->index('author_agent_id');
+                $table->index('created_at');
+                $table->index(['managed_task_id', 'created_at']);
             });
         }
     }
