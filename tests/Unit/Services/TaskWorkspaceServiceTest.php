@@ -250,6 +250,71 @@ class TaskWorkspaceServiceTest extends TestCase
         }
     }
 
+    // =================================================================
+    // US4 (Phase 6, T032): FR-009 -- concurrent writes never clobber.
+    // recordEntry() is a bare, lock-free TaskWorkspaceEntry::create()
+    // (Phase 2) -- every writer gets its own row/PK, so there is no
+    // shared mutable state to race over. The guarantee is structural,
+    // not timing-dependent, so ordinary sequential PHPUnit execution
+    // with no artificial stagger between calls already exercises it
+    // (tasks.md's own "no true multi-process test required" call).
+    // =================================================================
+
+    #[Test]
+    public function five_near_simultaneous_writers_each_survive_intact_with_no_cross_contamination(): void
+    {
+        $task = $this->makeManagedTask();
+        $service = app(TaskWorkspaceService::class);
+
+        $writers = [];
+        for ($i = 1; $i <= 5; $i++) {
+            $writers[] = [
+                'author_agent_id' => (string) Str::uuid(),
+                'content' => "Distinct finding number {$i} from writer {$i}: unique-marker-{$i}-".Str::random(8),
+            ];
+        }
+
+        $entries = [];
+        foreach ($writers as $writer) {
+            // No artificial stagger between calls -- the guarantee is
+            // structural (independent INSERTs), not timing-dependent.
+            $entries[] = $service->recordEntry($task, $writer['author_agent_id'], $writer['content']);
+        }
+
+        $this->assertSame(5, TaskWorkspaceEntry::where('managed_task_id', $task->id)->count());
+
+        foreach ($entries as $i => $entry) {
+            $this->assertNotNull($entry, "writer {$i} must have its own entry recorded");
+        }
+
+        // Every entry has its own distinct primary key.
+        $entryIds = array_map(fn (TaskWorkspaceEntry $e) => $e->id, $entries);
+        $this->assertSame(5, count(array_unique($entryIds)), 'each writer must get its own distinct entry_id');
+
+        // Each entry carries its own writer's correct author_agent_id and
+        // its own writer's exact content -- no cross-contamination.
+        foreach ($entries as $i => $entry) {
+            $this->assertSame($writers[$i]['author_agent_id'], $entry->author_agent_id);
+            $this->assertSame($writers[$i]['content'], $entry->content);
+        }
+
+        // No entry's content contains a fragment of another entry's
+        // content -- pairwise cross-check across all 5 entries.
+        foreach ($entries as $i => $entryA) {
+            foreach ($entries as $j => $entryB) {
+                if ($i === $j) {
+                    continue;
+                }
+
+                $this->assertStringNotContainsString(
+                    $entryB->content,
+                    $entryA->content,
+                    "entry {$i}'s content must not contain a fragment of entry {$j}'s content"
+                );
+            }
+        }
+    }
+
     private function methodSource(\ReflectionMethod $method): string
     {
         $filename = $method->getDeclaringClass()->getFileName();
