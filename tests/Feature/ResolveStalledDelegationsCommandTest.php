@@ -234,4 +234,126 @@ class ResolveStalledDelegationsCommandTest extends TestCase
         );
         $this->assertNull($row->completed_at);
     }
+
+    // -----------------------------------------------------------------
+    // Reconciliation (quickstart.md Scenario 5): --dry-run
+    // must skip the NEW solo branch's whole write path -- not only the
+    // direct force-finalize of the row the query matched, but
+    // finalizeStalledChain()'s ancestor walk, which writes to rows the
+    // eligibility query never selected at all.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function dry_run_leaves_an_eligible_solo_delegation_and_its_ancestors_untouched(): void
+    {
+        // A -> B -> C, both hops stale and idle, exactly the shape the
+        // whole-subtree unwind finalizes on a real run.
+        $convB = $this->helperConversation();
+        $convC = $this->helperConversation();
+
+        $leaf = Delegation::create([
+            'parent_conversation_id' => $convB->id,
+            'helper_agent_id' => (string) Str::uuid(),
+            'helper_conversation_id' => $convC->id,
+            'owner_user_id' => $this->user->id,
+            'task' => 'A dry-run fixture leaf delegation.',
+            'depth' => 2,
+            'status' => 'in_progress',
+            'batch_id' => null,
+            'started_at' => $this->staleTimestamp(),
+        ]);
+        $ancestor = $this->makeSoloDelegation('in_progress', $this->staleTimestamp(), $convB->id);
+
+        $exitCode = Artisan::call('llm-client:resolve-stalled-delegations', ['--dry-run' => true]);
+        $output = Artisan::output();
+
+        $this->assertSame(0, $exitCode);
+
+        $this->assertSame(
+            'in_progress',
+            $this->fresh($leaf)->status,
+            '--dry-run must never force-finalize an eligible solo delegation',
+        );
+        $this->assertNull($this->fresh($leaf)->completed_at);
+        $this->assertSame(
+            'in_progress',
+            $this->fresh($ancestor)->status,
+            '--dry-run must never reach finalizeStalledChain()\'s ancestor walk either -- an ancestor is written by the chain walk, not by the eligibility query, so gating only the directly-matched row would still mutate the database in dry-run mode',
+        );
+        $this->assertNull($this->fresh($ancestor)->completed_at);
+
+        $this->assertStringContainsString(
+            'Solo delegations that would be force-finalized',
+            $output,
+            '--dry-run must still report what the solo branch found',
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Reconciliation (contracts/delegation-chain-bounds.md §3, quickstart
+    // Scenario 8 / mutation-checklist row 8): the hoisted
+    // delegation.stale_after_minutes wins, and the legacy nested
+    // delegation.concurrency.stale_after_minutes is read as the fallback
+    // when the hoisted key is absent -- the case of an installation whose
+    // PUBLISHED config predates the hoist and only carries the nested key.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function the_solo_branch_falls_back_to_the_legacy_nested_stale_after_minutes_when_the_hoisted_key_is_absent(): void
+    {
+        // Genuinely REMOVE the hoisted key rather than setting it to null:
+        // a published config file predating the hoist does not carry the
+        // key at all, and config('...', $default) returns $default only for
+        // a truly absent key -- a key present-but-null returns null, which
+        // would (int)-cast to 0 and sweep everything, masking the very
+        // difference this test exists to detect.
+        $delegationConfig = config('llm-client.delegation');
+        unset($delegationConfig['stale_after_minutes']);
+        $delegationConfig['concurrency']['stale_after_minutes'] = 1;
+        config(['llm-client.delegation' => $delegationConfig]);
+        config(['llm-client.delegation.idle_after_minutes' => 1]);
+
+        $this->assertFalse(
+            array_key_exists('stale_after_minutes', config('llm-client.delegation')),
+            'fixture sanity: the hoisted key must be genuinely absent, exactly as it is in a config file published before the hoist',
+        );
+
+        $helperConversation = $this->helperConversation();
+
+        // 5 minutes old: stale under the legacy override (1 minute) but
+        // NOT under the hardcoded 10-minute default the hoisted key would
+        // otherwise fall back to.
+        $delegation = $this->makeSoloDelegation('in_progress', now()->subMinutes(5), $helperConversation->id);
+
+        Artisan::call('llm-client:resolve-stalled-delegations');
+
+        $this->assertSame(
+            'exhausted',
+            $this->fresh($delegation)->status,
+            'an installation that overrode only the legacy nested delegation.concurrency.stale_after_minutes must keep that threshold for the solo branch too -- dropping to the hardcoded default silently changes its behavior, which contracts §3\'s one-release fallback exists to prevent',
+        );
+        $this->assertSame('chain_stalled', $this->fresh($delegation)->result_reason);
+    }
+
+    #[Test]
+    public function the_hoisted_stale_after_minutes_wins_over_the_legacy_nested_key_when_both_are_set(): void
+    {
+        config(['llm-client.delegation.stale_after_minutes' => 10]);
+        config(['llm-client.delegation.concurrency.stale_after_minutes' => 1]);
+        config(['llm-client.delegation.idle_after_minutes' => 1]);
+
+        $helperConversation = $this->helperConversation();
+
+        // 5 minutes old: stale under the legacy key (1) but not under the
+        // hoisted key (10), which must take precedence.
+        $delegation = $this->makeSoloDelegation('in_progress', now()->subMinutes(5), $helperConversation->id);
+
+        Artisan::call('llm-client:resolve-stalled-delegations');
+
+        $this->assertSame(
+            'in_progress',
+            $this->fresh($delegation)->status,
+            'the hoisted delegation.stale_after_minutes must take precedence whenever it is present -- the legacy nested key is a fallback, never an override',
+        );
+    }
 }

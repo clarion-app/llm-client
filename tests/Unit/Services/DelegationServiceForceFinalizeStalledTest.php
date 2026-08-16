@@ -4,7 +4,10 @@ namespace ClarionApp\LlmClient\Tests\Unit\Services;
 
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Events\DelegationUpdated;
+use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
+use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\DelegationService;
 use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
@@ -12,6 +15,7 @@ use ClarionApp\LlmClient\ValueObjects\RunKind;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
+use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
@@ -51,9 +55,12 @@ class DelegationServiceForceFinalizeStalledTest extends TestCase
 
     protected function tearDown(): void
     {
+        Mockery::close();
+
         DB::table('agent_delegations')->delete();
         DB::table('agent_run_actions')->delete();
         DB::table('agent_run_steps')->delete();
+        DB::table('conversations')->delete();
         DB::table('agent_runs')->delete();
         DB::table('users')->delete();
 
@@ -251,6 +258,104 @@ class DelegationServiceForceFinalizeStalledTest extends TestCase
         $this->assertTrue($firstCompletedAt->equalTo($delegation->completed_at));
 
         // No second broadcast for the discarded late write.
+        Event::assertNotDispatched(DelegationUpdated::class);
+    }
+
+    // =================================================================
+    // Reconciliation (FR-013, spec.md Edge Cases, quickstart.md Scenario
+    // 7): the test above proves forceFinalizeStalledDelegation()'s OWN
+    // guard is idempotent -- it re-enters the very method that already
+    // carried a terminal-status check, so it can only ever re-confirm
+    // that check. A genuinely late result does not arrive through that
+    // method at all: it arrives through runDelegatedTask(), the terminal
+    // write a still-alive process performs when its nested run() finally
+    // returns, and that path had NO terminal-status guard of its own --
+    // so the swept row was silently flipped back to 'completed', a second
+    // DelegationUpdated fired, and the already-closed run-trace action was
+    // closed again.
+    //
+    // This is reachable in ordinary operation, not contrived: stale +
+    // idle is evidence a process is gone, never proof of it, and
+    // finalizeStalledChain() deliberately finalizes a trigger row's
+    // ancestors without checking their own idleness at all. The chain is
+    // stopped here through finalizeStalledChain() -- the exact method the
+    // sweep's solo branch calls (that the sweep selects such a row is
+    // proven separately by tests/Feature/ResolveStalledDelegationsCommandTest
+    // and tests/Integration/DelegationChainUnwindJourneyTest).
+    // =================================================================
+
+    #[Test]
+    public function a_late_in_process_completion_arriving_through_the_run_path_is_discarded(): void
+    {
+        $helperConversation = Conversation::factory()->create([
+            'user_id' => $this->user->id,
+            'title' => 'Already titled',
+        ]);
+
+        $delegation = $this->makeDelegation('in_progress', [
+            'helper_conversation_id' => $helperConversation->id,
+            'started_at' => now()->subMinutes(30),
+        ]);
+
+        // The sweep stops the chain while this delegation's owning process
+        // is, in fact, still running.
+        app(DelegationService::class)->finalizeStalledChain($delegation);
+
+        $swept = Delegation::find($delegation->id);
+        $this->assertSame('exhausted', $swept->status, 'fixture sanity: the chain must be stopped first');
+        $this->assertSame('chain_stalled', $swept->result_reason);
+        $sweptSummary = $swept->result_summary;
+        $sweptCompletedAt = $swept->completed_at;
+
+        // That still-alive process's nested run() now returns, completed,
+        // and goes to write its own outcome. Its in-memory $delegation
+        // model still reads 'in_progress', exactly as a live process's own
+        // copy would.
+        $agentLoopService = Mockery::mock(AgentLoopService::class);
+        $agentLoopService->shouldReceive('run')->andReturn([
+            'status' => 'completed',
+            'content' => 'A late answer nobody is waiting for any more.',
+            'validated' => [
+                'status' => 'success',
+                'summary' => 'Late summary that must never land.',
+                'output' => ['late' => true],
+                'undone' => '',
+            ],
+        ]);
+        $this->app->instance(AgentLoopService::class, $agentLoopService);
+
+        Event::fake([DelegationUpdated::class]);
+
+        $method = new \ReflectionMethod(DelegationService::class, 'runDelegatedTask');
+        $method->setAccessible(true);
+        $result = $method->invoke(
+            app(DelegationService::class),
+            $delegation,
+            new Agent(['name' => 'late-helper']),
+            $helperConversation,
+            null,
+        );
+
+        $row = Delegation::find($delegation->id);
+
+        $this->assertSame(
+            'exhausted',
+            $row->status,
+            'FR-013: a late result arriving after the chain has already been stopped must be discarded, never applied on top of the already-resolved row',
+        );
+        $this->assertSame('chain_stalled', $row->result_reason);
+        $this->assertSame($sweptSummary, $row->result_summary);
+        $this->assertNull($row->result_output, 'the late run\'s own output must never be written onto a stopped chain\'s row');
+        $this->assertTrue(
+            $sweptCompletedAt->equalTo($row->completed_at),
+            'an already-resolved row\'s completed_at must never be rewritten by a late result',
+        );
+
+        // The late caller is handed back what the chain actually resolved
+        // to -- never a second, contradictory account of the same row.
+        $this->assertSame('failure', $result['status'] ?? null);
+        $this->assertSame('chain_stalled', $result['reason'] ?? null);
+
         Event::assertNotDispatched(DelegationUpdated::class);
     }
 

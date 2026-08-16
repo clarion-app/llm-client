@@ -309,4 +309,67 @@ class DelegationServiceStopReportTest extends TestCase
             'US4 AC2/FR-008: a stalled chain\'s report must name the parent agent the delegation was working for at the point of the stop -- currently never named at all, regardless of whether an assistant message exists',
         );
     }
+
+    // =================================================================
+    // Reconciliation (FR-006 + FR-008/US4 AC2 together) -- the two are
+    // NOT alternatives. data-model.md's "Stop Record" composes the helper
+    // agent's name, the parent agent's name, the reason AND (when
+    // non-empty) the partial output already produced. T031 proves the
+    // partial output survives; T039 above proves both names are present
+    // -- but T039 deliberately seeds NO assistant message, so between
+    // them the two tests only ever exercised mutually exclusive branches
+    // of the same composition, leaving the case that matters most
+    // (a stop that DID preserve partial work) naming no participant at
+    // all.
+    // =================================================================
+
+    #[Test]
+    public function a_stalled_delegation_with_partial_output_names_both_agents_and_keeps_the_partial_output(): void
+    {
+        $owner = $this->user();
+        $parentAgent = $this->makeAgent($owner, 'stop-report-partial-parent');
+        $helperAgent = $this->makeAgent($owner, 'stop-report-partial-helper');
+
+        $parentConversation = $this->conversation($owner, $parentAgent);
+        $helperConversation = $this->conversation($owner, $helperAgent);
+
+        $partialOutput = 'Partial output the helper actually produced before its process died.';
+        \ClarionApp\LlmClient\Models\Message::factory()->create([
+            'conversation_id' => $helperConversation->id,
+            'role' => 'assistant',
+            'content' => $partialOutput,
+        ]);
+
+        $delegation = $this->seedDelegationRow([
+            'parent_conversation_id' => $parentConversation->id,
+            'parent_agent_id' => $parentAgent->id,
+            'helper_agent_id' => $helperAgent->id,
+            'helper_conversation_id' => $helperConversation->id,
+            'owner_user_id' => $owner->id,
+            'depth' => 1,
+            'started_at' => now()->subMinutes(30),
+        ]);
+
+        $this->delegationService()->forceFinalizeStalledDelegation($delegation);
+
+        $delegation->refresh();
+
+        $summary = (string) $delegation->result_summary;
+
+        $this->assertStringContainsString(
+            $partialOutput,
+            $summary,
+            'FR-006: partial work already produced before the stop must be preserved in what is reported back',
+        );
+        $this->assertStringContainsString(
+            $helperAgent->name,
+            $summary,
+            'FR-008/US4 AC2: the account must still name the helper agent even when there IS partial output to report -- the two requirements hold together, they are not alternatives',
+        );
+        $this->assertStringContainsString(
+            $parentAgent->name,
+            $summary,
+            'FR-008/US4 AC2: the account must still name the parent agent the delegation was working for even when there IS partial output to report',
+        );
+    }
 }

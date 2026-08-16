@@ -123,7 +123,19 @@ class ResolveStalledDelegationsCommand extends Command
      */
     private function resolveSoloDelegations(DelegationService $delegationService, bool $dryRun): void
     {
-        $staleMinutes = (int) config('llm-client.delegation.stale_after_minutes', 10);
+        // contracts/delegation-chain-bounds.md §3: stale_after_minutes was
+        // hoisted out of delegation.concurrency.* to delegation.* because it
+        // now bounds solo delegations too. The package's own config file
+        // resolves both keys from one env var, so an env-level override is
+        // carried across by construction -- but an installation that
+        // PUBLISHED config/llm-client.php before the hoist has only the
+        // nested key in its published copy, and the hoisted key resolves to
+        // null there. Reading the legacy nested key as the fallback (rather
+        // than silently dropping to the hardcoded default) is what §3's "read
+        // as a fallback for one release to avoid silently changing behavior
+        // for an installation with an existing override" actually asks for.
+        $staleMinutes = (int) (config('llm-client.delegation.stale_after_minutes')
+            ?? config('llm-client.delegation.concurrency.stale_after_minutes', 10));
         $cutoff = now()->subMinutes($staleMinutes);
 
         $this->info("Solo delegations — stale threshold: {$staleMinutes} minutes (cutoff: {$cutoff->toDateTimeString()})");

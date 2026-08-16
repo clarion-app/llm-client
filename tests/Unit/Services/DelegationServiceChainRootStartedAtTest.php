@@ -182,4 +182,44 @@ class DelegationServiceChainRootStartedAtTest extends TestCase
             "must NOT return hop 2's (the immediate parent's) started_at ({$immediateParentStartedAt->toDateTimeString()})",
         );
     }
+
+    /**
+     * Reconciliation: the visited-conversation-id guard is what keeps this
+     * walk terminating against a data-level cycle in agent_delegations -- a
+     * row naming its own helper conversation as its parent, or any longer
+     * loop. Nothing at the database level forbids either (agent_delegations
+     * carries no FKs at all, by design), and the walk is driven by a bare
+     * `while (true)`, so a refactor that dropped the guard, or applied it to
+     * the wrong variable (the delegation's id rather than the conversation
+     * id it actually follows), would hang the delegating request forever
+     * rather than fail. The bound is asserted here so that regression is
+     * caught by a test rather than by a stuck worker.
+     */
+    #[Test]
+    public function a_delegation_naming_itself_as_its_own_parent_terminates_instead_of_looping_forever(): void
+    {
+        $owner = $this->user();
+        $selfReferential = $this->conversation($owner);
+
+        $startedAt = \Carbon\Carbon::parse('2026-02-02 12:00:00');
+
+        // A data anomaly: parent_conversation_id === helper_conversation_id,
+        // so following parent_conversation_id lands straight back on the row
+        // the walk just visited.
+        $this->seedDelegationRow([
+            'parent_conversation_id' => $selfReferential->id,
+            'helper_conversation_id' => $selfReferential->id,
+            'owner_user_id' => $owner->id,
+            'depth' => 1,
+            'started_at' => $startedAt,
+        ]);
+
+        $result = $this->chainRootStartedAt($selfReferential);
+
+        $this->assertNotNull($result, 'the walk must still report the one row it did see');
+        $this->assertTrue(
+            $startedAt->equalTo($result),
+            'a self-parenting row is its own chain root -- the walk must stop there rather than following the same edge again',
+        );
+    }
 }

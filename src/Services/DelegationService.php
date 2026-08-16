@@ -532,19 +532,19 @@ class DelegationService
      * of the hardcoded 'batch_join_timeout'.
      *
      * 110-delegation-deadlock-timeout (Phase 5, tasks.md T035, research.md
-     * D4, data-model.md "Stop Record"): result_summary/outcome_summary are
-     * composed from the delegation's own helper conversation's last
-     * persisted assistant Message -- mirroring runDelegatedTask()'s own
-     * $exhaustionReasons branch verbatim (same
+     * D4, data-model.md "Stop Record"): result_summary/outcome_summary name
+     * both participants (Phase 6, T040) AND carry the delegation's own
+     * helper conversation's last persisted assistant Message when there is
+     * one -- read exactly as runDelegatedTask()'s own $exhaustionReasons
+     * branch reads it (same
      * `->messages()->where('role', 'assistant')->orderByDesc('created_at')
-     * ->value('content')` read, the same `Str::limit(..., 500)` cap) -- so
+     * ->value('content')` query, same `Str::limit(..., 500)` cap) -- so
      * whatever partial, useful work the helper had already produced before
      * its owning process died is preserved in what is reported back
-     * (FR-006). That content already lives in the database by the time the
-     * sweep runs; nothing about the dead process needs to still be alive to
-     * report it. Falls back to the same plain, generic placeholder text
-     * this method used before T035 when there is no assistant message at
-     * all to read (a helper that died before producing any output).
+     * (FR-006) without costing the account of what was waiting on what
+     * (FR-008/US4 AC2). That content already lives in the database by the
+     * time the sweep runs; nothing about the dead process needs to still be
+     * alive to report it.
      *
      * Idempotent against a row that is already terminal by the time the
      * caller reaches it, exactly like forceFinalizeBatchJoinTimeout().
@@ -579,9 +579,27 @@ class DelegationService
         $helperAgentName = Agent::withTrashed()->find($delegation->helper_agent_id)?->name ?? $delegation->helper_agent_id;
         $parentAgentName = Agent::withTrashed()->find($delegation->parent_agent_id)?->name ?? $delegation->parent_agent_id;
 
+        // 110-delegation-deadlock-timeout (reconciliation of Phase 5's
+        // T035 against Phase 6's T040, data-model.md "Stop Record"): the
+        // participant account and the preserved partial output are NOT
+        // alternatives -- data-model.md composes a Stop Record from "the
+        // helper agent's name, the parent agent's name, the reason, and --
+        // when the finalized row's own last-known helper conversation
+        // content is non-empty -- the partial output already produced".
+        // Composing them as an either/or (T035's partial-only summary,
+        // T040's names-only placeholder) satisfied FR-006 and US4 AC2 only
+        // in mutually exclusive branches: a stop that HAD preserved partial
+        // work named no participants at all, which is precisely the case
+        // US4 AC2 asks the account for. The account is stated first so it
+        // survives any downstream truncation, with the partial content
+        // appended under the same "Partial: " label
+        // translateCapabilityResult() already uses for a bound-exceeded
+        // helper's own partial output.
+        $stopAccount = "The delegation from \"{$parentAgentName}\" to \"{$helperAgentName}\" was force-finalized as stalled.";
+
         $resultSummary = $partialResult !== ''
-            ? Str::limit($partialResult, 500)
-            : "The delegation from \"{$parentAgentName}\" to \"{$helperAgentName}\" was force-finalized as stalled.";
+            ? $stopAccount.' Partial: '.Str::limit($partialResult, 500)
+            : $stopAccount;
         $resultUndone = 'Everything -- the task could not be completed.';
 
         $delegation->status = 'exhausted';
@@ -1037,6 +1055,15 @@ class DelegationService
         try {
             $rawResult = $this->agentLoopService->run($helperConversation, $composedMessage, $delegationOptions);
         } catch (\Throwable $e) {
+            // 110-delegation-deadlock-timeout (FR-013): if the chain was
+            // stopped while this hop was still running, the outcome this
+            // hop is about to report is a LATE result and must be
+            // discarded rather than written over the already-resolved row.
+            $lateResult = $this->discardedLateResult($delegation);
+            if ($lateResult !== null) {
+                return $lateResult;
+            }
+
             // D5: a thrown exception from the nested run() call must never
             // propagate to the parent's own loop -- caught here and mapped
             // to a terminal 'failed' Delegation, matching the ordinary
@@ -1103,6 +1130,16 @@ class DelegationService
             if ($enclosingRunId !== null) {
                 Context::add('run_id', $enclosingRunId);
             }
+        }
+
+        // 110-delegation-deadlock-timeout (FR-013): the same late-result
+        // check the catch branch above applies, covering every one of the
+        // terminal writes below (completed / bound-exceeded / confirmation
+        // required / no-output) in one place, since all four are reached
+        // only through this single point after the nested run() returns.
+        $lateResult = $this->discardedLateResult($delegation);
+        if ($lateResult !== null) {
+            return $lateResult;
         }
 
         $content = $rawResult['content'] ?? '';
@@ -1473,6 +1510,53 @@ class DelegationService
         foreach ($stillPending as $delegation) {
             $this->forceFinalizeBatchJoinTimeout($delegation);
         }
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (FR-013, spec.md Edge Cases: "a late
+     * result arriving from a participant after its chain has already been
+     * stopped MUST be discarded rather than applied to a chain that has
+     * already reached a resolved state").
+     *
+     * The generalized stalled-chain sweep (ResolveStalledDelegationsCommand,
+     * research.md D3) can now force-finalize a SOLO delegation's row while
+     * the process that owns it is in fact still alive -- staleness plus
+     * idleness is strong evidence a process is gone, never proof of it, and
+     * finalizeStalledChain() deliberately finalizes a trigger row's
+     * ancestors without re-checking their own idleness at all. When such a
+     * still-alive process finally returns, runDelegatedTask()'s own terminal
+     * write would otherwise overwrite the already-resolved row (flipping
+     * 'exhausted'/'chain_stalled' back to 'completed'), fire a second
+     * DelegationUpdated for the same row, and re-close an already-closed
+     * run-trace action -- three contradictory accounts of one stop.
+     *
+     * Re-reading the persisted status immediately before that write -- the
+     * same terminal-status guard forceFinalizeBatchJoinTimeout()/
+     * forceFinalizeStalledDelegation()/recordBatchMemberTimeoutOrFailure()
+     * already apply to their own writes, just applied on the completion path
+     * that had none -- discards the late result instead and hands the caller
+     * back whatever the chain actually resolved to, reconstructed by the
+     * existing sixFieldResultFromRow(). One extra O(1) read per delegation,
+     * on a path that has just made at least one model call.
+     *
+     * Returns null (the ordinary case) whenever the row is still
+     * non-terminal, leaving every existing write path untouched.
+     */
+    private function discardedLateResult(Delegation $delegation): ?array
+    {
+        $persisted = Delegation::find($delegation->id);
+
+        if ($persisted === null || !in_array($persisted->status, ['completed', 'exhausted', 'failed'], true)) {
+            return null;
+        }
+
+        Log::warning('DelegationService: discarding a late delegation result against an already-resolved row', [
+            'delegation_id' => $delegation->id,
+            'resolved_status' => $persisted->status,
+            'resolved_reason' => $persisted->result_reason,
+        ]);
+
+        return $this->sixFieldResultFromRow($persisted);
     }
 
     /**
