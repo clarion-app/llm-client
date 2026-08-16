@@ -395,6 +395,46 @@ class TaskWorkspaceServiceTest extends TestCase
         $this->assertSame(0, TaskWorkspaceEntry::where('managed_task_id', $task->id)->count(), 'no row may be written and then orphaned by the discard');
     }
 
+    // =================================================================
+    // Polish (Phase 9, T050 mutation-testing checklist row 3): the write
+    // itself must never be wrapped in the same lock that guards the trim
+    // (research.md D3) -- doing so would make recordEntry() wait up to
+    // lock_wait seconds TWICE (once for the insert, once for the trim)
+    // whenever the trim lock is already held elsewhere, stalling the
+    // write for a housekeeping step that must never block it. Correctness
+    // alone (the write still eventually succeeds) does not distinguish
+    // the two designs -- only timing does, per quickstart.md's own row 3.
+    // =================================================================
+
+    #[Test]
+    public function record_entry_does_not_double_wait_on_the_trim_lock_when_it_is_already_held(): void
+    {
+        config(['llm-client.task_workspace.lock_wait' => 1]);
+
+        $task = $this->makeManagedTask();
+        $service = app(TaskWorkspaceService::class);
+
+        $lockKey = "task-workspace:{$task->id}:trim";
+        $externalLock = \Illuminate\Support\Facades\Cache::lock($lockKey, 10);
+        $this->assertTrue($externalLock->get(), 'fixture sanity -- must be able to acquire the trim lock externally first, simulating a stalled trim');
+
+        try {
+            $start = microtime(true);
+            $entry = $service->recordEntry($task, (string) Str::uuid(), 'Recorded while the trim lock is held elsewhere.');
+            $elapsed = microtime(true) - $start;
+
+            $this->assertNotNull($entry, 'the write itself must still succeed even when the trim lock cannot be acquired');
+            $this->assertLessThan(
+                1.2,
+                $elapsed,
+                'recordEntry() must wait on the trim lock at most once (lock_wait seconds, here 1s) before falling through -- '.
+                "took {$elapsed}s, suggesting the insert itself is also waiting on the same lock as the trim (double the wait)."
+            );
+        } finally {
+            $externalLock->forceRelease();
+        }
+    }
+
     private function methodSource(\ReflectionMethod $method): string
     {
         $filename = $method->getDeclaringClass()->getFileName();

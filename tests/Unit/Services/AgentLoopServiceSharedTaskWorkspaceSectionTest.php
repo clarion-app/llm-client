@@ -156,4 +156,37 @@ class AgentLoopServiceSharedTaskWorkspaceSectionTest extends TestCase
         $this->assertStringContainsString($notice, $section, 'the trailing truncation notice must name the authoritative full-record endpoint');
         $this->assertStringEndsWith($notice, $section, 'the truncation notice must be trailing, not merely present somewhere in the section');
     }
+
+    // =================================================================
+    // Polish (Phase 9, T051): quickstart scenario 2's second half -- "the
+    // system prompt for the manager's first turn contains no
+    // '## Shared Task Notes' heading at all" for a brand-new task with no
+    // entries yet. TaskWorkspaceControllerTest's own empty-workspace test
+    // (T015) only covers the HTTP 200 {"entries": []} half of scenario 2;
+    // this closes the other half, which had no owning test until now.
+    // =================================================================
+
+    #[Test]
+    public function returns_null_for_a_task_with_no_entries_yet_matching_us1_ac3s_empty_not_error(): void
+    {
+        $manager = $this->makeAgent('manager-'.uniqid());
+        $task = app(ManagerService::class)->createManagedTask($this->user->id, $manager->id, 'A brand-new task, no notes yet.');
+
+        $section = $this->callBuildSharedTaskWorkspaceSection($task->id);
+
+        $this->assertNull(
+            $section,
+            'a task with no recorded entries yet must render no "Shared Task Notes" section at all -- '.
+            "quickstart scenario 2's second half, mirroring buildManagedTaskProgressSection()'s own ".
+            'append-nothing contract for an empty/absent case'
+        );
+    }
+
+    #[Test]
+    public function returns_null_when_the_conversation_resolves_no_managed_task_at_all(): void
+    {
+        $section = $this->callBuildSharedTaskWorkspaceSection(null);
+
+        $this->assertNull($section);
+    }
 }
