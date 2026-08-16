@@ -16,6 +16,7 @@ use ClarionApp\LlmClient\Models\ManagedTaskPart;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\McpSession;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Models\TaskWorkspaceEntry;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\SchemaValidator;
 use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
@@ -74,6 +75,7 @@ class AgentLoopService
     private ?RunTraceRecorder $runTraceRecorder;
     private ConversationAgentDefinitionResolver $agentDefinitionResolver;
     private EffectiveBoundResolver $effectiveBoundResolver;
+    private TaskWorkspaceQuery $taskWorkspaceQuery;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -95,7 +97,8 @@ class AgentLoopService
         ?MetricsRecorder $metricsRecorder = null,
         ?RunTraceRecorder $runTraceRecorder = null,
         ?ConversationAgentDefinitionResolver $agentDefinitionResolver = null,
-        ?EffectiveBoundResolver $effectiveBoundResolver = null
+        ?EffectiveBoundResolver $effectiveBoundResolver = null,
+        ?TaskWorkspaceQuery $taskWorkspaceQuery = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -117,6 +120,7 @@ class AgentLoopService
         $this->runTraceRecorder = $runTraceRecorder;
         $this->agentDefinitionResolver = $agentDefinitionResolver ?? new ConversationAgentDefinitionResolver(new AgentDefinitionParser());
         $this->effectiveBoundResolver = $effectiveBoundResolver ?? new EffectiveBoundResolver(new AgentHelperQuery(new AgentQuery(new AgentDefinitionParser()), new AgentDefinitionParser()));
+        $this->taskWorkspaceQuery = $taskWorkspaceQuery ?? new TaskWorkspaceQuery(new ManagedTaskQuery());
     }
 
     /**
@@ -2693,6 +2697,34 @@ class AgentLoopService
             ];
         }
 
+        // 108-shared-task-workspace (US1, contracts/task-workspace-meta-tool.md
+        // §1, research.md D5): gated on resolveManagedTaskIdForConversation()
+        // returning non-null -- deliberately NOT the channel === 'managed-task'
+        // gate the 103 block above uses. This widens the audience to every
+        // helper conversation nested under a managed task's tree (any
+        // nesting depth), not only the manager's own conversation
+        // (mutation-checklist row 9's own named risk -- reusing the
+        // manager-only gate here would silently exclude every helper).
+        if ($conversation !== null && $this->taskWorkspaceQuery->resolveManagedTaskIdForConversation($conversation->id) !== null) {
+            $tools[] = [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'record_task_note',
+                    'description' => 'Add a finding, decision, or open question to this task\'s shared workspace, visible to every other agent currently working on the same task. Use it to record something teammates should not have to re-derive themselves — do not use it for your own private scratch work. Entries cannot be edited or removed once written; if you change your mind, record a new entry rather than trying to correct an old one.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'content' => [
+                                'type' => 'string',
+                                'description' => 'The finding, decision, or open question, written so a teammate with no other context can understand it.',
+                            ],
+                        ],
+                        'required' => ['content'],
+                    ],
+                ],
+            ];
+        }
+
         if (empty($withheld)) {
             return $tools;
         }
@@ -2858,6 +2890,7 @@ class AgentLoopService
             'accept_part' => $this->handleAcceptPart($arguments, $conversation),
             'report_shortfall' => $this->handleReportShortfall($arguments, $conversation),
             'finalize_task' => $this->handleFinalizeTask($arguments, $conversation),
+            'record_task_note' => $this->handleRecordTaskNote($arguments, $conversation),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
@@ -3519,6 +3552,61 @@ class AgentLoopService
     }
 
     /**
+     * 108-shared-task-workspace (US1, contracts/task-workspace-meta-tool.md
+     * §2, research.md D6). Mirrors buildManagedTaskProgressSection()'s
+     * exact shape (null early-return, implode(PHP_EOL, $lines),
+     * ContentSanitizer::truncate() against its own independently-sized
+     * config cap, isTruncated()-gated notice) -- but for the WIDENED
+     * audience task-workspace-meta-tool.md §1's own gate uses (the
+     * manager's own conversation AND every helper conversation nested
+     * under a managed task's tree), not the manager-only audience the
+     * progress section keeps. Entries render strictly oldest-first and
+     * are never reordered on read (US5/FR-010 forbids promoting a
+     * contradicted entry).
+     */
+    private function buildSharedTaskWorkspaceSection(?string $managedTaskId): ?string
+    {
+        if ($managedTaskId === null) {
+            return null;
+        }
+
+        $entries = TaskWorkspaceEntry::where('managed_task_id', $managedTaskId)
+            ->orderBy('created_at')
+            ->get();
+
+        if ($entries->isEmpty()) {
+            return null;
+        }
+
+        $agentIds = $entries->pluck('author_agent_id')->filter()->unique()->values()->all();
+        $names = empty($agentIds) ? [] : Agent::whereIn('id', $agentIds)->pluck('name', 'id')->all();
+
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '## Shared Task Notes';
+        $lines[] = '';
+
+        foreach ($entries as $entry) {
+            $authorName = $names[$entry->author_agent_id] ?? $entry->author_agent_id;
+            $timestamp = $entry->created_at?->utc()->format('Y-m-d H:i') . ' UTC';
+            $lines[] = "- [{$timestamp}, {$authorName}]: {$entry->content}";
+        }
+
+        $section = implode(PHP_EOL, $lines);
+
+        $sanitizer = app(ContentSanitizer::class);
+        $cap = (int) config('llm-client.task_workspace.context_budget_bytes', 8192);
+        $truncated = $sanitizer->truncate($section, $cap);
+
+        if ($sanitizer->isTruncated($truncated)) {
+            $truncated .= PHP_EOL . PHP_EOL
+                . '(This section was truncated to fit the context budget -- see GET /managed-tasks/{id}/workspace for the authoritative full record.)';
+        }
+
+        return $truncated;
+    }
+
+    /**
      * Build the auto-retrieved memory section for injection into the system prompt.
      * Uses AutoMemoryRetriever when available, falls back to PreferenceInjector.
      *
@@ -3684,6 +3772,22 @@ class AgentLoopService
         $managedTaskProgressSection = $this->buildManagedTaskProgressSection($managedTaskId);
         if ($managedTaskProgressSection !== null) {
             $systemPrompt .= $managedTaskProgressSection;
+        }
+
+        // Append "Shared Task Notes" section (108-shared-task-workspace,
+        // research.md D5/D6) for the WIDENED audience -- the manager's own
+        // conversation AND every helper conversation nested under a
+        // managed task's tree. Deliberately a SEPARATE, independently
+        // resolved value from $managedTaskId above (Grounding note item
+        // 6): that local is null for every helper conversation (it is
+        // gated on channel === 'managed-task', true only for the manager's
+        // own conversation), so reusing it here would silently exclude
+        // every helper conversation from ever seeing this section --
+        // reintroducing 103's manager-only gate through the back door.
+        $sharedWorkspaceTaskId = $this->taskWorkspaceQuery->resolveManagedTaskIdForConversation($conversation->id);
+        $sharedTaskWorkspaceSection = $this->buildSharedTaskWorkspaceSection($sharedWorkspaceTaskId);
+        if ($sharedTaskWorkspaceSection !== null) {
+            $systemPrompt .= $sharedTaskWorkspaceSection;
         }
 
         if (!empty($systemPrompt)) {
@@ -4145,6 +4249,47 @@ class AgentLoopService
         $managedTask->refresh();
 
         return json_encode(['managed_task_id' => $managedTask->id, 'status' => $managedTask->status]);
+    }
+
+    /**
+     * 108-shared-task-workspace (US1, contracts/task-workspace-meta-tool.md
+     * §1). Only ever reached when buildToolsPayload() has actually
+     * injected record_task_note (resolveManagedTaskIdForConversation()
+     * !== null for this exact conversation) -- a null resolution here
+     * would mean a race against the task's own forced-finalize between
+     * tool injection and this call, handled defensively rather than
+     * assumed unreachable (research.md D5's own liveness argument).
+     *
+     * The empty-content check runs BEFORE the task_concluded check (the
+     * contract's own ordering) using the identical ContentSanitizer::
+     * truncate() call TaskWorkspaceService::recordEntry() itself makes --
+     * deliberately duplicated rather than shared, mirroring
+     * handleFinalizeTask()'s own "compute the refusal check, then call
+     * the write separately" shape above.
+     */
+    private function handleRecordTaskNote(array $arguments, Conversation $conversation): string
+    {
+        $managedTaskId = $this->taskWorkspaceQuery->resolveManagedTaskIdForConversation($conversation->id);
+        if ($managedTaskId === null) {
+            return json_encode(['error' => 'not_a_managed_task', 'message' => 'record_task_note is only usable inside a managed task.']);
+        }
+
+        $content = (string) ($arguments['content'] ?? '');
+        $truncated = app(ContentSanitizer::class)->truncate($content, (int) config('llm-client.task_workspace.max_entry_bytes'));
+        if ($truncated === '') {
+            return json_encode(['error' => 'empty_content', 'message' => 'content must not be empty.']);
+        }
+
+        $managedTask = ManagedTask::find($managedTaskId);
+        $entry = $managedTask !== null
+            ? app(TaskWorkspaceService::class)->recordEntry($managedTask, $conversation->agent_id, $content)
+            : null;
+
+        if ($entry === null) {
+            return json_encode(['error' => 'task_concluded', 'message' => 'This task has already concluded; its shared workspace is no longer available.']);
+        }
+
+        return json_encode(['entry_id' => $entry->id, 'recorded_at' => $entry->created_at?->toJSON()]);
     }
 
     /**

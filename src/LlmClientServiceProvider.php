@@ -322,7 +322,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 $app->make(\ClarionApp\LlmClient\Services\MetricsRecorder::class),
                 $app->make(\ClarionApp\LlmClient\Services\RunTraceRecorder::class),
                 null,
-                $app->make(\ClarionApp\LlmClient\Services\EffectiveBoundResolver::class)
+                $app->make(\ClarionApp\LlmClient\Services\EffectiveBoundResolver::class),
+                $app->make(\ClarionApp\LlmClient\Services\TaskWorkspaceQuery::class)
             );
         });
 

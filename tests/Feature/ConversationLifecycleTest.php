@@ -48,6 +48,17 @@ class ConversationLifecycleTest extends TestCase
         // clean 'none' decision, never a table-missing error).
         $this->defineAgentSchema();
 
+        // 108-shared-task-workspace: buildToolsPayload()/buildMessagesPayload()
+        // now call TaskWorkspaceQuery::resolveManagedTaskIdForConversation()
+        // unconditionally for every conversation (not gated behind
+        // channel === 'managed-task' the way 103's own progress section
+        // stays) -- so 'managed_tasks' and 'agent_delegations' must exist
+        // here too, even though this test never creates a managed task
+        // (an ordinary conversation resolving to "no managed task" is a
+        // clean null, never a table-missing error).
+        $this->defineManagedTaskSchema();
+        $this->defineAgentDelegationSchema();
+
         Schema::create('users', function (Blueprint $table) {
             $table->uuid('id')->primary();
             $table->string('name');
