@@ -188,4 +188,75 @@ class TaskWorkspaceServiceTest extends TestCase
         $this->assertStringStartsWith('This finding', $entry->content);
         $this->assertSame(1, TaskWorkspaceEntry::where('managed_task_id', $task->id)->count());
     }
+
+    // =================================================================
+    // US2 (Phase 4, T023): structural proof of FR-007 -- no update path
+    // exists anywhere in TaskWorkspaceService, not merely "none is
+    // exercised by the tests above."
+    // =================================================================
+
+    #[Test]
+    public function record_entry_is_the_only_public_method_that_touches_an_individual_rows_fields(): void
+    {
+        $publicMethods = array_values(array_filter(
+            get_class_methods(TaskWorkspaceService::class),
+            fn (string $name) => $name !== '__construct' && strpos($name, '__') !== 0
+        ));
+
+        // Phase 4 (US2): only recordEntry() exists. Phase 8 (US6) adds
+        // exactly two more -- trimToCap() (count-cap eviction, never
+        // touches an individual row's content/author_agent_id/created_at,
+        // only whether the row exists at all) and discardForTask() (bulk
+        // delete, same "existence only" character). Neither is a
+        // *content*-mutating update path, so this assertion is written to
+        // stay true across both phases rather than pin an exact count
+        // that Phase 8 would immediately break.
+        $this->assertContains('recordEntry', $publicMethods);
+
+        $allowedAfterPhase8 = ['recordEntry', 'trimToCap', 'discardForTask'];
+        $unexpected = array_diff($publicMethods, $allowedAfterPhase8);
+        $this->assertSame(
+            [],
+            $unexpected,
+            'TaskWorkspaceService must expose no public method beyond recordEntry()/trimToCap()/discardForTask() -- '.
+            'found: '.implode(', ', $unexpected)
+        );
+
+        // The structural core of FR-007's "MUST NOT allow" phrasing:
+        // recordEntry() is the sole method whose implementation writes to
+        // an individual TaskWorkspaceEntry's content/author_agent_id/
+        // created_at fields at all -- confirmed by reflecting over the
+        // service's method bodies and asserting none but recordEntry()
+        // references TaskWorkspaceEntry::create() or ->save()/->update()
+        // on a fetched instance.
+        $reflection = new \ReflectionClass(TaskWorkspaceService::class);
+        foreach ($reflection->getMethods(\ReflectionMethod::IS_PUBLIC) as $method) {
+            if ($method->isConstructor() || $method->getName() === 'recordEntry') {
+                continue;
+            }
+
+            $source = $this->methodSource($method);
+            $this->assertStringNotContainsString(
+                'TaskWorkspaceEntry::create',
+                $source,
+                "{$method->getName()}() must not construct a new TaskWorkspaceEntry -- only recordEntry() may."
+            );
+            $this->assertDoesNotMatchRegularExpression(
+                '/->save\s*\(|->update\s*\(/',
+                $source,
+                "{$method->getName()}() must not call ->save()/->update() on an individual row -- ".
+                'only bulk, field-blind operations (count, delete) are permitted outside recordEntry().'
+            );
+        }
+    }
+
+    private function methodSource(\ReflectionMethod $method): string
+    {
+        $filename = $method->getDeclaringClass()->getFileName();
+        $lines = file($filename);
+        $start = $method->getStartLine() - 1;
+        $length = $method->getEndLine() - $start;
+
+        return implode('', array_slice($lines, $start, $length));
+    }
 }

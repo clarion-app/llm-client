@@ -135,4 +135,59 @@ class TaskWorkspaceControllerTest extends TestCase
         $this->assertSame($entryTwo->id, $second['entry_id']);
         $this->assertSame('Cross-check against the Q2 deck instead.', $second['content']);
     }
+
+    // =================================================================
+    // US2 (Phase 4, T022): attribution/immutability -- proven, not assumed
+    // =================================================================
+
+    #[Test]
+    public function two_different_authors_entries_are_each_individually_and_permanently_attributed(): void
+    {
+        $manager = $this->makeAgent('Manager Agent');
+        $helper = $this->makeAgent('Helper Agent');
+        $task = app(ManagerService::class)->createManagedTask($this->user->id, $manager->id, 'A task worked by a manager and a helper.');
+
+        // The manager records first, then a helper -- order matters for
+        // this test's "does writing #2 disturb #1" assertion, but the
+        // Independent Test explicitly calls out "in either order", so the
+        // manager-then-helper ordering here is representative, not special.
+        $managerEntry = app(TaskWorkspaceService::class)->recordEntry($task, $manager->id, 'Manager: kicking off, no findings yet.');
+
+        $firstFetch = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/managed-tasks/{$task->id}/workspace");
+        $firstFetch->assertStatus(200);
+        $entryAfterFirstWrite = collect($firstFetch->json('entries'))->firstWhere('entry_id', $managerEntry->id);
+        $this->assertNotNull($entryAfterFirstWrite);
+
+        usleep(1000);
+        $helperEntry = app(TaskWorkspaceService::class)->recordEntry($task, $helper->id, 'Helper: found the vendor requires an auth header now.');
+
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/managed-tasks/{$task->id}/workspace");
+        $response->assertStatus(200);
+        $body = $response->json();
+
+        $this->assertCount(2, $body['entries']);
+
+        $managerRow = collect($body['entries'])->firstWhere('entry_id', $managerEntry->id);
+        $helperRow = collect($body['entries'])->firstWhere('entry_id', $helperEntry->id);
+
+        $this->assertNotNull($managerRow);
+        $this->assertNotNull($helperRow);
+
+        // Each entry individually reports its own correct authorship.
+        $this->assertSame($manager->id, $managerRow['author_agent_id']);
+        $this->assertSame('Manager Agent', $managerRow['author_agent_name']);
+        $this->assertSame($helper->id, $helperRow['author_agent_id']);
+        $this->assertSame('Helper Agent', $helperRow['author_agent_name']);
+
+        // No cross-contamination: the manager's row must not carry the
+        // helper's identity or vice versa.
+        $this->assertNotSame($managerRow['author_agent_id'], $helperRow['author_agent_id']);
+        $this->assertNotSame($managerRow['author_agent_name'], $helperRow['author_agent_name']);
+
+        // Re-fetching after the second write leaves every field of the
+        // first entry's own row byte-for-byte unchanged.
+        $this->assertSame($entryAfterFirstWrite, $managerRow);
+    }
 }
