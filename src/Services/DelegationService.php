@@ -709,6 +709,10 @@ class DelegationService
      * EffectiveBoundResolver::check() uses, against a data-level cycle in
      * agent_delegations.
      *
+     * Read (not modified) by 110-delegation-deadlock-timeout's new
+     * chain-time-bound check, which reuses this same backward-walk
+     * pattern in a sibling method (chainRootStartedAt()).
+     *
      * @return list<string>
      */
     private function ancestorAgentIds(Conversation $conversation): array
