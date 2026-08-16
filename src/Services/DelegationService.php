@@ -176,6 +176,19 @@ class DelegationService
             return ['error' => 'This delegation chain has reached its maximum depth and cannot delegate any further.'];
         }
 
+        // 110-delegation-deadlock-timeout (Phase 4/US2, research.md D1,
+        // contracts/delegation-chain-bounds.md §1): the identical
+        // chain-time bound resolveAndValidate() enforces, applied to
+        // invokeAsCapability()'s own caller conversation -- checked after
+        // depth, before the identity-cycle backstop below, mirroring the
+        // same ordering (data-model.md "Validation rules"). Returns before
+        // createDelegationRow() is ever reached, exactly like the depth
+        // and identity refusals in this method already do.
+        $chainRootStartedAt = $this->chainRootStartedAt($callerConversation);
+        if ($chainRootStartedAt !== null && $chainRootStartedAt->diffInSeconds(now()) > config('llm-client.delegation.max_chain_seconds', 900)) {
+            return ['error' => 'This delegation chain has been running too long and cannot delegate any further.'];
+        }
+
         // 109-agent-as-capability (Phase 5/US3, data-model.md §7): the
         // agent-identity backstop -- refuses re-invoking $offeredAgent if
         // it is already active earlier in this SAME live chain, regardless
@@ -458,7 +471,7 @@ class DelegationService
      * 101-parallel-subagent-execution (research.md D4 layer 2, contracts
      * §1): force-finalizes a batch member that never reached a terminal
      * status within delegateBatch()'s own join-wait bound, or that
-     * llm-client:resolve-stalled-delegation-batches finds still stale.
+     * llm-client:resolve-stalled-delegations finds still stale.
      * Idempotent against a row that is already terminal by the time either
      * caller reaches it (the parent's own join-wait deadline check and the
      * sweep can both race to finalize the same row).
@@ -625,6 +638,21 @@ class DelegationService
             return [
                 'error' => 'delegation_depth_exceeded',
                 'message' => 'This delegation chain has reached its maximum depth and cannot delegate any further.',
+            ];
+        }
+
+        // 110-delegation-deadlock-timeout (Phase 4/US2, research.md D1,
+        // contracts/delegation-chain-bounds.md §1): the cumulative
+        // chain-wide elapsed-time bound -- checked AFTER depth (the
+        // cheaper, O(1) check) but BEFORE the O(depth) identity-cycle
+        // backstop below (data-model.md "Validation rules"). Refuses
+        // before a new Delegation row is ever written, identical to the
+        // depth refusal's own all-or-nothing contract.
+        $chainRootStartedAt = $this->chainRootStartedAt($parentConversation);
+        if ($chainRootStartedAt !== null && $chainRootStartedAt->diffInSeconds(now()) > config('llm-client.delegation.max_chain_seconds', 900)) {
+            return [
+                'error' => 'delegation_chain_time_exceeded',
+                'message' => 'This delegation chain has been running too long and cannot delegate any further.',
             ];
         }
 
@@ -1204,7 +1232,7 @@ class DelegationService
      * genuinely down" from "nothing has looked at this batch yet". That
      * distinction is real, but it does not justify skipping
      * force-finalization -- doing so left every row 'queued' indefinitely
-     * (until the scheduled resolve-stalled-delegation-batches sweep,
+     * (until the scheduled resolve-stalled-delegations sweep,
      * layer 3, eventually got to it, up to stale_after_minutes later) while
      * delegateBatch() itself still returned immediately once its own
      * bounded deadline passed, reconstructing a six-field result from a
@@ -1344,6 +1372,64 @@ class DelegationService
             'truncated' => (bool) $delegation->result_truncated,
             'reason' => $delegation->result_reason,
         ];
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 4/US2, research.md D2,
+     * data-model.md "Idle duration", contracts/delegation-chain-bounds.md
+     * §2): whether $delegation has had no run-trace action activity
+     * (opened or closed) within `delegation.idle_after_minutes` -- the
+     * signal that distinguishes a genuinely stuck chain from one that is
+     * merely old but still working (used only by the generalized sweep,
+     * never to gate an in-flight hop's own execution).
+     *
+     * Resolves the helper run via the SAME helperRunIdFor() lookup already
+     * used elsewhere in this class (by helper_conversation_id, kind
+     * Interactive, oldest) -- this does not require helper_run_id to
+     * already be populated on the row, since that column is only ever
+     * written once a delegation reaches a terminal state through the
+     * normal, non-stalled path.
+     *
+     * If there is no run at all, or a run with no agent_run_actions rows
+     * at all, activity is judged against the delegation's own started_at
+     * instead -- never having produced a single action after
+     * idle_after_minutes counts as idle just as much as having gone quiet
+     * after producing some.
+     *
+     * Public (not private, despite this feature's own tasks.md phrasing
+     * it as "e.g. private"): ResolveStalledDelegationsCommand's new solo
+     * branch (T026) filters candidate rows through this exact method, so
+     * the sweep's eligibility decision and this class's own notion of
+     * idleness can never independently drift apart.
+     */
+    public function isIdle(Delegation $delegation): bool
+    {
+        $idleCutoff = now()->subMinutes((int) config('llm-client.delegation.idle_after_minutes', 15));
+
+        $runId = $this->helperRunIdFor($delegation->helper_conversation_id);
+
+        if ($runId === null) {
+            return $delegation->started_at->lt($idleCutoff);
+        }
+
+        $lastActivity = null;
+        foreach (['started_at', 'ended_at'] as $column) {
+            $value = DB::table('agent_run_actions')->where('run_id', $runId)->max($column);
+            if ($value === null) {
+                continue;
+            }
+
+            $timestamp = \Carbon\Carbon::parse($value);
+            if ($lastActivity === null || $timestamp->gt($lastActivity)) {
+                $lastActivity = $timestamp;
+            }
+        }
+
+        if ($lastActivity === null) {
+            return $delegation->started_at->lt($idleCutoff);
+        }
+
+        return $lastActivity->lt($idleCutoff);
     }
 
     /**

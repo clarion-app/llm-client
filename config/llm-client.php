@@ -815,7 +815,7 @@ return [
             'join_poll_interval_ms' => (int) env('LLM_CLIENT_DELEGATION_JOIN_POLL_INTERVAL_MS', 200),
 
             // How long a queued/in_progress batch member may sit with no
-            // terminal status before resolve-stalled-delegation-batches
+            // terminal status before resolve-stalled-delegations
             // treats it as abandoned (research.md D4, layer 3).
             'stale_after_minutes' => $delegationStaleAfterMinutesDefault,
         ],
