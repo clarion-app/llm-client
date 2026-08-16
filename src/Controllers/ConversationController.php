@@ -90,6 +90,23 @@ class ConversationController extends Controller
         $validatedData['character'] = "Clarion";
         $validatedData['channel'] = $validatedData['channel'] ?? 'web';
 
+        // Provision the user's `research` agent (111-research-agent,
+        // Phase 2, FR-001). Idempotent: a repeat call returns the existing
+        // agent without a duplicate row. This is a convenience enhancement,
+        // not part of the conversation-creation contract — a provisioning
+        // failure (e.g. the operation catalog not yet populated) must never
+        // block or break the primary conversation-creation flow, so failures
+        // are logged, not thrown.
+        try {
+            app(\ClarionApp\LlmClient\Services\ResearchAgentProvisioner::class)
+                ->ensureForUser(Auth::id());
+        } catch (\Throwable $e) {
+            Log::warning('Research agent provisioning failed', [
+                'user_id' => Auth::id(),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         $agentId = $validatedData['agent_id'] ?? null;
         if ($agentId !== null) {
             $agent = app(\ClarionApp\LlmClient\Services\AgentQuery::class)->findAccessibleAgent(Auth::id(), $agentId);

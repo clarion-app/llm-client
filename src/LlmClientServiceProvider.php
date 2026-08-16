@@ -625,6 +625,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        // ResearchAgentProvisioner holds only the already-singleton
+        // AgentService — safe as singleton() for the identical reason as
+        // AgentService above (111-research-agent, Phase 2).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ResearchAgentProvisioner::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\ResearchAgentProvisioner(
+                $app->make(\ClarionApp\LlmClient\Services\AgentService::class),
+            );
+        });
+
         // GitDefinitionFileReader holds no state (every call is a fresh
         // filesystem/process read); AgentDivergenceChecker holds only the
         // already-singleton GitDefinitionFileReader — both safe as
