@@ -108,6 +108,18 @@ class ResolveStalledDelegationsCommand extends Command
      * 110-delegation-deadlock-timeout (Phase 4/US2): the new solo-delegation
      * branch -- batch_id IS NULL, status = 'in_progress', stale by age AND
      * idle by activity (DelegationService::isIdle()).
+     *
+     * 110-delegation-deadlock-timeout (Phase 5/US3, tasks.md T034,
+     * research.md D3, contracts/delegation-chain-bounds.md §2
+     * "Whole-subtree finalization (new)"): each stale+idle row this
+     * branch's own flat query finds is passed to
+     * DelegationService::finalizeStalledChain() rather than
+     * forceFinalizeStalledDelegation() directly -- finalizeStalledChain()
+     * finalizes the row itself and then walks its parent_conversation_id
+     * ancestry, finalizing every still-in_progress ancestor found along the
+     * way too, so a dead process that left an entire chain stranded
+     * in_progress is unwound in one sweep pass, not just the one row this
+     * branch's own eligibility check happened to match directly (FR-007).
      */
     private function resolveSoloDelegations(DelegationService $delegationService, bool $dryRun): void
     {
@@ -133,7 +145,7 @@ class ResolveStalledDelegationsCommand extends Command
 
         if (!$dryRun) {
             foreach ($idleRows as $delegation) {
-                $delegationService->forceFinalizeStalledDelegation($delegation);
+                $delegationService->finalizeStalledChain($delegation);
             }
         }
     }

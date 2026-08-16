@@ -206,6 +206,54 @@ class DelegationServiceForceFinalizeStalledTest extends TestCase
         ];
     }
 
+    // =================================================================
+    // 110-delegation-deadlock-timeout, Phase 5 (US3, tasks.md T032,
+    // FR-013): a late "in-process completion" write arriving after the
+    // sweep already force-finalized the row must be discarded, not applied
+    // on top of the already-resolved row. forceFinalizeStalledDelegation()
+    // already carries the terminal-status guard added in Phase 2 (T007),
+    // so this specific assertion is expected to ALREADY PASS today --
+    // written anyway since it is explicitly required coverage per
+    // tasks.md (mirrors Phase 3's own precedent of a test that confirms an
+    // existing guard rather than proving a new red-phase gap).
+    // =================================================================
+
+    #[Test]
+    public function a_late_completion_attempt_arriving_after_the_sweep_already_finalized_the_row_is_discarded(): void
+    {
+        $delegation = $this->makeDelegation('in_progress');
+
+        // The sweep finalizes it first -- the ordinary chain_stalled path.
+        app(DelegationService::class)->forceFinalizeStalledDelegation($delegation);
+
+        $delegation->refresh();
+        $firstCompletedAt = $delegation->completed_at;
+        $firstResultReason = $delegation->result_reason;
+        $firstResultSummary = $delegation->result_summary;
+
+        Event::fake([DelegationUpdated::class]);
+
+        // Simulate the "actually still alive" process finally returning and
+        // attempting to write its own, different outcome onto the same row
+        // -- the same terminal-write path a genuine late in-process
+        // completion would go through.
+        app(DelegationService::class)->forceFinalizeStalledDelegation($delegation, 'late_in_process_completion');
+
+        $delegation->refresh();
+
+        $this->assertSame('exhausted', $delegation->status);
+        $this->assertSame(
+            $firstResultReason,
+            $delegation->result_reason,
+            'FR-013: a late write arriving after the chain is already stopped must be discarded, not applied on top of the already-resolved row',
+        );
+        $this->assertSame($firstResultSummary, $delegation->result_summary);
+        $this->assertTrue($firstCompletedAt->equalTo($delegation->completed_at));
+
+        // No second broadcast for the discarded late write.
+        Event::assertNotDispatched(DelegationUpdated::class);
+    }
+
     #[Test]
     #[\PHPUnit\Framework\Attributes\DataProvider('terminalStatusProvider')]
     public function an_already_terminal_row_is_left_untouched(string $terminalStatus): void

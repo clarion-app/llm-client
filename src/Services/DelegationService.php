@@ -528,10 +528,20 @@ class DelegationService
      * difference is $reason, which becomes result_reason directly instead
      * of the hardcoded 'batch_join_timeout'.
      *
-     * The result_summary text here is a deliberate placeholder -- a later
-     * phase (tasks.md T035) replaces it with a richer summary composed from
-     * the helper conversation's own messages (research.md D4); this phase's
-     * version is plain and generic on purpose.
+     * 110-delegation-deadlock-timeout (Phase 5, tasks.md T035, research.md
+     * D4, data-model.md "Stop Record"): result_summary/outcome_summary are
+     * composed from the delegation's own helper conversation's last
+     * persisted assistant Message -- mirroring runDelegatedTask()'s own
+     * $exhaustionReasons branch verbatim (same
+     * `->messages()->where('role', 'assistant')->orderByDesc('created_at')
+     * ->value('content')` read, the same `Str::limit(..., 500)` cap) -- so
+     * whatever partial, useful work the helper had already produced before
+     * its owning process died is preserved in what is reported back
+     * (FR-006). That content already lives in the database by the time the
+     * sweep runs; nothing about the dead process needs to still be alive to
+     * report it. Falls back to the same plain, generic placeholder text
+     * this method used before T035 when there is no assistant message at
+     * all to read (a helper that died before producing any output).
      *
      * Idempotent against a row that is already terminal by the time the
      * caller reaches it, exactly like forceFinalizeBatchJoinTimeout().
@@ -542,7 +552,18 @@ class DelegationService
             return;
         }
 
-        $resultSummary = 'The delegation chain was force-finalized as stalled.';
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+
+        $partialResult = $helperConversation !== null
+            ? (string) ($helperConversation->messages()
+                ->where('role', 'assistant')
+                ->orderByDesc('created_at')
+                ->value('content') ?? '')
+            : '';
+
+        $resultSummary = $partialResult !== ''
+            ? Str::limit($partialResult, 500)
+            : 'The delegation chain was force-finalized as stalled.';
         $resultUndone = 'Everything -- the task could not be completed.';
 
         $delegation->status = 'exhausted';
@@ -574,6 +595,64 @@ class DelegationService
                 null,
                 json_encode($sixFieldResult),
             );
+        }
+    }
+
+    /**
+     * 110-delegation-deadlock-timeout (Phase 5/US3, tasks.md T034,
+     * research.md D3, contracts/delegation-chain-bounds.md §2
+     * "Whole-subtree finalization (new)"): the entry point
+     * ResolveStalledDelegationsCommand's solo-delegation branch calls for
+     * each row its own flat stale+idle query directly matches (the
+     * "trigger" row) -- finalizes that row via forceFinalizeStalledDelegation()
+     * and then walks the trigger row's OWN parent_conversation_id chain
+     * backward, the identical `Delegation::where('helper_conversation_id',
+     * ...)->first()` traversal ancestorAgentIds() already performs (same
+     * loop shape, same visited-conversation-id guard against a data-level
+     * cycle), finalizing every ancestor Delegation row found along the way
+     * that is STILL 'in_progress'.
+     *
+     * Deliberately does NOT re-check staleness/idleness on an ancestor: a
+     * dead process leaves every Delegation row from the point of failure up
+     * to the chain's root simultaneously 'in_progress' (they were all
+     * synchronously blocked waiting on each other inside the SAME OS
+     * process), so an ancestor whose own row happens to look "recently
+     * active" in isolation (its helper run produced a run-trace action
+     * shortly before the process died) is still just as stuck as the
+     * trigger row that proved the process is gone -- only the trigger row
+     * itself, found by the sweep's own flat query, is required to pass the
+     * ordinary stale+idle eligibility check (data-model.md "Validation
+     * rules"). A row already terminal by the time the walk reaches it (won
+     * a race against an earlier sweep run, or completed normally moments
+     * before its process died) is left untouched, both by this method's own
+     * explicit status check below and by forceFinalizeStalledDelegation()'s
+     * own internal terminal-status guard -- the walk still continues past
+     * it toward the root regardless, since a terminal ancestor does not
+     * prove anything about whether ITS OWN parent is also stuck.
+     */
+    public function finalizeStalledChain(Delegation $delegation): void
+    {
+        $this->forceFinalizeStalledDelegation($delegation);
+
+        $visitedConversationIds = [];
+        $currentConversationId = $delegation->parent_conversation_id;
+
+        while (true) {
+            if (isset($visitedConversationIds[$currentConversationId])) {
+                break;
+            }
+            $visitedConversationIds[$currentConversationId] = true;
+
+            $ancestor = Delegation::where('helper_conversation_id', $currentConversationId)->first();
+            if ($ancestor === null) {
+                break;
+            }
+
+            if ($ancestor->status === 'in_progress') {
+                $this->forceFinalizeStalledDelegation($ancestor);
+            }
+
+            $currentConversationId = $ancestor->parent_conversation_id;
         }
     }
 
