@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Jobs\RunDelegationBatchMemberJob;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
+use ClarionApp\LlmClient\Models\CapabilityOffering;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
@@ -109,6 +110,132 @@ class DelegationService
         $helperConversation = Conversation::find($delegation->helper_conversation_id);
 
         return $this->runDelegatedTask($delegation, $resolved['helperAgent'], $helperConversation);
+    }
+
+    /**
+     * 109-agent-as-capability (Phase 3/US1, data-model.md §6, research.md
+     * D5): the one new public entry point letting a capability-offering
+     * `execute_operation` call reuse this class's own existing, unmodified
+     * write path -- createDelegationRow()/runDelegatedTask() -- rather than
+     * a second, independently-maintained copy of either recipe.
+     *
+     * Eligibility is the one genuine fork from delegate()'s own
+     * resolveAndValidate(): a CapabilityOffering-based check (offering
+     * still active AND its caller_agent_id matches the calling
+     * conversation's own bound agent) instead of an
+     * AgentHelperAssignment-based one. Re-confirmed LIVE here, via a fresh
+     * lookup by id -- never trusted from whatever state the caller's own
+     * earlier CapabilityOffering::find($operationId) lookup happened to
+     * see (mutation-checklist row 7) -- so a withdrawal racing an
+     * in-flight dispatch is caught at the one moment that actually matters:
+     * immediately before the nested call is made.
+     *
+     * Depth: the SAME single-hop enclosing-Delegation lookup
+     * resolveAndValidate() already uses -- depth is chain-wide, not per
+     * edge type (research.md D3/D4). The full ancestor walk for the
+     * agent-identity cycle backstop is deferred to Phase 5/US3.
+     *
+     * On eligibility/depth failure, returns the plain {"error": "..."}
+     * shape (never a raw internal rejection). On success, calls the
+     * existing, unmodified createDelegationRow() (composing the seed
+     * message from $input ALONE -- $context is null, so
+     * composeSeedMessage()'s own existing "(none provided)" branch fires
+     * automatically, with no new formatting code needed -- and passing
+     * origin: 'capability_offering') then runDelegatedTask() unchanged, and
+     * translates the resulting six-field delegation result into
+     * execute_operation's own shape (contracts/capability-agent-call.md).
+     *
+     * @return array<string, mixed> JSON-encodable -- either
+     *   {"error": "..."} or the offered agent's own raw output content.
+     */
+    public function invokeAsCapability(Conversation $callerConversation, CapabilityOffering $offering, string $input): array
+    {
+        $fresh = CapabilityOffering::find($offering->id);
+
+        if ($fresh === null || $fresh->caller_agent_id !== $callerConversation->agent_id) {
+            return ['error' => 'This capability is no longer available.'];
+        }
+
+        $ownerUserId = (string) $callerConversation->user_id;
+        $offeredAgent = $this->agentQuery->findAgent($ownerUserId, $fresh->offered_agent_id);
+
+        if ($offeredAgent === null || $offeredAgent->is_active === false) {
+            return ['error' => 'This capability is no longer available.'];
+        }
+
+        // D4: depth, computed and enforced -- identical recipe to
+        // resolveAndValidate()'s own single-hop lookup. agent_delegations
+        // has no created_at column (data-model.md §1 of 098), so
+        // latest('started_at') is required, never a bare latest().
+        $enclosingDelegation = Delegation::where('helper_conversation_id', $callerConversation->id)
+            ->latest('started_at')
+            ->first();
+        $depth = $enclosingDelegation !== null ? $enclosingDelegation->depth + 1 : 1;
+
+        if ($depth > config('llm-client.delegation.max_chain_depth', 5)) {
+            return ['error' => 'This delegation chain has reached its maximum depth and cannot delegate any further.'];
+        }
+
+        $delegation = $this->createDelegationRow(
+            $callerConversation,
+            $offeredAgent,
+            $depth,
+            $input,
+            null,
+            'in_progress',
+            null,
+            $enclosingDelegation?->managed_task_id,
+            null,
+            'capability_offering',
+        );
+
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+
+        $sixFieldResult = $this->runDelegatedTask($delegation, $offeredAgent, $helperConversation);
+
+        return $this->translateCapabilityResult($sixFieldResult);
+    }
+
+    /**
+     * contracts/capability-agent-call.md "Result shapes": the six-field
+     * delegation result, reduced to execute_operation's own plain shape --
+     * byte-shape-identical to executeApiCall()'s own results, with no
+     * status/helper/delegation_id/reason field leaking through on any
+     * path (FR-005/FR-016/FR-017).
+     *
+     * 'reason' === 'bound_exceeded' (an exhausted/ceiling-reached
+     * delegation) is checked FIRST, before the generic status === 'failure'
+     * branch below -- runDelegatedTask() reports this case with
+     * status: 'partial' (data-model.md §6's own "success/partial" grouping
+     * describes a HELPER-reported partial success, output still present;
+     * this is a distinct, System-detected non-completion with output
+     * always null), so status alone cannot disambiguate it. Composed to
+     * match the contract's own worked example verbatim: "Reached its time
+     * limit before finishing. Partial: <content>".
+     *
+     * Every other status === 'failure' case (a thrown exception, the
+     * helper's own self-reported failure, confirmation_required, or no
+     * output at all) maps to {"error": $summary} directly. Anything else
+     * (status success/partial with real output) returns that output raw,
+     * unwrapped.
+     */
+    private function translateCapabilityResult(array $sixFieldResult): array
+    {
+        if (($sixFieldResult['reason'] ?? null) === 'bound_exceeded') {
+            $message = $sixFieldResult['undone'] ?? 'Reached its limit before finishing.';
+            $partial = $sixFieldResult['summary'] ?? '';
+            if ($partial !== '') {
+                $message .= ' Partial: '.$partial;
+            }
+
+            return ['error' => $message];
+        }
+
+        if (($sixFieldResult['status'] ?? null) === 'failure') {
+            return ['error' => $sixFieldResult['summary'] ?? 'The delegation failed due to an unexpected error.'];
+        }
+
+        return $sixFieldResult['output'] ?? [];
     }
 
     /**
@@ -431,6 +558,15 @@ class DelegationService
      * status: 'in_progress'/batchId: null (its own existing behavior,
      * unchanged); delegateBatch() calls it with status: 'queued'/batchId:
      * the batch's own freshly-generated id.
+     *
+     * $origin (109-agent-as-capability, data-model.md §6, Grounding note
+     * 9): defaults to 'delegate_to_helper' for every pre-existing call
+     * site, unchanged; only invokeAsCapability() passes
+     * 'capability_offering'. Read-only, audit/reconstruction purpose only
+     * (FR-020) -- no runtime branch anywhere else reads this column except
+     * composeDelegationDisclosure()'s own deliberate exclusion below, which
+     * must never announce a capability-agent call back to the calling
+     * agent (FR-003).
      */
     private function createDelegationRow(
         Conversation $parentConversation,
@@ -442,6 +578,7 @@ class DelegationService
         ?string $batchId,
         ?string $managedTaskId = null,
         ?string $partId = null,
+        string $origin = 'delegate_to_helper',
     ): Delegation {
         $ownerUserId = (string) $parentConversation->user_id;
 
@@ -485,6 +622,7 @@ class DelegationService
             // assign_part handling ever passes non-null here.
             'managed_task_id' => $managedTaskId,
             'part_id' => $partId,
+            'origin' => $origin,
         ]);
 
         $actionId = $this->runTraceRecorder->openAction(

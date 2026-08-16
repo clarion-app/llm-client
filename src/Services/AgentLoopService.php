@@ -2877,7 +2877,7 @@ class AgentLoopService
         return match ($toolName) {
             'list_applications' => $this->handleListApplications(),
             'execute_operation' => $this->handleExecuteOperation($arguments, $conversation),
-            'search_operations' => $this->handleSearchOperations($arguments),
+            'search_operations' => $this->handleSearchOperations($arguments, $conversation),
             'memory_create' => $this->handleMemoryCreate($arguments, $conversation),
             'memory_read' => $this->handleMemoryRead($arguments, $conversation),
             'memory_search' => $this->handleMemorySearch($arguments, $conversation),
@@ -3050,7 +3050,7 @@ class AgentLoopService
         return json_encode($apps);
     }
 
-    private function handleSearchOperations(array $arguments): string
+    private function handleSearchOperations(array $arguments, Conversation $conversation): string
     {
         $query = $arguments['query'] ?? '';
         if (empty($query)) {
@@ -3060,13 +3060,20 @@ class AgentLoopService
         // Silently truncate long queries to a safe length
         $query = mb_substr($query, 0, 500);
 
+        // 109-agent-as-capability (Phase 3/US1, data-model.md §5, Grounding
+        // note 3): offerings matching the query must remain findable via
+        // search_operations regardless of the real operation index's own
+        // state -- appended into EVERY return path below, not only the
+        // happy path.
+        $offeringResults = $this->matchingCapabilityOfferingResults($query, $conversation);
+
         // Graceful degradation: check table existence before search
         $searchService = app(OperationsSearchService::class);
 
         if (!$searchService->tableExists()) {
             return json_encode([
                 'hint' => 'Search index is not available. Run reindex command first.',
-                'results' => [],
+                'results' => $offeringResults,
             ]);
         }
 
@@ -3079,19 +3086,19 @@ class AgentLoopService
                 if ($count === 0) {
                     return json_encode([
                         'hint' => "Search index is empty. Run 'php artisan llm-client:reindex' first.",
-                        'results' => [],
+                        'results' => $offeringResults,
                     ]);
                 }
                 // Table has data but query returned no matches
                 return json_encode([
                     'hint' => 'No operations matched your query. Try broader search terms or use list_applications to browse available applications.',
-                    'results' => [],
+                    'results' => $offeringResults,
                 ]);
             } catch (\Throwable $e) {
                 // Fallback if count fails
                 return json_encode([
                     'hint' => 'Search index is not available. Run reindex command first.',
-                    'results' => [],
+                    'results' => $offeringResults,
                 ]);
             }
         }
@@ -3121,7 +3128,48 @@ class AgentLoopService
             }
         }
 
+        $formatted = array_merge($formatted, $offeringResults);
+
         return json_encode(['results' => $formatted]);
+    }
+
+    /**
+     * 109-agent-as-capability (Phase 3/US1, data-model.md §5, Grounding
+     * note 3): a plain, non-indexed filter over CapabilityOffering rows
+     * eligible to this conversation's own bound (caller) agent, matched
+     * against capability_name/capability_description -- offering counts
+     * per installation are small (research.md D2), so no full-text index
+     * table is needed here, unlike operation_search_index's real-operation
+     * case. Formatted via CapabilityCatalogMerger::formatOffering() (the
+     * SAME recipe entriesFor() uses) plus the 'type' => 'operation'
+     * wrapper every $formatted entry above already carries, so the two
+     * call sites can never independently drift out of agreement about the
+     * entry shape.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function matchingCapabilityOfferingResults(string $query, Conversation $conversation): array
+    {
+        if ($conversation->agent_id === null) {
+            return [];
+        }
+
+        $needle = '%'.$query.'%';
+
+        $offerings = \ClarionApp\LlmClient\Models\CapabilityOffering::where('caller_agent_id', $conversation->agent_id)
+            ->where(function ($q) use ($needle) {
+                $q->where('capability_name', 'like', $needle)
+                    ->orWhere('capability_description', 'like', $needle);
+            })
+            ->get();
+
+        return $offerings
+            ->map(fn (\ClarionApp\LlmClient\Models\CapabilityOffering $offering) => array_merge(
+                ['type' => 'operation'],
+                CapabilityCatalogMerger::formatOffering($offering),
+            ))
+            ->values()
+            ->all();
     }
 
     private function handleExecuteOperation(array $arguments, Conversation $conversation): string
@@ -3132,6 +3180,22 @@ class AgentLoopService
         }
 
         $params = $arguments['parameters'] ?? [];
+
+        // 109-agent-as-capability (Phase 3/US1, contracts/
+        // capability-agent-call.md "Dispatch", research.md D1): a
+        // synthetic capability-offering operationId is the offering's own
+        // UUID primary key -- a single indexed lookup, checked BEFORE the
+        // ApiManager/ApiCallValidator path below, since a synthetic id
+        // would never resolve there. A hit routes to the nested
+        // capability-agent call and returns immediately; a miss (the
+        // overwhelmingly common case) falls through to today's exact code,
+        // unchanged.
+        $offering = \ClarionApp\LlmClient\Models\CapabilityOffering::find($operationId);
+        if ($offering !== null) {
+            $result = app(DelegationService::class)->invokeAsCapability($conversation, $offering, $params['input'] ?? '');
+
+            return json_encode($result);
+        }
 
         // Check cache first — skip ApiManager lookup on hit
         $cached = $this->operationCache->get($conversation->id, $operationId);
@@ -3266,6 +3330,18 @@ class AgentLoopService
     private function buildKnownOperationsSection(Conversation $conversation): ?string
     {
         $entries = $this->operationCache->getEntries($conversation->id, 20);
+
+        // 109-agent-as-capability (Phase 3/US1, data-model.md §5,
+        // research.md D2): eligible capability offerings are
+        // unconditionally pre-seeded here, merged in BEFORE the
+        // empty($entries) check below -- so a caller with zero cached real
+        // operations but >=1 eligible offering still gets a "Known
+        // Operations" section on its very first turn, with no prior
+        // search_operations call needed (Acceptance Scenario 1).
+        $offeringEntries = app(CapabilityCatalogMerger::class)->entriesFor($conversation);
+        if (!empty($offeringEntries)) {
+            $entries = array_merge($entries, $offeringEntries);
+        }
 
         if (empty($entries)) {
             return null;
@@ -4498,7 +4574,15 @@ class AgentLoopService
             return null;
         }
 
+        // 109-agent-as-capability (Phase 3/US1, FR-003, contracts/
+        // capability-agent-call.md): a capability-offering-originated
+        // Delegation row must NEVER be announced back to the calling
+        // agent -- doing so would itself be exactly the "indication that a
+        // capability entry is backed by another agent" FR-003 forbids.
+        // Ordinary delegate_to_helper delegations are unaffected (every
+        // pre-existing row defaults to this origin).
         $names = Delegation::where('parent_run_id', $runId)
+            ->where('origin', 'delegate_to_helper')
             ->get()
             ->map(fn (Delegation $delegation) => Agent::withTrashed()->find($delegation->helper_agent_id)?->name ?? 'a retired agent')
             ->unique()

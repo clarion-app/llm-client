@@ -767,13 +767,22 @@ class AgentLoopServiceTest extends TestCase
 
     /**
      * Helper to invoke private handleSearchOperations via reflection.
+     *
+     * 109-agent-as-capability (Phase 3/US1): handleSearchOperations() now
+     * also needs the calling Conversation, to scope its own new
+     * capability-offering search match against the conversation's bound
+     * agent. Every pre-existing caller here passes no offering-related
+     * fixtures, so an unsaved, unbound Conversation() (agent_id null) is
+     * enough -- matchingCapabilityOfferingResults() returns [] immediately
+     * for a null agent_id, leaving every one of these tests' own assertions
+     * unaffected.
      */
-    private function invokeHandleSearchOperations(AgentLoopService $service, array $arguments): string
+    private function invokeHandleSearchOperations(AgentLoopService $service, array $arguments, ?Conversation $conversation = null): string
     {
         $reflection = new \ReflectionClass($service);
         $method = $reflection->getMethod('handleSearchOperations');
         $method->setAccessible(true);
-        return $method->invoke($service, $arguments);
+        return $method->invoke($service, $arguments, $conversation ?? new Conversation());
     }
 
     // T006
