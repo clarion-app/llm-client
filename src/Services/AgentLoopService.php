@@ -55,6 +55,15 @@ use GuzzleHttp\Client;
 
 class AgentLoopService
 {
+    /**
+     * The operationId of the page/text fetch operation (feature 111, US1).
+     *
+     * Results of this operation are wrapped in a source envelope (source.url +
+     * untrusted-wrapped content) so the consulted-source manifest can be derived
+     * from the run trace, and so the fetched body is treated as untrusted data.
+     */
+    private const PAGE_TEXT_OPERATION_ID = 'clarionApp.llmClient.fetchPage.getTextFromUrl';
+
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
@@ -1410,9 +1419,14 @@ class AgentLoopService
                         ];
                     }
 
-                    // Close tool action on normal completion.
+                    // Close tool action on normal completion. Feature 111 (US1):
+                    // record the page/text envelope (JSON) as the action content
+                    // so the consulted-source manifest (T014) can read source.url.
                     if ($this->runTraceRecorder !== null && $activeActionId !== null) {
-                        $this->runTraceRecorder->closeAction($activeActionId, ActionOutcome::Success);
+                        $actionContent = ($toolName === 'execute_operation' && ($arguments['operationId'] ?? '') === self::PAGE_TEXT_OPERATION_ID)
+                            ? $result
+                            : null;
+                        $this->runTraceRecorder->closeAction($activeActionId, ActionOutcome::Success, null, $actionContent);
                         $activeActionId = null;
                     }
 
@@ -2037,9 +2051,14 @@ class AgentLoopService
                     ];
                 }
 
-                // Close tool action on normal completion.
+                // Close tool action on normal completion. Feature 111 (US1):
+                // record the page/text envelope (JSON) as the action content
+                // so the consulted-source manifest (T014) can read source.url.
                 if ($this->runTraceRecorder !== null && $toolActionId !== null) {
-                    $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success);
+                    $actionContent = ($toolName === 'execute_operation' && ($arguments['operationId'] ?? '') === self::PAGE_TEXT_OPERATION_ID)
+                        ? $result
+                        : null;
+                    $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success, null, $actionContent);
                 }
 
                 // Tool executed (not a confirmation pause) — record its outcome.
@@ -3270,6 +3289,36 @@ class AgentLoopService
         return $this->executeApiCall($operationId, $method, $pathTemplate, $params, $conversation);
     }
 
+    /**
+     * Wrap a page/text fetch result in a source envelope (feature 111, US1/US5).
+     *
+     * The envelope (data-model.md §3) carries the fetch input URL (source.url —
+     * the url argument of the page/text call, never rewritten), the optional
+     * page title (source.title — parsed from the page, never fabricated), the
+     * body text wrapped in the untrusted-response delimiters (content), and a
+     * reference_id set by ToolResultCondenser when the content is condensed.
+     *
+     * Static and pure so it can be exercised without constructing the (heavy)
+     * AgentLoopService; the condenser is injected so callers can pass their
+     * configured instance.
+     *
+     * @return array{source: array{url: string, title: string|null}, content: string, reference_id: string|null}
+     */
+    public static function buildPageTextEnvelope(string $url, ?string $title, string $body, string $conversationId, ?ToolResultCondenser $condenser = null): array
+    {
+        $blockBuilder = new RubricJudgmentPromptBuilder();
+        $wrapped = $blockBuilder->untrustedResponseBlock($body, []);
+
+        $condenser = $condenser ?? new ToolResultCondenser();
+        $condensed = $condenser->condense($conversationId, 'execute_operation', $wrapped);
+
+        return [
+            'source' => ['url' => $url, 'title' => $title],
+            'content' => $condensed['content'],
+            'reference_id' => $condensed['reference_id'] ?? null,
+        ];
+    }
+
     public function executeApiCall(string $operationId, string $method, string $pathTemplate, array $params, Conversation $conversation): string
     {
         // research.md D3: the branch that matters most — execute_operation
@@ -3288,8 +3337,19 @@ class AgentLoopService
         $session = $this->getOrCreateSession($conversation);
         $resolved = $this->toolExecutor->extractArguments($params, $pathTemplate);
         $result = $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
+        $raw = $this->extractResultContent($result);
 
-        return $this->extractResultContent($result);
+        // Feature 111 (US1/US5): wrap page/text results in a source envelope so
+        // the consulted-source manifest can be derived and the body is treated
+        // as untrusted data. Other operations pass through unchanged.
+        if ($operationId === self::PAGE_TEXT_OPERATION_ID) {
+            $url = (string) ($params['url'] ?? '');
+            $envelope = self::buildPageTextEnvelope($url, null, $raw, $conversation->id, $this->toolResultCondenser);
+
+            return json_encode($envelope, JSON_UNESCAPED_SLASHES);
+        }
+
+        return $raw;
     }
 
     /**

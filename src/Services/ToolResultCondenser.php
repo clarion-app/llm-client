@@ -345,8 +345,17 @@ class ToolResultCondenser
             }
         }
 
-        // Extract file paths.
-        if (preg_match_all('/(?:\/[^\/\s]+\){2,}|(?:[A-Z]:\\\/[^\'\s]+)/', $content, $matches)) {
+        // Extract URLs — the primary citation-bearing detail for research
+        // results, so they must survive condensation (feature 111, US1).
+        if (preg_match_all('/https?:\/\/[^\s"\'<>]+/i', $content, $matches)) {
+            $urls = array_unique(array_map('trim', $matches[0]));
+            foreach (array_slice($urls, 0, 5) as $url) {
+                $preserved[] = "URL: {$url}";
+            }
+        }
+
+        // Extract file paths (Unix absolute or Windows drive paths).
+        if (preg_match_all('/(?:\/[\w.\-]+){2,}|[A-Za-z]:\\\\[\w.\-\\\\]+/', $content, $matches)) {
             $paths = array_unique(array_map('trim', $matches[0]));
             foreach (array_slice($paths, 0, 5) as $path) {
                 $preserved[] = "Path: {$path}";

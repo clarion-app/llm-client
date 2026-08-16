@@ -290,6 +290,46 @@ class RunTraceQuery
     }
 
     /**
+     * Derive the consulted-source manifest for a run (feature 111, US1/US4).
+     *
+     * The manifest is the distinct set of URLs the run fetched via the page/text
+     * operation, in fetch order (action started_at). Ownership is checked by
+     * delegating to actionsForRun(), which compares agent_runs.user_id before
+     * returning any rows — a run id alone never grants access to another user's
+     * sources (data-model.md §4).
+     *
+     * @return string[] distinct source URLs, in fetch order
+     */
+    public function consultedSourcesForRun(string $callerUserId, string $runId): array
+    {
+        $actions = $this->actionsForRun($callerUserId, $runId);
+
+        $urls = [];
+        foreach ($actions as $action) {
+            if (($action['type'] ?? null) !== 'tool_invocation') {
+                continue;
+            }
+            if (($action['target'] ?? null) !== 'execute_operation') {
+                continue;
+            }
+
+            $content = $action['content'] ?? null;
+            if ($content === null) {
+                continue;
+            }
+
+            $decoded = json_decode($content, true);
+            $url = $decoded['source']['url'] ?? null;
+
+            if (is_string($url) && $url !== '' && !in_array($url, $urls, true)) {
+                $urls[] = $url;
+            }
+        }
+
+        return $urls;
+    }
+
+    /**
      * Get child actions of a given action (user ownership filter via run JOIN).
      *
      * @return array<int, array{
@@ -656,23 +696,26 @@ class RunTraceQuery
      */
     private function actionRowToArray($row): array
     {
+        // Defensive: the agent_run_actions schema (src/Migrations) has
+        // action_type / failure_reason and no cost columns, so map the real
+        // columns and null-coalesce anything a raw row may not carry.
         return [
             'id' => $row->id ?? null,
             'run_id' => $row->run_id ?? null,
             'step_id' => $row->step_id ?? null,
-            'parent_action_id' => $row->parent_action_id,
-            'type' => $row->type ?? '',
+            'parent_action_id' => $row->parent_action_id ?? null,
+            'type' => $row->action_type ?? $row->type ?? '',
             'outcome' => $row->outcome ?? '',
-            'target' => $row->target,
-            'content' => $row->content,
-            'reason' => $row->reason,
+            'target' => $row->target ?? null,
+            'content' => $row->content ?? null,
+            'reason' => $row->failure_reason ?? $row->reason ?? null,
             'started_at' => $row->started_at ?? '',
-            'ended_at' => $row->ended_at,
-            'duration_ms' => $row->duration_ms,
-            'token_cost' => $row->token_cost,
-            'wait_ms' => $row->wait_ms,
-            'cost_cents' => $row->cost_cents,
-            'currency' => $row->currency,
+            'ended_at' => $row->ended_at ?? null,
+            'duration_ms' => $row->duration_ms ?? null,
+            'token_cost' => $row->token_cost ?? null,
+            'wait_ms' => $row->wait_ms ?? null,
+            'cost_cents' => $row->cost_cents ?? null,
+            'currency' => $row->currency ?? null,
             'pending_confirmation' => $row->pending_confirmation ?? false,
         ];
     }
