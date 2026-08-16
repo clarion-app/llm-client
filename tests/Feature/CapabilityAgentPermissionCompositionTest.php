@@ -586,4 +586,70 @@ YAML;
             'the rejection must name A specifically, at exactly 2 levels up (contracts §3) -- even though both B\'s own bound and C\'s own bound still include Y, since neither of their own definitions is ever edited, proving the composition rejects at the correct ancestor and NOT at B',
         );
     }
+
+    // =================================================================
+    // T029(d) -- an offering is never invokable by a caller it was not
+    // offered to (mutation-testing checklist row 7's own explicit target:
+    // DelegationService::invokeAsCapability()'s eligibility check must
+    // re-confirm caller_agent_id against a FRESH lookup, not trust the
+    // conversation's own claim). Simulates an uninvolved agent that
+    // somehow already knows an offering's synthetic operationId (it would
+    // never be discoverable to it via "Known Operations"/search_operations
+    // in the first place, since CapabilityOfferingQuery::eligibleFor()
+    // already scopes by caller_agent_id) attempting to invoke it directly.
+    // =================================================================
+
+    #[Test]
+    public function an_offering_is_never_invokable_by_a_caller_it_was_not_offered_to(): void
+    {
+        $this->seedXyzOperationCatalog();
+
+        $offeredX = $this->makeAgentPermitting('t029d-offered-x', ['x.operation']);
+        $intendedCallerA = $this->makeAgentPermitting('t029d-intended-caller-a', ['x.operation']);
+        $uninvolvedCallerZ = $this->makeAgentPermitting('t029d-uninvolved-caller-z', ['x.operation']);
+
+        // X is offered to A ONLY -- Z is a completely uninvolved agent,
+        // never named as this offering's caller_agent_id.
+        $offering = $this->offerCapability(
+            $offeredX,
+            $intendedCallerA,
+            'do_x_capability',
+            'Attempts operation X on behalf of the caller.',
+            'What to attempt.',
+        );
+
+        $conversationZ = $this->makeConversation($uninvolvedCallerZ);
+
+        $service = $this->serviceWithScriptedProvider([
+            // Z attempts execute_operation directly against A's own
+            // offering id -- something Z could never have discovered
+            // through its own "Known Operations"/search_operations (both
+            // scoped by caller_agent_id), simulating an uninvolved caller
+            // that already knows the synthetic operationId some other way.
+            $this->toolCallReply([$this->executeOperationCall($offering->id, 'Please attempt operation X.', 'call_z_invoke_x')]),
+            $this->plainReply('Z could not invoke that capability.'),
+        ]);
+        $this->app->instance(AgentLoopService::class, $service);
+
+        $result = $service->run($conversationZ->fresh(), 'Please attempt operation X via this capability id.');
+        $this->assertSame('completed', $result['status'], 'fixture sanity: the top-level turn must complete regardless of the rejected invocation');
+
+        // No Delegation row of any kind may be created -- the eligibility
+        // check must refuse before createDelegationRow() is ever reached.
+        $this->assertSame(
+            0,
+            Delegation::where('parent_conversation_id', $conversationZ->id)->count(),
+            'an uninvolved caller\'s attempt must never create a Delegation row -- the eligibility check must refuse before createDelegationRow() is ever reached',
+        );
+
+        $zToolMessage = $this->toolCallMessages($conversationZ)->first();
+        $this->assertNotNull($zToolMessage, 'fixture sanity: Z must actually have attempted execute_operation against the offering id');
+        $zToolResult = $this->firstToolResultContent($zToolMessage);
+        $this->assertIsArray($zToolResult);
+        $this->assertSame(
+            ['error'],
+            array_keys($zToolResult),
+            'an uninvolved caller must receive the ordinary plain {"error": "..."} shape, never the offered agent\'s own raw output (FR-005/data-model.md §6 eligibility re-check, mutation-testing checklist row 7)',
+        );
+    }
 }
