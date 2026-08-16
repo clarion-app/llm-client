@@ -214,4 +214,55 @@ class TaskWorkspaceQueryTest extends TestCase
         $unknown = app(TaskWorkspaceQuery::class)->entriesForTask($this->user->id, (string) Str::uuid());
         $this->assertNull($unknown, 'an unknown task id must resolve to null');
     }
+
+    // =================================================================
+    // Phase 5 (US3), tasks.md T028: cross-task isolation of
+    // resolveManagedTaskIdForConversation() itself, mutation-checklist
+    // row 2.
+    // =================================================================
+
+    #[Test]
+    public function a_helper_conversation_in_task_bs_delegation_tree_resolves_only_to_task_b_never_task_a(): void
+    {
+        $taskA = $this->makeManagedTask($this->user);
+        $taskB = $this->makeManagedTask($this->user);
+
+        $helperConversationId = (string) Str::uuid();
+
+        // The helper conversation belongs solely to task B's own
+        // delegation tree -- task A is otherwise untouched.
+        Delegation::create([
+            'parent_conversation_id' => $taskB->conversation_id,
+            'helper_agent_id' => (string) Str::uuid(),
+            'helper_conversation_id' => $helperConversationId,
+            'owner_user_id' => $this->user->id,
+            'task' => 'Do a part of task B.',
+            'depth' => 1,
+            'status' => 'in_progress',
+            'started_at' => now(),
+            'managed_task_id' => $taskB->id,
+        ]);
+
+        $resolved = app(TaskWorkspaceQuery::class)->resolveManagedTaskIdForConversation($helperConversationId);
+
+        $this->assertSame($taskB->id, $resolved);
+        $this->assertNotSame($taskA->id, $resolved, 'a helper in task B\'s tree must never resolve to task A\'s id');
+
+        // record_task_note takes no managed_task_id parameter at all
+        // (contracts §1) -- the resolved id above is the sole basis
+        // AgentLoopService::handleRecordTaskNote() ever uses to decide
+        // which ManagedTask to write against. Writing an entry using
+        // exactly that resolved id must therefore only ever be able to
+        // land in task B's area, never task A's, even by construction.
+        $task = app(\ClarionApp\LlmClient\Models\ManagedTask::class)->newQuery()->find($resolved);
+        $this->assertNotNull($task);
+        app(TaskWorkspaceService::class)->recordEntry($task, (string) Str::uuid(), 'Written via the resolved conversation id.');
+
+        $entriesA = app(TaskWorkspaceQuery::class)->entriesForTask($this->user->id, $taskA->id);
+        $this->assertSame([], $entriesA, 'task A\'s workspace must remain untouched by a write resolved through task B\'s helper conversation');
+
+        $entriesB = app(TaskWorkspaceQuery::class)->entriesForTask($this->user->id, $taskB->id);
+        $this->assertCount(1, $entriesB);
+        $this->assertSame('Written via the resolved conversation id.', $entriesB[0]['content']);
+    }
 }
