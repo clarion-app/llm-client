@@ -1117,7 +1117,7 @@ abstract class TestCase extends BaseTestCase
                 $table->timestamps();
                 $table->timestamp('deleted_at')->nullable();
 
-                $table->unique(['offered_agent_id', 'caller_agent_id']);
+                $table->unique(['offered_agent_id', 'caller_agent_id'], 'agent_capability_offerings_offered_caller_unique');
                 $table->index('offered_agent_id');
                 $table->index('caller_agent_id');
                 $table->index('owner_user_id');

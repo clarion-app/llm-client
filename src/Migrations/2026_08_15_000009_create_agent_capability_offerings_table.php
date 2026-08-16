@@ -43,7 +43,10 @@ return new class extends Migration
             $table->timestamps();
             $table->softDeletes();
 
-            $table->unique(['offered_agent_id', 'caller_agent_id']);
+            // Explicit name: the auto-generated one
+            // ("agent_capability_offerings_offered_agent_id_caller_agent_id_unique")
+            // is 66 characters, over MySQL's 64-character identifier limit.
+            $table->unique(['offered_agent_id', 'caller_agent_id'], 'agent_capability_offerings_offered_caller_unique');
             $table->index('offered_agent_id');
             $table->index('caller_agent_id');
             $table->index('owner_user_id');
