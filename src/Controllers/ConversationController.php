@@ -156,6 +156,20 @@ class ConversationController extends Controller
             ]);
         }
 
+        // Provision the user's `scheduler` agent, same seam and same
+        // log-and-continue guarantee as the research, coding, and data
+        // agents above -- a provisioning failure must never block
+        // conversation creation.
+        try {
+            app(\ClarionApp\LlmClient\Services\SchedulerAgentProvisioner::class)
+                ->ensureForUser(Auth::id());
+        } catch (\Throwable $e) {
+            Log::warning('Scheduler agent provisioning failed', [
+                'user_id' => Auth::id(),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         $agentId = $validatedData['agent_id'] ?? null;
         if ($agentId !== null) {
             $agent = app(\ClarionApp\LlmClient\Services\AgentQuery::class)->findAccessibleAgent(Auth::id(), $agentId);
