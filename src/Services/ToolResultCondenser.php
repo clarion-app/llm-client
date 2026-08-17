@@ -370,7 +370,62 @@ class ToolResultCondenser
             }
         }
 
+        // Extract numeric values (currency, percentages, plain multi-digit
+        // numbers) — feature 113's own additive extension, mirroring
+        // feature 111's URL-preservation precedent above: a figure the
+        // summarizing model would otherwise be free to round or paraphrase
+        // is instead spliced back in verbatim.
+        foreach ($this->extractNumericValues($content) as $numeric) {
+            $preserved[] = $numeric;
+        }
+
         return implode("\n", $preserved);
+    }
+
+    /**
+     * Extract currency amounts, percentages, and plain multi-digit numbers
+     * so a figure inside prose survives LLM summarization exactly
+     * (FR-014/SC-007). Deliberately excludes bare single-digit numbers so
+     * incidental small numbers in prose (list positions, minor counts)
+     * don't flood the preserved-values block.
+     *
+     * @return array<int, string>
+     */
+    private function extractNumericValues(string $content): array
+    {
+        $numbers = [];
+
+        // Currency: an optional leading '$' with a two-decimal amount, or
+        // a bare '$' amount with no decimal part.
+        if (preg_match_all('/\$?\d[\d,]*\.\d{2}|\$\d[\d,]*/', $content, $matches)) {
+            $amounts = array_unique(array_map('trim', $matches[0]));
+            foreach (array_slice($amounts, 0, 5) as $amount) {
+                $numbers[] = "Amount: {$amount}";
+            }
+        }
+
+        // Percentages.
+        if (preg_match_all('/\d+(?:\.\d+)?%/', $content, $matches)) {
+            $percentages = array_unique(array_map('trim', $matches[0]));
+            foreach (array_slice($percentages, 0, 5) as $percentage) {
+                $numbers[] = "Percentage: {$percentage}";
+            }
+        }
+
+        // Plain multi-digit integers/decimals — 2+ significant digits only,
+        // so a lone single digit (a list position, a minor count) never
+        // qualifies. A comma-grouped number's leading group may itself be a
+        // single digit (e.g. "1,204"), so that shape is matched separately
+        // from the plain, non-grouped case rather than by one alternation
+        // that would otherwise only capture the trailing "204".
+        if (preg_match_all('/\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\b\d{2,}(?:\.\d+)?\b/', $content, $matches)) {
+            $plain = array_unique(array_map('trim', $matches[0]));
+            foreach (array_slice($plain, 0, 5) as $number) {
+                $numbers[] = "Number: {$number}";
+            }
+        }
+
+        return $numbers;
     }
 
     /**
