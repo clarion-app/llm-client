@@ -643,6 +643,23 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        // DataAgentProvisioner holds only the already-singleton
+        // AgentService — safe as singleton() for the identical reason as
+        // ResearchAgentProvisioner/CodingAgentProvisioner above
+        // (113-data-agent, Foundational).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\DataAgentProvisioner::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\DataAgentProvisioner(
+                $app->make(\ClarionApp\LlmClient\Services\AgentService::class),
+            );
+        });
+
+        // OwnerScopedResultFilter holds no state of its own — every call
+        // resolves its inputs fresh (113-data-agent, Foundational, D5) —
+        // safe as singleton() for the same reason as PathContainment above.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\OwnerScopedResultFilter::class, function () {
+            return new \ClarionApp\LlmClient\Services\OwnerScopedResultFilter();
+        });
+
         // PathContainment holds no state of its own — every call resolves
         // its inputs fresh (112-coding-agent, Foundational, D4) — safe as
         // singleton() for the same reason as UrlValidator's own static-only

@@ -110,6 +110,7 @@ class AgentLoopService
     private EffectiveBoundResolver $effectiveBoundResolver;
     private TaskWorkspaceQuery $taskWorkspaceQuery;
     private RunTraceQuery $runTraceQuery;
+    private OwnerScopedResultFilter $ownerScopedResultFilter;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -133,7 +134,8 @@ class AgentLoopService
         ?ConversationAgentDefinitionResolver $agentDefinitionResolver = null,
         ?EffectiveBoundResolver $effectiveBoundResolver = null,
         ?TaskWorkspaceQuery $taskWorkspaceQuery = null,
-        ?RunTraceQuery $runTraceQuery = null
+        ?RunTraceQuery $runTraceQuery = null,
+        ?OwnerScopedResultFilter $ownerScopedResultFilter = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -157,6 +159,7 @@ class AgentLoopService
         $this->effectiveBoundResolver = $effectiveBoundResolver ?? new EffectiveBoundResolver(new AgentHelperQuery(new AgentQuery(new AgentDefinitionParser()), new AgentDefinitionParser()));
         $this->taskWorkspaceQuery = $taskWorkspaceQuery ?? new TaskWorkspaceQuery(new ManagedTaskQuery());
         $this->runTraceQuery = $runTraceQuery ?? new RunTraceQuery();
+        $this->ownerScopedResultFilter = $ownerScopedResultFilter ?? new OwnerScopedResultFilter();
     }
 
     /**
@@ -3692,6 +3695,24 @@ class AgentLoopService
         $resolved = $this->toolExecutor->extractArguments($params, $pathTemplate);
         $result = $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
         $raw = $this->extractResultContent($result);
+
+        // Foundational (security-critical, D5, FR-010/FR-011/FR-012): every
+        // execute_operation GET result, for every agent bound to the
+        // conversation, is run through OwnerScopedResultFilter before
+        // anything else -- including feature 111's own envelope-wrapping
+        // branch immediately below -- ever sees it, so a foreign-owned row
+        // can never survive by being wrapped inside an envelope the filter
+        // never inspected. $conversation->user_id is the same identity
+        // getOrCreateSession() already resolved above to mint this call's
+        // bearer token -- no new identity lookup. Never throws: a body
+        // that does not decode to an array is unchanged (json_decode()
+        // returns null for it and $raw !== 'null', so the block below is
+        // skipped entirely).
+        $decoded = json_decode($raw, true);
+        if ($decoded !== null || $raw === 'null') {
+            $filtered = $this->ownerScopedResultFilter->apply($decoded, (string) $conversation->user_id);
+            $raw = json_encode($filtered, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        }
 
         // Feature 111 (US1/US5): wrap page/text results in a source envelope so
         // the consulted-source manifest can be derived and the body is treated

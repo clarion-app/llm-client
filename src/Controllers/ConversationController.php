@@ -142,6 +142,20 @@ class ConversationController extends Controller
             ]);
         }
 
+        // Provision the user's `data` agent (113-data-agent, Foundational,
+        // FR-001), same seam and same log-and-continue guarantee as the
+        // research and coding agents above -- a provisioning failure must
+        // never block conversation creation.
+        try {
+            app(\ClarionApp\LlmClient\Services\DataAgentProvisioner::class)
+                ->ensureForUser(Auth::id());
+        } catch (\Throwable $e) {
+            Log::warning('Data agent provisioning failed', [
+                'user_id' => Auth::id(),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         $agentId = $validatedData['agent_id'] ?? null;
         if ($agentId !== null) {
             $agent = app(\ClarionApp\LlmClient\Services\AgentQuery::class)->findAccessibleAgent(Auth::id(), $agentId);
