@@ -126,4 +126,74 @@ class DataAgentDefinitionTest extends TestCase
             'citing a source or period that was not actually queried must be explicitly forbidden',
         );
     }
+
+    // ---------------------------------------------------------------
+    // Missing data, stated plainly and never estimated
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function instructions_require_stating_plainly_when_data_cannot_be_found(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'cannot be answered from the data',
+            $instructions,
+            'a question that cannot be answered, in whole or in part, must be addressed explicitly',
+        );
+        $this->assertStringContainsString(
+            'say so plainly: state what you looked for and that you',
+            $instructions,
+            'the agent must be required to say plainly what it looked for and that it could not find it',
+        );
+        $this->assertStringContainsString(
+            'could not find it. Never fill the gap with an estimate presented as fact.',
+            $instructions,
+            'filling a gap with an estimate presented as fact must be explicitly forbidden',
+        );
+    }
+
+    #[Test]
+    public function the_template_requires_distinguishing_missing_data_from_a_zero_finding(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'Keep this distinct from a legitimate empty or zero result.',
+            $instructions,
+            'a missing-data statement must be required to read differently from a legitimate zero/empty finding',
+        );
+        $this->assertStringContainsString(
+            'is not the same statement as',
+            $instructions,
+            '"no source can answer this" must be required to differ from "queried X, found none for this period"',
+        );
+        $this->assertStringContainsString(
+            'a finding, not a gap. Never word the two the same way.',
+            $instructions,
+            'wording a zero/empty finding the same way as a missing-data statement must be explicitly forbidden',
+        );
+    }
+
+    #[Test]
+    public function instructions_require_reporting_unreachable_sources_as_failed_queries(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'When a data source fails or becomes unreachable mid-query, report that as',
+            $instructions,
+            'a source that fails or becomes unreachable mid-query must be required to be reported as a failed query',
+        );
+        $this->assertStringContainsString(
+            'a failed query against that source — not as a zero/empty finding, and',
+            $instructions,
+            'a failed query must be required to read distinctly from a zero/empty finding',
+        );
+        $this->assertStringContainsString(
+            'not as "no source available"',
+            $instructions,
+            'a failed query must be required to read distinctly from "no source available"',
+        );
+    }
 }
