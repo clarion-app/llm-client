@@ -3,9 +3,27 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
+use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\AgentLoopStreamHandler;
+use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
+use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
+use ClarionApp\LlmClient\Events\ToolExecutionEvent;
+use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
+use ClarionApp\LlmClient\Services\AgentService;
+use ClarionApp\LlmClient\Services\DataAgentProvisioner;
+use ClarionApp\LlmClient\Services\GitDefinitionFileReader;
+use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinition;
 use Dedoc\Scramble\Generator;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Schema;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
@@ -24,10 +42,35 @@ use Tests\TestCase;
  */
 class DataAgentDefinitionTest extends TestCase
 {
+    private User $user;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // Isolate the read-only assertions to the data agent's own
+        // tools.allow/safety.confirmation_required — the installation
+        // ceiling (api_denylist / confirm_methods) is not this phase's
+        // concern, matching ResearchAgentDefinitionTest's own setUp.
+        $this->app['config']->set('llm-client.confirm_methods', []);
+        $this->app['config']->set('llm-client.api_denylist', []);
+
+        $this->user = User::factory()->create();
+
+        $this->createSupportingTables();
+    }
+
     protected function tearDown(): void
     {
         $this->clearOperationCatalog();
         Mockery::close();
+
+        DB::table('conversations')->delete();
+        DB::table('agent_versions')->delete();
+        DB::table('agents')->delete();
+        DB::table('llm_servers')->delete();
+        DB::table('mcp_sessions')->delete();
+        DB::table('users')->delete();
 
         parent::tearDown();
     }
@@ -45,11 +88,89 @@ class DataAgentDefinitionTest extends TestCase
         );
     }
 
+    private function provisioner(): DataAgentProvisioner
+    {
+        return new DataAgentProvisioner(
+            new AgentService(new AgentDefinitionParser(), new GitDefinitionFileReader()),
+        );
+    }
+
+    private function createSupportingTables(): void
+    {
+        // execute_operation's real path touches these; none exist in the
+        // base TestCase schema bootstrap (mirrors
+        // ResearchAgentDefinitionTest's own createSupportingTables()).
+        if (!Schema::hasTable('episodic_memories')) {
+            Schema::create('episodic_memories', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id');
+                $table->uuid('conversation_id');
+                $table->text('summary');
+                $table->json('topics');
+                $table->boolean('protected')->default(false);
+                $table->unsignedInteger('word_count');
+                $table->unsignedInteger('summary_word_count');
+                $table->json('embedding')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+            });
+        }
+
+        if (!Schema::hasTable('condensation_states')) {
+            Schema::create('condensation_states', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id')->unique();
+                $table->unsignedInteger('consecutive_failures')->default(0);
+                $table->timestamp('cooldown_until')->nullable();
+                $table->timestamps();
+            });
+        }
+
+        if (!Schema::hasTable('mcp_sessions')) {
+            Schema::create('mcp_sessions', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id');
+                $table->string('protocol_version');
+                $table->string('client_name')->nullable();
+                $table->string('client_version')->nullable();
+                $table->json('capabilities')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+                $table->index('user_id');
+            });
+        }
+    }
+
     private function seedCatalog(): void
     {
         $doc = ['paths' => [
             '/api/contacts' => ['get' => ['operationId' => 'contacts.index', 'summary' => 'List contacts']],
         ]];
+
+        $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
+        $prop->setAccessible(true);
+        $prop->setValue(null, $doc);
+
+        $generator = Mockery::mock(Generator::class);
+        $generator->shouldReceive('__invoke')->andReturn($doc);
+        $this->app->instance(Generator::class, $generator);
+    }
+
+    /**
+     * Seeds an arbitrary [operationId => {path, method, summary}] catalog,
+     * used by the read-only unit case below to exercise both a GET and a
+     * mutation operationId in the same call.
+     */
+    private function seedOperationCatalog(array $operations): void
+    {
+        $paths = [];
+        foreach ($operations as $operationId => $entry) {
+            $paths[$entry['path']][$entry['method']] = [
+                'operationId' => $operationId,
+                'summary' => $entry['summary'],
+            ];
+        }
+        $doc = ['paths' => $paths];
 
         $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
         $prop->setAccessible(true);
@@ -194,6 +315,207 @@ class DataAgentDefinitionTest extends TestCase
             'not as "no source available"',
             $instructions,
             'a failed query must be required to read distinctly from "no source available"',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Answering questions never writes anything: enforced at the
+    // operation level, plus decline-with-reason for writes, dashboards,
+    // and the out-of-scope half of a bundled request
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function the_data_definition_permits_get_but_not_a_mutation_and_never_requires_confirmation(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.index' => ['path' => '/api/contacts', 'method' => 'get', 'summary' => 'List contacts'],
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Create a contact'],
+        ]);
+
+        $definition = (new AgentDefinitionParser())->parse(
+            (string) file_get_contents(__DIR__ . '/../../src/Templates/data.yaml'),
+        );
+
+        $this->assertTrue(
+            $definition->isOperationPermitted('contacts.index'),
+            'a representative GET operation must be permitted',
+        );
+        $this->assertFalse(
+            $definition->isOperationPermitted('contacts.store'),
+            'a representative mutation operation must NOT be permitted -- read-only, tools.allow: [GET] alone',
+        );
+        $this->assertFalse(
+            $definition->isConfirmationRequired('contacts.index'),
+            'nothing is ever gated behind confirmation -- the data agent never mutates in the first place',
+        );
+        $this->assertFalse(
+            $definition->isConfirmationRequired('contacts.store'),
+            'nothing is ever gated behind confirmation, even for a mutation op that is never permitted to begin with',
+        );
+    }
+
+    #[Test]
+    public function a_mutation_under_the_data_agent_is_rejected_by_the_bound_definition(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.index' => ['path' => '/api/contacts', 'method' => 'get', 'summary' => 'List contacts'],
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Create a contact'],
+        ]);
+
+        $agent = $this->provisioner()->ensureForUser($this->user->id);
+
+        $server = Server::create([
+            'name' => 'DataServer',
+            'server_url' => 'https://api.openai.com/v1/chat/completions',
+            'token' => 'test-token',
+        ]);
+
+        $response = $this->actingAs($this->user, 'api')->postJson('/api/clarion-app/llm-client/conversation', [
+            'agent_id' => $agent->id,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ]);
+        $response->assertStatus(201);
+        $conversationId = $response->json('id');
+
+        // The real executeApiCall() would mint a token and make an outgoing
+        // HTTP call -- mocked out since this test's concern is
+        // authorization, not the round trip. Only reached if the (wrongly)
+        // mutation is allowed through.
+        $executorMock = Mockery::mock(McpToolExecutor::class);
+        $executorMock->shouldReceive('extractArguments')->andReturn(['path' => '/api/contacts', 'query' => [], 'body' => []]);
+        $executorMock->shouldReceive('executeHttpCall')->andReturn([
+            'content' => [['type' => 'text', 'text' => 'unexpectedly allowed through']],
+            'isError' => false,
+        ]);
+        $this->app->instance(McpToolExecutor::class, $executorMock);
+
+        Event::fake([
+            NewConversationMessageEvent::class,
+            UpdateOpenAIConversationResponseEvent::class,
+            FinishOpenAIConversationResponseEvent::class,
+            ToolExecutionEvent::class,
+            ApiCallConfirmationRequiredEvent::class,
+        ]);
+        Queue::fake();
+
+        // Constructed directly, mirroring ResearchAgentDefinitionTest's own
+        // established pattern -- drives the exact reload-then-continue
+        // shape production has.
+        $handler = new AgentLoopStreamHandler();
+        $handler->toolCalls = [
+            [
+                'id' => 'call_mutation',
+                'type' => 'function',
+                'function' => [
+                    'name' => 'execute_operation',
+                    'arguments' => json_encode(['operationId' => 'contacts.store', 'parameters' => []]),
+                ],
+            ],
+        ];
+        $handler->message = Message::create([
+            'conversation_id' => $conversationId,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'content' => '',
+            'responseTime' => 0,
+        ]);
+
+        $handler->finish(json_encode([
+            'conversation_id' => $conversationId,
+            'iteration' => 1,
+        ]), 2);
+
+        $handler->message->refresh();
+        $toolResults = $handler->message->tool_data['tool_results'] ?? [];
+        $this->assertNotEmpty($toolResults, 'the execute_operation tool call must have produced a result');
+
+        $resultContent = $toolResults[0]['content'] ?? '';
+        $this->assertStringContainsString(
+            'Operation not permitted by the agent version this conversation is bound to.',
+            $resultContent,
+            'the bound data definition must reject the mutation op -- read-only, enforced at the operation level',
+        );
+    }
+
+    #[Test]
+    public function instructions_require_declining_any_write_request_with_a_stated_reason(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'You never create, modify, or delete data, under any circumstance,',
+            $instructions,
+            'the agent must be required to never create, modify, or delete data under any circumstance',
+        );
+        $this->assertStringContainsString(
+            'including when explicitly asked to. Decline plainly, stating that',
+            $instructions,
+            'an explicit write request must still be required to be declined plainly, with a stated reason',
+        );
+        $this->assertStringContainsString(
+            'modifying data is outside your purpose, and do not attempt a workaround.',
+            $instructions,
+            'a write decline must be required to state a reason and never attempt a workaround',
+        );
+    }
+
+    #[Test]
+    public function instructions_require_declining_dashboard_or_persistent_reporting_requests(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'You do not build, save, or maintain a dashboard or other persistent',
+            $instructions,
+            'a request to build, save, or maintain a dashboard must be required to be declined',
+        );
+        $this->assertStringContainsString(
+            'visual reporting artifact. State plainly that this is outside your',
+            $instructions,
+            'a dashboard decline must be required to state plainly that it is outside the agent\'s purpose',
+        );
+        $this->assertStringContainsString(
+            'purpose when asked',
+            $instructions,
+            'the dashboard decline must be required whenever asked, not merely implied',
+        );
+        $this->assertStringContainsString(
+            'you can still answer the underlying data question',
+            $instructions,
+            'declining to build a dashboard must not prevent answering the underlying data question itself',
+        );
+    }
+
+    #[Test]
+    public function instructions_require_splitting_a_bundled_in_scope_and_out_of_scope_request(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'When a request bundles an in-scope data question with an out-of-scope',
+            $instructions,
+            'a bundled in-scope/out-of-scope request must be addressed explicitly by the instructions',
+        );
+        $this->assertStringContainsString(
+            'action (a write, or a dashboard), answer the in-scope part normally and',
+            $instructions,
+            'the in-scope part of a bundled request must be required to be answered normally',
+        );
+        $this->assertStringContainsString(
+            'decline the out-of-scope part with a stated reason',
+            $instructions,
+            'the out-of-scope part of a bundled request must be required to be declined with a stated reason',
+        );
+        $this->assertStringContainsString(
+            'never silently drop',
+            $instructions,
+            'silently dropping the out-of-scope part of a bundled request must be explicitly forbidden',
+        );
+        $this->assertStringContainsString(
+            'or silently attempt either.',
+            $instructions,
+            'silently attempting the out-of-scope part of a bundled request must be explicitly forbidden',
         );
     }
 }
