@@ -46,6 +46,7 @@ use ClarionApp\LlmClient\Controllers\ConsensusController;
 use ClarionApp\LlmClient\Controllers\SequenceController;
 use ClarionApp\LlmClient\Controllers\CodingProjectController;
 use ClarionApp\LlmClient\Controllers\CodingWorkspaceController;
+use ClarionApp\LlmClient\Controllers\SchedulerTriggerController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -405,6 +406,17 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('coding-project/{project}/git-status', [CodingWorkspaceController::class, "gitStatus"]);
     Route::get('coding-project/{project}/git-diff', [CodingWorkspaceController::class, "gitDiff"]);
     Route::post('coding-project/{project}/run-tests', [CodingWorkspaceController::class, "runTests"]);
+
+    // Scheduler Agent -- human-driven trigger registration, CRUD scoped
+    // entirely to the caller's own triggers.
+    // Never named in scheduler.yaml's own tools.allow; a trigger is
+    // configured by a person, run only by RunSchedulerTriggerJob, and read
+    // (its produced runs) only through the existing RunController.
+    Route::post('scheduler-triggers', [SchedulerTriggerController::class, "store"]);
+    Route::get('scheduler-triggers', [SchedulerTriggerController::class, "index"]);
+    Route::get('scheduler-triggers/{id}', [SchedulerTriggerController::class, "show"]);
+    Route::put('scheduler-triggers/{id}', [SchedulerTriggerController::class, "update"]);
+    Route::delete('scheduler-triggers/{id}', [SchedulerTriggerController::class, "destroy"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {

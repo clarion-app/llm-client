@@ -129,6 +129,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\RecomputeEvalPassRateSummariesCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentCreateCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentKindsCommand::class,
+                \ClarionApp\LlmClient\Commands\EvaluateSchedulerTriggersCommand::class,
             ]);
         }
 
@@ -224,6 +225,18 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // Drain the external-forwarding buffer every minute. A tick with
             // nothing due (forwarding disabled, or nothing queued) is a no-op.
             $schedule->command('llm-client:forward-run-traces')
+                ->everyMinute()
+                ->withoutOverlapping();
+
+            // Tick every active scheduler trigger every minute and dispatch
+            // RunSchedulerTriggerJob for whichever ones a due evaluation
+            // newly wins the scheduler_trigger_firings dedup latch for. No
+            // separate crash-recovery sweep is registered for this one --
+            // the existing resolve-abandoned-runs sweep above already
+            // force-closes a stale in_progress run left behind by a crashed
+            // RunSchedulerTriggerJob, whatever kind of agent_runs row
+            // produced it.
+            $schedule->command('llm-client:evaluate-scheduler-triggers')
                 ->everyMinute()
                 ->withoutOverlapping();
         });

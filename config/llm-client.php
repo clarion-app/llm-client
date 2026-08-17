@@ -956,5 +956,15 @@ return [
         // instead of the ordinary per-file one.
         'scope_surface_threshold_files' => (int) env('LLM_CLIENT_CODING_AGENT_SCOPE_SURFACE_THRESHOLD_FILES', 8),
     ],
+
+    // Scheduler Agent — the per-action retry ceiling
+    // SchedulerTriggerController persists onto a newly-created SchedulerTrigger
+    // when the caller omits retry_limit from the request body. Applied exactly
+    // once, at creation, so no later reader ever has to default it again;
+    // explicitly supplying 0 always persists 0 ("never retry"), never this
+    // default.
+    'scheduler' => [
+        'default_retry_limit' => (int) env('LLM_CLIENT_SCHEDULER_DEFAULT_RETRY_LIMIT', 3),
+    ],
 ];
 
