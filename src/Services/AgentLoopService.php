@@ -114,6 +114,19 @@ class AgentLoopService
     private RunTraceQuery $runTraceQuery;
     private OwnerScopedResultFilter $ownerScopedResultFilter;
 
+    /**
+     * The raw McpToolExecutor::executeHttpCall()-shaped outcome of the
+     * most recently dispatched execute_operation call (set in
+     * executeApiCall(), cleared before every attempt). Consulted only by
+     * dispatchExecuteOperationWithRetry() immediately after a dispatch
+     * returns, to judge whether that attempt is worth retrying
+     * (RetryEligibility::isTransient()) -- never read anywhere else, and
+     * never populated for a call that never reached dispatch (a
+     * validation refusal, an unknown operation, a coding-workspace
+     * binding rejection).
+     */
+    private ?array $lastOperationDispatchOutcome = null;
+
     public function __construct(
         McpToolRegistry $toolRegistry,
         McpToolExecutor $toolExecutor,
@@ -1099,6 +1112,16 @@ class AgentLoopService
         $currentStepId = null;
         $activeActionId = null;
 
+        // Set once a scheduler-triggered retry sequence exhausts its limit
+        // (or a first attempt is never transient) and never cleared again
+        // for the rest of this run -- the model still gets its own turn to
+        // report what happened (below), exactly like an ordinary failed
+        // tool call already does, but the run's own final close uses
+        // RunEndState::Failed instead of Completed once this is set,
+        // naming the exhausted action, regardless of how the model's own
+        // report words the outcome.
+        $unrecoverableFailureReason = null;
+
         try {
             // Unattended refuse-and-stop guarantee, checked before the loop
             // opens even its first step: ConversationAgentDefinitionResolver
@@ -1356,18 +1379,33 @@ class AgentLoopService
 
                     $conversation->update(['is_processing' => false]);
 
-                    // Close the current step and the run as completed.
+                    // Close the current step and the run. An unrecoverable
+                    // scheduler-triggered action failure earlier in this
+                    // same run (tracked above, action-record already
+                    // reflects it) makes this final close Failed rather
+                    // than Completed, regardless of how the model's own
+                    // report -- already produced above -- happens to word
+                    // the outcome; an ordinary run with no such failure is
+                    // unaffected.
                     if ($this->runTraceRecorder !== null && $runId !== null) {
+                        $finalEndState = $unrecoverableFailureReason !== null
+                            ? RunEndState::Failed
+                            : RunEndState::Completed;
+                        $finalReason = $unrecoverableFailureReason !== null
+                            ? Str::limit($unrecoverableFailureReason, 500)
+                            : null;
+
                         if ($currentStepId !== null) {
                             $this->runTraceRecorder->closeStep(
                                 $currentStepId,
-                                RunEndState::Completed,
+                                $finalEndState,
+                                $finalReason,
                             );
                         }
                         $this->runTraceRecorder->closeRun(
                             $runId,
-                            RunEndState::Completed,
-                            null,
+                            $finalEndState,
+                            $finalReason,
                             $assistantMessage->id,
                         );
                     }
@@ -1458,15 +1496,14 @@ class AgentLoopService
                     }
 
                     // Site 2: ToolInvocation around executeMetaTool in run().
+                    // A scheduler-triggered (unattended) execute_operation
+                    // call is dispatched through its own bounded retry
+                    // sequence below (dispatchExecuteOperationWithRetry())
+                    // rather than this single open/execute/decode pairing
+                    // -- every other tool call, and every interactive
+                    // execute_operation call, keeps this exact one-shot
+                    // shape, byte-for-byte unchanged.
                     $activeActionId = null;
-                    if ($this->runTraceRecorder !== null && $currentStepId !== null) {
-                        $activeActionId = $this->runTraceRecorder->openAction(
-                            $currentStepId,
-                            ActionType::ToolInvocation,
-                            $toolName,
-                            $attemptGroupId,
-                        );
-                    }
 
                     // 101-parallel-subagent-execution (US1, contracts §1):
                     // a delegate_to_helper call that was part of a 2+ burst
@@ -1475,11 +1512,47 @@ class AgentLoopService
                     // inline through executeMetaTool()/delegate() a second
                     // time.
                     if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCallId, $batchDelegationResults)) {
+                        if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                            $activeActionId = $this->runTraceRecorder->openAction(
+                                $currentStepId,
+                                ActionType::ToolInvocation,
+                                $toolName,
+                                $attemptGroupId,
+                            );
+                        }
                         $result = json_encode($batchDelegationResults[$toolCallId]);
+                        $decoded = json_decode($result, true);
+                    } elseif ($unattended && $toolName === 'execute_operation') {
+                        [$result, $decoded, $dispatchFailureReason] = $this->dispatchExecuteOperationWithRetry(
+                            $arguments,
+                            $conversation,
+                            $runId,
+                            $currentStepId,
+                            (int) ($options['retry_limit'] ?? 0),
+                            $activeActionId,
+                        );
+
+                        // The model still gets its own turn to see this
+                        // result and report on it below (FR-012), exactly
+                        // like an ordinary failed tool call already does;
+                        // only the run's eventual close-reason changes.
+                        // The first exhausted action's reason wins if more
+                        // than one occurs in the same run.
+                        if ($dispatchFailureReason !== null && $unrecoverableFailureReason === null) {
+                            $unrecoverableFailureReason = $dispatchFailureReason;
+                        }
                     } else {
+                        if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                            $activeActionId = $this->runTraceRecorder->openAction(
+                                $currentStepId,
+                                ActionType::ToolInvocation,
+                                $toolName,
+                                $attemptGroupId,
+                            );
+                        }
                         $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId, $unattended);
+                        $decoded = json_decode($result, true);
                     }
-                    $decoded = json_decode($result, true);
 
                     if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
                         $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
@@ -1627,6 +1700,22 @@ class AgentLoopService
                         }
                         $activeActionId = null;
                     }
+
+                    // A scheduler-triggered retry sequence (above) that
+                    // never produced a usable result -- either the first
+                    // attempt was never transient, or every retry up to
+                    // retry_limit failed too -- has already had its last
+                    // attempt's action closed Failure by the block just
+                    // above (the same $decoded['error'] check every
+                    // ordinary failed tool call goes through). It does not
+                    // stop the run here: the model still gets this result
+                    // fed back like any other failed tool call, so it can
+                    // produce its own report (FR-012) -- $unrecoverableFailureReason,
+                    // set at the dispatch site above, is what makes this
+                    // run's own eventual close use RunEndState::Failed
+                    // instead of Completed once the model's own turn ends
+                    // the loop, regardless of how its report words the
+                    // outcome.
 
                     // Tool executed (not a confirmation pause) — record its outcome.
                     $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
@@ -3867,6 +3956,7 @@ class AgentLoopService
         if (Context::get('eval_run_simulating_tools', false)) {
             $schema = $this->toolRegistry->inputSchemaForOperationId($operationId);
             $result = $this->toolExecutor->simulateCall(['inputSchema' => $schema ?? []]);
+            $this->lastOperationDispatchOutcome = $result;
 
             return $this->extractResultContent($result);
         }
@@ -3874,6 +3964,7 @@ class AgentLoopService
         $session = $this->getOrCreateSession($conversation);
         $resolved = $this->toolExecutor->extractArguments($params, $pathTemplate);
         $result = $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
+        $this->lastOperationDispatchOutcome = $result;
         $raw = $this->extractResultContent($result);
 
         // Foundational (security-critical, D5, FR-010/FR-011/FR-012): every
@@ -3910,6 +4001,100 @@ class AgentLoopService
         }
 
         return $raw;
+    }
+
+    /**
+     * Bounded per-action retry for a scheduler-triggered (unattended)
+     * execute_operation call: the same operationId/arguments are
+     * re-dispatched, same as SpendingCeilingReached's own single-purpose
+     * event is fired from one isolated site, up to $retryLimit further
+     * times, but only while each failed attempt is transport-level
+     * transient (RetryEligibility::isTransient()). Every attempt gets its
+     * own ToolInvocation action row, all sharing one attempt_group_id, so
+     * an eventual success still leaves the earlier failures visible in
+     * the action record rather than hidden behind it.
+     *
+     * A permission/authorization refusal (UnattendedActionRefusedException)
+     * is thrown by executeMetaTool()/handleExecuteOperation() itself,
+     * before any dispatch is attempted, and is deliberately left
+     * uncaught here -- it unwinds straight past this method to run()'s
+     * own outer catch, exactly once, never retried. $activeActionId is
+     * taken by reference, not returned, specifically so that unwind still
+     * leaves the caller's own copy pointing at the just-opened action --
+     * the same variable run()'s own UnattendedActionRefusedException
+     * handler already closes Failure for the single-attempt case, so a
+     * refusal reached through a retry-eligible operation's first attempt
+     * is closed exactly the same way, not left permanently open.
+     *
+     * @param-out ?string $activeActionId
+     * @return array{0: string, 1: ?array, 2: ?string} [the final
+     *   attempt's JSON result string, its decoded form, and a
+     *   run-failure reason once the failure was never transient or the
+     *   retry limit is exhausted -- null while the run should continue
+     *   exactly as it does for a single successful (or interactive) tool
+     *   call]
+     */
+    private function dispatchExecuteOperationWithRetry(
+        array $arguments,
+        Conversation $conversation,
+        ?string $runId,
+        ?string $currentStepId,
+        int $retryLimit,
+        ?string &$activeActionId,
+    ): array {
+        $retryGroupId = (string) Str::uuid();
+        $attempts = 0;
+        $result = '';
+        $decoded = null;
+
+        while (true) {
+            $activeActionId = null;
+            if ($this->runTraceRecorder !== null && $currentStepId !== null) {
+                $activeActionId = $this->runTraceRecorder->openAction(
+                    $currentStepId,
+                    ActionType::ToolInvocation,
+                    'execute_operation',
+                    $retryGroupId,
+                );
+            }
+
+            $this->lastOperationDispatchOutcome = null;
+            $result = $this->executeMetaTool('execute_operation', $arguments, $conversation, $runId, true);
+            $attempts++;
+            $decoded = json_decode($result, true);
+
+            $failed = is_array($decoded)
+                && empty($decoded['__requires_confirmation'] ?? false)
+                && is_string($decoded['error'] ?? null);
+
+            if (!$failed) {
+                return [$result, $decoded, null];
+            }
+
+            $outcome = $this->lastOperationDispatchOutcome ?? ['status' => null];
+
+            if (RetryEligibility::isTransient($outcome) && $attempts <= $retryLimit) {
+                if ($this->runTraceRecorder !== null && $activeActionId !== null) {
+                    $this->runTraceRecorder->closeAction(
+                        $activeActionId,
+                        ActionOutcome::Failure,
+                        Str::limit((string) $decoded['error'], 500),
+                    );
+                }
+
+                continue;
+            }
+
+            $operationId = (string) ($arguments['operationId'] ?? 'execute_operation');
+            $reason = sprintf(
+                '%s failed after %d attempt(s): %s',
+                $operationId,
+                $attempts,
+                (string) $decoded['error'],
+            );
+
+            return [$result, $decoded, $reason];
+        }
     }
 
     /**

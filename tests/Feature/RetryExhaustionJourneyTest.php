@@ -378,6 +378,7 @@ class RetryExhaustionJourneyTest extends TestCase
 
         $service = $this->serviceWithScriptedProvider([
             $this->toolCallResponse('scheduler.flaky_read'),
+            $this->textResponse('failed: scheduler.flaky_read never recovered after retrying.'),
         ]);
 
         $result = $service->run($conversation, 'Do the defined work.', [
@@ -444,6 +445,7 @@ class RetryExhaustionJourneyTest extends TestCase
 
         $service = $this->serviceWithScriptedProvider([
             $this->toolCallResponse('scheduler.bad_argument'),
+            $this->textResponse('failed: scheduler.bad_argument was rejected.'),
         ]);
 
         $service->run($conversation, 'Do the defined work.', [

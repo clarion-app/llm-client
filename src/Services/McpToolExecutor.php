@@ -206,7 +206,16 @@ class McpToolExecutor
             };
 
             if ($response->failed()) {
-                return $this->errorResult($response->body());
+                // The HTTP status code rides along on this array's own
+                // 'status' key -- additive, ignored by every consumer that
+                // only reads 'content'/'isError', consulted by
+                // AgentLoopService's own retry loop (via
+                // RetryEligibility::isTransient()) to tell a plausibly-
+                // transient 5xx/429 apart from an ordinary 4xx.
+                $failure = $this->errorResult($response->body());
+                $failure['status'] = $response->status();
+
+                return $failure;
             }
 
             $responseBody = $response->body();
@@ -223,6 +232,7 @@ class McpToolExecutor
                     ],
                 ],
                 'isError' => false,
+                'status' => $response->status(),
             ];
         } catch (\Exception $e) {
             return $this->errorResult('Internal error: ' . $e->getMessage());

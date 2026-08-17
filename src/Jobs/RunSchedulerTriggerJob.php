@@ -58,7 +58,10 @@ final class RunSchedulerTriggerJob implements ShouldQueue
         $conversation = $this->resolveOrCreateConversation($trigger);
 
         try {
-            $loop->run($conversation, $trigger->defined_work, ['unattended' => true]);
+            $loop->run($conversation, $trigger->defined_work, [
+                'unattended' => true,
+                'retry_limit' => $trigger->retry_limit,
+            ]);
         } finally {
             // run()'s own return value never carries the run id it opened
             // (every one of its return shapes omits it), so the run this
