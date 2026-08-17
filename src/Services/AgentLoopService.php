@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
+use ClarionApp\LlmClient\Exceptions\UnattendedActionRefusedException;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
@@ -25,6 +26,7 @@ use ClarionApp\LlmClient\Contracts\MemoryScope;
 use ClarionApp\LlmClient\Contracts\EpisodicMemoryService as EpisodicMemoryServiceContract;
 use ClarionApp\LlmClient\Contracts\DeclarativeMemoryService as DeclarativeMemoryServiceContract;
 use ClarionApp\LlmClient\Events\AgentTurnCompleted;
+use ClarionApp\LlmClient\Events\SchedulerTriggerRunRefused;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
 use ClarionApp\LlmClient\ValueObjects\ContextManagementOutcome;
 use ClarionApp\LlmClient\ValueObjects\ToolFailureCategory;
@@ -984,10 +986,18 @@ class AgentLoopService
      */
     public function run(Conversation $conversation, string $message, array $options = []): array
     {
+        // Trigger-fired work (a scheduler run with nobody present) carries
+        // its own work kind and run kind throughout this method, never a
+        // second, separate code path -- every existing caller that passes
+        // no 'unattended' key keeps today's exact behaviour, since the two
+        // conditionals below both fall back to the same values they always
+        // hard-coded.
+        $unattended = (bool) ($options['unattended'] ?? false);
+
         // First statement, before is_processing is set and before a run is
         // opened: a refusal here has to be a clean no-op, and there is no path
         // that unwinds either of those for work that never started.
-        $this->admitInteractiveWork($conversation, BudgetWorkKind::Interactive);
+        $this->admitInteractiveWork($conversation, $unattended ? BudgetWorkKind::SystemInitiated : BudgetWorkKind::Interactive);
 
         // Revocation check (096-agent-sharing, research.md D5): a shared
         // agent whose grant has since been revoked refuses the turn here,
@@ -1006,7 +1016,9 @@ class AgentLoopService
         $runId = null;
         if ($this->runTraceRecorder !== null) {
             $runId = $this->runTraceRecorder->openRun(
-                \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+                $unattended
+                    ? \ClarionApp\LlmClient\ValueObjects\RunKind::SystemInitiated
+                    : \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
                 (string) $conversation->user_id,
                 $conversation->id,
                 streamed: false,
@@ -1088,6 +1100,25 @@ class AgentLoopService
         $activeActionId = null;
 
         try {
+            // Unattended refuse-and-stop guarantee, checked before the loop
+            // opens even its first step: ConversationAgentDefinitionResolver
+            // degrades a since-deleted or dangling agent/version binding to
+            // null rather than throwing, which is fine for an interactive
+            // turn (a live user notices instructions/permissions are
+            // missing) but not for a run nobody is watching -- that would
+            // otherwise run un-narrowed with no bound instructions at all.
+            // Thrown here so it is caught by this same try/catch's
+            // UnattendedActionRefusedException handler below; no step or
+            // action has been opened yet, so that handler's closeAction()/
+            // closeStep() calls are no-ops and only closeRun() does
+            // anything.
+            if ($unattended && $this->agentDefinitionResolver->effectiveDefinitionFor($conversation) === null) {
+                throw new UnattendedActionRefusedException(
+                    '(no operation attempted)',
+                    'No resolvable agent definition is bound to this conversation; refusing to run unattended.',
+                );
+            }
+
             for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
                 // Delegation time bound (research.md D3): checked before any
                 // per-iteration work for this iteration begins, mirroring the
@@ -1446,7 +1477,7 @@ class AgentLoopService
                     if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCallId, $batchDelegationResults)) {
                         $result = json_encode($batchDelegationResults[$toolCallId]);
                     } else {
-                        $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId);
+                        $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId, $unattended);
                     }
                     $decoded = json_decode($result, true);
 
@@ -1684,6 +1715,91 @@ class AgentLoopService
                 'content' => 'Maximum iterations reached',
                 'message_id' => null,
                 'code' => 'max_iterations',
+            ];
+        } catch (UnattendedActionRefusedException $e) {
+            // The unattended refuse-and-stop guarantee: never re-thrown,
+            // never left pending for a human who is not present to answer
+            // it. Closed in the same action-before-step-before-run order
+            // the generic \Throwable branch below uses, then StoppedEarly
+            // rather than Failed -- this is an expected, designed-for
+            // outcome, not a crash.
+            $conversation->update(['is_processing' => false]);
+
+            if ($this->runTraceRecorder !== null && $activeActionId !== null) {
+                $this->runTraceRecorder->closeAction(
+                    $activeActionId,
+                    ActionOutcome::Failure,
+                    Str::limit($e->getMessage(), 500),
+                );
+            }
+
+            if ($this->runTraceRecorder !== null && $runId !== null) {
+                if ($currentStepId !== null) {
+                    $this->runTraceRecorder->closeStep(
+                        $currentStepId,
+                        RunEndState::StoppedEarly,
+                        Str::limit($e->getMessage(), 500),
+                    );
+                }
+                $this->runTraceRecorder->closeRun(
+                    $runId,
+                    RunEndState::StoppedEarly,
+                    Str::limit($e->getMessage(), 500),
+                );
+            }
+
+            // Isolated in its own inner try/catch, entirely separate from
+            // the run-closing writes above: RunTraceRecorder::closeRun()'s
+            // own enqueueForwarding()/broadcast() calls are isolated this
+            // same way for exactly this reason -- a broadcast failure here
+            // must never propagate and turn an already-closed run's return
+            // value into an uncaught exception. No step existed yet when
+            // the top-level guard fires before the loop's first iteration,
+            // so a fresh one is opened to carry this notification action
+            // and closed again immediately after; every other refusal
+            // route reuses the step it already closed above, since
+            // opening an action only needs a valid step id to resolve the
+            // run it belongs to, not an open one.
+            if ($this->runTraceRecorder !== null && $runId !== null && $conversation->user_id !== null) {
+                $notifyStepId = $currentStepId ?? $this->runTraceRecorder->openStep($runId);
+                $notifyActionId = $this->runTraceRecorder->openAction(
+                    $notifyStepId,
+                    ActionType::Notification,
+                    'scheduler_trigger_run_refused',
+                );
+
+                try {
+                    event(new SchedulerTriggerRunRefused(
+                        (string) $conversation->user_id,
+                        $runId,
+                        $e->operationId,
+                        $e->getMessage(),
+                    ));
+
+                    $this->runTraceRecorder->closeAction($notifyActionId, ActionOutcome::Success);
+                } catch (\Throwable $notifyError) {
+                    $this->runTraceRecorder->closeAction(
+                        $notifyActionId,
+                        ActionOutcome::Failure,
+                        Str::limit($notifyError->getMessage(), 500),
+                    );
+
+                    Log::warning('AgentLoopService: failed to notify unattended run refusal', [
+                        'run_id' => $runId,
+                        'operation_id' => $e->operationId,
+                        'error' => $notifyError->getMessage(),
+                    ]);
+                } finally {
+                    if ($currentStepId === null) {
+                        $this->runTraceRecorder->closeStep($notifyStepId, RunEndState::Completed);
+                    }
+                }
+            }
+
+            return [
+                'status' => 'stopped_unauthorized',
+                'operation_id' => $e->operationId,
+                'reason' => $e->getMessage(),
             ];
         } catch (\Throwable $e) {
             $agentId = $conversation->character ?? $conversation->id;
@@ -3095,11 +3211,11 @@ class AgentLoopService
         ));
     }
 
-    public function executeMetaTool(string $toolName, array $arguments, Conversation $conversation, ?string $runId = null): string
+    public function executeMetaTool(string $toolName, array $arguments, Conversation $conversation, ?string $runId = null, bool $unattended = false): string
     {
         return match ($toolName) {
             'list_applications' => $this->handleListApplications(),
-            'execute_operation' => $this->handleExecuteOperation($arguments, $conversation, $runId),
+            'execute_operation' => $this->handleExecuteOperation($arguments, $conversation, $runId, $unattended),
             'search_operations' => $this->handleSearchOperations($arguments, $conversation),
             'memory_create' => $this->handleMemoryCreate($arguments, $conversation),
             'memory_read' => $this->handleMemoryRead($arguments, $conversation),
@@ -3395,7 +3511,7 @@ class AgentLoopService
             ->all();
     }
 
-    private function handleExecuteOperation(array $arguments, Conversation $conversation, ?string $runId = null): string
+    private function handleExecuteOperation(array $arguments, Conversation $conversation, ?string $runId = null, bool $unattended = false): string
     {
         $operationId = $arguments['operationId'] ?? '';
         if (empty($operationId)) {
@@ -3487,6 +3603,41 @@ class AgentLoopService
                     'status' => ApiCallValidator::STATUS_REJECT,
                     'reason' => "Operation not permitted: ancestor agent \"{$chain['blocking_agent_name']}\" ({$chain['levels_up']} level(s) up in this delegation chain) does not permit \"{$operationId}\".",
                 ];
+            }
+        }
+
+        // Unattended refuse-and-stop guarantee (scheduler-triggered runs):
+        // inserted after the delegation-chain check above, which can itself
+        // upgrade $validation['status'] to STATUS_REJECT ("reject wins",
+        // overriding a prior confirm) -- checking any earlier would let an
+        // unattended run miss a chain-derived rejection and hand it back to
+        // the model as ordinary tool-result data below. A rejection always
+        // stops the run outright rather than being fed back for the model
+        // to try something else; a confirmation-required operation either
+        // was pre-authorized in advance (checked once, against the bound
+        // agent's own declared list, never via a live prompt) or the run
+        // stops here too -- it is never auto-approved and never left
+        // pending for nobody to answer.
+        if ($unattended) {
+            if ($validation['status'] === ApiCallValidator::STATUS_REJECT) {
+                throw new UnattendedActionRefusedException(
+                    $operationId,
+                    "Action outside the permitted set: {$operationId}.",
+                );
+            }
+
+            if ($validation['status'] === ApiCallValidator::STATUS_CONFIRM) {
+                if ($boundDefinition !== null && $boundDefinition->isUnattendedAuthorized($operationId)) {
+                    // Proceed exactly as if already confirmed -- falls
+                    // through to executeApiCall() below without ever
+                    // constructing the __requires_confirmation marker.
+                    $validation['status'] = ApiCallValidator::STATUS_ALLOW;
+                } else {
+                    throw new UnattendedActionRefusedException(
+                        $operationId,
+                        "Action requires confirmation and was not pre-authorized for unattended execution: {$operationId}.",
+                    );
+                }
             }
         }
 
