@@ -269,6 +269,44 @@ class UnattendedConfirmationRefusalJourneyTest extends TestCase
         $this->app->instance(McpToolExecutor::class, $executor);
     }
 
+    /**
+     * Proves the run genuinely stopped rather than skipping ahead or
+     * substituting a different action: the refused tool-call action is
+     * the last action attempted, with nothing following it except the
+     * stop notification itself. Ordered by started_at (microsecond
+     * precision), not created_at (second precision only, per
+     * tests/TestCase.php's agent_run_actions schema) -- two actions
+     * opened within the same run frequently share a created_at second.
+     */
+    private function assertNoActionFollowsTheRefusedAttemptExceptNotification(object $run): void
+    {
+        $actions = DB::table('agent_run_actions')
+            ->where('run_id', $run->id)
+            ->orderBy('started_at')
+            ->get();
+
+        $refusedIndex = null;
+        foreach ($actions as $index => $action) {
+            if ($action->action_type === ActionType::ToolInvocation->value && $action->outcome === ActionOutcome::Failure->value) {
+                $refusedIndex = $index;
+                break;
+            }
+        }
+        $this->assertNotNull($refusedIndex, 'the refused tool-call action must itself be recorded');
+
+        $after = $actions->slice($refusedIndex + 1)->values();
+        $this->assertCount(
+            1,
+            $after,
+            'no action may be attempted after the refused one, other than the stop notification itself -- the run must not skip ahead or substitute a different action',
+        );
+        $this->assertSame(
+            ActionType::Notification->value,
+            $after[0]->action_type,
+            'the only action after the refused attempt must be the stop notification',
+        );
+    }
+
     // -----------------------------------------------------------------
     // Row 1 / Edge Case 1 — unresolvable bound agent definition
     // -----------------------------------------------------------------
@@ -380,6 +418,11 @@ class UnattendedConfirmationRefusalJourneyTest extends TestCase
         $this->assertSame(RunEndState::StoppedEarly->value, $run->end_state);
 
         Event::assertDispatched(SchedulerTriggerRunRefused::class);
+
+        // The run genuinely stopped -- it did not skip ahead to try
+        // something else in place of the operation it was not permitted
+        // for (Acceptance Scenario 1/3).
+        $this->assertNoActionFollowsTheRefusedAttemptExceptNotification($run);
     }
 
     // -----------------------------------------------------------------
@@ -459,6 +502,13 @@ class UnattendedConfirmationRefusalJourneyTest extends TestCase
         $this->assertFalse($pending, 'an unattended run must never create a pending_confirmation message — there is no one present to answer it');
 
         Event::assertDispatched(SchedulerTriggerRunRefused::class);
+
+        // Not authorized means stopped, not improvised around -- the run
+        // did not attempt some other action in place of the one it was
+        // not authorized for.
+        $run = $this->latestRunFor($conversation);
+        $this->assertNotNull($run);
+        $this->assertNoActionFollowsTheRefusedAttemptExceptNotification($run);
     }
 
     // -----------------------------------------------------------------
