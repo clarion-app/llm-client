@@ -559,13 +559,20 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
             // Meta tools or unresolved non-meta tools: fall through to executeMetaTool
             if ($result === null) {
-                $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation);
+                $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId);
 
                 // Check if execute_operation needs confirmation
                 $decoded = json_decode($result, true);
                 if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
+                    // Read back the same way the synchronous
+                    // run()/resumeSync() pause-construction does —
+                    // 'api_call' is the existing default fallback,
+                    // 'scope_surface' a new value alongside it.
+                    $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
+
                     $pendingConfirmation = [
                         'tool_name' => 'execute_operation',
+                        'confirmation_type' => $confirmationType,
                         'operationId' => $decoded['operationId'],
                         'method' => $decoded['method'],
                         'path' => $decoded['path'],
@@ -580,6 +587,12 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         // pause never carried until now.
                         'action_id' => $toolActionId,
                     ];
+
+                    if ($confirmationType === 'scope_surface') {
+                        $pendingConfirmation['files_touched_so_far'] = $decoded['files_touched_so_far'] ?? [];
+                        $pendingConfirmation['would_add'] = $decoded['would_add'] ?? null;
+                        $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
+                    }
 
                     $toolData = [
                         'tool_calls' => $this->toolCalls,

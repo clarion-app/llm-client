@@ -950,6 +950,11 @@ return [
         // a killed run still reports status = completed with
         // timed_out = true, never a fourth ambiguous state.
         'test_timeout_seconds' => (int) env('LLM_CLIENT_CODING_AGENT_TEST_TIMEOUT_SECONDS', 120),
+
+        // How many distinct files a single run may touch (writeFile/deleteFile)
+        // before the next new file triggers a scope-surfacing confirmation
+        // instead of the ordinary per-file one.
+        'scope_surface_threshold_files' => (int) env('LLM_CLIENT_CODING_AGENT_SCOPE_SURFACE_THRESHOLD_FILES', 8),
     ],
 ];
 

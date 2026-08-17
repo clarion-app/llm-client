@@ -109,6 +109,7 @@ class AgentLoopService
     private ConversationAgentDefinitionResolver $agentDefinitionResolver;
     private EffectiveBoundResolver $effectiveBoundResolver;
     private TaskWorkspaceQuery $taskWorkspaceQuery;
+    private RunTraceQuery $runTraceQuery;
 
     public function __construct(
         McpToolRegistry $toolRegistry,
@@ -131,7 +132,8 @@ class AgentLoopService
         ?RunTraceRecorder $runTraceRecorder = null,
         ?ConversationAgentDefinitionResolver $agentDefinitionResolver = null,
         ?EffectiveBoundResolver $effectiveBoundResolver = null,
-        ?TaskWorkspaceQuery $taskWorkspaceQuery = null
+        ?TaskWorkspaceQuery $taskWorkspaceQuery = null,
+        ?RunTraceQuery $runTraceQuery = null
     ) {
         $this->toolRegistry = $toolRegistry;
         $this->toolExecutor = $toolExecutor;
@@ -154,6 +156,7 @@ class AgentLoopService
         $this->agentDefinitionResolver = $agentDefinitionResolver ?? new ConversationAgentDefinitionResolver(new AgentDefinitionParser());
         $this->effectiveBoundResolver = $effectiveBoundResolver ?? new EffectiveBoundResolver(new AgentHelperQuery(new AgentQuery(new AgentDefinitionParser()), new AgentDefinitionParser()));
         $this->taskWorkspaceQuery = $taskWorkspaceQuery ?? new TaskWorkspaceQuery(new ManagedTaskQuery());
+        $this->runTraceQuery = $runTraceQuery ?? new RunTraceQuery();
     }
 
     /**
@@ -499,6 +502,27 @@ class AgentLoopService
                 $toolData['tool_results'] = [
                     ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
                 ];
+            } elseif ($confirmationType === 'scope_surface') {
+                // Approving the aggregate scope acknowledgment never
+                // itself writes or deletes the file that triggered it —
+                // scope-surfacing is additive, never a replacement for the
+                // per-file gate. The tool result tells the model the scope
+                // was confirmed so it reissues that same file's operation,
+                // which this time reaches its own ordinary api_call
+                // confirmation (scopeSurfaceStateForRun() below is now
+                // marked surfaced for this run, via the action content
+                // this branch closes $inboundActionId with).
+                $resultContent = json_encode([
+                    'scope_confirmed' => true,
+                    'files_touched_so_far' => $pending['files_touched_so_far'] ?? [],
+                    'would_add' => $pending['would_add'] ?? null,
+                    'message' => 'Scope confirmed. Reissue the file operation to proceed with its own confirmation.',
+                ]);
+
+                $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
+                $toolData['tool_results'] = [
+                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
+                ];
             } else {
                 // Re-check the ancestor-chain bound at the moment of
                 // execution (100-subagent-tool-restrictions, FR-004/
@@ -556,11 +580,24 @@ class AgentLoopService
             ], true)
         ) {
             if ($approved) {
+                // An approved scope_surface confirmation is closed with a
+                // distinct content shape ({confirmation_type, approved})
+                // rather than the ordinary {operationId, path} change
+                // shape, so RunTraceQuery::scopeSurfaceStateForRun() can
+                // tell "this run already had its aggregate scope approved"
+                // apart from "this run has a confirmed file change" — the
+                // file itself was never written by this approval (no
+                // executeApiCall() call above), so recording it as a
+                // change would be wrong.
+                $content = $confirmationType === 'scope_surface'
+                    ? json_encode(['confirmation_type' => 'scope_surface', 'approved' => true])
+                    : ($apiCallExecuted ? $this->codingWorkspaceChangeActionContent($pending['operationId'], $pending['arguments'] ?? []) : null);
+
                 $this->runTraceRecorder->closeAction(
                     $inboundActionId,
                     ActionOutcome::Success,
                     null,
-                    $apiCallExecuted ? $this->codingWorkspaceChangeActionContent($pending['operationId'], $pending['arguments'] ?? []) : null,
+                    $content,
                 );
             } else {
                 $this->runTraceRecorder->closeAction(
@@ -1406,7 +1443,7 @@ class AgentLoopService
                     if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCallId, $batchDelegationResults)) {
                         $result = json_encode($batchDelegationResults[$toolCallId]);
                     } else {
-                        $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                        $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId);
                     }
                     $decoded = json_decode($result, true);
 
@@ -1431,10 +1468,16 @@ class AgentLoopService
                                 'expires_at' => $pendingConfirmation['expires_at'],
                             ];
                         } else {
-                            // Default: execute_operation (api_call)
+                            // Default: execute_operation (api_call), or its
+                            // scope_surface variant — same base shape, plus
+                            // the three extra scope fields when present.
+                            // $confirmationType is read back from $decoded
+                            // above rather than hard-coded, so a third
+                            // confirmation_type value survives the pause
+                            // unchanged.
                             $pendingConfirmation = [
                                 'tool_name' => 'execute_operation',
-                                'confirmation_type' => 'api_call',
+                                'confirmation_type' => $confirmationType,
                                 'operationId' => $decoded['operationId'],
                                 'method' => $decoded['method'],
                                 'path' => $decoded['path'],
@@ -1443,23 +1486,50 @@ class AgentLoopService
                             ];
 
                             $confirmationPayload = [
-                                'confirmation_type' => 'api_call',
+                                'confirmation_type' => $confirmationType,
                                 'operationId' => $decoded['operationId'],
                                 'method' => $decoded['method'],
                                 'path' => $decoded['path'],
                                 'arguments' => $decoded['parameters'] ?? [],
                                 'expires_at' => $pendingConfirmation['expires_at'],
                             ];
+
+                            if ($confirmationType === 'scope_surface') {
+                                $pendingConfirmation['files_touched_so_far'] = $decoded['files_touched_so_far'] ?? [];
+                                $pendingConfirmation['would_add'] = $decoded['would_add'] ?? null;
+                                $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
+
+                                $confirmationPayload['files_touched_so_far'] = $pendingConfirmation['files_touched_so_far'];
+                                $confirmationPayload['would_add'] = $pendingConfirmation['would_add'];
+                                $confirmationPayload['threshold'] = $pendingConfirmation['threshold'];
+                            }
                         }
 
                         // Close the tool action as awaiting confirmation and store
                         // action_id in tool_data for the resuming process (T029b).
+                        //
+                        // $activeActionId is deliberately NOT nulled out
+                        // here (unlike this method's other closeAction()
+                        // call sites) -- this branch returns immediately
+                        // below, so nulling it served no
+                        // double-close-prevention purpose and only
+                        // corrupted the action_id the pause message is
+                        // about to be stored with, a few lines down. That
+                        // silently broke resume()/resumeSync()'s "resolve
+                        // the inbound paused action" step for every run's
+                        // *first* confirmed write/delete (its action row
+                        // was left permanently awaiting_confirmation,
+                        // uncounted by
+                        // RunTraceQuery::changedFilesFromRunTrace()/
+                        // scopeSurfaceStateForRun()) -- found while testing
+                        // scope-surfacing's running file count, which
+                        // depends on every confirmed write actually being
+                        // recorded, starting with the first one.
                         if ($this->runTraceRecorder !== null && $activeActionId !== null) {
                             $this->runTraceRecorder->closeAction(
                                 $activeActionId,
                                 ActionOutcome::AwaitingConfirmation,
                             );
-                            $activeActionId = null;
                         }
 
                         // Store message with pending confirmation. The step stays
@@ -1748,7 +1818,31 @@ class AgentLoopService
         // only a real execution ever produces change-report content.
         $apiCallExecuted = false;
 
-        if ($approved) {
+        // Read back exactly like resume()'s identical variable,
+        // immediately above the same relative point in that sibling
+        // method — resumeSync() has no declarative_memory branch of its
+        // own, but does need to recognize a scope_surface pause so
+        // approving it never executes the underlying operation.
+        $confirmationType = $pending['confirmation_type'] ?? 'api_call';
+
+        if ($approved && $confirmationType === 'scope_surface') {
+            // See resume()'s identical branch for the full rationale:
+            // approving the aggregate scope acknowledgment never itself
+            // writes or deletes the file that triggered it — it only lets
+            // the loop continue so the model reissues that file's own
+            // operation, which this time reaches its ordinary per-file
+            // confirmation.
+            $resultContent = json_encode([
+                'scope_confirmed' => true,
+                'files_touched_so_far' => $pending['files_touched_so_far'] ?? [],
+                'would_add' => $pending['would_add'] ?? null,
+                'message' => 'Scope confirmed. Reissue the file operation to proceed with its own confirmation.',
+            ]);
+
+            $toolData['tool_results'] = [
+                ['tool_call_id' => $toolCallId, 'content' => $resultContent],
+            ];
+        } elseif ($approved) {
             try {
                 // See resume()'s identical re-check, immediately above the
                 // same relative point in that sibling method
@@ -1808,16 +1902,22 @@ class AgentLoopService
         // a safe no-op per contract C13.
         if ($this->runTraceRecorder !== null && $inboundActionId !== null) {
             if ($approved) {
-                // 112-coding-agent (US1, data-model.md §6): a null content
-                // for any operationId other than the two coding-workspace
-                // mutations, identical to today's behavior — this only
-                // changes what gets recorded for those two, and only when
-                // executeApiCall() genuinely ran ($apiCallExecuted).
+                // A null content for any operationId other than the two
+                // coding-workspace mutations, identical to today's
+                // behavior. For those two, a scope_surface approval is
+                // closed with its own distinct content shape (never the
+                // ordinary change shape, since no write/delete actually
+                // ran) so RunTraceQuery::scopeSurfaceStateForRun() can
+                // tell the two apart — see resume()'s identical branch.
+                $content = $confirmationType === 'scope_surface'
+                    ? json_encode(['confirmation_type' => 'scope_surface', 'approved' => true])
+                    : ($apiCallExecuted ? $this->codingWorkspaceChangeActionContent($pending['operationId'] ?? '', $pending['arguments'] ?? []) : null);
+
                 $this->runTraceRecorder->closeAction(
                     $inboundActionId,
                     ActionOutcome::Success,
                     null,
-                    $apiCallExecuted ? $this->codingWorkspaceChangeActionContent($pending['operationId'] ?? '', $pending['arguments'] ?? []) : null,
+                    $content,
                 );
             } else {
                 $this->runTraceRecorder->closeAction(
@@ -2053,7 +2153,7 @@ class AgentLoopService
                 if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCall['id'] ?? '', $batchDelegationResults)) {
                     $result = json_encode($batchDelegationResults[$toolCall['id'] ?? '']);
                 } else {
-                    $result = $this->executeMetaTool($toolName, $arguments, $conversation);
+                    $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId);
                 }
                 $decoded = json_decode($result, true);
 
@@ -2078,10 +2178,13 @@ class AgentLoopService
                             'expires_at' => $pendingConfirmation['expires_at'],
                         ];
                     } else {
-                        // Default: execute_operation (api_call)
+                        // Default: execute_operation (api_call), or its
+                        // scope_surface variant — see run()'s identical
+                        // construction, immediately above the same
+                        // relative point in that sibling method.
                         $pendingConfirmation = [
                             'tool_name' => 'execute_operation',
-                            'confirmation_type' => 'api_call',
+                            'confirmation_type' => $confirmationType,
                             'operationId' => $decoded['operationId'],
                             'method' => $decoded['method'],
                             'path' => $decoded['path'],
@@ -2090,13 +2193,23 @@ class AgentLoopService
                         ];
 
                         $confirmationPayload = [
-                            'confirmation_type' => 'api_call',
+                            'confirmation_type' => $confirmationType,
                             'operationId' => $decoded['operationId'],
                             'method' => $decoded['method'],
                             'path' => $decoded['path'],
                             'arguments' => $decoded['parameters'] ?? [],
                             'expires_at' => $pendingConfirmation['expires_at'],
                         ];
+
+                        if ($confirmationType === 'scope_surface') {
+                            $pendingConfirmation['files_touched_so_far'] = $decoded['files_touched_so_far'] ?? [];
+                            $pendingConfirmation['would_add'] = $decoded['would_add'] ?? null;
+                            $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
+
+                            $confirmationPayload['files_touched_so_far'] = $pendingConfirmation['files_touched_so_far'];
+                            $confirmationPayload['would_add'] = $pendingConfirmation['would_add'];
+                            $confirmationPayload['threshold'] = $pendingConfirmation['threshold'];
+                        }
                     }
 
                     // Close the tool action as awaiting confirmation and store
@@ -2979,11 +3092,11 @@ class AgentLoopService
         ));
     }
 
-    public function executeMetaTool(string $toolName, array $arguments, Conversation $conversation): string
+    public function executeMetaTool(string $toolName, array $arguments, Conversation $conversation, ?string $runId = null): string
     {
         return match ($toolName) {
             'list_applications' => $this->handleListApplications(),
-            'execute_operation' => $this->handleExecuteOperation($arguments, $conversation),
+            'execute_operation' => $this->handleExecuteOperation($arguments, $conversation, $runId),
             'search_operations' => $this->handleSearchOperations($arguments, $conversation),
             'memory_create' => $this->handleMemoryCreate($arguments, $conversation),
             'memory_read' => $this->handleMemoryRead($arguments, $conversation),
@@ -3279,7 +3392,7 @@ class AgentLoopService
             ->all();
     }
 
-    private function handleExecuteOperation(array $arguments, Conversation $conversation): string
+    private function handleExecuteOperation(array $arguments, Conversation $conversation, ?string $runId = null): string
     {
         $operationId = $arguments['operationId'] ?? '';
         if (empty($operationId)) {
@@ -3379,9 +3492,23 @@ class AgentLoopService
         }
 
         if ($validation['status'] === 'confirm') {
+            // For the two coding-workspace mutations only, surface the
+            // run's aggregate scope BEFORE the ordinary per-file marker
+            // below, when admitting this file would newly cross
+            // scope_surface_threshold_files and this run has not already
+            // had an approved scope_surface confirmation. Additive, never
+            // a replacement — a run whose actual scope never crosses the
+            // threshold falls straight through to the ordinary marker
+            // exactly as before.
+            $scopeSurfaceMarker = $this->codingWorkspaceScopeSurfaceMarker($operationId, $method, $pathTemplate, $params, $runId, $conversation);
+            if ($scopeSurfaceMarker !== null) {
+                return $scopeSurfaceMarker;
+            }
+
             // Return a special marker — the stream handler will detect this and suspend
             return json_encode([
                 '__requires_confirmation' => true,
+                'confirmation_type' => 'api_call',
                 'operationId' => $operationId,
                 'method' => $method,
                 'path' => $pathTemplate,
@@ -3391,6 +3518,64 @@ class AgentLoopService
 
         // Execute directly
         return $this->executeApiCall($operationId, $method, $pathTemplate, $params, $conversation);
+    }
+
+    /**
+     * The scope-surfacing check layered in front of the ordinary per-file
+     * writeFile/deleteFile confirmation marker. Returns the
+     * scope_surface-typed marker JSON when admitting this call's own
+     * target file would newly cross
+     * config('llm-client.coding_agent.scope_surface_threshold_files') and
+     * this run has not already had an approved scope_surface
+     * confirmation (RunTraceQuery::scopeSurfaceStateForRun()); returns
+     * null otherwise, so the caller falls through to the ordinary
+     * api_call marker unchanged (both for every non-mutation operation
+     * and for a run whose actual scope never crosses the threshold).
+     *
+     * A null $runId (no run trace recorder configured, or a call outside
+     * a tracked run) is treated the same as "nothing touched yet" would
+     * be pointless to query — scope-surfacing is simply skipped, exactly
+     * as every other run-trace-derived feature in this class degrades
+     * when $this->runTraceRecorder/$runId is unavailable.
+     */
+    private function codingWorkspaceScopeSurfaceMarker(string $operationId, string $method, string $pathTemplate, array $params, ?string $runId, Conversation $conversation): ?string
+    {
+        if ($runId === null) {
+            return null;
+        }
+
+        if ($operationId !== self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID) {
+            return null;
+        }
+
+        $filePath = $params['body']['path'] ?? $params['query']['path'] ?? null;
+        if (!is_string($filePath) || $filePath === '') {
+            return null;
+        }
+
+        $state = $this->runTraceQuery->scopeSurfaceStateForRun((string) $conversation->user_id, $runId);
+        if ($state['already_surfaced']) {
+            return null;
+        }
+
+        $threshold = (int) config('llm-client.coding_agent.scope_surface_threshold_files', 8);
+        $touchedCount = count($state['touched_paths']);
+        if (($touchedCount + 1) <= $threshold) {
+            return null;
+        }
+
+        return json_encode([
+            '__requires_confirmation' => true,
+            'confirmation_type' => 'scope_surface',
+            'operationId' => $operationId,
+            'method' => $method,
+            'path' => $pathTemplate,
+            'parameters' => $params,
+            'files_touched_so_far' => $state['touched_paths'],
+            'would_add' => $filePath,
+            'threshold' => $threshold,
+        ]);
     }
 
     /**

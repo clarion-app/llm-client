@@ -411,6 +411,50 @@ class RunTraceQuery
     }
 
     /**
+     * The scope-surfacing running state for a run.
+     *
+     * `touched_paths` reuses changedFilesFromRunTrace()'s own distinct,
+     * confirmed-and-executed writeFile/deleteFile paths for this run — a
+     * file only counts once it has actually been approved and applied,
+     * never while its own confirmation is still pending. `already_surfaced`
+     * scans this run's actions for a prior *approved* scope_surface
+     * confirmation, recorded by AgentLoopService::resume()/resumeSync() as
+     * a distinct action-content shape ({confirmation_type: 'scope_surface',
+     * approved: true}) once the user has approved that marker — so a run
+     * is only ever asked once, at the point it first crosses the
+     * threshold. Both are derived from existing AgentRunAction rows; no
+     * new column/table.
+     *
+     * @return array{touched_paths: list<string>, already_surfaced: bool}
+     */
+    public function scopeSurfaceStateForRun(string $callerUserId, string $runId): array
+    {
+        $touchedPaths = array_column($this->changedFilesFromRunTrace($callerUserId, $runId), 'path');
+
+        $alreadySurfaced = false;
+        foreach ($this->actionsForRun($callerUserId, $runId) as $action) {
+            if (($action['type'] ?? null) !== 'tool_invocation') {
+                continue;
+            }
+
+            $content = $action['content'] ?? null;
+            if ($content === null) {
+                continue;
+            }
+
+            $decoded = json_decode($content, true);
+            if (is_array($decoded)
+                && ($decoded['confirmation_type'] ?? null) === 'scope_surface'
+                && ($decoded['approved'] ?? false) === true) {
+                $alreadySurfaced = true;
+                break;
+            }
+        }
+
+        return ['touched_paths' => $touchedPaths, 'already_surfaced' => $alreadySurfaced];
+    }
+
+    /**
      * Get child actions of a given action (user ownership filter via run JOIN).
      *
      * @return array<int, array{
