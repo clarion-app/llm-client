@@ -5,18 +5,25 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
+use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\AgentDefinitionParser;
+use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\AgentService;
 use ClarionApp\LlmClient\Services\DataAgentProvisioner;
 use ClarionApp\LlmClient\Services\GitDefinitionFileReader;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
+use ClarionApp\LlmClient\Services\McpToolRegistry;
+use ClarionApp\LlmClient\Services\OperationCache;
+use ClarionApp\LlmClient\Services\StructuredOutputPresetRegistry;
 use ClarionApp\LlmClient\ValueObjects\AgentDefinition;
 use Dedoc\Scramble\Generator;
 use Illuminate\Database\Schema\Blueprint;
@@ -186,6 +193,33 @@ class DataAgentDefinitionTest extends TestCase
         $prop = (new \ReflectionClass(ApiManager::class))->getProperty('apiDocsCache');
         $prop->setAccessible(true);
         $prop->setValue(null, null);
+    }
+
+    /**
+     * Builds an AgentLoopService whose LlmProvider is scripted to return a
+     * single plain reply (no tool calls) -- used to prove the tool-call-
+     * free-turn mechanism the "Ambiguous questions" instructions rest on.
+     * Mirrors DataAgentAccessScopingTest's own service() helper.
+     */
+    private function serviceWithPlainReply(string $content): AgentLoopService
+    {
+        $provider = Mockery::mock(LlmProvider::class);
+        $provider->shouldReceive('chat')->andReturn([
+            'choices' => [['message' => ['content' => $content, 'tool_calls' => []]]],
+        ]);
+        $provider->shouldReceive('countTokens')->andReturnUsing(fn ($t) => (int) ceil(strlen((string) $t) / 4));
+
+        $registry = Mockery::mock(ProviderRegistry::class);
+        $registry->shouldReceive('resolve')->andReturn($provider);
+        $registry->shouldReceive('resolveByType')->andReturn($provider);
+
+        return new AgentLoopService(
+            app(McpToolRegistry::class),
+            app(McpToolExecutor::class),
+            app(OperationCache::class),
+            $registry,
+            presetRegistry: app(StructuredOutputPresetRegistry::class),
+        );
     }
 
     // ---------------------------------------------------------------
@@ -516,6 +550,124 @@ class DataAgentDefinitionTest extends TestCase
             'or silently attempt either.',
             $instructions,
             'silently attempting the out-of-scope part of a bundled request must be explicitly forbidden',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // An ambiguous question is clarified, not guessed at: the mechanism
+    // (an ordinary tool-call-free assistant turn) already exists and is
+    // unaffected by this feature; the policy (when to use it) is carried
+    // entirely by the template's own instructions text.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_tool_call_free_turn_ends_the_run_with_no_pending_confirmation(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.index' => ['path' => '/api/contacts', 'method' => 'get', 'summary' => 'List contacts'],
+        ]);
+
+        $agent = $this->provisioner()->ensureForUser($this->user->id);
+
+        $server = Server::create([
+            'name' => 'DataServer',
+            'server_url' => 'https://api.openai.com/v1/chat/completions',
+            'token' => 'test-token',
+        ]);
+
+        $conversation = Conversation::create([
+            'user_id' => $this->user->id,
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+            'character' => 'Clarion',
+            'title' => 'Already titled',
+            'agent_id' => $agent->id,
+            'agent_version_id' => $agent->current_version_id,
+        ]);
+
+        $service = $this->serviceWithPlainReply('Do you mean the sales total or the refund total?');
+
+        $result = $service->run($conversation, 'What is the total?');
+
+        $this->assertSame(
+            'completed',
+            $result['status'],
+            'a tool-call-free assistant turn must end the run/turn on its own -- this is the ordinary mechanism the "Ambiguous questions" instructions rest on (D8), not a new pause state',
+        );
+
+        $conversation->refresh();
+        $this->assertFalse(
+            $conversation->is_processing,
+            'is_processing must be cleared once a tool-call-free turn completes -- the conversation is immediately usable again, exactly like any other reply',
+        );
+
+        $message = Message::where('conversation_id', $conversation->id)
+            ->where('role', 'assistant')
+            ->latest('id')
+            ->first();
+        $this->assertNotNull($message, 'the tool-call-free turn must have produced an assistant reply');
+        $this->assertNull(
+            $message->tool_data,
+            'a tool-call-free turn must never leave a pending-confirmation (or any other tool-call) state behind -- there is no tool call to confirm',
+        );
+    }
+
+    #[Test]
+    public function the_template_requires_clarifying_before_answering_ambiguous_questions(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'ask a clarifying question',
+            $instructions,
+            'a genuinely, materially ambiguous question must be required to be met with a clarifying question',
+        );
+        $this->assertStringContainsString(
+            'before querying anything, rather than picking one reading and answering',
+            $instructions,
+            'the clarifying question must be required before any tool call or answer, never a silently assumed interpretation',
+        );
+        $this->assertStringContainsString(
+            'as if it were the only one. Ask in your reply; do not call an operation',
+            $instructions,
+            'the clarifying question must be required to be asked in the reply itself, with no operation called that turn',
+        );
+        $this->assertStringContainsString(
+            'this turn.',
+            $instructions,
+            'the "no operation this turn" requirement must be stated explicitly',
+        );
+        $this->assertStringContainsString(
+            'Once the user clarifies, answer the clarified question and state which',
+            $instructions,
+            'once clarified, the agent must be required to answer the clarified question',
+        );
+        $this->assertStringContainsString(
+            'interpretation you answered.',
+            $instructions,
+            'once clarified, the agent must be required to state which interpretation it answered',
+        );
+    }
+
+    #[Test]
+    public function instructions_require_answering_directly_when_only_one_reading_is_reasonable(): void
+    {
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'When a question has only one reasonable reading, answer directly',
+            $instructions,
+            'a question with only one reasonable reading must be required to be answered directly, with no clarification detour',
+        );
+        $this->assertStringContainsString(
+            'clarification is for genuine, materially different ambiguity, not for',
+            $instructions,
+            'clarification must be scoped to genuine, materially different ambiguity',
+        );
+        $this->assertStringContainsString(
+            'every question that could theoretically be read two ways.',
+            $instructions,
+            'clarification must be explicitly required NOT to be triggered by every question that could theoretically be read two ways',
         );
     }
 }
