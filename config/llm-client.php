@@ -940,5 +940,16 @@ return [
         // caller.
         'lock_wait' => (int) env('LLM_CLIENT_TASK_WORKSPACE_LOCK_WAIT', 3),
     ],
+
+    // Coding Agent (112-coding-agent) — namespaced separately from
+    // agent_definitions.kinds above (that block belongs to the unrelated
+    // 089-agent-scaffolding-cli CLI-kind registry; see tasks.md Grounding
+    // note 15).
+    'coding_agent' => [
+        // codingWorkspace.runTests's process timeout (contracts §3, D5) —
+        // a killed run still reports status = completed with
+        // timed_out = true, never a fourth ambiguous state.
+        'test_timeout_seconds' => (int) env('LLM_CLIENT_CODING_AGENT_TEST_TIMEOUT_SECONDS', 120),
+    ],
 ];
 

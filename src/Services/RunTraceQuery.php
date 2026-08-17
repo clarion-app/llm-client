@@ -10,6 +10,12 @@ use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use Illuminate\Support\Facades\DB;
 
+// AgentLoopService is referenced only for its two public
+// CODING_WORKSPACE_*_OPERATION_ID constants (112-coding-agent, US1,
+// data-model.md §6) — no instance is constructed or injected, so this
+// does not introduce a real service-level dependency between the two
+// classes.
+
 class RunTraceQuery
 {
     /**
@@ -337,6 +343,71 @@ class RunTraceQuery
         }
 
         return $urls;
+    }
+
+    /**
+     * The run-trace fallback half of the coding agent's change-report
+     * derivation for a non-git-backed project (112-coding-agent, US1,
+     * data-model.md §6, contracts/coding-workspace-operations.md §2).
+     *
+     * Ownership is checked by delegating to actionsForRun(), which
+     * compares agent_runs.user_id before returning any rows — a run id
+     * alone never grants access to another user's actions. Filters to
+     * this run's confirmed codingWorkspace.writeFile/deleteFile tool
+     * invocations — recorded with their operationId and target path as
+     * the action's own content once approved and executed
+     * (AgentLoopService::resume()/resumeSync(),
+     * codingWorkspaceChangeActionContent()) — and returns the distinct
+     * {path, operation} pairs actually confirmed and executed,
+     * most-recent-wins per path (actionsForRun() orders by started_at
+     * ascending, so a later row for the same path overwrites an earlier
+     * one). A declined confirmation is never recorded with a decodable
+     * content payload (executeApiCall() is never invoked for it), so it
+     * never appears here.
+     *
+     * @return list<array{path: string, operation: 'writeFile'|'deleteFile'}>
+     */
+    public function changedFilesFromRunTrace(string $callerUserId, string $runId): array
+    {
+        $byPath = [];
+
+        foreach ($this->actionsForRun($callerUserId, $runId) as $action) {
+            if (($action['type'] ?? null) !== 'tool_invocation') {
+                continue;
+            }
+            if (($action['target'] ?? null) !== 'execute_operation') {
+                continue;
+            }
+
+            $content = $action['content'] ?? null;
+            if ($content === null) {
+                continue;
+            }
+
+            $decoded = json_decode($content, true);
+            if (!is_array($decoded)) {
+                continue;
+            }
+
+            $path = $decoded['path'] ?? null;
+            if (!is_string($path) || $path === '') {
+                continue;
+            }
+
+            $operation = match ($decoded['operationId'] ?? null) {
+                AgentLoopService::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID => 'writeFile',
+                AgentLoopService::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID => 'deleteFile',
+                default => null,
+            };
+
+            if ($operation === null) {
+                continue;
+            }
+
+            $byPath[$path] = ['path' => $path, 'operation' => $operation];
+        }
+
+        return array_values($byPath);
     }
 
     /**

@@ -571,6 +571,14 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         'path' => $decoded['path'],
                         'arguments' => $decoded['parameters'] ?? [],
                         'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                        // 112-coding-agent (US1, data-model.md §6): lets
+                        // AgentLoopService::resume() resolve the exact
+                        // ToolInvocation action this confirmation paused
+                        // once approved/declined — mirrors the synchronous
+                        // run()/resumeSync() pair's existing action_id
+                        // round-trip (T029b/T029c), which the streaming
+                        // pause never carried until now.
+                        'action_id' => $toolActionId,
                     ];
 
                     $toolData = [

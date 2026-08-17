@@ -76,6 +76,18 @@ class AgentLoopService
      */
     private const CODING_WORKSPACE_OPERATION_PREFIX = 'clarionApp.llmClient.codingWorkspace.';
 
+    /**
+     * Resolved operationId strings (112-coding-agent, tasks.md T013) for
+     * the two confirmed file mutations. Public, mirroring
+     * PAGE_TEXT_OPERATION_ID's own visibility, because RunTraceQuery's
+     * run-trace change-report fallback (US1, data-model.md §6) reads the
+     * same identifiers back out of the action content these two
+     * operationIds are recorded under (see
+     * codingWorkspaceChangeActionContent() below).
+     */
+    public const CODING_WORKSPACE_WRITE_FILE_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.writeFile';
+    public const CODING_WORKSPACE_DELETE_FILE_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.deleteFile';
+
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
@@ -424,6 +436,15 @@ class AgentLoopService
         $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
+        // 112-coding-agent (US1, data-model.md §6): only ever set by the
+        // default execute_operation/api_call pause branch in
+        // AgentLoopStreamHandler (which now stores it alongside run_id/
+        // step_id). Used narrowly below to resolve the coding-workspace
+        // ToolInvocation action this confirmation paused, so the
+        // run-trace change-report fallback has a real path/operationId to
+        // read back once the call is approved and executed.
+        $inboundActionId = $toolData['action_id'] ?? null;
+
         // Close the step that spanned the confirmation pause, recording the human
         // wait portion (FR-004, SC-012). The continuation's own step is opened by
         // dispatchStreamRequest() below, so the streamed path records the same
@@ -439,6 +460,14 @@ class AgentLoopService
         }
 
         $confirmationType = $pending['confirmation_type'] ?? 'api_call';
+
+        // 112-coding-agent (US1, data-model.md §6): see resumeSync()'s
+        // identical tracking variable, immediately above the same
+        // relative point in that sibling method — a chain-check rejection
+        // below (approved by the user, but blocked by a since-narrowed
+        // ancestor permission) must never be recorded as an executed
+        // change either.
+        $apiCallExecuted = false;
 
         if ($approved) {
             if ($confirmationType === 'declarative_memory') {
@@ -497,6 +526,7 @@ class AgentLoopService
                         $pending['arguments'] ?? [],
                         $conversation
                     );
+                    $apiCallExecuted = true;
                 }
 
                 $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
@@ -508,6 +538,37 @@ class AgentLoopService
             $toolData['tool_results'] = [
                 ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'],
             ];
+        }
+
+        // 112-coding-agent (US1, data-model.md §6): resolve the inbound
+        // coding-workspace ToolInvocation action this confirmation paused
+        // — scoped narrowly to the two mutation operationIds so every
+        // other confirmed operation's behavior on this (streaming,
+        // production) path is completely unchanged; $inboundActionId is
+        // only ever non-null for the api_call branch AgentLoopStreamHandler
+        // now stamps it on. Mirrors resumeSync()'s own resolution of its
+        // inbound action, immediately above the same relative point in
+        // that sibling method.
+        if ($this->runTraceRecorder !== null && $inboundActionId !== null
+            && in_array($pending['operationId'] ?? '', [
+                self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID,
+                self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID,
+            ], true)
+        ) {
+            if ($approved) {
+                $this->runTraceRecorder->closeAction(
+                    $inboundActionId,
+                    ActionOutcome::Success,
+                    null,
+                    $apiCallExecuted ? $this->codingWorkspaceChangeActionContent($pending['operationId'], $pending['arguments'] ?? []) : null,
+                );
+            } else {
+                $this->runTraceRecorder->closeAction(
+                    $inboundActionId,
+                    ActionOutcome::Failure,
+                    'User declined',
+                );
+            }
         }
 
         $toolData['pending_confirmation'] = null;
@@ -1680,6 +1741,13 @@ class AgentLoopService
             }
         }
 
+        // 112-coding-agent (US1, data-model.md §6): tracks whether
+        // executeApiCall() genuinely ran, so a chain-check rejection below
+        // (approved by the user, but blocked by a since-narrowed ancestor
+        // permission) is never recorded as an executed change either —
+        // only a real execution ever produces change-report content.
+        $apiCallExecuted = false;
+
         if ($approved) {
             try {
                 // See resume()'s identical re-check, immediately above the
@@ -1703,6 +1771,7 @@ class AgentLoopService
                         $pending['arguments'] ?? [],
                         $conversation
                     );
+                    $apiCallExecuted = true;
                 }
 
                 // Record the confirmed operation's outcome (fire-and-forget).
@@ -1739,9 +1808,16 @@ class AgentLoopService
         // a safe no-op per contract C13.
         if ($this->runTraceRecorder !== null && $inboundActionId !== null) {
             if ($approved) {
+                // 112-coding-agent (US1, data-model.md §6): a null content
+                // for any operationId other than the two coding-workspace
+                // mutations, identical to today's behavior — this only
+                // changes what gets recorded for those two, and only when
+                // executeApiCall() genuinely ran ($apiCallExecuted).
                 $this->runTraceRecorder->closeAction(
                     $inboundActionId,
                     ActionOutcome::Success,
+                    null,
+                    $apiCallExecuted ? $this->codingWorkspaceChangeActionContent($pending['operationId'] ?? '', $pending['arguments'] ?? []) : null,
                 );
             } else {
                 $this->runTraceRecorder->closeAction(
@@ -3343,6 +3419,43 @@ class AgentLoopService
         }
 
         return null;
+    }
+
+    /**
+     * 112-coding-agent (US1, data-model.md §6): the action content a
+     * confirmed writeFile/deleteFile call is closed with once approved and
+     * executed, so RunTraceQuery's run-trace change-report fallback
+     * (RunTraceQuery::changedFilesFromRunTrace()) can read the operationId
+     * and target path back out of the run trace for a non-git-backed
+     * project — mirroring the existing PAGE_TEXT_OPERATION_ID
+     * envelope-content precedent (executeApiCall()), but scoped to
+     * exactly these two operationIds so every other confirmed operation's
+     * action content is completely unaffected.
+     *
+     * $arguments is the confirmed call's own {path, query, body}
+     * parameters (the same shape enforceCodingProjectBinding() reads
+     * `path.project` from) — writeFile carries its target file path under
+     * `body.path` (contracts §2 body {path, content}), deleteFile under
+     * `query.path` (contracts §2 query path).
+     *
+     * Returns null for any other operationId, and is only ever called
+     * from the approved branch of resume()/resumeSync() — a declined
+     * confirmation never reaches this, and never executeApiCall(), so it
+     * is never recorded as an executed change (data-model.md §6).
+     */
+    private function codingWorkspaceChangeActionContent(string $operationId, array $arguments): ?string
+    {
+        if ($operationId !== self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID) {
+            return null;
+        }
+
+        $path = $arguments['body']['path'] ?? $arguments['query']['path'] ?? null;
+        if (!is_string($path) || $path === '') {
+            return null;
+        }
+
+        return json_encode(['operationId' => $operationId, 'path' => $path]);
     }
 
     /**
