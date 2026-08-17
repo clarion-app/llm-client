@@ -32,10 +32,25 @@ class ActionTypeTest extends TestCase
     }
 
     /** @test */
-    public function has_exactly_four_cases(): void
+    public function has_notification_case(): void
+    {
+        $this->assertEquals('notification', ActionType::Notification->value);
+    }
+
+    /**
+     * Deliberately exact. Adding a case must break this test, because a new
+     * case is never a PHP-only change: agent_run_actions.action_type is an
+     * ENUM in production and a CHECK-constrained column in the suite's two
+     * hand-declared SQLite schemas, and a case added without widening all
+     * three fails its INSERT silently inside openAction()'s try/catch. That
+     * has already happened once here, to ActionType::Delegation.
+     *
+     * @test
+     */
+    public function has_exactly_five_cases(): void
     {
         $cases = ActionType::cases();
-        $this->assertCount(4, $cases);
+        $this->assertCount(5, $cases);
     }
 
     /** @test */
@@ -45,6 +60,7 @@ class ActionTypeTest extends TestCase
         $this->assertIsString(ActionType::ToolInvocation->value);
         $this->assertIsString(ActionType::ContextReshape->value);
         $this->assertIsString(ActionType::Delegation->value);
+        $this->assertIsString(ActionType::Notification->value);
     }
 
     /** @test */
@@ -54,6 +70,7 @@ class ActionTypeTest extends TestCase
         $this->assertSame(ActionType::ToolInvocation, ActionType::from('tool_invocation'));
         $this->assertSame(ActionType::ContextReshape, ActionType::from('context_reshape'));
         $this->assertSame(ActionType::Delegation, ActionType::from('delegation'));
+        $this->assertSame(ActionType::Notification, ActionType::from('notification'));
     }
 
     /** @test */

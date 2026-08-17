@@ -8,4 +8,5 @@ enum ActionType: string
     case ToolInvocation = 'tool_invocation';
     case ContextReshape = 'context_reshape';
     case Delegation     = 'delegation';
+    case Notification   = 'notification';
 }

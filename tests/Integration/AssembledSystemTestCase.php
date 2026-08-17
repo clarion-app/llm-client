@@ -247,7 +247,16 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->uuid('id')->primary();
                 $table->uuid('run_id');
                 $table->uuid('step_id');
-                $table->enum('action_type', ['llm_request', 'tool_invocation', 'context_reshape']);
+                // Kept in step with the agent_run_actions ENUM in production
+                // (see the add_*_to_agent_run_actions_action_type_enum
+                // migrations) and with tests/TestCase.php's own declaration of
+                // this table. This list had fallen behind by one value:
+                // 'delegation' was never added here, so every
+                // ActionType::Delegation INSERT made by a test extending this
+                // base class was rejected by SQLite's CHECK constraint and
+                // swallowed by openAction()'s try/catch. Both missing values
+                // are restored together.
+                $table->enum('action_type', ['llm_request', 'tool_invocation', 'context_reshape', 'delegation', 'notification']);
                 $table->string('target', 256)->nullable();
                 $table->uuid('attempt_group_id')->nullable();
                 $table->uuid('parent_action_id')->nullable();

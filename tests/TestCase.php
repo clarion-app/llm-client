@@ -170,10 +170,12 @@ abstract class TestCase extends BaseTestCase
                 $table->string('routing_reason', 16)->nullable();
                 $table->timestamp('routing_disclosed_at')->nullable();
                 $table->uuid('coding_project_id')->nullable();
+                $table->uuid('scheduler_trigger_id')->nullable();
                 $table->index('user_id');
                 $table->index('agent_id');
                 $table->index('agent_version_id');
                 $table->index('coding_project_id');
+                $table->index('scheduler_trigger_id');
             });
         }
 
@@ -190,6 +192,53 @@ abstract class TestCase extends BaseTestCase
                 $table->softDeletes();
 
                 $table->index('user_id');
+            });
+        }
+
+        // scheduler_triggers table — the SQLite counterpart of
+        // create_scheduler_triggers_table. Kept column-for-column in step with
+        // that migration: a divergence between the two is exactly the class of
+        // defect that left agent_run_actions.action_type without 'delegation'
+        // for an entire feature's lifetime.
+        if (!Schema::hasTable('scheduler_triggers')) {
+            Schema::create('scheduler_triggers', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id');
+                $table->uuid('agent_id');
+                $table->string('name');
+                $table->enum('kind', ['schedule', 'condition']);
+                $table->string('schedule_expression')->nullable();
+                $table->string('condition_operation_id')->nullable();
+                $table->string('condition_path')->nullable();
+                $table->enum('condition_comparator', ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains'])->nullable();
+                $table->string('condition_value')->nullable();
+                $table->boolean('last_condition_state')->nullable();
+                $table->timestamp('last_evaluated_at')->nullable();
+                $table->text('defined_work');
+                $table->integer('retry_limit');
+                $table->boolean('is_active')->default(true);
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index('user_id');
+                $table->index('agent_id');
+            });
+        }
+
+        // scheduler_trigger_firings table — the dedup latch. The unique index
+        // below is the whole guarantee, so it is declared here too: without
+        // it, every test of duplicate firing would pass vacuously against a
+        // table that cannot actually reject a duplicate.
+        if (!Schema::hasTable('scheduler_trigger_firings')) {
+            Schema::create('scheduler_trigger_firings', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('trigger_id');
+                $table->string('fire_key');
+                $table->uuid('run_id')->nullable();
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->unique(['trigger_id', 'fire_key'], 'scheduler_trigger_firings_latch_unique');
+                $table->index('run_id');
             });
         }
 
@@ -575,7 +624,12 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('id')->primary();
                 $table->uuid('run_id');
                 $table->uuid('step_id');
-                $table->enum('action_type', ['llm_request', 'tool_invocation', 'context_reshape', 'delegation']);
+                // Kept in step with the agent_run_actions ENUM in production
+                // (see the add_*_to_agent_run_actions_action_type_enum
+                // migrations). SQLite renders this as a CHECK constraint, so
+                // a value missing here is genuinely rejected at INSERT time
+                // rather than quietly accepted.
+                $table->enum('action_type', ['llm_request', 'tool_invocation', 'context_reshape', 'delegation', 'notification']);
                 $table->string('target', 256)->nullable();
                 $table->uuid('attempt_group_id')->nullable();
                 $table->uuid('parent_action_id')->nullable();
