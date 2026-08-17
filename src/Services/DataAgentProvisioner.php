@@ -27,7 +27,7 @@ class DataAgentProvisioner
     private const AGENT_NAME = 'data';
 
     /** The template is the single source of truth. */
-    private const TEMPLATE_PATH = __DIR__.'/../Templates/data.yaml';
+    public const TEMPLATE_PATH = __DIR__.'/../Templates/data.yaml';
 
     public function __construct(
         private readonly AgentService $agentService,

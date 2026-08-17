@@ -249,6 +249,9 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
         // Register built-in ready-made agent kinds (089-agent-scaffolding-cli)
         $this->registerAgentKinds();
+
+        // Register built-in ready-made agent starting points
+        $this->registerAgentStartingPoints();
     }
 
     public function register(): void
@@ -751,6 +754,16 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Services\AgentKindRegistry::class, function () {
             return new \ClarionApp\LlmClient\Services\AgentKindRegistry();
         });
+
+        // AgentStartingPointCatalog holds only its validator collaborator
+        // and in-memory, boot-time-registered AgentStartingPoint value
+        // objects -- safe as singleton() for the identical reason as
+        // AgentKindRegistry above.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\AgentStartingPointCatalog::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\AgentStartingPointCatalog(
+                $app->make(\ClarionApp\LlmClient\Services\AgentDefinitionValidator::class)
+            );
+        });
     }
 
     /**
@@ -844,6 +857,50 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         foreach ($kinds as $slug => $factory) {
             if (in_array($slug, $enabled, true)) {
                 $registry->register($factory());
+            }
+        }
+    }
+
+    /**
+     * Register built-in ready-made agent starting points with the
+     * catalog. Adding a fifth starting point costs one new YAML file
+     * under src/Templates/ plus one new entry here -- zero change to the
+     * listing controller, the creation controller, or
+     * AgentStartingPointCatalog itself.
+     */
+    protected function registerAgentStartingPoints(): void
+    {
+        $catalog = $this->app->make(\ClarionApp\LlmClient\Services\AgentStartingPointCatalog::class);
+        $enabled = config('llm-client.agent_definitions.starting_points.enabled', [
+            'research', 'coding', 'data', 'scheduler',
+        ]);
+
+        $startingPoints = [
+            'research' => fn () => new \ClarionApp\LlmClient\ValueObjects\AgentStartingPoint(
+                'research',
+                'A ready-made agent that answers questions by fetching and citing sources it can actually reach, rather than acting or asserting from memory.',
+                \ClarionApp\LlmClient\Services\ResearchAgentProvisioner::TEMPLATE_PATH,
+            ),
+            'coding' => fn () => new \ClarionApp\LlmClient\ValueObjects\AgentStartingPoint(
+                'coding',
+                'A ready-made agent that reads, edits, and tests code inside a single registered project, holding every file change for confirmation.',
+                \ClarionApp\LlmClient\Services\CodingAgentProvisioner::TEMPLATE_PATH,
+            ),
+            'data' => fn () => new \ClarionApp\LlmClient\ValueObjects\AgentStartingPoint(
+                'data',
+                'A ready-made agent that answers questions from queryable data sources, read-only, always naming its source and period.',
+                \ClarionApp\LlmClient\Services\DataAgentProvisioner::TEMPLATE_PATH,
+            ),
+            'scheduler' => fn () => new \ClarionApp\LlmClient\ValueObjects\AgentStartingPoint(
+                'scheduler',
+                'A ready-made agent for unattended, trigger-driven work -- runs pre-authorized actions on a schedule or condition and reports the outcome, with no one present to confirm anything mid-run.',
+                \ClarionApp\LlmClient\Services\SchedulerAgentProvisioner::TEMPLATE_PATH,
+            ),
+        ];
+
+        foreach ($startingPoints as $slug => $factory) {
+            if (in_array($slug, $enabled, true)) {
+                $catalog->register($factory());
             }
         }
     }

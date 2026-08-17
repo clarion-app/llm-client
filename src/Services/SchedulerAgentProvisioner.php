@@ -31,7 +31,7 @@ class SchedulerAgentProvisioner
     private const AGENT_NAME = 'scheduler';
 
     /** The template is the single source of truth. */
-    private const TEMPLATE_PATH = __DIR__.'/../Templates/scheduler.yaml';
+    public const TEMPLATE_PATH = __DIR__.'/../Templates/scheduler.yaml';
 
     public function __construct(
         private readonly AgentService $agentService,

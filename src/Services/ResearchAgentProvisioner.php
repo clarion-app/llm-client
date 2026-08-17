@@ -26,7 +26,7 @@ class ResearchAgentProvisioner
     private const AGENT_NAME = 'research';
 
     /** The template is the single source of truth (D1). */
-    private const TEMPLATE_PATH = __DIR__.'/../Templates/research.yaml';
+    public const TEMPLATE_PATH = __DIR__.'/../Templates/research.yaml';
 
     public function __construct(
         private readonly AgentService $agentService,

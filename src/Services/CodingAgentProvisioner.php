@@ -39,7 +39,7 @@ class CodingAgentProvisioner
     private const AGENT_NAME = 'coding';
 
     /** The template is the single source of truth. */
-    private const TEMPLATE_PATH = __DIR__.'/../Templates/coding.yaml';
+    public const TEMPLATE_PATH = __DIR__.'/../Templates/coding.yaml';
 
     public function __construct(
         private readonly AgentService $agentService,

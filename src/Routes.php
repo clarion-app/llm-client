@@ -47,6 +47,7 @@ use ClarionApp\LlmClient\Controllers\SequenceController;
 use ClarionApp\LlmClient\Controllers\CodingProjectController;
 use ClarionApp\LlmClient\Controllers\CodingWorkspaceController;
 use ClarionApp\LlmClient\Controllers\SchedulerTriggerController;
+use ClarionApp\LlmClient\Controllers\AgentStartingPointController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -257,6 +258,12 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
 
     Route::post('agents', [StoredAgentController::class, "store"]);
     Route::put('agents/{id}', [StoredAgentController::class, "update"]);
+
+    // Ready-made agent starting points -- browse and create-from.
+    // Additive-only: neither route changes agents/check, agents (POST),
+    // or agents/{id} (PUT) above in any way.
+    Route::get('agent-starting-points', [AgentStartingPointController::class, "index"]);
+    Route::post('agent-starting-points/{slug}', [AgentStartingPointController::class, "store"]);
 
     // Agent version history — list/read/restore (contracts/agent-versioning-api.md
     // §2/§3/§5/§6/§7, 087-agent-model-versioning, Phase 4/US2).

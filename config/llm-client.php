@@ -736,6 +736,14 @@ return [
         'kinds' => [
             'enabled' => ['research', 'coding'],
         ],
+
+        // Ready-made agent starting points -- which built-in templates
+        // GET /agent-starting-points and POST /agent-starting-points/{slug}
+        // may offer. Sibling to 'kinds' => ['enabled' => [...]]'s own
+        // shape, above.
+        'starting_points' => [
+            'enabled' => ['research', 'coding', 'data', 'scheduler'],
+        ],
     ],
 
     // Agent Version History (087-agent-model-versioning) — bounds for
