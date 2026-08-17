@@ -1599,11 +1599,32 @@ class AgentLoopService
                     // Close tool action on normal completion. Feature 111 (US1):
                     // record the page/text envelope (JSON) as the action content
                     // so the consulted-source manifest (T014) can read source.url.
+                    //
+                    // A tool call that executed without throwing can still have
+                    // failed at the target's own level (a permitted operation
+                    // called with a bad argument, for example) -- $decoded is
+                    // already computed above, and a top-level "error" key in it
+                    // is exactly what allExecuteOperationsSucceeded() a little
+                    // further down this same method already treats as a failed
+                    // tool result for its own auto-stop decision. Checking it
+                    // here too means the action record itself never reports
+                    // that failure as a success -- the two checks read the same
+                    // signal for two different purposes rather than disagreeing
+                    // about what "failed" means.
                     if ($this->runTraceRecorder !== null && $activeActionId !== null) {
                         $actionContent = ($toolName === 'execute_operation' && ($arguments['operationId'] ?? '') === self::PAGE_TEXT_OPERATION_ID)
                             ? $result
                             : null;
-                        $this->runTraceRecorder->closeAction($activeActionId, ActionOutcome::Success, null, $actionContent);
+                        if (is_array($decoded) && is_string($decoded['error'] ?? null)) {
+                            $this->runTraceRecorder->closeAction(
+                                $activeActionId,
+                                ActionOutcome::Failure,
+                                Str::limit($decoded['error'], 500),
+                                $actionContent,
+                            );
+                        } else {
+                            $this->runTraceRecorder->closeAction($activeActionId, ActionOutcome::Success, null, $actionContent);
+                        }
                         $activeActionId = null;
                     }
 
