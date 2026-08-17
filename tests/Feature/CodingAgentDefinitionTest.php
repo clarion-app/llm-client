@@ -280,6 +280,25 @@ class CodingAgentDefinitionTest extends TestCase
     }
 
     #[Test]
+    public function instructions_require_enumerating_partial_work_and_forbid_calling_it_done(): void
+    {
+        $this->seedCatalog();
+
+        $instructions = $this->definition()->instructions;
+
+        $this->assertStringContainsString(
+            'Enumerate exactly what was and was not done.',
+            $instructions,
+            'the template must require enumerating exactly what was and was not completed when work is partial (FR-012)',
+        );
+        $this->assertStringContainsString(
+            'describe partial work as complete because most of it succeeded.',
+            $instructions,
+            'the template must forbid describing partial work as done because most of it succeeded (FR-012)',
+        );
+    }
+
+    #[Test]
     public function instructions_require_stating_a_cross_project_request_is_out_of_bounds(): void
     {
         $this->seedCatalog();
