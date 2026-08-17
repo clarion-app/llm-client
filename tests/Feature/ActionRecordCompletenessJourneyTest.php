@@ -277,6 +277,65 @@ class ActionRecordCompletenessJourneyTest extends TestCase
         $this->app->instance(McpToolExecutor::class, $executor);
     }
 
+    /**
+     * Both operations dispatch to application-level errors -- the
+     * "every action fails" shape, distinct from
+     * installTwoOperationExecutorDouble's mixed success/failure pair.
+     */
+    private function installTwoFailingOperationsExecutorDouble(): void
+    {
+        $executor = Mockery::mock(McpToolExecutor::class);
+
+        $executor->shouldReceive('extractArguments')
+            ->with(Mockery::any(), '/api/scheduler/status')
+            ->andReturn(['path' => '/api/scheduler/status', 'query' => [], 'body' => []]);
+        $executor->shouldReceive('executeHttpCall')
+            ->with('GET', '/api/scheduler/status', [], [], Mockery::any())
+            ->andReturn([
+                'content' => [['type' => 'text', 'text' => json_encode(['error' => 'Status endpoint unreachable'])]],
+                'isError' => true,
+            ]);
+
+        $executor->shouldReceive('extractArguments')
+            ->with(Mockery::any(), '/api/scheduler/widget')
+            ->andReturn(['path' => '/api/scheduler/widget', 'query' => [], 'body' => []]);
+        $executor->shouldReceive('executeHttpCall')
+            ->with('GET', '/api/scheduler/widget', [], [], Mockery::any())
+            ->andReturn([
+                'content' => [['type' => 'text', 'text' => json_encode(['error' => 'Invalid widget id: bad-argument'])]],
+                'isError' => true,
+            ]);
+
+        $this->app->instance(McpToolExecutor::class, $executor);
+    }
+
+    /**
+     * Reads a run's own report -- the last assistant message that carries
+     * actual content, distinguishing it from an earlier assistant turn
+     * that only carried a tool_calls request -- via the existing,
+     * unmodified conversation message endpoint, the same shape
+     * TriggerFiresUnattendedJourneyTest already establishes for a
+     * single-turn run.
+     */
+    private function finalReportFor(Conversation $conversation): string
+    {
+        $response = $this->actingAs($this->user, 'api')
+            ->getJson("/api/clarion-app/llm-client/conversation/{$conversation->id}");
+        $response->assertStatus(200);
+
+        $report = collect($response->json('messages'))
+            ->where('role', 'assistant')
+            ->filter(fn (array $message) => filled($message['content'] ?? null))
+            ->last();
+
+        $this->assertNotNull(
+            $report,
+            'the run\'s report -- its final assistant message carrying content -- must be readable after the fact',
+        );
+
+        return (string) $report['content'];
+    }
+
     private function latestRunFor(Conversation $conversation): ?object
     {
         return DB::table('agent_runs')
@@ -401,6 +460,179 @@ class ActionRecordCompletenessJourneyTest extends TestCase
         $this->assertNull(
             $successAction['failure_reason'],
             'a successful action must not carry a failure reason; got: '.json_encode($successAction),
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // US5, Acceptance Scenarios 1-3: a failed run's report states that it
+    // failed, plainly and naming what was attempted; a partially-failed
+    // run's report distinguishes succeeded from failed parts rather than
+    // presenting one uniform outcome; a fully-successful run's report
+    // states that it succeeded, in wording no one could mistake for
+    // either of the other two.
+    //
+    // The scripted LlmProvider double below is written to actually say
+    // completed/partial/failed, per the template's own instructed
+    // vocabulary -- this proves the action record built above gives the
+    // model enough signal to report correctly (readable success/failure
+    // per action, readable after the fact through the same endpoints),
+    // not that the model is compelled to comply, which is an instruction
+    // rather than something enforceable in code.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_fully_failed_run_reports_failed_plainly_and_names_what_was_attempted(): void
+    {
+        $this->seedOperationCatalog([
+            'scheduler.read_status' => ['path' => '/api/scheduler/status', 'method' => 'get', 'summary' => 'Read status'],
+            'scheduler.read_widget' => ['path' => '/api/scheduler/widget', 'method' => 'get', 'summary' => 'Read a widget'],
+        ]);
+
+        $yaml = "name: two-action-agent\ninstructions: Do the defined work.\ntools:\n  allow:\n    - scheduler.read_status\n    - scheduler.read_widget\nsafety:\n  confirmation_required: []\n  unattended_authorized: []\n";
+
+        [, , $conversation] = $this->bindConversation($yaml, 'two-action-agent');
+
+        $this->installTwoFailingOperationsExecutorDouble();
+
+        $service = $this->serviceWithScriptedProvider([
+            $this->multiToolCallResponse([
+                ['scheduler.read_status', []],
+                ['scheduler.read_widget', []],
+            ]),
+            $this->textResponse('failed: attempted scheduler.read_status and scheduler.read_widget; both failed because the target rejected each call.'),
+        ]);
+
+        $service->run($conversation, 'Do the defined work.', ['unattended' => true]);
+
+        $run = $this->latestRunFor($conversation);
+        $this->assertNotNull($run, 'the scripted turns above must have produced exactly one run to read back');
+
+        $report = $this->finalReportFor($conversation);
+
+        $this->assertMatchesRegularExpression(
+            '/\bfailed\b/i',
+            $report,
+            'a fully-failed run\'s report must state "failed" plainly; got: '.$report,
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '/\bcompleted\b/i',
+            $report,
+            'a fully-failed run must never be reported as though nothing went wrong; got: '.$report,
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '/\bpartial\b/i',
+            $report,
+            'a fully-failed run is not a partial outcome -- the wording must not blur the two; got: '.$report,
+        );
+        $this->assertStringContainsString(
+            'scheduler.read_status',
+            $report,
+            'the report must name what was attempted, not merely say it failed; got: '.$report,
+        );
+        $this->assertStringContainsString(
+            'scheduler.read_widget',
+            $report,
+            'the report must name what was attempted, not merely say it failed; got: '.$report,
+        );
+    }
+
+    #[Test]
+    public function a_partially_failed_run_reports_partial_and_distinguishes_succeeded_from_failed(): void
+    {
+        $this->seedOperationCatalog([
+            'scheduler.read_status' => ['path' => '/api/scheduler/status', 'method' => 'get', 'summary' => 'Read status'],
+            'scheduler.read_widget' => ['path' => '/api/scheduler/widget', 'method' => 'get', 'summary' => 'Read a widget'],
+        ]);
+
+        $yaml = "name: two-action-agent\ninstructions: Do the defined work.\ntools:\n  allow:\n    - scheduler.read_status\n    - scheduler.read_widget\nsafety:\n  confirmation_required: []\n  unattended_authorized: []\n";
+
+        [, , $conversation] = $this->bindConversation($yaml, 'two-action-agent');
+
+        // The same success+failure fixture the action-record test above
+        // already builds on -- one operation succeeds, the other fails at
+        // the target's own level.
+        $this->installTwoOperationExecutorDouble();
+
+        $service = $this->serviceWithScriptedProvider([
+            $this->multiToolCallResponse([
+                ['scheduler.read_status', []],
+                ['scheduler.read_widget', []],
+            ]),
+            $this->textResponse('partial: scheduler.read_status succeeded; scheduler.read_widget failed because Invalid widget id: bad-argument.'),
+        ]);
+
+        $service->run($conversation, 'Do the defined work.', ['unattended' => true]);
+
+        $run = $this->latestRunFor($conversation);
+        $this->assertNotNull($run, 'the scripted turns above must have produced exactly one run to read back');
+
+        $report = $this->finalReportFor($conversation);
+
+        $this->assertMatchesRegularExpression(
+            '/\bpartial\b/i',
+            $report,
+            'a partially-failed run\'s report must state "partial" plainly; got: '.$report,
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '/\bcompleted\b/i',
+            $report,
+            'a partial outcome must never be presented as a uniform success; got: '.$report,
+        );
+        $this->assertStringContainsString(
+            'scheduler.read_status succeeded',
+            $report,
+            'the report must say which part succeeded; got: '.$report,
+        );
+        $this->assertStringContainsString(
+            'scheduler.read_widget failed',
+            $report,
+            'the report must say which part failed, distinctly from the part that succeeded, not one uniform outcome; got: '.$report,
+        );
+    }
+
+    #[Test]
+    public function a_fully_successful_run_reports_completed_plainly(): void
+    {
+        $this->seedOperationCatalog([
+            'scheduler.read_status' => ['path' => '/api/scheduler/status', 'method' => 'get', 'summary' => 'Read status'],
+            'scheduler.read_widget' => ['path' => '/api/scheduler/widget', 'method' => 'get', 'summary' => 'Read a widget'],
+        ]);
+
+        $yaml = "name: one-action-agent\ninstructions: Do the defined work.\ntools:\n  allow:\n    - scheduler.read_status\nsafety:\n  confirmation_required: []\n  unattended_authorized: []\n";
+
+        [, , $conversation] = $this->bindConversation($yaml, 'one-action-agent');
+
+        // Reused for its already-registered success stub on
+        // /api/scheduler/status; the widget stub goes unused here, which
+        // Mockery permits without an explicit call-count expectation.
+        $this->installTwoOperationExecutorDouble();
+
+        $service = $this->serviceWithScriptedProvider([
+            $this->toolCallResponse('scheduler.read_status'),
+            $this->textResponse('completed: scheduler.read_status succeeded; the defined work finished as expected.'),
+        ]);
+
+        $service->run($conversation, 'Do the defined work.', ['unattended' => true]);
+
+        $run = $this->latestRunFor($conversation);
+        $this->assertNotNull($run, 'the scripted turns above must have produced exactly one run to read back');
+
+        $report = $this->finalReportFor($conversation);
+
+        $this->assertMatchesRegularExpression(
+            '/\bcompleted\b/i',
+            $report,
+            'a fully-successful run\'s report must state "completed" plainly; got: '.$report,
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '/\bfailed\b/i',
+            $report,
+            'a real success must never read as though something went wrong; got: '.$report,
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '/\bpartial\b/i',
+            $report,
+            'a full success must not be worded as a partial outcome; got: '.$report,
         );
     }
 }

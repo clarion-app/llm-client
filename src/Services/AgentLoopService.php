@@ -1686,7 +1686,15 @@ class AgentLoopService
 
                 // If all tool calls were successful execute_operation calls,
                 // stop the loop — no need for a summary response from the LLM.
-                if ($this->allExecuteOperationsSucceeded($toolCalls, $toolResults)) {
+                // An unattended run is excluded from this shortcut: nobody is
+                // watching it happen live, so the only place a fully-successful
+                // run's outcome can ever be stated is a report the model itself
+                // produces, exactly like the failed and partial cases already
+                // require one more turn to state their outcome. Skipping this
+                // turn here would leave a fully-successful triggered run with
+                // no report at all -- not merely a report indistinguishable
+                // from success, but no report whatsoever.
+                if (!$unattended && $this->allExecuteOperationsSucceeded($toolCalls, $toolResults)) {
                     $agentId = $conversation->character ?? $conversation->id;
                     $conversation->update(['is_processing' => false]);
 
