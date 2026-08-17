@@ -169,9 +169,27 @@ abstract class TestCase extends BaseTestCase
                 $table->timestamp('ended_at')->nullable();
                 $table->string('routing_reason', 16)->nullable();
                 $table->timestamp('routing_disclosed_at')->nullable();
+                $table->uuid('coding_project_id')->nullable();
                 $table->index('user_id');
                 $table->index('agent_id');
                 $table->index('agent_version_id');
+                $table->index('coding_project_id');
+            });
+        }
+
+        // coding_projects table (112-coding-agent, Foundational, data-model.md
+        // §1) — mirrors the llm_servers block above exactly.
+        if (!Schema::hasTable('coding_projects')) {
+            Schema::create('coding_projects', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id');
+                $table->string('name');
+                $table->string('root_path');
+                $table->string('test_command')->nullable();
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index('user_id');
             });
         }
 

@@ -634,6 +634,23 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             );
         });
 
+        // CodingAgentProvisioner holds only the already-singleton
+        // AgentService — safe as singleton() for the identical reason as
+        // ResearchAgentProvisioner above (112-coding-agent, Foundational).
+        $this->app->singleton(\ClarionApp\LlmClient\Services\CodingAgentProvisioner::class, function ($app) {
+            return new \ClarionApp\LlmClient\Services\CodingAgentProvisioner(
+                $app->make(\ClarionApp\LlmClient\Services\AgentService::class),
+            );
+        });
+
+        // PathContainment holds no state of its own — every call resolves
+        // its inputs fresh (112-coding-agent, Foundational, D4) — safe as
+        // singleton() for the same reason as UrlValidator's own static-only
+        // shape would be, were it ever registered.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\PathContainment::class, function () {
+            return new \ClarionApp\LlmClient\Services\PathContainment();
+        });
+
         // GitDefinitionFileReader holds no state (every call is a fresh
         // filesystem/process read); AgentDivergenceChecker holds only the
         // already-singleton GitDefinitionFileReader — both safe as

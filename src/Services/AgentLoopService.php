@@ -67,6 +67,15 @@ class AgentLoopService
      */
     public const PAGE_TEXT_OPERATION_ID = 'clarionApp.llmClient.fetchPage.getTextFromUrl';
 
+    /**
+     * The operationId prefix every coding-workspace operation shares
+     * (112-coding-agent, Foundational, D2, data-model.md §4). Used only by
+     * enforceCodingProjectBinding() below — checked before, and
+     * independent of, isOperationPermitted()/isConfirmationRequired(), so
+     * a misconfigured tools.allow can never leak cross-project access.
+     */
+    private const CODING_WORKSPACE_OPERATION_PREFIX = 'clarionApp.llmClient.codingWorkspace.';
+
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
@@ -3203,6 +3212,22 @@ class AgentLoopService
 
         $params = $arguments['parameters'] ?? [];
 
+        // 112-coding-agent (Foundational, D2, data-model.md §4): every
+        // coding-workspace operation's own `project` path argument is
+        // cross-checked against $conversation->coding_project_id here,
+        // BEFORE anything else in this method runs — independent of, and
+        // checked before, isOperationPermitted()/isConfirmationRequired(),
+        // so a misconfigured or overly broad tools.allow can never leak
+        // cross-project access. Runs for every operation under the
+        // coding-workspace prefix, so a newly added operation under that
+        // prefix is covered automatically.
+        if (str_starts_with($operationId, self::CODING_WORKSPACE_OPERATION_PREFIX)) {
+            $rejection = $this->enforceCodingProjectBinding($conversation, $params);
+            if ($rejection !== null) {
+                return $rejection;
+            }
+        }
+
         // 109-agent-as-capability (Phase 3/US1, contracts/
         // capability-agent-call.md "Dispatch", research.md D1): a
         // synthetic capability-offering operationId is the offering's own
@@ -3290,6 +3315,34 @@ class AgentLoopService
 
         // Execute directly
         return $this->executeApiCall($operationId, $method, $pathTemplate, $params, $conversation);
+    }
+
+    /**
+     * The coding-workspace project-binding guard (112-coding-agent,
+     * Foundational, D2, data-model.md §4). `$params` is the raw
+     * `execute_operation` tool-call `parameters` argument (the
+     * {path, query, body} shape McpToolExecutor::extractArguments() also
+     * reads) — the requested project id is read directly from
+     * `$params['path']['project']`, never from the resolved HTTP path,
+     * since this check must run before the path template is even
+     * substituted.
+     *
+     * Returns a hard-reject JSON string (the same shape an unpermitted
+     * operation returns) when the conversation has no bound project or
+     * the requested project does not match it; returns null when the
+     * call may proceed to the ordinary isOperationPermitted()/
+     * isConfirmationRequired() checks.
+     */
+    private function enforceCodingProjectBinding(Conversation $conversation, array $params): ?string
+    {
+        $requestedProject = $params['path']['project'] ?? null;
+
+        if ($conversation->coding_project_id === null
+            || (string) $conversation->coding_project_id !== (string) $requestedProject) {
+            return json_encode(['error' => 'Operation rejected: this conversation is not bound to the requested project.']);
+        }
+
+        return null;
     }
 
     /**

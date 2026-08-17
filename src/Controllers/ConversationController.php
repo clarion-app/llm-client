@@ -84,11 +84,33 @@ class ConversationController extends Controller
             'server_id' => 'nullable|string',
             'channel' => 'nullable|string|max:50|regex:/^[a-z0-9_-]+$/',
             'agent_id' => 'nullable|string',
+            'coding_project_id' => 'nullable|string',
         ]);
 
         $validatedData['user_id'] = Auth::id();
         $validatedData['character'] = "Clarion";
         $validatedData['channel'] = $validatedData['channel'] ?? 'web';
+
+        // Optional project binding (112-coding-agent, Foundational,
+        // data-model.md §2) — set only here, at creation; no later route
+        // or tool call ever updates conversations.coding_project_id. A
+        // project id the requesting user does not own is refused (422),
+        // the same ownership-check shape every other user-scoped resource
+        // in this codebase already applies.
+        $codingProjectId = $validatedData['coding_project_id'] ?? null;
+        if ($codingProjectId !== null) {
+            $codingProject = \ClarionApp\LlmClient\Models\CodingProject::where('id', $codingProjectId)
+                ->where('user_id', Auth::id())
+                ->first();
+
+            if ($codingProject === null) {
+                return response()->json([
+                    'errors' => [
+                        'coding_project_id' => ['Coding project not found.'],
+                    ],
+                ], 422);
+            }
+        }
 
         // Provision the user's `research` agent (111-research-agent,
         // Phase 2, FR-001). Idempotent: a repeat call returns the existing
@@ -102,6 +124,19 @@ class ConversationController extends Controller
                 ->ensureForUser(Auth::id());
         } catch (\Throwable $e) {
             Log::warning('Research agent provisioning failed', [
+                'user_id' => Auth::id(),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Provision the user's `coding` agent (112-coding-agent,
+        // Foundational, D3, FR-001), same seam and same log-and-continue
+        // guarantee as the research agent above.
+        try {
+            app(\ClarionApp\LlmClient\Services\CodingAgentProvisioner::class)
+                ->ensureForUser(Auth::id());
+        } catch (\Throwable $e) {
+            Log::warning('Coding agent provisioning failed', [
                 'user_id' => Auth::id(),
                 'error' => $e->getMessage(),
             ]);

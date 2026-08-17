@@ -44,6 +44,8 @@ use ClarionApp\LlmClient\Controllers\DelegationController;
 use ClarionApp\LlmClient\Controllers\ManagedTaskController;
 use ClarionApp\LlmClient\Controllers\ConsensusController;
 use ClarionApp\LlmClient\Controllers\SequenceController;
+use ClarionApp\LlmClient\Controllers\CodingProjectController;
+use ClarionApp\LlmClient\Controllers\CodingWorkspaceController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -382,6 +384,27 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('sequence-definitions/{id}/runs', [SequenceController::class, "storeRun"]);
     Route::get('sequence-runs/{id}', [SequenceController::class, "showRun"]);
     Route::post('sequence-runs/{id}/resume', [SequenceController::class, "resume"]);
+
+    // Coding Agent (112-coding-agent, contracts/coding-workspace-operations.md
+    // §0-§3). CodingProjectController is human-driven registration only,
+    // never named in coding.yaml's tools.allow. CodingWorkspaceController
+    // is the agent-callable read/write/test/git surface, every route
+    // scoped to a single {project} and cross-checked against
+    // $conversation->coding_project_id at the AgentLoopService seam
+    // before any of these methods run (data-model.md §4). Phase 2
+    // (Foundational): CodingProjectController is fully implemented;
+    // CodingWorkspaceController's methods are still 501 placeholders,
+    // filled in across Phase 3 (US1).
+    Route::post('coding-project', [CodingProjectController::class, "store"]);
+    Route::get('coding-project', [CodingProjectController::class, "index"]);
+    Route::delete('coding-project/{id}', [CodingProjectController::class, "destroy"]);
+    Route::get('coding-project/{project}/files', [CodingWorkspaceController::class, "listFiles"]);
+    Route::get('coding-project/{project}/file', [CodingWorkspaceController::class, "readFile"]);
+    Route::post('coding-project/{project}/file', [CodingWorkspaceController::class, "writeFile"]);
+    Route::delete('coding-project/{project}/file', [CodingWorkspaceController::class, "deleteFile"]);
+    Route::get('coding-project/{project}/git-status', [CodingWorkspaceController::class, "gitStatus"]);
+    Route::get('coding-project/{project}/git-diff', [CodingWorkspaceController::class, "gitDiff"]);
+    Route::post('coding-project/{project}/run-tests', [CodingWorkspaceController::class, "runTests"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
