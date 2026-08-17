@@ -333,6 +333,93 @@ class DataAgentAccessScopingTest extends TestCase
     }
 
     // ---------------------------------------------------------------
+    // Two different users asking the identical question against the same
+    // unscoped underlying source: each must see only their own row, and
+    // the two answers are allowed to differ.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function two_different_users_asking_the_same_question_each_see_only_their_own_data(): void
+    {
+        $this->fakeContactsHttp();
+
+        $conversationA = $this->makeConversation($this->userA, $this->agent($this->userA));
+        $serviceA = $this->service([
+            $this->toolCallReply([$this->toolCall('execute_operation', [
+                'operationId' => 'contacts.index',
+                'parameters' => [],
+            ], 'call_list_a')]),
+            $this->plainReply('You have 1 contact.'),
+        ]);
+        $resultA = $serviceA->run($conversationA->fresh(), 'How many contacts do I have?');
+        $this->assertSame('completed', $resultA['status']);
+        $idsA = array_column(json_decode($this->toolResultContent($conversationA), true), 'id');
+
+        $conversationB = $this->makeConversation($this->userB, $this->agent($this->userB));
+        $serviceB = $this->service([
+            $this->toolCallReply([$this->toolCall('execute_operation', [
+                'operationId' => 'contacts.index',
+                'parameters' => [],
+            ], 'call_list_b')]),
+            $this->plainReply('You have 1 contact.'),
+        ]);
+        $resultB = $serviceB->run($conversationB->fresh(), 'How many contacts do I have?');
+        $this->assertSame('completed', $resultB['status']);
+        $idsB = array_column(json_decode($this->toolResultContent($conversationB), true), 'id');
+
+        $this->assertSame([self::USER_A_CONTACT_ID], $idsA, "user A's own row must be the only row in user A's result");
+        $this->assertSame([self::USER_B_CONTACT_ID], $idsB, "user B's own row must be the only row in user B's result");
+        $this->assertNotSame($idsA, $idsB, 'the two users asking the identical question may legitimately get different, correctly scoped answers');
+        $this->assertEmpty(
+            array_intersect($idsA, $idsB),
+            'neither user\'s filtered result may contain a row belonging to the other user',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // A foreign-owned single object must give no hint that it exists at
+    // all -- not a count, not an id, not a differently-worded refusal.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_foreign_owned_single_contact_result_gives_no_hint_that_the_excluded_data_exists(): void
+    {
+        $this->fakeContactsHttp();
+
+        $conversation = $this->makeConversation($this->userA, $this->agent($this->userA));
+
+        $service = $this->service([
+            $this->toolCallReply([$this->toolCall('execute_operation', [
+                'operationId' => 'contacts.show',
+                'parameters' => ['path' => ['id' => self::USER_B_CONTACT_ID]],
+            ], 'call_show')]),
+            $this->plainReply('I could not find that contact.'),
+        ]);
+
+        $result = $service->run($conversation->fresh(), 'Show me contact '.self::USER_B_CONTACT_ID);
+        $this->assertSame('completed', $result['status']);
+
+        $content = $this->toolResultContent($conversation);
+        $decoded = json_decode($content, true);
+
+        // The response must read no differently than if the excluded row
+        // were entirely absent -- exactly the generic shape, nothing more.
+        $this->assertSame(['error' => 'Not found.'], $decoded);
+        $this->assertCount(1, $decoded, 'no extra key may accompany the generic error, since any extra key could hint at what was excluded');
+        $this->assertArrayNotHasKey('id', $decoded);
+        $this->assertArrayNotHasKey('count', $decoded);
+        $this->assertArrayNotHasKey('meta', $decoded);
+
+        foreach ([self::USER_B_CONTACT_ID, "B's contact", (string) $this->userB->id, '1000'] as $needle) {
+            $this->assertStringNotContainsString(
+                $needle,
+                $content,
+                'no fragment of the excluded contact\'s identity or content may leak into the raw result the model sees',
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
     // gtd/lists-shaped: no user_id anywhere -> full passthrough,
     // unaffected by this feature
     // ---------------------------------------------------------------
