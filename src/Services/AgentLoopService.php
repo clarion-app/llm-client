@@ -61,8 +61,11 @@ class AgentLoopService
      * Results of this operation are wrapped in a source envelope (source.url +
      * untrusted-wrapped content) so the consulted-source manifest can be derived
      * from the run trace, and so the fetched body is treated as untrusted data.
+     *
+     * Public because AgentLoopStreamHandler records the same envelope on the
+     * streaming path and must recognise the same operation.
      */
-    private const PAGE_TEXT_OPERATION_ID = 'clarionApp.llmClient.fetchPage.getTextFromUrl';
+    public const PAGE_TEXT_OPERATION_ID = 'clarionApp.llmClient.fetchPage.getTextFromUrl';
 
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
@@ -3343,7 +3346,12 @@ class AgentLoopService
         // the consulted-source manifest can be derived and the body is treated
         // as untrusted data. Other operations pass through unchanged.
         if ($operationId === self::PAGE_TEXT_OPERATION_ID) {
-            $url = (string) ($params['url'] ?? '');
+            // buildExecuteOperationSchema() declares `parameters` as
+            // {path, query, body} sub-objects, and extractArguments() reads
+            // only that shape — so for this POST the fetch URL arrives under
+            // `body`. A flat `url` is accepted as a last-resort fallback for a
+            // caller that passes parameters unstructured.
+            $url = (string) ($resolved['body']['url'] ?? $resolved['query']['url'] ?? $params['url'] ?? '');
             $envelope = self::buildPageTextEnvelope($url, null, $raw, $conversation->id, $this->toolResultCondenser);
 
             return json_encode($envelope, JSON_UNESCAPED_SLASHES);

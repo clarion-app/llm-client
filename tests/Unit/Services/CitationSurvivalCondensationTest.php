@@ -142,6 +142,54 @@ class CitationSurvivalCondensationTest extends TestCase
         $this->assertSame([], $query->consultedSourcesForRun($otherUser->id, $runId));
     }
 
+    #[Test]
+    public function a_truncated_envelope_still_yields_its_source_url(): void
+    {
+        $user = User::factory()->create();
+
+        $runId = (string) Str::uuid();
+        DB::table('agent_runs')->insert([
+            'id' => $runId,
+            'kind' => 'interactive',
+            'user_id' => $user->id,
+            'conversation_id' => null,
+            'started_at' => '2026-01-01 09:59:00.000000',
+        ]);
+
+        $stepId = (string) Str::uuid();
+        DB::table('agent_run_steps')->insert([
+            'id' => $stepId,
+            'run_id' => $runId,
+            'position' => 1,
+            'started_at' => '2026-01-01 10:00:00.000000',
+        ]);
+
+        // What ContentSanitizer::prepare() leaves behind when an envelope
+        // exceeds run_trace.action_content_cap_bytes: a valid prefix plus the
+        // truncation marker, which json_decode() cannot parse.
+        $url = 'https://truncated.example/long-page';
+        $truncated = '{"source":{"url":"'.$url.'","title":null},"content":"--- BEGIN RESPONSE UNDER EVALUATION ---'
+            ."\n".str_repeat('body ', 50)."\n\n[TRUNCATED: original content exceeded cap]";
+        $this->assertNull(json_decode($truncated, true), 'the fixture must really be unparseable JSON');
+
+        DB::table('agent_run_actions')->insert([
+            'id' => (string) Str::uuid(),
+            'run_id' => $runId,
+            'step_id' => $stepId,
+            'action_type' => 'tool_invocation',
+            'target' => 'execute_operation',
+            'outcome' => 'success',
+            'content' => $truncated,
+            'started_at' => '2026-01-01 10:00:00.000000',
+        ]);
+
+        $this->assertSame(
+            [$url],
+            (new RunTraceQuery())->consultedSourcesForRun($user->id, $runId),
+            'a source the run consulted must not drop out of the manifest because its envelope was truncated',
+        );
+    }
+
     // --- helpers ---
 
     private function insertPageTextAction(string $runId, string $stepId, string $url, string $startedAt): void

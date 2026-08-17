@@ -321,6 +321,16 @@ class RunTraceQuery
             $decoded = json_decode($content, true);
             $url = $decoded['source']['url'] ?? null;
 
+            // A large envelope may have been truncated by ContentSanitizer
+            // (run_trace.action_content_cap_bytes) on its way into the row,
+            // which leaves the JSON unparseable. source.url is the envelope's
+            // first field, so it survives in the retained prefix — read it back
+            // rather than silently dropping a source the run really did consult
+            // (contracts §3: the manifest lists every fetched source).
+            if (!is_string($url) && preg_match('/"url"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"/', $content, $m) === 1) {
+                $url = json_decode('"'.$m[1].'"');
+            }
+
             if (is_string($url) && $url !== '' && !in_array($url, $urls, true)) {
                 $urls[] = $url;
             }

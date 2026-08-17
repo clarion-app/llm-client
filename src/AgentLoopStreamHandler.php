@@ -682,11 +682,22 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     $outcome = $toolError === null
                         ? \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Success
                         : \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Failure;
+                    // Feature 111 (US1): record the page/text envelope (JSON) as
+                    // the action content so the consulted-source manifest
+                    // (RunTraceQuery::consultedSourcesForRun(), contracts §3) can
+                    // read source.url back. The streaming path is the one a live
+                    // research conversation takes, so it must record the envelope
+                    // exactly as AgentLoopService::run()/resumeSync() do — the
+                    // manifest is empty for the whole run otherwise.
+                    $actionContent = ($toolName === 'execute_operation'
+                        && ($arguments['operationId'] ?? '') === AgentLoopService::PAGE_TEXT_OPERATION_ID)
+                        ? $result
+                        : null;
                     $this->runTraceRecorder->closeAction(
                         $toolActionId,
                         $outcome,
                         $toolError,
-                        null,
+                        $actionContent,
                     );
                 } catch (\Throwable $e) {
                     Log::warning('Failed to close tool_invocation action', [
