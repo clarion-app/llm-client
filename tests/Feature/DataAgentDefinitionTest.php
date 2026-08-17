@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
@@ -469,6 +470,52 @@ class DataAgentDefinitionTest extends TestCase
             'Operation not permitted by the agent version this conversation is bound to.',
             $resultContent,
             'the bound data definition must reject the mutation op -- read-only, enforced at the operation level',
+        );
+    }
+
+    #[Test]
+    public function starting_a_conversation_through_the_real_endpoint_provisions_a_data_agent_for_a_fresh_user(): void
+    {
+        // Closes a coverage gap found during this feature's Phase 9
+        // manual-walkthrough reconciliation, the same class of gap a prior
+        // feature's own Phase 9 found for a registered HTTP controller left
+        // with zero end-to-end coverage: DataAgentProvisioner::ensureForUser()
+        // is wired into ConversationController::store() (the real entry
+        // point a live user's "start a conversation" request goes through),
+        // but every other test provisions the data agent directly via the
+        // service class or supplies an explicit agent_id, so nothing proved
+        // the wiring itself fires as a side effect of the real route. This
+        // test drives that real POST route for a fresh user with zero
+        // agents and confirms exactly one `data` agent is provisioned as a
+        // result -- proving the wiring is genuinely reachable end-to-end,
+        // not just correct when the service is called directly.
+        $this->seedOperationCatalog([
+            'contacts.index' => ['path' => '/api/contacts', 'method' => 'get', 'summary' => 'List contacts'],
+        ]);
+
+        $server = Server::create([
+            'name' => 'DataServer',
+            'server_url' => 'https://api.openai.com/v1/chat/completions',
+            'token' => 'test-token',
+        ]);
+
+        $this->assertSame(
+            0,
+            Agent::where('user_id', $this->user->id)->where('name', 'data')->count(),
+            'the fresh user must not already have a data agent before the request',
+        );
+
+        $response = $this->actingAs($this->user, 'api')->postJson('/api/clarion-app/llm-client/conversation', [
+            'server_id' => $server->id,
+            'model' => 'gpt-4o',
+        ]);
+
+        $response->assertStatus(201);
+
+        $this->assertSame(
+            1,
+            Agent::where('user_id', $this->user->id)->where('name', 'data')->count(),
+            'ConversationController::store() must provision exactly one data agent as a side effect of the real request',
         );
     }
 
