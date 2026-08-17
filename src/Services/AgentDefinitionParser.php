@@ -33,8 +33,9 @@ use Symfony\Component\Yaml\Yaml;
  *   8. tools.allow / tools.deny -> EmptyOperationPattern (author-written patterns only)
  *   9. safety.confirmation_required -> EmptyOperationPattern (bare verbs exempt)
  *  10. safety.denylist -> EmptyOperationPattern (bare verbs exempt)
+ *  11. safety.unattended_authorized -> EmptyOperationPattern (bare verbs exempt)
  *
- * collect() is the sole implementation of the 11-step rule set, in
+ * collect() is the sole implementation of the 12-step rule set, in
  * collecting form: it never throws for a content-level problem, instead
  * appending every one it finds (including every repeated occurrence within
  * a single step) to a returned list and continuing through every remaining
@@ -61,7 +62,7 @@ final class AgentDefinitionParser
 
     private const TOOLS_KEYS = ['allow', 'deny'];
 
-    private const SAFETY_KEYS = ['confirmation_required', 'denylist'];
+    private const SAFETY_KEYS = ['confirmation_required', 'denylist', 'unattended_authorized'];
 
     public function parse(string $rawYaml): AgentDefinition
     {
@@ -75,7 +76,7 @@ final class AgentDefinitionParser
     }
 
     /**
-     * The sole implementation of the 11-step rule set (fixed check order
+     * The sole implementation of the 12-step rule set (fixed check order
      * above, unchanged), in collecting form: every problem a step finds is
      * appended to the returned result's problems list instead of being
      * thrown, and every step still runs regardless of whether an earlier
@@ -144,6 +145,7 @@ final class AgentDefinitionParser
         [$toolsAllow, $toolsDeny] = $this->resolveTools($document, $catalog, $problems);
         $safetyConfirmationRequired = $this->resolveSafetyList($document, 'confirmation_required', $catalog, $problems);
         $safetyDenylist = $this->resolveSafetyList($document, 'denylist', $catalog, $problems);
+        $unattendedAuthorized = $this->resolveSafetyList($document, 'unattended_authorized', $catalog, $problems);
 
         $version = $document['version'] ?? null;
         $version = $version !== null ? (string) $version : null;
@@ -160,6 +162,7 @@ final class AgentDefinitionParser
             toolsDeny: $toolsDeny,
             safetyConfirmationRequired: $safetyConfirmationRequired,
             safetyDenylist: $safetyDenylist,
+            unattendedAuthorized: $unattendedAuthorized,
         );
 
         return new AgentDefinitionCollectionResult(
@@ -189,6 +192,7 @@ final class AgentDefinitionParser
             toolsDeny: [],
             safetyConfirmationRequired: [],
             safetyDenylist: [],
+            unattendedAuthorized: [],
         );
     }
 
@@ -540,10 +544,11 @@ final class AgentDefinitionParser
     }
 
     /**
-     * Steps 9-10: safety.confirmation_required / safety.denylist. Same
-     * shape, both default []. Bare HTTP-verb tokens are exempt from the
-     * emptiness check (a verb always denotes "every operation with this
-     * method," checked only against the fixed 5-verb set).
+     * Steps 9-11: safety.confirmation_required / safety.denylist /
+     * safety.unattended_authorized. Same shape, all three default []. Bare
+     * HTTP-verb tokens are exempt from the emptiness check (a verb always
+     * denotes "every operation with this method," checked only against the
+     * fixed 5-verb set).
      *
      * Every pattern that resolves empty — not only the first — is
      * appended to $problems; the loop never stops early.

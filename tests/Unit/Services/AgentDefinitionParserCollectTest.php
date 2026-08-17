@@ -13,6 +13,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Schema;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
+use Symfony\Component\Yaml\Yaml;
 use Tests\TestCase;
 
 /**
@@ -166,6 +167,120 @@ YAML;
         $this->assertSame($expected->toolsDeny, $result->definition->toolsDeny);
         $this->assertSame($expected->safetyConfirmationRequired, $result->definition->safetyConfirmationRequired);
         $this->assertSame($expected->safetyDenylist, $result->definition->safetyDenylist);
+        $this->assertSame($expected->unattendedAuthorized, $result->definition->unattendedAuthorized);
+    }
+
+    #[Test]
+    public function safety_unattended_authorized_resolves_a_declared_pattern_and_is_never_flagged_unknown(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        $raw = <<<YAML
+name: scheduler-like-agent
+safety:
+  unattended_authorized:
+    - contacts.destroy
+YAML;
+
+        $result = (new AgentDefinitionParser())->collect($raw);
+
+        $this->assertSame([], $result->problems, 'a declared safety.unattended_authorized key must never itself be reported as an unknown key');
+        $this->assertSame(['contacts.destroy'], $result->definition->unattendedAuthorized);
+    }
+
+    #[Test]
+    public function safety_unattended_authorized_defaults_to_an_empty_list_when_absent(): void
+    {
+        $this->seedOperationCatalog([]);
+
+        $result = (new AgentDefinitionParser())->collect('name: no-safety-block-agent');
+
+        $this->assertSame([], $result->problems);
+        $this->assertSame([], $result->definition->unattendedAuthorized);
+    }
+
+    /**
+     * D6's own explicit claim ("every existing template ... simply does
+     * not declare this key ... parses with zero behavior change") proven
+     * directly, not assumed: every template shipped before this key
+     * existed still parses with zero problems and an empty
+     * unattendedAuthorized list now that the key is recognized.
+     */
+    #[Test]
+    public function every_pre_existing_shipped_template_still_parses_cleanly_now_that_safety_unattended_authorized_exists(): void
+    {
+        $this->seedOperationCatalog([
+            'clarionApp.llmClient.conversations.index' => [
+                'path' => '/api/conversations',
+                'method' => 'get',
+                'summary' => 'List conversations',
+            ],
+            'clarionApp.llmClient.fetchPage.getTextFromUrl' => [
+                'path' => '/api/page/text',
+                'method' => 'post',
+                'summary' => 'Fetch the text of a page',
+            ],
+            'clarionApp.llmClient.codingWorkspace.writeFile' => [
+                'path' => '/api/coding-project/{project}/file',
+                'method' => 'post',
+                'summary' => 'Write a file in a registered project',
+            ],
+            'clarionApp.llmClient.codingWorkspace.deleteFile' => [
+                'path' => '/api/coding-project/{project}/file',
+                'method' => 'delete',
+                'summary' => 'Delete a file in a registered project',
+            ],
+            'clarionApp.llmClient.codingWorkspace.runTests' => [
+                'path' => '/api/coding-project/{project}/run-tests',
+                'method' => 'post',
+                'summary' => "Run a registered project's own test command",
+            ],
+        ]);
+
+        $parser = new AgentDefinitionParser();
+
+        foreach (['research.yaml', 'coding.yaml', 'data.yaml'] as $template) {
+            $raw = (string) file_get_contents(__DIR__ . '/../../../src/Templates/' . $template);
+            $result = $parser->collect($raw);
+
+            $this->assertSame([], $result->problems, $template . ' must still parse with zero problems');
+            $this->assertSame([], $result->definition->unattendedAuthorized, $template . ' does not declare safety.unattended_authorized, so it must resolve to an empty list');
+        }
+    }
+
+    /**
+     * scheduler.yaml (data-model.md §5, contracts/scheduler-agent-template.md)
+     * is the fourth ready-made template, and the first one to declare
+     * safety.unattended_authorized at all. Checked two ways: a raw YAML
+     * structural parse (Yaml::parseFile(), independent of
+     * AgentDefinitionParser entirely) and a full AgentDefinitionParser
+     * pass -- both must agree the document is well-formed, and the parsed
+     * definition's tools.allow / safety.unattended_authorized must both be
+     * exactly the empty list the narrow-by-default posture requires.
+     */
+    #[Test]
+    public function scheduler_yaml_is_well_formed_yaml_and_parses_with_empty_tools_allow_and_empty_unattended_authorized(): void
+    {
+        $path = __DIR__ . '/../../../src/Templates/scheduler.yaml';
+
+        $parsed = Yaml::parseFile($path);
+        $this->assertIsArray($parsed, 'scheduler.yaml must be a well-formed YAML mapping');
+        $this->assertSame('scheduler', $parsed['name'] ?? null);
+        $this->assertArrayHasKey('safety', $parsed);
+        $this->assertArrayHasKey('unattended_authorized', $parsed['safety']);
+
+        $this->seedOperationCatalog([]);
+
+        $result = (new AgentDefinitionParser())->collect((string) file_get_contents($path));
+
+        $this->assertSame([], $result->problems, 'scheduler.yaml must parse with zero problems');
+        $this->assertSame('scheduler', $result->definition->name);
+        $this->assertSame([], $result->definition->toolsAllow, 'tools.allow must be exactly [] -- no execute_operation call is ever permitted until explicitly widened');
+        $this->assertSame([], $result->definition->safetyConfirmationRequired);
+        $this->assertSame([], $result->definition->safetyDenylist);
+        $this->assertSame([], $result->definition->unattendedAuthorized, 'safety.unattended_authorized must be exactly [] -- nothing is pre-authorized until explicitly widened');
     }
 
     #[Test]

@@ -171,6 +171,82 @@ class AgentDefinitionTest extends TestCase
     }
 
     // =================================================================
+    // isUnattendedAuthorized() (114-scheduler-agent) -- the "granted in
+    // advance, as part of setup" axis, independent of isConfirmationRequired
+    // and consulted only by the unattended execution path. No installation
+    // ceiling is unioned in here, unlike isConfirmationRequired().
+    // =================================================================
+
+    #[Test]
+    public function is_unattended_authorized_is_true_when_a_declared_pattern_matches(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        $definition = $this->makeDefinition(unattendedAuthorized: ['contacts.destroy']);
+
+        $this->assertTrue($definition->isUnattendedAuthorized('contacts.destroy'));
+    }
+
+    #[Test]
+    public function is_unattended_authorized_is_true_for_a_bare_verb_matching_the_operations_resolved_method(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        $definition = $this->makeDefinition(unattendedAuthorized: ['DELETE']);
+
+        $this->assertTrue($definition->isUnattendedAuthorized('contacts.destroy'));
+    }
+
+    #[Test]
+    public function is_unattended_authorized_is_false_when_the_list_is_absent_or_empty(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        $definition = $this->makeDefinition();
+
+        $this->assertFalse($definition->isUnattendedAuthorized('contacts.destroy'));
+    }
+
+    #[Test]
+    public function is_unattended_authorized_is_false_when_the_declared_pattern_does_not_match_this_operation(): void
+    {
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+            'contacts.store' => ['path' => '/api/contacts', 'method' => 'post', 'summary' => 'Store a contact'],
+        ]);
+
+        $definition = $this->makeDefinition(unattendedAuthorized: ['contacts.store']);
+
+        $this->assertFalse($definition->isUnattendedAuthorized('contacts.destroy'));
+    }
+
+    #[Test]
+    public function is_unattended_authorized_is_independent_of_is_confirmation_required(): void
+    {
+        // A definition can require confirmation for an operation while also
+        // pre-authorizing it unattended -- pre-authorization *is* the
+        // confirmation, resolved at setup time instead of at the moment of
+        // acting. The two lists never have to agree with each other.
+        $this->seedOperationCatalog([
+            'contacts.destroy' => ['path' => '/api/contacts/{id}', 'method' => 'delete', 'summary' => 'Delete a contact'],
+        ]);
+
+        $definition = $this->makeDefinition(
+            safetyConfirmationRequired: ['contacts.destroy'],
+            unattendedAuthorized: ['contacts.destroy'],
+        );
+
+        $this->assertTrue($definition->isConfirmationRequired('contacts.destroy'));
+        $this->assertTrue($definition->isUnattendedAuthorized('contacts.destroy'));
+    }
+
+    // =================================================================
     // permittedOperationIds() (095-agent-summary-cards, T005, US1,
     // data-model.md §5, research.md D4). Unlike isOperationPermitted(),
     // the catalog is caller-supplied rather than resolved internally
@@ -260,6 +336,7 @@ class AgentDefinitionTest extends TestCase
      * @param list<string> $toolsDeny
      * @param list<string> $safetyConfirmationRequired
      * @param list<string> $safetyDenylist
+     * @param list<string> $unattendedAuthorized
      */
     private function makeDefinition(
         ?array $memory = null,
@@ -268,6 +345,7 @@ class AgentDefinitionTest extends TestCase
         array $toolsDeny = [],
         array $safetyConfirmationRequired = [],
         array $safetyDenylist = [],
+        array $unattendedAuthorized = [],
     ): AgentDefinition {
         $memory ??= array_fill_keys(
             array_map(static fn (MemoryKind $kind): string => $kind->value, MemoryKind::cases()),
@@ -286,6 +364,7 @@ class AgentDefinitionTest extends TestCase
             toolsDeny: $toolsDeny,
             safetyConfirmationRequired: $safetyConfirmationRequired,
             safetyDenylist: $safetyDenylist,
+            unattendedAuthorized: $unattendedAuthorized,
         );
     }
 

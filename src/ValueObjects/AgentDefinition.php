@@ -35,6 +35,7 @@ final class AgentDefinition
      * @param list<string> $toolsDeny raw, unexpanded patterns
      * @param list<string> $safetyConfirmationRequired raw, unexpanded patterns/verbs
      * @param list<string> $safetyDenylist raw, unexpanded patterns/verbs
+     * @param list<string> $unattendedAuthorized raw, unexpanded patterns/verbs
      */
     public function __construct(
         public readonly string $formatVersion,
@@ -48,6 +49,7 @@ final class AgentDefinition
         public readonly array $toolsDeny,
         public readonly array $safetyConfirmationRequired,
         public readonly array $safetyDenylist,
+        public readonly array $unattendedAuthorized = [],
     ) {
     }
 
@@ -129,6 +131,33 @@ final class AgentDefinition
         }
 
         return $this->isConfirmationRequiredByInstallation($operationId);
+    }
+
+    /**
+     * Whether this operation was explicitly pre-authorized, as part of this
+     * definition's own setup, to proceed without a live confirmation when
+     * no user is present to answer one (the scheduler-agent family's own
+     * "advance authorization" axis — see scheduler.yaml). Resolved via the
+     * same OperationGroupPattern::resolve() every other pattern list on
+     * this class already uses. Unlike isConfirmationRequired(), there is no
+     * installation-wide ceiling to union with here: pre-authorization is
+     * granted only by this definition's own setup, never by an
+     * installation-wide default.
+     *
+     * Consulted only from the unattended execution path — an interactive
+     * turn never reads this method, so a definition that omits the
+     * declaring key (resolving to an empty list) behaves identically to
+     * one written before this method existed.
+     */
+    public function isUnattendedAuthorized(string $operationId): bool
+    {
+        $catalog = $this->resolveCatalog();
+
+        return in_array(
+            $operationId,
+            OperationGroupPattern::resolve($this->unattendedAuthorized, $catalog),
+            true,
+        );
     }
 
     /**
