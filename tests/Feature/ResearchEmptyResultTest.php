@@ -62,6 +62,22 @@ class ResearchEmptyResultTest extends TestCase
     }
 
     #[Test]
+    public function an_ambiguous_question_is_answered_by_stating_the_reading_chosen(): void
+    {
+        // Spec edge case: the agent researches the most reasonable reading of an
+        // ambiguous question and states that reading in its answer, so a user who
+        // meant something else can see the mismatch and re-ask. The contract
+        // (contracts/research-agent-template.md) carries this as an explicit
+        // template instruction; the implemented template must carry it too.
+        $instructions = $this->templateInstructions();
+
+        $this->assertMatchesRegularExpression(
+            '/ambiguous.*?state the reading.*?proceed/is',
+            $instructions,
+        );
+    }
+
+    #[Test]
     public function an_empty_fetch_yields_a_source_envelope_with_nothing_usable_to_cite(): void
     {
         Cache::flush();
