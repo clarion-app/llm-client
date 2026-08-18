@@ -1,0 +1,142 @@
+<?php
+
+namespace Tests\Fixtures\ReferenceMcpServer;
+
+use Symfony\Component\Process\Process;
+
+/**
+ * A minimal, protocol-correct initialize/tools-list/tools-call JSON-RPC
+ * implementation, servable two ways so both real transport
+ * implementations can be exercised over real loopback I/O -- never
+ * mocked at the HTTP/process boundary:
+ *
+ *  - startHttp()/stopHttp(): spawns PHP's own built-in web server on a
+ *    free loopback port, running bin/http_server.php, and returns the
+ *    base URL a Streamable HTTP transport would be configured against.
+ *  - stdioCommand()/stdioEnv(): the command/args/environment a stdio
+ *    transport would spawn per call, running bin/stdio_server.php.
+ *
+ * One instance per test; call stopHttp() in tearDown() so no fixture
+ * process outlives the test that started it.
+ */
+final class ReferenceMcpServer
+{
+    private ?Process $httpProcess = null;
+
+    /**
+     * Start (or, for the unreachable mode, deliberately not start) an
+     * HTTP-servable instance of the fixture. Returns the base URL a
+     * StreamableHttpMcpTransport would be pointed at.
+     *
+     * @param array{expected_token?: string, delay_seconds?: float} $options
+     */
+    public function startHttp(string $mode, array $options = []): string
+    {
+        $port = self::findFreePort();
+
+        if ($mode === Protocol::MODE_UNREACHABLE) {
+            // No process is started -- the port found above is left
+            // closed, so a real connection attempt to it fails exactly
+            // like a genuinely offline server.
+            return "http://127.0.0.1:{$port}";
+        }
+
+        $env = ['REFERENCE_MCP_MODE' => $mode];
+        if (isset($options['expected_token'])) {
+            $env['REFERENCE_MCP_EXPECTED_TOKEN'] = $options['expected_token'];
+        }
+        if (isset($options['delay_seconds'])) {
+            $env['REFERENCE_MCP_DELAY_SECONDS'] = (string) $options['delay_seconds'];
+        }
+
+        $this->httpProcess = new Process(
+            ['php', '-S', "127.0.0.1:{$port}", __DIR__ . '/bin/http_server.php'],
+            null,
+            $env,
+        );
+        $this->httpProcess->start();
+
+        self::waitUntilAcceptingConnections('127.0.0.1', $port);
+
+        return "http://127.0.0.1:{$port}";
+    }
+
+    /**
+     * Stop the HTTP-servable instance started by startHttp(), if any.
+     * Safe to call even when nothing was started (the unreachable mode,
+     * or a test that never called startHttp() at all).
+     */
+    public function stopHttp(): void
+    {
+        $this->httpProcess?->stop();
+        $this->httpProcess = null;
+    }
+
+    /**
+     * The command a stdio transport would spawn for one call, for the
+     * unreachable mode a deliberately nonexistent binary path so the
+     * spawn itself fails.
+     *
+     * @return list<string>
+     */
+    public function stdioCommand(string $mode): array
+    {
+        if ($mode === Protocol::MODE_UNREACHABLE) {
+            return ['/nonexistent/reference-mcp-server-binary'];
+        }
+
+        return ['php', __DIR__ . '/bin/stdio_server.php'];
+    }
+
+    /**
+     * The environment a stdio transport would set for one call --
+     * carrying the mode (and, for the credential-checking case, the
+     * expected/actual credential) the same way StdioMcpTransport carries
+     * a server's own credential: as an environment variable, never a
+     * command-line argument.
+     *
+     * @param array{expected_credential?: string, delay_seconds?: float} $options
+     * @return array<string, string>
+     */
+    public function stdioEnv(string $mode, array $options = []): array
+    {
+        $env = ['REFERENCE_MCP_MODE' => $mode];
+        if (isset($options['expected_credential'])) {
+            $env['REFERENCE_MCP_EXPECTED_CREDENTIAL'] = $options['expected_credential'];
+        }
+        if (isset($options['delay_seconds'])) {
+            $env['REFERENCE_MCP_DELAY_SECONDS'] = (string) $options['delay_seconds'];
+        }
+
+        return $env;
+    }
+
+    private static function findFreePort(): int
+    {
+        $socket = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        if ($socket === false) {
+            throw new \RuntimeException("Could not allocate a loopback port for the reference MCP server fixture: {$errstr}");
+        }
+
+        $name = stream_socket_get_name($socket, false);
+        fclose($socket);
+
+        return (int) substr($name, strrpos($name, ':') + 1);
+    }
+
+    private static function waitUntilAcceptingConnections(string $host, int $port, float $timeoutSeconds = 5.0): void
+    {
+        $deadline = microtime(true) + $timeoutSeconds;
+        while (microtime(true) < $deadline) {
+            $connection = @stream_socket_client("tcp://{$host}:{$port}", $errno, $errstr, 0.1);
+            if ($connection !== false) {
+                fclose($connection);
+
+                return;
+            }
+            usleep(20_000);
+        }
+
+        throw new \RuntimeException("The reference MCP server fixture did not start listening on {$host}:{$port} in time.");
+    }
+}

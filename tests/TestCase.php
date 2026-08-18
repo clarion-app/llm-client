@@ -368,6 +368,7 @@ abstract class TestCase extends BaseTestCase
         $this->defineStageResultSchema();
         $this->defineAgentMessageSchema();
         $this->defineTaskWorkspaceEntrySchema();
+        $this->defineMcpClientSchema();
 
         // tool_invocation_records table (for metrics tests).
         if (!Schema::hasTable('tool_invocation_records')) {
@@ -1684,6 +1685,65 @@ abstract class TestCase extends BaseTestCase
 
                 $table->unique(['agent_label', 'period_date']);
                 $table->index(['agent_label', 'period_date']);
+            });
+        }
+    }
+
+    /**
+     * The three new tables MCP client support reads and writes. Mirrors
+     * the production migrations exactly. Guarded by Schema::hasTable()
+     * like every existing block here, called from
+     * defineDatabaseMigrations() directly, matching this file's own
+     * established call-site pattern for a feature-scoped schema block.
+     */
+    protected function defineMcpClientSchema(): void
+    {
+        if (!Schema::hasTable('mcp_client_servers')) {
+            Schema::create('mcp_client_servers', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->string('name');
+                $table->string('transport');
+                $table->string('url')->nullable();
+                $table->string('command')->nullable();
+                $table->json('args')->nullable();
+                $table->string('credential')->nullable();
+                $table->uuid('user_id');
+                $table->timestamps();
+                $table->softDeletes();
+
+                $table->index('user_id');
+            });
+        }
+
+        if (!Schema::hasTable('mcp_client_server_statuses')) {
+            Schema::create('mcp_client_server_statuses', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('server_id')->unique();
+                $table->string('connection_status')->default('unknown');
+                $table->text('last_error')->nullable();
+                $table->integer('tool_count')->nullable();
+                $table->timestamp('refresh_started_at')->nullable();
+                $table->timestamp('refresh_finished_at')->nullable();
+                $table->string('triggered_by')->nullable();
+                $table->timestamps();
+
+                $table->index('server_id');
+            });
+        }
+
+        if (!Schema::hasTable('mcp_client_tools')) {
+            Schema::create('mcp_client_tools', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('server_id');
+                $table->string('synthetic_operation_id')->unique();
+                $table->string('name');
+                $table->text('description')->nullable();
+                $table->json('input_schema');
+                $table->json('annotations')->nullable();
+                $table->timestamp('last_seen_at');
+                $table->timestamps();
+
+                $table->index('server_id');
             });
         }
     }

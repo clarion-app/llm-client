@@ -974,5 +974,28 @@ return [
     'scheduler' => [
         'default_retry_limit' => (int) env('LLM_CLIENT_SCHEDULER_DEFAULT_RETRY_LIMIT', 3),
     ],
+
+    // MCP Client Support -- bounds applied to every call this package
+    // makes outward to a third-party Model Context Protocol server, and
+    // how long a cached tool list may go unrefreshed before the
+    // scheduled sweep refreshes it again.
+    'mcp_client' => [
+        // Bounded wait for a single tool invocation. Independent of the
+        // provider-call timeout and the confirmation-wait timeout above --
+        // a tool call is expected to return far sooner than either.
+        'call_timeout_seconds' => (int) env('LLM_CLIENT_MCP_CLIENT_CALL_TIMEOUT_SECONDS', 30),
+
+        // Bounded wait for the initialize/tools-list handshake during a
+        // discovery refresh.
+        'discovery_timeout_seconds' => (int) env('LLM_CLIENT_MCP_CLIENT_DISCOVERY_TIMEOUT_SECONDS', 15),
+
+        // How stale a server's cached tool list may be before the
+        // scheduled sweep refreshes it again.
+        'tool_cache_ttl_minutes' => (int) env('LLM_CLIENT_MCP_CLIENT_TOOL_CACHE_TTL_MINUTES', 15),
+
+        // Truncation bound applied to a server-supplied tool description
+        // at cache-write time.
+        'description_max_length' => (int) env('LLM_CLIENT_MCP_CLIENT_DESCRIPTION_MAX_LENGTH', 500),
+    ],
 ];
 
