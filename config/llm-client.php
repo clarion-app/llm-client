@@ -963,6 +963,12 @@ return [
         // before the next new file triggers a scope-surfacing confirmation
         // instead of the ordinary per-file one.
         'scope_surface_threshold_files' => (int) env('LLM_CLIENT_CODING_AGENT_SCOPE_SURFACE_THRESHOLD_FILES', 8),
+
+        // The single byte-size threshold governing both readFile's truncation
+        // decision and a search match's file_oversized tag (256 KiB default) —
+        // one config value, two call sites, so a file is never treated as fine
+        // in one path and oversized in the other.
+        'file_size_threshold_bytes' => (int) env('LLM_CLIENT_CODING_AGENT_FILE_SIZE_THRESHOLD_BYTES', 262144),
     ],
 
     // Scheduler Agent — the per-action retry ceiling
