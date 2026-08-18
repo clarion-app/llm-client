@@ -553,6 +553,38 @@ class ConfirmationRelaxationJourneyTest extends TestCase
         $this->assertFalse($this->projectFileExists($this->tmpDirA, 'deleteme.txt'), 'the relaxed delete must actually remove the file');
     }
 
+    #[Test]
+    public function delete_file_on_a_relaxed_project_applies_even_when_the_installation_wide_delete_ceiling_is_the_confirm_source(): void
+    {
+        // Every other case in this file isolates confirmation to the
+        // coding agent's own definition (confirm_methods=[]). Here the
+        // installation-wide DELETE-method ceiling is restored to its
+        // ordinary default, so the pending-confirmation status this
+        // relaxation check downgrades originates from that ceiling, not
+        // from the agent definition's own list -- proving the check
+        // reads only the already-combined status, never which upstream
+        // source produced it.
+        config(['llm-client.confirm_methods' => ['DELETE']]);
+
+        $this->makeFile($this->tmpDirA, 'deleteme.txt', "to be removed\n");
+        $this->relaxProject($this->projectA, true)->assertStatus(200);
+
+        $conversation = $this->makeConversation($this->agent(), $this->projectA);
+
+        $service = $this->service([
+            $this->toolCallReply([$this->deleteFileCall($this->projectA, 'deleteme.txt', 'call_delete_2')]),
+            $this->plainReply('Deleted deleteme.txt.'),
+        ]);
+
+        $result = $service->run($conversation->fresh(), 'Delete deleteme.txt.');
+
+        $this->assertSame('completed', $result['status'], 'a relaxed delete must apply immediately regardless of which upstream check produced the pending confirmation');
+
+        $message = Message::find($result['message_id']);
+        $this->assertNull($message->tool_data['pending_confirmation'] ?? null);
+        $this->assertFalse($this->projectFileExists($this->tmpDirA, 'deleteme.txt'), 'the relaxed delete must actually remove the file');
+    }
+
     // -----------------------------------------------------------------
     // Contract error shapes
     // -----------------------------------------------------------------
