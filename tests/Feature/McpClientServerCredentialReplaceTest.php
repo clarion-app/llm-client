@@ -245,4 +245,36 @@ class McpClientServerCredentialReplaceTest extends TestCase
         $response->assertStatus(404);
         $response->assertJson(['code' => 'mcp_client_server_not_found']);
     }
+
+    #[Test]
+    public function replacing_the_credential_on_a_project_scoped_server_is_allowed_for_any_user_at_the_installation(): void
+    {
+        Bus::fake();
+
+        $server = McpClientServer::create([
+            'name' => 'Shared team server',
+            'transport' => 'streamable_http',
+            'url' => 'https://mcp.example.com/mcp',
+            'credential' => 'old-token',
+            'user_id' => McpClientServer::INSTALLATION_SCOPE_ID,
+        ]);
+
+        $anotherUser = User::factory()->create(['password' => Hash::make('password')]);
+
+        $response = $this->actingAs($anotherUser)->patchJson(
+            "/api/clarion-app/llm-client/mcp-client-server/{$server->id}/credential",
+            ['credential' => 'new-token']
+        );
+
+        $response->assertStatus(200);
+        $this->assertArrayNotHasKey('credential', $response->json());
+        $this->assertSame('Shared team server', $response->json('name'));
+        $this->assertSame('new-token', $server->fresh()->credential);
+
+        Bus::assertDispatched(
+            RefreshMcpClientServerToolsJob::class,
+            fn (RefreshMcpClientServerToolsJob $job) => $job->serverId === $server->id
+                && $job->triggeredBy === 'credential_replace'
+        );
+    }
 }
