@@ -407,6 +407,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('coding-project', [CodingProjectController::class, "store"]);
     Route::get('coding-project', [CodingProjectController::class, "index"]);
     Route::delete('coding-project/{id}', [CodingProjectController::class, "destroy"]);
+    Route::patch('coding-project/{id}/confirmation-setting', [CodingProjectController::class, "updateConfirmationSetting"]);
     Route::get('coding-project/{project}/files', [CodingWorkspaceController::class, "listFiles"]);
     Route::get('coding-project/{project}/search-files', [CodingWorkspaceController::class, "searchFiles"]);
     Route::get('coding-project/{project}/search-content', [CodingWorkspaceController::class, "searchContent"]);

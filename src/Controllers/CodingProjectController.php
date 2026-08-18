@@ -83,6 +83,35 @@ class CodingProjectController extends Controller
         return response()->json([], 204);
     }
 
+    /**
+     * PATCH coding-project/{id}/confirmation-setting
+     * (121-workspace-boundary-hardening, US3, contracts/
+     * confirmation-relaxation.md §1). Ownership-checked identically to
+     * destroy() — a project belonging to another user is reported not
+     * found, never distinguished from a genuinely absent id. Never listed
+     * in coding.yaml's tools.allow, matching this controller's other
+     * human-only actions.
+     */
+    public function updateConfirmationSetting(Request $request, string $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'relaxed' => 'required|boolean',
+        ]);
+
+        $project = CodingProject::where('id', $id)
+            ->where('user_id', Auth::id())
+            ->first();
+
+        if ($project === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $project->confirmation_relaxed = $validated['relaxed'];
+        $project->save();
+
+        return response()->json($project, 200);
+    }
+
     private function notFoundResponse(string $error, string $code): JsonResponse
     {
         return response()->json([

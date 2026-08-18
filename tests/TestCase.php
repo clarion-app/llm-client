@@ -188,6 +188,10 @@ abstract class TestCase extends BaseTestCase
                 $table->string('name');
                 $table->string('root_path');
                 $table->string('test_command')->nullable();
+                // 121-workspace-boundary-hardening, US3 — mirrors
+                // 2026_08_18_000003_add_confirmation_relaxed_to_coding_projects_table.php
+                // exactly.
+                $table->boolean('confirmation_relaxed')->default(false);
                 $table->timestamps();
                 $table->softDeletes();
 
