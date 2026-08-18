@@ -10,6 +10,7 @@ use ClarionApp\LlmClient\Models\McpClientTool;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use Dedoc\Scramble\Generator;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
@@ -88,6 +89,36 @@ class ExternalToolDenylistTest extends TestCase
         ]);
     }
 
+    /**
+     * Mirrors makeExternalTool() exactly, except the synthetic_operation_id
+     * is derived from the row's own locally-generated id (the
+     * "mcp:{server_id}:{tool_id}" form McpClientToolDiscoveryService now
+     * derives) rather than from the tool's name -- for proving a denylist
+     * rule can be anchored to the durable form directly, without a real
+     * discover() run.
+     */
+    private function makeExternalToolWithDurableId(string $serverName, string $toolName): McpClientTool
+    {
+        $server = McpClientServer::create([
+            'name' => $serverName,
+            'transport' => 'streamable_http',
+            'url' => 'https://example.test/mcp',
+            'user_id' => $this->user->id,
+        ]);
+
+        $id = (string) Str::uuid();
+
+        return McpClientTool::create([
+            'id' => $id,
+            'server_id' => $server->id,
+            'synthetic_operation_id' => "mcp:{$server->id}:{$id}",
+            'name' => $toolName,
+            'description' => 'An external tool.',
+            'input_schema' => ['type' => 'object', 'properties' => []],
+            'last_seen_at' => now(),
+        ]);
+    }
+
     private function invoke(McpClientTool $tool, Conversation $conversation): array
     {
         return json_decode(
@@ -114,6 +145,25 @@ class ExternalToolDenylistTest extends TestCase
         $this->assertFalse(
             (bool) ($result['__requires_confirmation'] ?? false),
             'a denylisted external tool must never raise a confirmation prompt -- it is refused outright, not paused for a decision',
+        );
+        $this->assertArrayNotHasKey('confirmation_type', (array) $result);
+    }
+
+    #[Test]
+    public function a_denylist_entry_written_against_a_tools_durable_synthetic_operation_id_rejects_the_call_outright(): void
+    {
+        $tool = $this->makeExternalToolWithDurableId('Durable Denylist Server', 'delete_everything');
+
+        config(['llm-client.api_denylist' => [$tool->synthetic_operation_id]]);
+
+        $conversation = Conversation::factory()->create(['user_id' => $this->user->id]);
+
+        $result = $this->invoke($tool, $conversation);
+
+        $this->assertArrayHasKey('error', (array) $result, 'got: '.json_encode($result));
+        $this->assertFalse(
+            (bool) ($result['__requires_confirmation'] ?? false),
+            'a denylist entry written against a tool\'s durable synthetic_operation_id must reject outright, exactly as the legacy name-based-pattern form already does above',
         );
         $this->assertArrayNotHasKey('confirmation_type', (array) $result);
     }
