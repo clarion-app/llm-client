@@ -3813,14 +3813,13 @@ class AgentLoopService
             // tool the server has since stopped offering is never
             // deleted by a refresh, only left behind by the next one
             // that didn't touch it (McpClientToolDiscoveryService's own
-            // create/update-by-natural-key reconciliation). A row with
-            // no status row for its server at all -- the seeding shape
-            // most of this feature's own tests use directly, having
-            // never gone through a real discover() run -- is left
-            // untouched here: there is no completed refresh to compare
-            // against, so there is no evidence the tool is gone.
-            $latestRefreshFinishedAt = \ClarionApp\LlmClient\Models\McpClientServerStatus::where('server_id', $externalTool->server_id)->value('refresh_finished_at');
-            if ($latestRefreshFinishedAt !== null && $externalTool->last_seen_at < $latestRefreshFinishedAt) {
+            // create/update-by-natural-key reconciliation). Delegates to
+            // McpClientTool::scopeActive() -- the same currency check
+            // matchingExternalToolResults() already applies for
+            // search_operations -- rather than an independent comparison
+            // of its own, so search and execute can never disagree about
+            // whether this exact row currently counts as offered.
+            if (!\ClarionApp\LlmClient\Models\McpClientTool::whereKey($externalTool->id)->active()->exists()) {
                 $externalTool = null;
             }
         }

@@ -130,17 +130,12 @@ class McpClientToolDiscoveryService
         // The pool a name/schema match is drawn from is every row for
         // this server sharing its own current maximum last_seen_at --
         // "the tools this server offered as of its last successful
-        // refresh" -- computed from the tool rows themselves rather than
-        // from McpClientTool::scopeActive() (which instead compares
-        // against the status row's refresh_finished_at). That distinction
-        // matters here specifically because refresh_finished_at is
-        // stamped on every discover() attempt, including a failed one
-        // that leaves every tool row untouched: scoping the pool to
-        // scopeActive() would let one transient failure empty it, and
-        // the very next successful refresh -- even reporting the exact
-        // same, un-renamed tools -- would then match nothing by name and
-        // mint a fresh id for all of them.
-        $maxLastSeenAt = McpClientTool::where('server_id', $server->id)->max('last_seen_at');
+        // refresh." McpClientTool::maxLastSeenAtFor() is this exact
+        // computation, now shared with McpClientTool::scopeActive() (which
+        // builds the same MAX(last_seen_at)-per-server comparison as a
+        // correlated subquery rather than N calls to this helper) so both
+        // agree on one definition of "this server's own current pool."
+        $maxLastSeenAt = McpClientTool::maxLastSeenAtFor($server->id);
 
         $candidateRowsByName = [];
         if ($maxLastSeenAt !== null) {
