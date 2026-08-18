@@ -183,6 +183,7 @@ class McpClientServerController extends Controller
                 'name' => $tool->name,
                 'description' => $tool->description,
                 'input_schema' => $tool->input_schema,
+                'synthetic_operation_id' => $tool->synthetic_operation_id,
             ])
             ->values();
 

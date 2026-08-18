@@ -6,6 +6,8 @@ use ClarionApp\LlmClient\Exceptions\McpAuthenticationException;
 use ClarionApp\LlmClient\Models\McpClientServer;
 use ClarionApp\LlmClient\Models\McpClientServerStatus;
 use ClarionApp\LlmClient\Models\McpClientTool;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
 
 /**
  * Runs the initialize -> tools/list handshake against one McpClientServer
@@ -87,31 +89,7 @@ class McpClientToolDiscoveryService
         // fails for any it did not -- the entire soft-removal mechanism
         // rests on both values being identical, not merely close.
         $refreshTimestamp = now();
-        $toolCount = 0;
-
-        foreach ($tools as $tool) {
-            $name = is_string($tool['name'] ?? null) ? $tool['name'] : null;
-            if ($name === null || $name === '') {
-                continue;
-            }
-
-            $inputSchema = is_array($tool['inputSchema'] ?? null) ? $tool['inputSchema'] : [];
-            $annotations = is_array($tool['annotations'] ?? null) ? $tool['annotations'] : null;
-            $description = $this->sanitizer->sanitize($tool['description'] ?? null, $server->name);
-
-            McpClientTool::updateOrCreate(
-                ['synthetic_operation_id' => "mcp:{$server->id}:{$name}"],
-                [
-                    'server_id' => $server->id,
-                    'name' => $name,
-                    'description' => $description,
-                    'input_schema' => $inputSchema,
-                    'annotations' => $annotations,
-                    'last_seen_at' => $refreshTimestamp,
-                ]
-            );
-            $toolCount++;
-        }
+        $toolCount = $this->reconcileTools($server, $tools, $refreshTimestamp);
 
         $status->update([
             'connection_status' => 'reachable',
@@ -121,5 +99,207 @@ class McpClientToolDiscoveryService
         ]);
 
         return $status->fresh();
+    }
+
+    /**
+     * Reconciles one refresh's reported tools against this server's
+     * existing rows and returns the number of tools successfully
+     * accounted for (matched-by-name, matched-by-schema, or newly
+     * inserted). Mirrors RefreshServerModelsJob's own create/reconcile/
+     * soft-delete shape, but with an extra middle step this table's own
+     * synthetic_operation_id durability requires: before falling back to
+     * "remove one, add one" (today's only behavior), an orphaned row and
+     * an unclaimed report sharing the same parameter schema -- and only
+     * they -- are recognized as the same capability under a new name, so
+     * the row's own id (and anything anchored to it) survives the
+     * rename.
+     *
+     * @param  list<array{name: string, description: ?string, inputSchema: array, annotations: ?array}>  $tools
+     */
+    private function reconcileTools(McpClientServer $server, array $tools, Carbon $refreshTimestamp): int
+    {
+        $reportedByName = [];
+        foreach ($tools as $tool) {
+            $name = is_string($tool['name'] ?? null) ? $tool['name'] : null;
+            if ($name === null || $name === '') {
+                continue;
+            }
+            $reportedByName[$name] = $tool;
+        }
+
+        // The pool a name/schema match is drawn from is every row for
+        // this server sharing its own current maximum last_seen_at --
+        // "the tools this server offered as of its last successful
+        // refresh" -- computed from the tool rows themselves rather than
+        // from McpClientTool::scopeActive() (which instead compares
+        // against the status row's refresh_finished_at). That distinction
+        // matters here specifically because refresh_finished_at is
+        // stamped on every discover() attempt, including a failed one
+        // that leaves every tool row untouched: scoping the pool to
+        // scopeActive() would let one transient failure empty it, and
+        // the very next successful refresh -- even reporting the exact
+        // same, un-renamed tools -- would then match nothing by name and
+        // mint a fresh id for all of them.
+        $maxLastSeenAt = McpClientTool::where('server_id', $server->id)->max('last_seen_at');
+
+        $candidateRowsByName = [];
+        if ($maxLastSeenAt !== null) {
+            foreach (McpClientTool::where('server_id', $server->id)->where('last_seen_at', $maxLastSeenAt)->get() as $row) {
+                $candidateRowsByName[$row->name] = $row;
+            }
+        }
+
+        $toolCount = 0;
+        $matchedNames = [];
+
+        // Fast path, unchanged from before this method existed: a
+        // reported name matching an existing row updates it in place,
+        // identity untouched.
+        foreach ($reportedByName as $name => $tool) {
+            if (!array_key_exists($name, $candidateRowsByName)) {
+                continue;
+            }
+
+            $this->applyToolFields($candidateRowsByName[$name], $tool, $server, $refreshTimestamp);
+            $matchedNames[$name] = true;
+            $toolCount++;
+        }
+
+        $orphaned = [];
+        foreach ($candidateRowsByName as $name => $row) {
+            if (!isset($matchedNames[$name])) {
+                $orphaned[] = $row;
+            }
+        }
+
+        $unclaimed = [];
+        foreach ($reportedByName as $name => $tool) {
+            if (!isset($matchedNames[$name])) {
+                $unclaimed[] = $tool;
+            }
+        }
+
+        $orphanedBySignature = [];
+        foreach ($orphaned as $row) {
+            $orphanedBySignature[self::schemaSignature($row->input_schema ?? [])][] = $row;
+        }
+
+        $unclaimedIndexesBySignature = [];
+        foreach ($unclaimed as $index => $tool) {
+            $schema = is_array($tool['inputSchema'] ?? null) ? $tool['inputSchema'] : [];
+            $unclaimedIndexesBySignature[self::schemaSignature($schema)][] = $index;
+        }
+
+        // A signature shared by exactly one orphaned row and exactly one
+        // unclaimed report is the only case treated as a rename/
+        // redescribe of the same capability -- any ambiguity on either
+        // side (zero or multiple candidates) is left for the fallback
+        // below rather than guessed at.
+        $claimedUnclaimedIndexes = [];
+        foreach ($orphanedBySignature as $signature => $rows) {
+            if (count($rows) !== 1) {
+                continue;
+            }
+
+            $candidateIndexes = $unclaimedIndexesBySignature[$signature] ?? [];
+            if (count($candidateIndexes) !== 1) {
+                continue;
+            }
+
+            $index = $candidateIndexes[0];
+            $this->applyToolFields($rows[0], $unclaimed[$index], $server, $refreshTimestamp);
+            $claimedUnclaimedIndexes[$index] = true;
+            $toolCount++;
+        }
+
+        // Everything left unclaimed -- no schema match, or an ambiguous
+        // one -- is a genuinely new row, with a freshly generated id
+        // this installation alone controls.
+        foreach ($unclaimed as $index => $tool) {
+            if (isset($claimedUnclaimedIndexes[$index])) {
+                continue;
+            }
+
+            $id = (string) Str::uuid();
+            $inputSchema = is_array($tool['inputSchema'] ?? null) ? $tool['inputSchema'] : [];
+            $annotations = is_array($tool['annotations'] ?? null) ? $tool['annotations'] : null;
+            $description = $this->sanitizer->sanitize($tool['description'] ?? null, $server->name);
+
+            McpClientTool::create([
+                'id' => $id,
+                'server_id' => $server->id,
+                'synthetic_operation_id' => "mcp:{$server->id}:{$id}",
+                'name' => $tool['name'],
+                'description' => $description,
+                'input_schema' => $inputSchema,
+                'annotations' => $annotations,
+                'last_seen_at' => $refreshTimestamp,
+            ]);
+            $toolCount++;
+        }
+
+        // Every remaining orphaned row (schema didn't match, or matched
+        // ambiguously) is left untouched this refresh -- it ages out via
+        // the pre-existing last_seen_at/scopeActive() mechanism once some
+        // other row for this server advances the server's own maximum
+        // last_seen_at past it.
+
+        return $toolCount;
+    }
+
+    /**
+     * Updates one existing row's mutable, server-reported fields in
+     * place -- name, description, input_schema, annotations,
+     * last_seen_at -- while leaving id and synthetic_operation_id
+     * untouched, whether the row was matched by name (the ordinary case)
+     * or recognized as a rename/redescribe by schema.
+     *
+     * @param  array{name: string, description: ?string, inputSchema: array, annotations: ?array}  $tool
+     */
+    private function applyToolFields(McpClientTool $row, array $tool, McpClientServer $server, Carbon $refreshTimestamp): void
+    {
+        $name = is_string($tool['name'] ?? null) ? $tool['name'] : $row->name;
+        $inputSchema = is_array($tool['inputSchema'] ?? null) ? $tool['inputSchema'] : [];
+        $annotations = is_array($tool['annotations'] ?? null) ? $tool['annotations'] : null;
+        $description = $this->sanitizer->sanitize($tool['description'] ?? null, $server->name);
+
+        $row->update([
+            'name' => $name,
+            'description' => $description,
+            'input_schema' => $inputSchema,
+            'annotations' => $annotations,
+            'last_seen_at' => $refreshTimestamp,
+        ]);
+    }
+
+    /**
+     * A canonical, order-independent-on-object-keys form of a tool's
+     * inputSchema, used only to decide whether two schemas are
+     * structurally identical for rename/redescribe matching -- recursive
+     * key-sort of every associative sub-array (list arrays keep their own
+     * order, since element order is itself part of a list's meaning),
+     * then json_encode.
+     */
+    private static function schemaSignature(array $schema): string
+    {
+        return json_encode(self::canonicalizeForSignature($schema));
+    }
+
+    private static function canonicalizeForSignature(mixed $value): mixed
+    {
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        $canonicalized = [];
+        foreach ($value as $key => $item) {
+            $canonicalized[$key] = self::canonicalizeForSignature($item);
+        }
+
+        if (!array_is_list($canonicalized)) {
+            ksort($canonicalized);
+        }
+
+        return $canonicalized;
     }
 }

@@ -113,6 +113,9 @@ class McpClientServerControllerTest extends TestCase
         $this->assertSame(1, $data['status']['tool_count']);
         $this->assertCount(1, $data['tools']);
         $this->assertSame('web_search', $data['tools'][0]['name']);
+
+        $cachedTool = McpClientTool::where('server_id', $server->id)->where('name', 'web_search')->firstOrFail();
+        $this->assertSame($cachedTool->synthetic_operation_id, $data['tools'][0]['synthetic_operation_id']);
     }
 
     #[Test]

@@ -34,10 +34,11 @@ use Tests\TestCase;
  * a completed call naming the exact server that carried it out.
  *
  * McpClientToolDiscoveryService already derives a synthetic_operation_id
- * of "mcp:{server_id}:{tool_name}" (McpClientToolDiscoveryServiceTest,
- * McpClientToolCatalogMergerTest) -- namespaced by the server's own UUID,
- * not merely the tool's own name -- so two servers offering the same
- * tool name were already guaranteed distinct ids before this file existed.
+ * of "mcp:{server_id}:{row_id}" (McpClientToolDiscoveryServiceTest,
+ * McpClientToolCatalogMergerTest) -- namespaced by the server's own UUID
+ * and the cached row's own locally-generated id, neither of which either
+ * server controls -- so two servers offering the same tool name were
+ * already guaranteed distinct ids before this file existed.
  * What this file proves is that the guarantee holds end to end: through
  * search, through the confirm-then-approve round trip, and through
  * which physical fixture process an approved call actually reaches.
@@ -275,8 +276,8 @@ class ExternalToolNameCollisionJourneyTest extends TestCase
         $toolA = McpClientTool::where('server_id', $serverA->id)->where('name', 'search')->firstOrFail();
         $toolB = McpClientTool::where('server_id', $serverB->id)->where('name', 'search')->firstOrFail();
 
-        $this->assertSame("mcp:{$serverA->id}:search", $toolA->synthetic_operation_id);
-        $this->assertSame("mcp:{$serverB->id}:search", $toolB->synthetic_operation_id);
+        $this->assertStringStartsWith("mcp:{$serverA->id}:", $toolA->synthetic_operation_id);
+        $this->assertStringStartsWith("mcp:{$serverB->id}:", $toolB->synthetic_operation_id);
         $this->assertNotSame(
             $toolA->synthetic_operation_id,
             $toolB->synthetic_operation_id,
