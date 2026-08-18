@@ -188,10 +188,32 @@ abstract class TestCase extends BaseTestCase
                 $table->string('name');
                 $table->string('root_path');
                 $table->string('test_command')->nullable();
+                // 121-workspace-boundary-hardening, US3 — mirrors
+                // 2026_08_18_000003_add_confirmation_relaxed_to_coding_projects_table.php
+                // exactly.
+                $table->boolean('confirmation_relaxed')->default(false);
                 $table->timestamps();
                 $table->softDeletes();
 
                 $table->index('user_id');
+            });
+        }
+
+        // coding_workspace_refusals table (121-workspace-boundary-hardening,
+        // US2, data-model.md §3) — mirrors
+        // 2026_08_18_000002_create_coding_workspace_refusals_table.php
+        // exactly, including the created_at useCurrent() default, which is
+        // load-bearing here too: CodingWorkspaceRefusal sets
+        // $timestamps = false and never passes created_at explicitly.
+        if (!Schema::hasTable('coding_workspace_refusals')) {
+            Schema::create('coding_workspace_refusals', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('coding_project_id');
+                $table->string('operation');
+                $table->string('reason');
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index('coding_project_id');
             });
         }
 

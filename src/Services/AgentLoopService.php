@@ -3889,6 +3889,30 @@ class AgentLoopService
             }
         }
 
+        // A user who has deliberately relaxed confirmation for this
+        // specific project gets it applied immediately instead of
+        // pausing -- checked only for the two coding-workspace mutation
+        // operations, only once both upstream sources of a CONFIRM status
+        // above have already been combined, so relaxation overrides
+        // either trigger uniformly. Reuses enforceCodingProjectBinding()'s
+        // own lookup value ($params['path']['project']), not a new query
+        // pattern. Never references PathContainment,
+        // containmentFailureResponse(), or WorkspaceRefusalRecorder --
+        // relaxation has no code path through which the boundary check or
+        // refusal recording become visible to it.
+        if (($operationId === self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID)
+            && $validation['status'] === ApiCallValidator::STATUS_CONFIRM) {
+            $relaxedProjectId = $params['path']['project'] ?? null;
+            $codingProject = $relaxedProjectId !== null
+                ? \ClarionApp\LlmClient\Models\CodingProject::find($relaxedProjectId)
+                : null;
+
+            if ($codingProject !== null && $codingProject->confirmation_relaxed) {
+                $validation['status'] = ApiCallValidator::STATUS_ALLOW;
+            }
+        }
+
         // A helper's own attempt is also bound by the CURRENT permissions
         // of every ancestor in the specific delegation chain that routed
         // the work to it — checked live, on every attempt, not only at

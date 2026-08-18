@@ -187,4 +187,131 @@ class PathContainmentTest extends TestCase
 
         $this->assertFalse($result['valid']);
     }
+
+    // ---------------------------------------------------------------
+    // A symlink already sitting at a write (not-yet-existing) leaf is
+    // refused, regardless of where it points -- realpath() never
+    // resolves the leaf itself in this mode, so this is the one shape
+    // realpath()-based resolution alone cannot catch.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_symlink_already_sitting_at_a_write_leaf_pointing_outside_the_project_is_rejected(): void
+    {
+        $outside = sys_get_temp_dir().'/coding_project_outside_'.bin2hex(random_bytes(8));
+        mkdir($outside);
+        file_put_contents($outside.'/secret.txt', 'top secret');
+
+        $leaf = $this->projectRoot.'/write-target.txt';
+        symlink($outside.'/secret.txt', $leaf);
+
+        try {
+            $result = PathContainment::validate($this->projectRoot, 'write-target.txt', targetMustExist: false);
+
+            $this->assertFalse($result['valid'], 'a symlink already at the write leaf must be refused before any comparison of where it points');
+            $this->assertSame('outside the registered project', $result['reason']);
+        } finally {
+            unlink($leaf);
+            $this->removeDirectory($outside);
+        }
+    }
+
+    #[Test]
+    public function a_symlink_already_sitting_at_a_write_leaf_pointing_inside_the_project_is_also_rejected(): void
+    {
+        $leaf = $this->projectRoot.'/write-target-inside.txt';
+        symlink($this->projectRoot.'/subdir/existing.txt', $leaf);
+
+        try {
+            $result = PathContainment::validate($this->projectRoot, 'write-target-inside.txt', targetMustExist: false);
+
+            $this->assertFalse($result['valid'], 'the guard fires because the leaf is a link at all, not because of where it happens to point');
+            $this->assertSame('outside the registered project', $result['reason']);
+        } finally {
+            unlink($leaf);
+        }
+    }
+
+    #[Test]
+    public function a_genuinely_new_create_target_is_unaffected_by_the_symlink_leaf_guard(): void
+    {
+        $result = PathContainment::validate($this->projectRoot, 'brand-new-file.txt', targetMustExist: false);
+
+        $this->assertTrue($result['valid'], 'a genuinely new leaf has nothing sitting at it to be a symlink, so the guard must never fire here');
+    }
+
+    // ---------------------------------------------------------------
+    // A hard-linked file is rejected in both the target-must-exist and
+    // create/overwrite branches -- an ordinary directory must never be
+    // misidentified as hard-linked.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_hard_linked_file_is_rejected_when_the_target_must_already_exist(): void
+    {
+        $target = $this->projectRoot.'/hardlink-target.txt';
+        file_put_contents($target, 'hard link content');
+        $linked = $this->projectRoot.'/hardlink-existing.txt';
+        link($target, $linked);
+
+        $result = PathContainment::validate($this->projectRoot, 'hardlink-existing.txt', targetMustExist: true);
+
+        $this->assertFalse($result['valid'], 'a hard-linked file must be refused exactly like a symlink escape');
+        $this->assertSame('outside the registered project', $result['reason']);
+    }
+
+    #[Test]
+    public function a_hard_linked_file_already_sitting_at_a_write_leaf_is_rejected(): void
+    {
+        $target = $this->projectRoot.'/hardlink-target-2.txt';
+        file_put_contents($target, 'hard link content');
+        $linked = $this->projectRoot.'/hardlink-write.txt';
+        link($target, $linked);
+
+        $result = PathContainment::validate($this->projectRoot, 'hardlink-write.txt', targetMustExist: false);
+
+        $this->assertFalse($result['valid'], 'a hard link already occupying a write leaf must be refused, covering the overwrite-an-existing-hard-link case');
+        $this->assertSame('outside the registered project', $result['reason']);
+    }
+
+    #[Test]
+    public function an_ordinary_directory_with_a_subdirectory_is_not_misidentified_as_hard_linked(): void
+    {
+        // A directory's own link count is greater than one for entirely
+        // ordinary reasons -- the hard-link guard must be scoped to
+        // regular files only, never firing here.
+        mkdir($this->projectRoot.'/subdir/nested-subdir');
+
+        $result = PathContainment::validate($this->projectRoot, 'subdir', targetMustExist: true);
+
+        $this->assertTrue($result['valid'], 'the hard-link guard must never misfire on an ordinary directory containing a subdirectory');
+    }
+
+    // ---------------------------------------------------------------
+    // resolved_identity: a {dev, ino} fingerprint of the resolved
+    // target, present when it exists, null on a genuine create.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function resolved_identity_matches_a_real_lstat_when_the_target_exists(): void
+    {
+        $result = PathContainment::validate($this->projectRoot, 'subdir/existing.txt', targetMustExist: true);
+
+        $this->assertTrue($result['valid']);
+        $this->assertArrayHasKey('resolved_identity', $result);
+
+        $expected = lstat($this->projectRoot.'/subdir/existing.txt');
+        $this->assertSame($expected['dev'], $result['resolved_identity']['dev']);
+        $this->assertSame($expected['ino'], $result['resolved_identity']['ino']);
+    }
+
+    #[Test]
+    public function resolved_identity_is_null_when_the_target_does_not_yet_exist(): void
+    {
+        $result = PathContainment::validate($this->projectRoot, 'subdir/pure-create.txt', targetMustExist: false);
+
+        $this->assertTrue($result['valid']);
+        $this->assertArrayHasKey('resolved_identity', $result);
+        $this->assertNull($result['resolved_identity']);
+    }
 }

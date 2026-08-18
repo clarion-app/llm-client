@@ -7,6 +7,7 @@ use Auth;
 use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Services\PathContainment;
 use ClarionApp\LlmClient\Services\WorkspaceFilePolicy;
+use ClarionApp\LlmClient\Services\WorkspaceRefusalRecorder;
 use ClarionApp\LlmClient\Services\WorkspaceSearchService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -39,6 +40,7 @@ class CodingWorkspaceController extends Controller
     public function __construct(
         private readonly WorkspaceSearchService $workspaceSearchService = new WorkspaceSearchService(),
         private readonly WorkspaceFilePolicy $filePolicy = new WorkspaceFilePolicy(),
+        private readonly WorkspaceRefusalRecorder $refusalRecorder = new WorkspaceRefusalRecorder(),
     ) {
     }
 
@@ -58,7 +60,7 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $subpath, true);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'list_files', $validation['reason'] ?? 'invalid path');
         }
 
         $resolvedPath = $validation['resolved_path'];
@@ -104,7 +106,7 @@ class CodingWorkspaceController extends Controller
 
         $result = $this->workspaceSearchService->searchFiles($codingProject, $subpath, $pattern);
         if (!$result['valid']) {
-            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'search_files', $result['reason'] ?? 'invalid path');
         }
 
         return response()->json([
@@ -139,7 +141,7 @@ class CodingWorkspaceController extends Controller
 
         $result = $this->workspaceSearchService->searchContent($codingProject, $subpath, $query, $pattern);
         if (!$result['valid']) {
-            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'search_content', $result['reason'] ?? 'invalid path');
         }
 
         return response()->json([
@@ -177,31 +179,45 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $path, true);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'read_file', $validation['reason'] ?? 'invalid path');
         }
 
         $resolvedPath = $validation['resolved_path'];
+        $resolvedIdentity = $validation['resolved_identity'] ?? null;
 
-        if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
+        // Nothing else runs between an approved location and opening it --
+        // everything from here on acts on the open handle, never on the
+        // path string again.
+        $this->beforeResolvedPathOpen($resolvedPath);
+
+        $handle = @fopen($resolvedPath, 'rb');
+        if ($handle === false) {
             return response()->json(['error' => 'not found'], 422);
         }
 
-        if ($this->filePolicy->isOversized($resolvedPath)) {
-            $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+        $actual = @fstat($handle);
+        if ($actual === false) {
+            fclose($handle);
 
-            $handle = @fopen($resolvedPath, 'rb');
-            if ($handle === false) {
-                return response()->json(['error' => 'not found'], 422);
-            }
+            return response()->json(['error' => 'not found'], 422);
+        }
 
+        if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
+            fclose($handle);
+
+            return $this->containmentFailureResponse($codingProject, 'read_file', 'outside the registered project');
+        }
+
+        $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+        $size = $actual['size'];
+
+        if ($size > $threshold) {
             $sample = @fread($handle, $threshold);
             fclose($handle);
 
             if ($sample === false) {
                 return response()->json(['error' => 'not found'], 422);
             }
-
-            $size = filesize($resolvedPath);
 
             if ($this->filePolicy->isBinary($sample)) {
                 return response()->json([
@@ -221,7 +237,10 @@ class CodingWorkspaceController extends Controller
             ], 200);
         }
 
-        $content = @file_get_contents($resolvedPath);
+        rewind($handle);
+        $content = @stream_get_contents($handle);
+        fclose($handle);
+
         if ($content === false) {
             return response()->json(['error' => 'not found'], 422);
         }
@@ -263,10 +282,34 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $validated['path'], false);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'write_file', $validation['reason'] ?? 'invalid path');
         }
 
-        $written = @file_put_contents($validation['resolved_path'], $validated['content']);
+        $resolvedPath = $validation['resolved_path'];
+        $resolvedIdentity = $validation['resolved_identity'] ?? null;
+
+        $this->beforeResolvedPathOpen($resolvedPath);
+
+        // Create-or-open, no truncate yet -- an overwrite's identity is
+        // verified against the handle before a single byte is written.
+        $handle = @fopen($resolvedPath, 'cb');
+        if ($handle === false) {
+            return response()->json(['error' => 'could not write file'], 422);
+        }
+
+        if ($resolvedIdentity !== null) {
+            $actual = @fstat($handle);
+            if ($actual === false || !$this->identityMatches($actual, $resolvedIdentity)) {
+                fclose($handle);
+
+                return $this->containmentFailureResponse($codingProject, 'write_file', 'outside the registered project');
+            }
+        }
+
+        ftruncate($handle, 0);
+        $written = @fwrite($handle, $validated['content']);
+        fclose($handle);
+
         if ($written === false) {
             return response()->json(['error' => 'could not write file'], 422);
         }
@@ -296,13 +339,36 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $path, true);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'delete_file', $validation['reason'] ?? 'invalid path');
         }
 
         $resolvedPath = $validation['resolved_path'];
+        $resolvedIdentity = $validation['resolved_identity'] ?? null;
 
-        if (!is_file($resolvedPath)) {
+        $this->beforeResolvedPathOpen($resolvedPath);
+
+        // Opened only to pin/verify identity via fstat() -- content is
+        // never read. unlink() itself still has to act on the path, not
+        // this handle -- PHP has no fd-based delete primitive -- so this
+        // operation's guarantee is honestly narrower than readFile's/
+        // writeFile's: it is bounded to "the wrong in-workspace entry
+        // could be removed," never "outside content exposed," since
+        // unlink() never dereferences a symlink to remove its target, only
+        // the directory entry it was given.
+        $handle = @fopen($resolvedPath, 'rb');
+        if ($handle === false) {
             return response()->json(['error' => 'not found'], 422);
+        }
+
+        $actual = @fstat($handle);
+        fclose($handle);
+
+        if ($actual === false) {
+            return response()->json(['error' => 'not found'], 422);
+        }
+
+        if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
+            return $this->containmentFailureResponse($codingProject, 'delete_file', 'outside the registered project');
         }
 
         $deleted = @unlink($resolvedPath);
@@ -431,11 +497,40 @@ class CodingWorkspaceController extends Controller
      * ("path traversal", "outside the registered project", "not found",
      * "project directory is not reachable", "invalid file name") is
      * reported the same way: a 422 naming the reason, never a 500 or a
-     * silently-allowed operation.
+     * silently-allowed operation. Every call site funnels through here --
+     * old and new alike -- so this is also the single seam
+     * WorkspaceRefusalRecorder::record() is called from
+     * (121-workspace-boundary-hardening, US2,
+     * contracts/refusal-recording.md §1): a durable record of the refusal
+     * is written before the response is built, independent of whether the
+     * caller was an agent's own tool call or a direct, non-agent request.
      */
-    private function containmentFailureResponse(string $reason): JsonResponse
+    private function containmentFailureResponse(CodingProject $project, string $operation, string $reason): JsonResponse
     {
+        $this->refusalRecorder->record($project, $operation, $reason);
+
         return response()->json(['error' => $reason], 422);
+    }
+
+    /**
+     * A no-op hook every production caller runs straight through,
+     * positioned as the last thing that happens between an approved
+     * location and the fopen() that follows it. It exists purely so a
+     * test can simulate the on-disk location being swapped out from
+     * under an already-approved path in that narrow window -- production
+     * code never overrides it.
+     */
+    protected function beforeResolvedPathOpen(string $resolvedPath): void
+    {
+    }
+
+    /**
+     * Compares a freshly-fstat()'d handle's {dev, ino} against the
+     * fingerprint PathContainment::validate() captured at approval time.
+     */
+    private function identityMatches(array $actualStat, array $resolvedIdentity): bool
+    {
+        return $actualStat['dev'] === $resolvedIdentity['dev'] && $actualStat['ino'] === $resolvedIdentity['ino'];
     }
 
     /**

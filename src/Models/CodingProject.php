@@ -23,6 +23,6 @@ class CodingProject extends Model
 {
     use HasFactory, EloquentMultiChainBridge, SoftDeletes;
 
-    protected $fillable = ['user_id', 'name', 'root_path', 'test_command'];
+    protected $fillable = ['user_id', 'name', 'root_path', 'test_command', 'confirmation_relaxed'];
     protected $table = 'coding_projects';
 }
