@@ -7,6 +7,7 @@ use Auth;
 use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Services\PathContainment;
 use ClarionApp\LlmClient\Services\WorkspaceFilePolicy;
+use ClarionApp\LlmClient\Services\WorkspaceRefusalRecorder;
 use ClarionApp\LlmClient\Services\WorkspaceSearchService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -39,6 +40,7 @@ class CodingWorkspaceController extends Controller
     public function __construct(
         private readonly WorkspaceSearchService $workspaceSearchService = new WorkspaceSearchService(),
         private readonly WorkspaceFilePolicy $filePolicy = new WorkspaceFilePolicy(),
+        private readonly WorkspaceRefusalRecorder $refusalRecorder = new WorkspaceRefusalRecorder(),
     ) {
     }
 
@@ -58,7 +60,7 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $subpath, true);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'list_files', $validation['reason'] ?? 'invalid path');
         }
 
         $resolvedPath = $validation['resolved_path'];
@@ -104,7 +106,7 @@ class CodingWorkspaceController extends Controller
 
         $result = $this->workspaceSearchService->searchFiles($codingProject, $subpath, $pattern);
         if (!$result['valid']) {
-            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'search_files', $result['reason'] ?? 'invalid path');
         }
 
         return response()->json([
@@ -139,7 +141,7 @@ class CodingWorkspaceController extends Controller
 
         $result = $this->workspaceSearchService->searchContent($codingProject, $subpath, $query, $pattern);
         if (!$result['valid']) {
-            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'search_content', $result['reason'] ?? 'invalid path');
         }
 
         return response()->json([
@@ -177,7 +179,7 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $path, true);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'read_file', $validation['reason'] ?? 'invalid path');
         }
 
         $resolvedPath = $validation['resolved_path'];
@@ -203,7 +205,7 @@ class CodingWorkspaceController extends Controller
         if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
             fclose($handle);
 
-            return $this->containmentFailureResponse('outside the registered project');
+            return $this->containmentFailureResponse($codingProject, 'read_file', 'outside the registered project');
         }
 
         $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
@@ -280,7 +282,7 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $validated['path'], false);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'write_file', $validation['reason'] ?? 'invalid path');
         }
 
         $resolvedPath = $validation['resolved_path'];
@@ -300,7 +302,7 @@ class CodingWorkspaceController extends Controller
             if ($actual === false || !$this->identityMatches($actual, $resolvedIdentity)) {
                 fclose($handle);
 
-                return $this->containmentFailureResponse('outside the registered project');
+                return $this->containmentFailureResponse($codingProject, 'write_file', 'outside the registered project');
             }
         }
 
@@ -337,7 +339,7 @@ class CodingWorkspaceController extends Controller
 
         $validation = PathContainment::validate($codingProject->root_path, $path, true);
         if (!$validation['valid']) {
-            return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
+            return $this->containmentFailureResponse($codingProject, 'delete_file', $validation['reason'] ?? 'invalid path');
         }
 
         $resolvedPath = $validation['resolved_path'];
@@ -366,7 +368,7 @@ class CodingWorkspaceController extends Controller
         }
 
         if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
-            return $this->containmentFailureResponse('outside the registered project');
+            return $this->containmentFailureResponse($codingProject, 'delete_file', 'outside the registered project');
         }
 
         $deleted = @unlink($resolvedPath);
@@ -495,10 +497,18 @@ class CodingWorkspaceController extends Controller
      * ("path traversal", "outside the registered project", "not found",
      * "project directory is not reachable", "invalid file name") is
      * reported the same way: a 422 naming the reason, never a 500 or a
-     * silently-allowed operation.
+     * silently-allowed operation. Every call site funnels through here --
+     * old and new alike -- so this is also the single seam
+     * WorkspaceRefusalRecorder::record() is called from
+     * (121-workspace-boundary-hardening, US2,
+     * contracts/refusal-recording.md §1): a durable record of the refusal
+     * is written before the response is built, independent of whether the
+     * caller was an agent's own tool call or a direct, non-agent request.
      */
-    private function containmentFailureResponse(string $reason): JsonResponse
+    private function containmentFailureResponse(CodingProject $project, string $operation, string $reason): JsonResponse
     {
+        $this->refusalRecorder->record($project, $operation, $reason);
+
         return response()->json(['error' => $reason], 422);
     }
 
