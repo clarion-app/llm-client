@@ -29,6 +29,15 @@ use ClarionApp\Backend\ApiManager;
 final class AgentDefinition
 {
     /**
+     * The fixed sentinel method every synthesized external-tool path
+     * carries (McpClientToolCatalogMerger's own "method" field) -- never
+     * a real HTTP verb, so a bare-verb pattern in tools.allow (e.g. "GET")
+     * can never accidentally permit an external tool; only a glob pattern
+     * written against an "mcp:"-prefixed operationId can.
+     */
+    private const EXTERNAL_TOOL_METHOD = 'MCP_EXTERNAL';
+
+    /**
      * @param array<string, bool> $memory keyed by MemoryKind::value
      * @param list<ReducibleTool> $capabilities
      * @param list<string> $toolsAllow raw, unexpanded patterns
@@ -74,6 +83,23 @@ final class AgentDefinition
     {
         if ($this->isDeniedByInstallation($operationId)) {
             return false;
+        }
+
+        // An external-tool operationId is never a member of ApiManager's
+        // own catalog (it names a per-user/per-server tool, not an
+        // installation-wide route), so resolveCatalog()'s enumerate-then-
+        // check-membership approach can never match one, regardless of
+        // what tools.allow/tools.deny say -- every external tool would
+        // otherwise be permanently unreachable no matter how a definition
+        // is configured. Matched directly against the raw patterns
+        // instead, the same per-pattern predicate resolve() itself calls
+        // internally, just without requiring catalog pre-enumeration.
+        if ($this->isExternalToolOperationId($operationId)) {
+            if ($this->matchesAnyPattern($operationId, self::EXTERNAL_TOOL_METHOD, $this->toolsDeny)) {
+                return false;
+            }
+
+            return $this->matchesAnyPattern($operationId, self::EXTERNAL_TOOL_METHOD, $this->toolsAllow);
         }
 
         $catalog = $this->resolveCatalog();
@@ -151,6 +177,10 @@ final class AgentDefinition
      */
     public function isUnattendedAuthorized(string $operationId): bool
     {
+        if ($this->isExternalToolOperationId($operationId)) {
+            return $this->matchesAnyPattern($operationId, self::EXTERNAL_TOOL_METHOD, $this->unattendedAuthorized);
+        }
+
         $catalog = $this->resolveCatalog();
 
         return in_array(
@@ -203,11 +233,43 @@ final class AgentDefinition
     }
 
     /**
+     * A synthesized external-tool operationId, distinguished from a real
+     * built-in one by its own reserved "mcp:" prefix
+     * (McpClientToolCatalogMerger's own operationId shape).
+     */
+    private function isExternalToolOperationId(string $operationId): bool
+    {
+        return str_starts_with($operationId, 'mcp:');
+    }
+
+    /**
+     * Whether any of the given raw patterns matches this exact
+     * operationId/method pair — OperationGroupPattern::matches()'s own
+     * per-pattern predicate, called directly rather than through
+     * resolve()'s catalog-enumeration wrapper, since an external tool's
+     * operationId is never a member of any catalog to enumerate.
+     *
+     * @param list<string> $patterns
+     */
+    private function matchesAnyPattern(string $operationId, string $method, array $patterns): bool
+    {
+        foreach ($patterns as $raw) {
+            if ((new OperationGroupPattern($raw))->matches($operationId, $method)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Builds the live [{operationId, method}, ...] catalog OperationGroupPattern
      * resolves patterns against — ApiManager::getOperations() for the full
      * operationId set, plus one getOperationDetails() lookup per candidate
      * for its method (research.md D8). Never cached on this object: called
      * fresh on every isOperationPermitted()/isConfirmationRequired() call.
+     * Never consulted for an external-tool operationId — see
+     * isExternalToolOperationId()'s own callers above.
      *
      * @return list<array{operationId: string, method: string}>
      */

@@ -541,6 +541,34 @@ class AgentLoopService
                 $toolData['tool_results'] = [
                     ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
                 ];
+            } elseif ($confirmationType === 'external_tool') {
+                // 116-mcp-client-support (Foundational, research.md D6):
+                // re-resolved from the local cache by operationId rather
+                // than trusted from whatever the pause itself carried --
+                // the same "never trust a value that sat pending" posture
+                // the ancestor-chain re-check just below (the default
+                // branch) already applies for a built-in operation. A miss
+                // here (the tool vanished from its server, or the server
+                // itself did, during the pending window) fails cleanly and
+                // locally, the identical wording handleExecuteOperation()
+                // already returns for a syntactically-external id with no
+                // matching row.
+                $externalTool = \ClarionApp\LlmClient\Models\McpClientTool::findBySyntheticId($pending['operationId'] ?? '');
+                $externalServer = $externalTool?->server;
+
+                if ($externalTool === null || $externalServer === null) {
+                    $resultContent = json_encode([
+                        'error' => 'This tool is no longer offered by its server. Search again for a current capability.',
+                    ]);
+                } else {
+                    $resultContent = json_encode(app(McpClientToolExecutor::class)->execute($externalServer, $externalTool, $pending['arguments'] ?? []));
+                    $apiCallExecuted = true;
+                }
+
+                $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
+                $toolData['tool_results'] = [
+                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
+                ];
             } else {
                 // Re-check the ancestor-chain bound at the moment of
                 // execution (100-subagent-tool-restrictions, FR-004/
@@ -2079,6 +2107,32 @@ class AgentLoopService
             $toolData['tool_results'] = [
                 ['tool_call_id' => $toolCallId, 'content' => $resultContent],
             ];
+        } elseif ($approved && $confirmationType === 'external_tool') {
+            // See resume()'s identical branch for the full rationale:
+            // re-resolved from the local cache by operationId rather than
+            // trusted from whatever the pause itself carried.
+            $externalTool = \ClarionApp\LlmClient\Models\McpClientTool::findBySyntheticId($pending['operationId'] ?? '');
+            $externalServer = $externalTool?->server;
+
+            if ($externalTool === null || $externalServer === null) {
+                $resultContent = json_encode([
+                    'error' => 'This tool is no longer offered by its server. Search again for a current capability.',
+                ]);
+            } else {
+                $resultContent = json_encode(app(McpClientToolExecutor::class)->execute($externalServer, $externalTool, $pending['arguments'] ?? []));
+                $apiCallExecuted = true;
+            }
+
+            $this->recordToolMetric(
+                $conversation,
+                $attemptGroupId,
+                $pending['tool_name'] ?? 'execute_operation',
+                json_decode($resultContent, true),
+            );
+
+            $toolData['tool_results'] = [
+                ['tool_call_id' => $toolCallId, 'content' => $resultContent],
+            ];
         } elseif ($approved) {
             try {
                 // See resume()'s identical re-check, immediately above the
@@ -3524,13 +3578,21 @@ class AgentLoopService
         // happy path.
         $offeringResults = $this->matchingCapabilityOfferingResults($query, $conversation);
 
+        // 116-mcp-client-support (Foundational): cached external tools
+        // matching the query must remain findable via search_operations
+        // regardless of the real operation index's own state, exactly like
+        // matchingCapabilityOfferingResults() just above -- appended into
+        // EVERY return path below alongside $offeringResults, never only
+        // the happy path.
+        $externalToolResults = $this->matchingExternalToolResults($query, $conversation);
+
         // Graceful degradation: check table existence before search
         $searchService = app(OperationsSearchService::class);
 
         if (!$searchService->tableExists()) {
             return json_encode([
                 'hint' => 'Search index is not available. Run reindex command first.',
-                'results' => $offeringResults,
+                'results' => array_merge($offeringResults, $externalToolResults),
             ]);
         }
 
@@ -3543,19 +3605,19 @@ class AgentLoopService
                 if ($count === 0) {
                     return json_encode([
                         'hint' => "Search index is empty. Run 'php artisan llm-client:reindex' first.",
-                        'results' => $offeringResults,
+                        'results' => array_merge($offeringResults, $externalToolResults),
                     ]);
                 }
                 // Table has data but query returned no matches
                 return json_encode([
                     'hint' => 'No operations matched your query. Try broader search terms or use list_applications to browse available applications.',
-                    'results' => $offeringResults,
+                    'results' => array_merge($offeringResults, $externalToolResults),
                 ]);
             } catch (\Throwable $e) {
                 // Fallback if count fails
                 return json_encode([
                     'hint' => 'Search index is not available. Run reindex command first.',
-                    'results' => $offeringResults,
+                    'results' => array_merge($offeringResults, $externalToolResults),
                 ]);
             }
         }
@@ -3585,7 +3647,7 @@ class AgentLoopService
             }
         }
 
-        $formatted = array_merge($formatted, $offeringResults);
+        $formatted = array_merge($formatted, $offeringResults, $externalToolResults);
 
         return json_encode(['results' => $formatted]);
     }
@@ -3624,6 +3686,54 @@ class AgentLoopService
             ->map(fn (\ClarionApp\LlmClient\Models\CapabilityOffering $offering) => array_merge(
                 ['type' => 'operation'],
                 CapabilityCatalogMerger::formatOffering($offering),
+            ))
+            ->values()
+            ->all();
+    }
+
+    /**
+     * 116-mcp-client-support (Foundational, research.md D4/D7): the sibling
+     * of matchingCapabilityOfferingResults() immediately above for a
+     * different non-OpenAPI source -- a plain, non-indexed filter over
+     * cached McpClientTool rows belonging to a server this conversation's
+     * own user is eligible for (McpClientServer::eligibleFor(), own rows
+     * plus every installation-scoped row -- never another user's), matched
+     * against the tool's own name/description. Read entirely from the
+     * local cache a discovery refresh already populated -- this method
+     * never talks to a configured server itself, the same "search never
+     * calls a transport" guarantee matchingCapabilityOfferingResults()'s
+     * own CapabilityOffering read already gets for free. Formatted via
+     * McpClientToolCatalogMerger::formatTool() plus the identical
+     * 'type' => 'operation' wrapper every other $formatted entry already
+     * carries.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function matchingExternalToolResults(string $query, Conversation $conversation): array
+    {
+        if ($conversation->user_id === null) {
+            return [];
+        }
+
+        $needle = '%'.$query.'%';
+
+        $tools = \ClarionApp\LlmClient\Models\McpClientTool::query()
+            ->active()
+            ->whereHas('server', function ($q) use ($conversation) {
+                $q->eligibleFor((string) $conversation->user_id);
+            })
+            ->where(function ($q) use ($needle) {
+                $q->where('name', 'like', $needle)
+                    ->orWhere('description', 'like', $needle);
+            })
+            ->with('server')
+            ->get();
+
+        return $tools
+            ->filter(fn (\ClarionApp\LlmClient\Models\McpClientTool $tool) => $tool->server !== null)
+            ->map(fn (\ClarionApp\LlmClient\Models\McpClientTool $tool) => array_merge(
+                ['type' => 'operation'],
+                McpClientToolCatalogMerger::formatTool($tool, $tool->server),
             ))
             ->values()
             ->all();
@@ -3670,26 +3780,63 @@ class AgentLoopService
             return json_encode($result);
         }
 
-        // Check cache first — skip ApiManager lookup on hit
-        $cached = $this->operationCache->get($conversation->id, $operationId);
-        if ($cached) {
-            $method = $cached['method'];
-            $pathTemplate = $cached['path'];
-        } else {
-            $details = ApiManager::getOperationDetails($operationId);
-            if (empty((array) $details)) {
-                return json_encode(['error' => "Unknown operation: {$operationId}"]);
-            }
+        // 116-mcp-client-support (Foundational, research.md D5): an O(1)
+        // indexed lookup on McpClientTool's own unique
+        // synthetic_operation_id column, checked BEFORE the operation-
+        // cache/ApiManager resolution below, at the same cost class already
+        // accepted for CapabilityOffering just above. Deliberately NOT an
+        // early return like the capability-offering check above it: an
+        // external tool call must still pass through every remaining line
+        // of this method exactly as a built-in operation already does --
+        // the bound-agent-version narrowing, the delegation-chain
+        // narrowing, and the unattended refuse-and-stop guarantee -- so
+        // only the two lines resolving $method/$pathTemplate and the
+        // validator call itself branch on whether this lookup hit; every
+        // line after that is byte-for-byte the same, unconditional code
+        // regardless of which branch ran.
+        $externalTool = \ClarionApp\LlmClient\Models\McpClientTool::findBySyntheticId($operationId);
+        $externalServer = $externalTool?->server;
 
-            // Cache the resolved operation details
-            $this->operationCache->put($conversation->id, $operationId, $details);
-
-            $method = strtoupper($details['method'] ?? 'GET');
-            $pathTemplate = $details['path'] ?? '';
+        if ($externalTool !== null && str_starts_with($operationId, 'mcp:') && $externalServer === null) {
+            // The cached tool row survived its server's own removal (a
+            // soft-deleted McpClientServer, since the cascade-delete
+            // foreign key only fires on a real row deletion) -- treated
+            // identically to a syntactically-external id with no matching
+            // row at all: a clean, local "no longer offered" result, never
+            // a fall-through to ApiManager's own "unknown operation" error.
+            $externalTool = null;
         }
 
-        // Check confirmation/rejection
-        $validation = ApiCallValidator::validate($operationId, $method, $pathTemplate);
+        if ($externalTool === null && str_starts_with($operationId, 'mcp:')) {
+            return json_encode(['error' => 'This tool is no longer offered by its server. Search again for a current capability.']);
+        }
+
+        if ($externalTool !== null) {
+            $method = 'MCP_EXTERNAL';
+            $pathTemplate = "/mcp-client/{$externalServer->id}/{$externalTool->name}";
+            $validation = app(McpClientCallValidator::class)->validate($operationId, $method, $pathTemplate);
+        } else {
+            // Check cache first — skip ApiManager lookup on hit
+            $cached = $this->operationCache->get($conversation->id, $operationId);
+            if ($cached) {
+                $method = $cached['method'];
+                $pathTemplate = $cached['path'];
+            } else {
+                $details = ApiManager::getOperationDetails($operationId);
+                if (empty((array) $details)) {
+                    return json_encode(['error' => "Unknown operation: {$operationId}"]);
+                }
+
+                // Cache the resolved operation details
+                $this->operationCache->put($conversation->id, $operationId, $details);
+
+                $method = strtoupper($details['method'] ?? 'GET');
+                $pathTemplate = $details['path'] ?? '';
+            }
+
+            // Check confirmation/rejection
+            $validation = ApiCallValidator::validate($operationId, $method, $pathTemplate);
+        }
 
         // A bound agent version's own tools.deny/safety.* narrows what the
         // installation-wide check alone would have allowed — it never
@@ -3775,6 +3922,26 @@ class AgentLoopService
             $scopeSurfaceMarker = $this->codingWorkspaceScopeSurfaceMarker($operationId, $method, $pathTemplate, $params, $runId, $conversation);
             if ($scopeSurfaceMarker !== null) {
                 return $scopeSurfaceMarker;
+            }
+
+            // 116-mcp-client-support (Foundational, research.md D6):
+            // server_name is the server's own CONFIGURED name (set by
+            // whoever added the server, at store() time) -- never the
+            // tool's own untrusted name/description -- so the confirmation
+            // prompt can name which external server will carry this out
+            // without ever surfacing server-supplied text as the thing
+            // that names it.
+            if ($externalTool !== null) {
+                return json_encode([
+                    '__requires_confirmation' => true,
+                    'confirmation_type' => 'external_tool',
+                    'operationId' => $operationId,
+                    'method' => $method,
+                    'path' => $pathTemplate,
+                    'server_name' => $externalServer->name,
+                    'tool_name' => $externalTool->name,
+                    'parameters' => $params,
+                ]);
             }
 
             // Return a special marker — the stream handler will detect this and suspend

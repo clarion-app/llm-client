@@ -587,6 +587,18 @@ final class AgentDefinitionParser
      */
     private function collectPatternProblem(string $pattern, array $catalog, array &$problems): void
     {
+        // An "mcp:"-prefixed pattern names an external tool, never a
+        // member of this installation-wide $catalog (that catalog is
+        // built from ApiManager alone) -- exempt for the same reason a
+        // bare HTTP verb already is in resolveSafetyList() above: whether
+        // it matches something real is a per-user/per-server runtime
+        // question (AgentDefinition::isOperationPermitted()'s own
+        // equivalent exemption), not a parse-time one this installation-
+        // wide catalog could ever answer.
+        if (str_starts_with($pattern, 'mcp:')) {
+            return;
+        }
+
         if (OperationGroupPattern::resolve([$pattern], $catalog) === []) {
             $problems[] = new AgentDefinitionResolutionException(AgentDefinitionResolutionErrorKind::EmptyOperationPattern, $pattern);
         }
