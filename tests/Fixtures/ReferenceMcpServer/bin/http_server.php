@@ -22,6 +22,8 @@ $expectedToken = getenv('REFERENCE_MCP_EXPECTED_TOKEN');
 $expectedToken = $expectedToken !== false ? $expectedToken : null;
 $delayRaw = getenv('REFERENCE_MCP_DELAY_SECONDS');
 $delaySeconds = $delayRaw !== false ? (float) $delayRaw : null;
+$toolNamesFile = getenv('REFERENCE_MCP_TOOL_NAMES_FILE');
+$toolNamesFile = $toolNamesFile !== false ? $toolNamesFile : null;
 
 header('Content-Type: application/json');
 
@@ -45,4 +47,16 @@ if ($expectedToken !== null) {
     }
 }
 
-echo Protocol::rawResponseBody($method, $params, $mode, $delaySeconds, $id);
+// Read fresh on every request (never cached in a variable set once at
+// process start, unlike $mode above) -- this is what lets setTools()
+// change what this same running process reports mid-test.
+$toolNames = null;
+if ($toolNamesFile !== null && is_file($toolNamesFile)) {
+    $raw = file_get_contents($toolNamesFile) ?: '';
+    $toolNames = array_values(array_filter(
+        array_map('trim', explode(',', $raw)),
+        fn (string $name) => $name !== '',
+    ));
+}
+
+echo Protocol::rawResponseBody($method, $params, $mode, $delaySeconds, $id, $toolNames);

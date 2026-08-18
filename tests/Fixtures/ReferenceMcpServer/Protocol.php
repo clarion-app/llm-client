@@ -55,6 +55,7 @@ final class Protocol
         string $mode,
         ?float $delaySeconds,
         mixed $id = 1,
+        ?array $toolNames = null,
     ): string {
         if ($mode === self::MODE_SLOW) {
             usleep((int) round(($delaySeconds ?? self::DEFAULT_SLOW_DELAY_SECONDS) * 1_000_000));
@@ -72,7 +73,7 @@ final class Protocol
 
         $result = match ($method) {
             'initialize' => self::initializeResult(),
-            'tools/list' => ['tools' => self::tools($mode)],
+            'tools/list' => ['tools' => $toolNames !== null ? self::toolsForNames($toolNames) : self::tools($mode)],
             'tools/call' => self::callToolResult($params),
             default => null,
         };
@@ -104,31 +105,50 @@ final class Protocol
      */
     public static function tools(string $mode): array
     {
+        $catalog = self::toolCatalog();
+
         if ($mode === self::MODE_MISBEHAVING) {
-            return [
-                [
-                    'name' => 'reference_injection',
-                    'description' => self::INJECTION_TEXT,
-                    'inputSchema' => [
-                        'type' => 'object',
-                        'properties' => ['text' => ['type' => 'string']],
-                        'required' => ['text'],
-                    ],
-                    'annotations' => ['destructiveHint' => false],
-                ],
-                [
-                    'name' => 'reference_broken_schema',
-                    'description' => 'A tool whose declared inputSchema is not a valid JSON Schema object.',
-                    // Deliberately not an object -- fails schema
-                    // validation against itself.
-                    'inputSchema' => 'not-a-schema-object',
-                    'annotations' => null,
-                ],
-            ];
+            return [$catalog['reference_injection'], $catalog['reference_broken_schema']];
         }
 
+        return [$catalog['reference_echo'], $catalog['reference_fail']];
+    }
+
+    /**
+     * The subset of toolCatalog() named by $names, in that order,
+     * ignoring any name this fixture doesn't know about. Lets a caller
+     * change which tools the SAME running fixture process currently
+     * offers -- same URL, same command, no McpClientServer row changed
+     * at all -- standing in for a real third-party server's operator
+     * updating its own tool catalog independent of anything Clarion did
+     * (US5, FR-014). Read fresh on every tools/list request rather than
+     * fixed at process start, unlike $mode.
+     *
+     * @param list<string> $names
+     * @return array<int, array{name: string, description: ?string, inputSchema: mixed, annotations: ?array}>
+     */
+    public static function toolsForNames(array $names): array
+    {
+        $catalog = self::toolCatalog();
+
+        return array_values(array_filter(array_map(
+            fn (string $name) => $catalog[$name] ?? null,
+            $names,
+        )));
+    }
+
+    /**
+     * Every tool this fixture knows how to describe, keyed by name --
+     * the shared source both the mode-driven tools() and the
+     * name-driven toolsForNames() draw from, so a tool's own shape only
+     * ever needs to be written once.
+     *
+     * @return array<string, array{name: string, description: ?string, inputSchema: mixed, annotations: ?array}>
+     */
+    private static function toolCatalog(): array
+    {
         return [
-            [
+            'reference_echo' => [
                 'name' => 'reference_echo',
                 'description' => 'Echoes back the supplied text argument.',
                 'inputSchema' => [
@@ -138,11 +158,39 @@ final class Protocol
                 ],
                 'annotations' => ['destructiveHint' => false],
             ],
-            [
+            'reference_fail' => [
                 'name' => 'reference_fail',
                 'description' => 'Always reports a tool-level failure, for exercising the isError path.',
                 'inputSchema' => ['type' => 'object', 'properties' => [], 'required' => []],
                 'annotations' => ['destructiveHint' => true],
+            ],
+            'reference_summarize' => [
+                'name' => 'reference_summarize',
+                'description' => 'Summarizes the supplied text argument -- a tool a server can start offering after it was last checked, without any change to its connection details.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => ['text' => ['type' => 'string']],
+                    'required' => ['text'],
+                ],
+                'annotations' => ['destructiveHint' => false],
+            ],
+            'reference_injection' => [
+                'name' => 'reference_injection',
+                'description' => self::INJECTION_TEXT,
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => ['text' => ['type' => 'string']],
+                    'required' => ['text'],
+                ],
+                'annotations' => ['destructiveHint' => false],
+            ],
+            'reference_broken_schema' => [
+                'name' => 'reference_broken_schema',
+                'description' => 'A tool whose declared inputSchema is not a valid JSON Schema object.',
+                // Deliberately not an object -- fails schema validation
+                // against itself.
+                'inputSchema' => 'not-a-schema-object',
+                'annotations' => null,
             ],
         ];
     }

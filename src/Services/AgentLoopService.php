@@ -3807,6 +3807,24 @@ class AgentLoopService
             $externalTool = null;
         }
 
+        if ($externalTool !== null) {
+            // A cached row can outlive the tool it once represented --
+            // mcp_client_tools has no deleted_at column at all, so a
+            // tool the server has since stopped offering is never
+            // deleted by a refresh, only left behind by the next one
+            // that didn't touch it (McpClientToolDiscoveryService's own
+            // create/update-by-natural-key reconciliation). A row with
+            // no status row for its server at all -- the seeding shape
+            // most of this feature's own tests use directly, having
+            // never gone through a real discover() run -- is left
+            // untouched here: there is no completed refresh to compare
+            // against, so there is no evidence the tool is gone.
+            $latestRefreshFinishedAt = \ClarionApp\LlmClient\Models\McpClientServerStatus::where('server_id', $externalTool->server_id)->value('refresh_finished_at');
+            if ($latestRefreshFinishedAt !== null && $externalTool->last_seen_at < $latestRefreshFinishedAt) {
+                $externalTool = null;
+            }
+        }
+
         if ($externalTool === null && str_starts_with($operationId, 'mcp:')) {
             return json_encode(['error' => 'This tool is no longer offered by its server. Search again for a current capability.']);
         }
