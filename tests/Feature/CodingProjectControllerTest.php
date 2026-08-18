@@ -192,7 +192,7 @@ class CodingProjectControllerTest extends TestCase
         $response = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project'));
 
         $response->assertStatus(200);
-        $ids = collect($response->json())->pluck('id');
+        $ids = collect($response->json('data'))->pluck('id');
 
         $this->assertTrue($ids->contains($mine->id));
         $this->assertFalse($ids->contains($theirs->id), 'another user\'s project must never be listed');
@@ -211,7 +211,110 @@ class CodingProjectControllerTest extends TestCase
         $response = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project'));
 
         $response->assertStatus(200);
-        $this->assertCount(0, $response->json());
+        $this->assertCount(0, $response->json('data'));
+    }
+
+    // -----------------------------------------------------------------
+    // GET coding-project (index) -- reachability + pagination
+    // (122-workspace-browser-ui, US1, contracts/workspace-list-api.md,
+    // research.md D3/D4, T006's flat-envelope decision)
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function index_reports_reachable_true_for_a_real_readable_directory_and_false_for_one_that_no_longer_exists(): void
+    {
+        $missingDir = sys_get_temp_dir().'/coding-agent-controller-missing-'.Str::random(12);
+        mkdir($missingDir, 0777, true);
+
+        $healthy = CodingProject::create([
+            'user_id' => $this->user->id,
+            'name' => 'Healthy',
+            'root_path' => $this->projectDir,
+            'test_command' => null,
+        ]);
+
+        $broken = CodingProject::create([
+            'user_id' => $this->user->id,
+            'name' => 'Broken',
+            'root_path' => $missingDir,
+            'test_command' => null,
+        ]);
+
+        // Directory removed AFTER registration -- reachable must reflect the
+        // CURRENT state of the filesystem, not whatever was true at
+        // registration time (FR-002, research.md D3).
+        $this->removeDirectory($missingDir);
+
+        $response = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project'));
+
+        $response->assertStatus(200);
+        $rows = collect($response->json('data'))->keyBy('id');
+
+        $this->assertTrue($rows[$healthy->id]['reachable']);
+        $this->assertFalse($rows[$broken->id]['reachable']);
+    }
+
+    #[Test]
+    public function index_rechecks_reachability_live_on_every_call_not_only_at_registration(): void
+    {
+        $dir = sys_get_temp_dir().'/coding-agent-controller-live-recheck-'.Str::random(12);
+        mkdir($dir, 0777, true);
+
+        $project = CodingProject::create([
+            'user_id' => $this->user->id,
+            'name' => 'Live Recheck',
+            'root_path' => $dir,
+            'test_command' => null,
+        ]);
+
+        $first = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project'));
+        $first->assertStatus(200);
+        $firstRow = collect($first->json('data'))->firstWhere('id', $project->id);
+        $this->assertTrue($firstRow['reachable'], 'must be reachable while the directory still exists');
+
+        // Directory removed BETWEEN the two GET calls, within the same
+        // test -- proving live per-call recomputation, not a value cached
+        // or stored from the first call (research.md D3, mutation
+        // checklist rows 3-4).
+        $this->removeDirectory($dir);
+
+        $second = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project'));
+        $second->assertStatus(200);
+        $secondRow = collect($second->json('data'))->firstWhere('id', $project->id);
+        $this->assertFalse($secondRow['reachable'], 'must reflect the directory now being gone, not a value cached from the first GET');
+    }
+
+    #[Test]
+    public function index_returns_the_flat_paginated_envelope_with_default_and_cap(): void
+    {
+        for ($i = 0; $i < 3; $i++) {
+            CodingProject::create([
+                'user_id' => $this->user->id,
+                'name' => "Project {$i}",
+                'root_path' => $this->projectDir,
+                'test_command' => null,
+            ]);
+        }
+
+        // Default: no page/per_page supplied.
+        $default = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project'));
+        $default->assertStatus(200);
+        $default->assertJsonStructure(['data', 'total', 'page', 'per_page']);
+        $this->assertSame(3, $default->json('total'));
+        $this->assertSame(1, $default->json('page'));
+        $this->assertSame(50, $default->json('per_page'));
+        $this->assertCount(3, $default->json('data'));
+
+        // per_page above the cap (100) is clamped down to it.
+        $capped = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project?per_page=500'));
+        $capped->assertStatus(200);
+        $this->assertSame(100, $capped->json('per_page'));
+
+        // page/per_page below 1 fall back to their floor/default.
+        $floored = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project?page=0&per_page=0'));
+        $floored->assertStatus(200);
+        $this->assertSame(1, $floored->json('page'));
+        $this->assertSame(50, $floored->json('per_page'));
     }
 
     // -----------------------------------------------------------------

@@ -51,16 +51,75 @@ class CodingProjectController extends Controller
     }
 
     /**
-     * GET coding-project (contracts §0). Lists the requesting user's own
-     * registered projects only.
+     * GET coding-project (122-workspace-browser-ui, US1, contracts/
+     * workspace-list-api.md). Lists the requesting user's own registered
+     * projects only, each annotated with a live-recomputed `reachable`
+     * flag, wrapped in the flat paginated envelope T006 settled on.
      */
     public function index(Request $request): JsonResponse
     {
+        [$page, $perPage] = $this->paginationParams($request, 50, 100);
+
+        $total = CodingProject::where('user_id', Auth::id())->count();
+
         $projects = CodingProject::where('user_id', Auth::id())
             ->orderBy('created_at', 'desc')
-            ->get();
+            ->forPage($page, $perPage)
+            ->get()
+            ->map(function (CodingProject $project) {
+                $data = $project->toArray();
+                // `reachable` is computed fresh, from the live filesystem,
+                // on every single call -- never stored on the model or
+                // cached from a prior call (FR-002/FR-014, research.md D3).
+                // A directory that goes missing between two GETs must
+                // report differently on each one.
+                $data['reachable'] = is_dir($project->root_path) && is_readable($project->root_path);
 
-        return response()->json($projects, 200);
+                return $data;
+            })
+            ->values()
+            ->all();
+
+        return response()->json($this->envelope($projects, $total, $page, $perPage), 200);
+    }
+
+    /**
+     * Resolve `page`/`per_page` query params against a per-endpoint
+     * default and cap (122-workspace-browser-ui T006 decision -- mirrors
+     * only RunController::paginationParams()'s floor/cap/default *logic*,
+     * not its nested envelope shape; this controller is not shared with
+     * RunController and has no cross-controller pagination helper to
+     * extract into).
+     *
+     * @return array{0: int, 1: int} [page, perPage]
+     */
+    private function paginationParams(Request $request, int $default, int $cap): array
+    {
+        $page = max(1, (int) $request->input('page', 1));
+
+        $perPage = (int) $request->input('per_page', $default);
+        if ($perPage < 1) {
+            $perPage = $default;
+        }
+        $perPage = min($perPage, $cap);
+
+        return [$page, $perPage];
+    }
+
+    /**
+     * The flat `{data, total, page, per_page}` envelope T006 settled on
+     * for this feature's list endpoints -- deliberately NOT
+     * RunController::envelope()'s nested `{data, meta: {...}}` shape
+     * (Grounding note 6).
+     */
+    private function envelope(array $data, int $total, int $page, int $perPage): array
+    {
+        return [
+            'data' => $data,
+            'total' => $total,
+            'page' => $page,
+            'per_page' => $perPage,
+        ];
     }
 
     /**
