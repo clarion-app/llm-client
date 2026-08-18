@@ -303,6 +303,109 @@ class ExternalToolNameCollisionJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------
+    // Composition with the per-server search result bound: two servers
+    // each offering an identically-named tool, both near/at the
+    // per-server cap independently -- collision-namespacing and the
+    // per-server bound must not weaken each other.
+    // -----------------------------------------------------------------
+
+    /**
+     * Direct-row creation of $count currently-active tools on $server, one
+     * of which is named exactly "search" (so both servers in the test
+     * below share that one colliding name), the rest sharing a common
+     * $matchWord so every one of them matches the same broad query --
+     * mirrors ExternalToolSearchResultBoundJourneyTest's own makeTools()
+     * helper, reused here rather than spinning up two real
+     * ReferenceMcpServer processes with a large dynamic tool list.
+     *
+     * @return list<McpClientTool>
+     */
+    private function makeCappedToolsWithCollidingName(McpClientServer $server, int $count, string $matchWord): array
+    {
+        $seenAt = now();
+        $tools = [];
+
+        $tools[] = McpClientTool::create([
+            'server_id' => $server->id,
+            'synthetic_operation_id' => "mcp:{$server->id}:search",
+            'name' => 'search',
+            'description' => "A {$matchWord} tool offered by {$server->name}.",
+            'input_schema' => ['type' => 'object', 'properties' => []],
+            'last_seen_at' => $seenAt,
+        ]);
+
+        for ($i = 1; $i < $count; $i++) {
+            $name = sprintf('%s_%02d', $matchWord, $i);
+            $tools[] = McpClientTool::create([
+                'server_id' => $server->id,
+                'synthetic_operation_id' => "mcp:{$server->id}:{$name}",
+                'name' => $name,
+                'description' => "A {$matchWord} tool offered by {$server->name}.",
+                'input_schema' => ['type' => 'object', 'properties' => []],
+                'last_seen_at' => $seenAt,
+            ]);
+        }
+
+        return $tools;
+    }
+
+    #[Test]
+    public function two_servers_each_offering_an_identically_named_tool_stay_distinguishable_while_each_independently_capped(): void
+    {
+        $limit = (int) config('llm-client.mcp_client.search_result_limit_per_server', 5);
+
+        $serverA = McpClientServer::create([
+            'name' => 'Alpha Capped Server',
+            'transport' => McpTransportKind::StreamableHttp,
+            'url' => 'https://example.test/mcp-a',
+            'user_id' => $this->user->id,
+        ]);
+        $serverB = McpClientServer::create([
+            'name' => 'Beta Capped Server',
+            'transport' => McpTransportKind::StreamableHttp,
+            'url' => 'https://example.test/mcp-b',
+            'user_id' => $this->user->id,
+        ]);
+
+        // Each server sits exactly at the cap -- "near/at" -- so every one
+        // of its own matches, including its own "search" tool, is expected
+        // to survive the bound untrimmed.
+        $this->makeCappedToolsWithCollidingName($serverA, $limit, 'widget');
+        $this->makeCappedToolsWithCollidingName($serverB, $limit, 'widget');
+
+        $conversation = Conversation::factory()->create(['user_id' => $this->user->id]);
+        $result = json_decode(
+            app(AgentLoopService::class)->executeMetaTool('search_operations', ['query' => 'widget'], $conversation),
+            true,
+        );
+        $results = $result['results'] ?? [];
+
+        $searchIdA = "mcp:{$serverA->id}:search";
+        $searchIdB = "mcp:{$serverB->id}:search";
+
+        $matchA = collect($results)->firstWhere('operationId', $searchIdA);
+        $matchB = collect($results)->firstWhere('operationId', $searchIdB);
+
+        $this->assertNotNull($matchA, 'Server A\'s own colliding "search" tool must survive the per-server cap; got: '.json_encode($results));
+        $this->assertNotNull($matchB, 'Server B\'s own colliding "search" tool must survive the per-server cap; got: '.json_encode($results));
+        $this->assertNotSame(
+            $searchIdA,
+            $searchIdB,
+            'the two servers\' own "search" tools must remain namespaced to distinct operationIds even under the per-server cap',
+        );
+
+        // Each server independently capped -- neither's presence borrows
+        // from or reduces the other's own share.
+        $resultsA = collect($results)->filter(fn (array $r) => str_starts_with((string) ($r['operationId'] ?? ''), "mcp:{$serverA->id}:"))->values();
+        $resultsB = collect($results)->filter(fn (array $r) => str_starts_with((string) ($r['operationId'] ?? ''), "mcp:{$serverB->id}:"))->values();
+
+        $this->assertLessThanOrEqual($limit, $resultsA->count(), 'got: '.json_encode($resultsA->all()));
+        $this->assertLessThanOrEqual($limit, $resultsB->count(), 'got: '.json_encode($resultsB->all()));
+        $this->assertCount($limit, $resultsA, 'Server A sits exactly at the cap, so every one of its own matches (including "search") must be present, not trimmed');
+        $this->assertCount($limit, $resultsB, 'Server B sits exactly at the cap, so every one of its own matches (including "search") must be present, not trimmed');
+    }
+
+    // -----------------------------------------------------------------
     // AC2/AC3: invoking one by its own synthetic id reaches that exact
     // server, never the other -- and the record of each call names the
     // correct one.
