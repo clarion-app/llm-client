@@ -393,4 +393,120 @@ YAML;
         $this->assertTrue($content['isError'] ?? false, 'reference_fail always reports isError -- the failure must be legible in the same shape a genuine external isError result would carry');
         $this->assertStringContainsString('reference_fail always reports a tool-level failure', $content['content'][0]['text'] ?? '');
     }
+
+    /**
+     * Re-confirms search_operations_reads_only_the_cache_and_makes_no_outbound_call_...'s
+     * own guarantee, but with a second server that was never reachable
+     * in the first place -- rather than one made unreachable mid-test --
+     * sitting in the eligible-server set alongside the reachable one, so
+     * a persistently broken configured server can never slow or block a
+     * search that has nothing to do with it.
+     */
+    #[Test]
+    public function search_operations_still_returns_the_reachable_servers_results_promptly_while_a_second_configured_server_is_unreachable(): void
+    {
+        $reachable = $this->discoverServer('Reachable Server', Protocol::MODE_HAPPY_PATH);
+        $reachableTool = McpClientTool::where('server_id', $reachable->id)->where('name', 'reference_echo')->firstOrFail();
+
+        // The reachable server's own process is no longer needed once its
+        // tool is cached -- search must never contact it regardless.
+        $this->referenceServer?->stopHttp();
+        $this->referenceServer = null;
+
+        // A second, distinct configured server that has never been
+        // successfully contactable at all.
+        $this->discoverServer('Unreachable Server', Protocol::MODE_UNREACHABLE);
+
+        $conversation = Conversation::factory()->create(['user_id' => $this->user->id]);
+
+        $start = microtime(true);
+        $result = json_decode(
+            app(AgentLoopService::class)->executeMetaTool('search_operations', ['query' => 'echo'], $conversation),
+            true,
+        );
+        $elapsed = microtime(true) - $start;
+
+        $this->assertLessThan(
+            1.0,
+            $elapsed,
+            'search_operations must complete promptly even though one configured server is unreachable -- it must never attempt to contact it'
+        );
+
+        $results = $result['results'] ?? [];
+        $match = collect($results)->firstWhere('operationId', $reachableTool->synthetic_operation_id);
+        $this->assertNotNull($match, 'the reachable server\'s tool must still be found; got: '.json_encode($result));
+    }
+
+    /**
+     * Extends invoking_a_discovered_external_tool_through_execute_operation_...'s
+     * own confirm-then-approve round trip: this time the server behind
+     * the already-cached tool has turned slow since it was last
+     * discovered, proving McpClientToolExecutor::execute() -- already
+     * unit-proven bounded by McpClientToolExecutorFailureIsolationTest's
+     * own slow-server case -- is genuinely reached and cut off at this,
+     * agent-facing level too. The turn completes with the same standard
+     * error envelope that case proves, never a hang or a raw exception.
+     */
+    #[Test]
+    public function a_slow_external_tool_call_is_cut_off_at_the_configured_call_timeout_and_the_agent_receives_a_legible_failure_rather_than_a_hang(): void
+    {
+        $server = $this->discoverServer('Slow Server', Protocol::MODE_HAPPY_PATH);
+        $tool = McpClientTool::where('server_id', $server->id)->where('name', 'reference_echo')->firstOrFail();
+
+        // The tool was cached while the server was still fast -- now the
+        // server behind it has turned slow, mirroring how a real
+        // third-party server can degrade after its tools were last
+        // discovered. A short call_timeout_seconds keeps this test fast
+        // rather than waiting out the real default.
+        $this->referenceServer?->stopHttp();
+        $this->referenceServer = new ReferenceMcpServer();
+        $slowUrl = $this->referenceServer->startHttp(Protocol::MODE_SLOW);
+        $server->update(['url' => $slowUrl]);
+        config(['llm-client.mcp_client.call_timeout_seconds' => 1]);
+
+        $conversation = $this->conversationWithAgentPermitting([$tool->synthetic_operation_id]);
+
+        $confirmResult = json_decode(
+            app(AgentLoopService::class)->executeMetaTool(
+                'execute_operation',
+                ['operationId' => $tool->synthetic_operation_id, 'parameters' => ['text' => 'hello']],
+                $conversation,
+            ),
+            true,
+        );
+        $this->assertTrue((bool) ($confirmResult['__requires_confirmation'] ?? false), 'got: '.json_encode($confirmResult));
+
+        $message = $this->pendingConfirmationMessage($conversation, $tool, ['text' => 'hello']);
+        $service = $this->serviceWithScriptedProvider([
+            $this->textResponse('The external tool did not respond in time.'),
+        ]);
+
+        $start = microtime(true);
+        $final = $service->resumeSync($conversation, $message, true);
+        $elapsed = microtime(true) - $start;
+
+        $this->assertLessThan(
+            10.0,
+            $elapsed,
+            'a slow server must be cut off at the configured call_timeout_seconds bound, not left to hang toward the real default'
+        );
+        $this->assertSame('completed', $final['status'] ?? null, 'the turn must still complete -- a slow external server must never stall the conversation; got: '.json_encode($final));
+
+        $toolResults = $message->fresh()->tool_data['tool_results'] ?? [];
+        $content = json_decode($toolResults[0]['content'] ?? 'null', true);
+
+        $this->assertIsArray($content, 'a timeout must still arrive as a real, parseable envelope, never an opaque stall');
+        $this->assertTrue($content['isError'] ?? false, 'got: '.json_encode($content));
+        $this->assertStringStartsWith(
+            'Error: ',
+            $content['content'][0]['text'] ?? '',
+            'the raw transport timeout exception must never reach the conversation directly -- only the standard error envelope'
+        );
+        $this->assertStringNotContainsString('Stack trace', $content['content'][0]['text'] ?? '');
+        $this->assertStringNotContainsString(
+            'McpTransportTimeoutException',
+            $content['content'][0]['text'] ?? '',
+            'the envelope must carry a plain-language message, not the exception\'s own class name'
+        );
+    }
 }
