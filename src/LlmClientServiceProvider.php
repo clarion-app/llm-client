@@ -130,6 +130,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\AgentCreateCommand::class,
                 \ClarionApp\LlmClient\Commands\AgentKindsCommand::class,
                 \ClarionApp\LlmClient\Commands\EvaluateSchedulerTriggersCommand::class,
+                \ClarionApp\LlmClient\Commands\RefreshStaleMcpClientServersCommand::class,
             ]);
         }
 
@@ -238,6 +239,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // produced it.
             $schedule->command('llm-client:evaluate-scheduler-triggers')
                 ->everyMinute()
+                ->withoutOverlapping();
+
+            // Refresh any configured MCP client server whose cached tool
+            // list is stale or missing -- the out-of-band sweep that keeps
+            // search_operations' external-tool results current across
+            // sessions without a live call on the search path itself.
+            $schedule->command('llm-client:refresh-external-mcp-tools')
+                ->everyFiveMinutes()
                 ->withoutOverlapping();
         });
 

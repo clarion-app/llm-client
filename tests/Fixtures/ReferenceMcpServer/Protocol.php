@@ -60,10 +60,13 @@ final class Protocol
             usleep((int) round(($delaySeconds ?? self::DEFAULT_SLOW_DELAY_SECONDS) * 1_000_000));
         }
 
-        if ($mode === self::MODE_MISBEHAVING && $method === 'tools/list') {
+        if ($mode === self::MODE_MISBEHAVING && ($method === 'tools/list' || $method === 'tools/call')) {
             // Deliberately truncated/invalid JSON -- proves a transport's
-            // own parser reports a protocol failure rather than silently
-            // accepting garbage.
+            // own parser (and, one layer up, McpClientToolExecutor's own
+            // catch-and-convert boundary) reports a protocol failure
+            // rather than silently accepting garbage. Applies to
+            // tools/call as well as tools/list: a misbehaving server is
+            // misbehaving for every request, not only discovery's own.
             return '{"jsonrpc": "2.0", "id": ' . json_encode($id) . ', "result": {"tools": [ MALFORMED';
         }
 

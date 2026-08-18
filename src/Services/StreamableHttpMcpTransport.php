@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Exceptions\McpAuthenticationException;
 use ClarionApp\LlmClient\Exceptions\McpProtocolException;
 use ClarionApp\LlmClient\Exceptions\McpTransportException;
 use ClarionApp\LlmClient\Exceptions\McpTransportTimeoutException;
@@ -84,7 +85,7 @@ class StreamableHttpMcpTransport implements McpTransport
         }
 
         if ($response->status() === 401 || $response->status() === 403) {
-            throw new McpTransportException('External server rejected the stored credential.');
+            throw new McpAuthenticationException('External server rejected the stored credential.');
         }
 
         if ($response->failed()) {
