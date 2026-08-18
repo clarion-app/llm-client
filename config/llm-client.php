@@ -1003,6 +1003,14 @@ return [
         // high-volume server can never crowd out every other source in
         // the same response.
         'search_result_limit_per_server' => (int) env('LLM_CLIENT_MCP_CLIENT_SEARCH_RESULT_LIMIT_PER_SERVER', 5),
+
+        // How long a mcp_client_connection_tests row (an ephemeral,
+        // credential-bearing "test before saving" attempt, FR-003/D3) may
+        // linger before the scheduled llm-client:purge-mcp-connection-tests
+        // sweep removes it -- deliberately short, unlike the run-trace
+        // purge's own default of 90 days, since this table's rows are
+        // scratch state, not a durable audit trail.
+        'connection_test_retention_hours' => (int) env('LLM_CLIENT_MCP_CLIENT_CONNECTION_TEST_RETENTION_HOURS', 1),
     ],
 ];
 

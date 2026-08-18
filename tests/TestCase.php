@@ -1724,6 +1724,7 @@ abstract class TestCase extends BaseTestCase
                 $table->integer('tool_count')->nullable();
                 $table->timestamp('refresh_started_at')->nullable();
                 $table->timestamp('refresh_finished_at')->nullable();
+                $table->timestamp('last_reachable_at')->nullable();
                 $table->string('triggered_by')->nullable();
                 $table->timestamps();
 
@@ -1744,6 +1745,28 @@ abstract class TestCase extends BaseTestCase
                 $table->timestamps();
 
                 $table->index('server_id');
+            });
+        }
+
+        if (!Schema::hasTable('mcp_client_connection_tests')) {
+            Schema::create('mcp_client_connection_tests', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id');
+                $table->string('transport');
+                $table->string('url')->nullable();
+                $table->string('command')->nullable();
+                $table->json('args')->nullable();
+                $table->text('credential')->nullable();
+                $table->string('status')->default('pending');
+                $table->string('failure_category')->nullable();
+                $table->text('message')->nullable();
+                $table->integer('tool_count')->nullable();
+                $table->timestamp('started_at')->nullable();
+                $table->timestamp('finished_at')->nullable();
+                $table->timestamps();
+
+                $table->index('user_id');
+                $table->index('created_at');
             });
         }
     }

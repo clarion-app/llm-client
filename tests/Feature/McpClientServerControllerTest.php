@@ -155,4 +155,130 @@ class McpClientServerControllerTest extends TestCase
 
         $response->assertStatus(404);
     }
+
+    /**
+     * US1 Acceptance Scenarios 1/3, FR-001, Grounding note 1 — index()
+     * currently returns only id/name/transport/scope with no status data
+     * at all. Two servers, each with its own status row (one reachable,
+     * one unreachable), must each carry its own connection_status/
+     * last_reachable_at/tool_count in the list response, independent of
+     * the other's values.
+     */
+    #[Test]
+    public function index_lists_each_servers_own_status_independently_of_the_others(): void
+    {
+        $reachableServer = McpClientServer::create([
+            'name' => 'Reachable server',
+            'transport' => 'streamable_http',
+            'url' => 'https://mcp.example.com/reachable',
+            'user_id' => $this->user->id,
+        ]);
+        // SQLite's datetime storage truncates to whole seconds, so the
+        // fixture's own timestamp is pre-truncated too -- otherwise the
+        // round trip through the database would never match byte-for-byte.
+        $reachableLastReachableAt = now()->subMinutes(5)->startOfSecond();
+        McpClientServerStatus::create([
+            'server_id' => $reachableServer->id,
+            'connection_status' => 'reachable',
+            'tool_count' => 4,
+            'refresh_started_at' => $reachableLastReachableAt,
+            'refresh_finished_at' => $reachableLastReachableAt,
+            'last_reachable_at' => $reachableLastReachableAt,
+            'triggered_by' => 'create',
+        ]);
+
+        $unreachableServer = McpClientServer::create([
+            'name' => 'Unreachable server',
+            'transport' => 'streamable_http',
+            'url' => 'https://mcp.example.com/unreachable',
+            'user_id' => $this->user->id,
+        ]);
+        McpClientServerStatus::create([
+            'server_id' => $unreachableServer->id,
+            'connection_status' => 'unreachable',
+            'last_error' => 'Connection refused',
+            'tool_count' => 0,
+            'refresh_started_at' => now(),
+            'refresh_finished_at' => now(),
+            'last_reachable_at' => null,
+            'triggered_by' => 'create',
+        ]);
+
+        $response = $this->actingAs($this->user)->getJson('/api/clarion-app/llm-client/mcp-client-server');
+
+        $response->assertStatus(200);
+        $data = collect($response->json())->keyBy('id');
+
+        $reachableData = $data[$reachableServer->id];
+        $this->assertSame('reachable', $reachableData['connection_status']);
+        $this->assertSame(4, $reachableData['tool_count']);
+        $this->assertNotNull($reachableData['last_reachable_at']);
+        $this->assertSame(
+            $reachableLastReachableAt->toISOString(),
+            \Carbon\Carbon::parse($reachableData['last_reachable_at'])->toISOString(),
+        );
+
+        $unreachableData = $data[$unreachableServer->id];
+        $this->assertSame('unreachable', $unreachableData['connection_status']);
+        $this->assertSame(0, $unreachableData['tool_count']);
+        $this->assertNull($unreachableData['last_reachable_at']);
+
+        // Independence: the unreachable server's failure must not leak
+        // into the reachable server's own reported status.
+        $this->assertNotSame($reachableData['connection_status'], $unreachableData['connection_status']);
+    }
+
+    /**
+     * US1 Acceptance Scenario 2, Grounding note 2 — a status row where a
+     * later *failed* discover() advanced refresh_finished_at but left
+     * last_reachable_at at its earlier, correct success time must show
+     * that distinction in both show() and index(), not collapse the two
+     * timestamps together.
+     */
+    #[Test]
+    public function show_and_index_distinguish_last_reachable_at_from_a_later_failed_refresh_finished_at(): void
+    {
+        $server = McpClientServer::create([
+            'name' => 'Flaky server',
+            'transport' => 'streamable_http',
+            'url' => 'https://mcp.example.com/flaky',
+            'user_id' => $this->user->id,
+        ]);
+
+        // SQLite's datetime storage truncates to whole seconds, so the
+        // fixture's own timestamps are pre-truncated too -- otherwise the
+        // round trip through the database would never match byte-for-byte.
+        $earlierSuccess = now()->subHours(2)->startOfSecond();
+        $laterFailedAttempt = now()->startOfSecond();
+
+        McpClientServerStatus::create([
+            'server_id' => $server->id,
+            'connection_status' => 'unreachable',
+            'last_error' => 'Timed out',
+            'tool_count' => 2,
+            'refresh_started_at' => $laterFailedAttempt,
+            'refresh_finished_at' => $laterFailedAttempt,
+            'last_reachable_at' => $earlierSuccess,
+            'triggered_by' => 'schedule',
+        ]);
+
+        $showResponse = $this->actingAs($this->user)->getJson("/api/clarion-app/llm-client/mcp-client-server/{$server->id}");
+        $showResponse->assertStatus(200);
+        $showStatus = $showResponse->json('status');
+        $this->assertNotNull($showStatus['last_reachable_at']);
+        $this->assertNotSame($showStatus['last_reachable_at'], $showStatus['refresh_finished_at']);
+        $this->assertSame(
+            $earlierSuccess->toISOString(),
+            \Carbon\Carbon::parse($showStatus['last_reachable_at'])->toISOString(),
+        );
+
+        $indexResponse = $this->actingAs($this->user)->getJson('/api/clarion-app/llm-client/mcp-client-server');
+        $indexResponse->assertStatus(200);
+        $indexData = collect($indexResponse->json())->keyBy('id')[$server->id];
+        $this->assertSame(
+            $earlierSuccess->toISOString(),
+            \Carbon\Carbon::parse($indexData['last_reachable_at'])->toISOString(),
+        );
+        $this->assertSame('unreachable', $indexData['connection_status']);
+    }
 }

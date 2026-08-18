@@ -30,6 +30,7 @@ class McpClientServerStatus extends Model
         'tool_count',
         'refresh_started_at',
         'refresh_finished_at',
+        'last_reachable_at',
         'triggered_by',
     ];
 
@@ -37,6 +38,7 @@ class McpClientServerStatus extends Model
         'tool_count' => 'integer',
         'refresh_started_at' => 'datetime',
         'refresh_finished_at' => 'datetime',
+        'last_reachable_at' => 'datetime',
     ];
 
     /**

@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Tests\Unit\Services;
 
+use ClarionApp\LlmClient\Exceptions\McpProtocolException;
 use ClarionApp\LlmClient\Models\McpClientServer;
 use ClarionApp\LlmClient\Models\McpClientTool;
 use ClarionApp\LlmClient\Services\McpClientTextSanitizer;
@@ -440,5 +441,64 @@ class McpClientToolDiscoveryServiceTest extends TestCase
 
         $activeNames = McpClientTool::where('server_id', $server->id)->active()->pluck('name')->all();
         $this->assertContains('search_records', $activeNames, 'a tool must remain in the active/search-visible pool immediately after an intervening failed discovery attempt, not only survive with an unchanged id');
+    }
+
+    // -----------------------------------------------------------------
+    // McpClientConnectionOutcomeClassifier delegation (protocol_error,
+    // last_reachable_at) -- written before discover() delegates to the
+    // classifier or the last_reachable_at column exists; expected FAIL
+    // red against the current, unmodified discover().
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_misbehaving_server_is_reported_as_protocol_error_distinct_from_unreachable(): void
+    {
+        $server = $this->makeServer('https://example.test/mcp');
+
+        $status = $this->service($this->factoryReturning(
+            $this->mockTransport(new McpProtocolException('malformed tools/list response'))
+        ))->discover($server);
+
+        $this->assertSame('protocol_error', $status->connection_status);
+        $this->assertNotSame('unreachable', $status->connection_status);
+        $this->assertNotNull($status->last_error);
+        $this->assertCount(0, McpClientTool::where('server_id', $server->id)->get());
+    }
+
+    #[Test]
+    public function a_successful_discovery_sets_last_reachable_at_to_the_refresh_timestamp(): void
+    {
+        $server = $this->makeServer('https://example.test/mcp');
+        $schema = ['type' => 'object'];
+
+        $status = $this->service($this->factoryReturning($this->mockTransport([
+            ['name' => 'search_records', 'description' => 'Searches records.', 'inputSchema' => $schema, 'annotations' => null],
+        ])))->discover($server);
+
+        $this->assertNotNull($status->last_reachable_at);
+        $this->assertSame($status->refresh_finished_at->toDateTimeString(), $status->last_reachable_at->toDateTimeString());
+    }
+
+    #[Test]
+    public function a_subsequent_failed_discovery_leaves_last_reachable_at_unchanged_from_the_prior_success(): void
+    {
+        $server = $this->makeServer('https://example.test/mcp');
+        $schema = ['type' => 'object'];
+
+        $successStatus = $this->service($this->factoryReturning($this->mockTransport([
+            ['name' => 'search_records', 'description' => 'Searches records.', 'inputSchema' => $schema, 'annotations' => null],
+        ])))->discover($server);
+
+        $lastReachableAt = $successStatus->last_reachable_at;
+        $this->assertNotNull($lastReachableAt);
+
+        \Illuminate\Support\Carbon::setTestNow(\Illuminate\Support\Carbon::now()->addSeconds(2));
+
+        $failedStatus = $this->service($this->factoryReturning(
+            $this->mockTransport(new \RuntimeException('connection refused'))
+        ))->discover($server);
+
+        $this->assertSame('unreachable', $failedStatus->connection_status);
+        $this->assertSame($lastReachableAt->toDateTimeString(), $failedStatus->last_reachable_at->toDateTimeString(), 'last_reachable_at must never regress on a failure branch');
     }
 }

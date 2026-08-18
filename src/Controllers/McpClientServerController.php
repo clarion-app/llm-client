@@ -4,6 +4,8 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Jobs\RefreshMcpClientServerToolsJob;
+use ClarionApp\LlmClient\Jobs\TestMcpClientConnectionJob;
+use ClarionApp\LlmClient\Models\McpClientConnectionTest;
 use ClarionApp\LlmClient\Models\McpClientServer;
 use ClarionApp\LlmClient\Models\McpClientServerStatus;
 use ClarionApp\LlmClient\Models\McpClientTool;
@@ -37,11 +39,22 @@ class McpClientServerController extends Controller
 
         $servers = McpClientServer::query()
             ->eligibleFor($callerUserId)
+            ->get();
+
+        // One query for every relevant status row, keyed by server_id, so
+        // this stays O(1) regardless of how many servers the caller has
+        // eligible -- never one status query per server (plan.md
+        // Performance Goals; Grounding note 1).
+        $statuses = McpClientServerStatus::query()
+            ->whereIn('server_id', $servers->pluck('id'))
             ->get()
-            ->map(fn (McpClientServer $server) => $this->serverSummary($server))
+            ->keyBy('server_id');
+
+        $summaries = $servers
+            ->map(fn (McpClientServer $server) => $this->serverSummaryWithStatus($server, $statuses->get($server->id)))
             ->values();
 
-        return response()->json($servers);
+        return response()->json($summaries);
     }
 
     /**
@@ -127,6 +140,124 @@ class McpClientServerController extends Controller
     }
 
     /**
+     * PATCH /mcp-client-server/{id}/credential -- replace only the
+     * credential column (D7, contracts/credential-replace-api.md).
+     * Validates exclusively `credential`; no other request field is even
+     * read, which is what makes FR-009's "without re-entering the
+     * server's other configuration details" a structural guarantee
+     * rather than a convention. Queues the same refresh job store()
+     * already dispatches on create, so a previously auth_failed server
+     * recovers on the very next check with no further user action
+     * (SC-003).
+     */
+    public function replaceCredential(Request $request, string $id): JsonResponse
+    {
+        $server = $this->findEligible($id);
+        if ($server === null) {
+            return $this->notFoundResponse();
+        }
+
+        $validated = $request->validate([
+            'credential' => ['required', 'string'],
+        ]);
+
+        $server->update(['credential' => $validated['credential']]);
+
+        RefreshMcpClientServerToolsJob::dispatch($server->id, 'credential_replace');
+
+        return response()->json($this->serverSummary($server));
+    }
+
+    /**
+     * POST /mcp-client-server/test-connection -- start a connection test
+     * without creating or touching any mcp_client_servers row (D3/D4).
+     * Runs on a queue worker (D2): this endpoint only creates the
+     * tracking row and dispatches the job; it never itself calls
+     * McpTransportFactory.
+     */
+    public function testConnection(Request $request): JsonResponse
+    {
+        $validated = $this->validatedConnectionOnly($request);
+
+        $test = McpClientConnectionTest::create([
+            'user_id' => Auth::user()->id,
+            'transport' => $validated['transport'],
+            'url' => $validated['url'] ?? null,
+            'command' => $validated['command'] ?? null,
+            'args' => $validated['args'] ?? null,
+            'credential' => $validated['credential'] ?? null,
+            'status' => 'pending',
+        ]);
+
+        TestMcpClientConnectionJob::dispatch($test->id);
+
+        return response()->json([
+            'id' => $test->id,
+            'status' => 'pending',
+        ], 202);
+    }
+
+    /**
+     * GET /mcp-client-server/test-connection/{id} -- polled by the
+     * frontend until status leaves pending. Scoped to the caller the
+     * same way every other read in this controller is (findEligible()'s
+     * pattern) -- an absent or foreign-owned test id is a uniform 404,
+     * never a distinguishing 403.
+     */
+    public function showTestConnection(Request $request, string $id): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $test = McpClientConnectionTest::where('id', $id)
+            ->where('user_id', $callerUserId)
+            ->first();
+
+        if ($test === null) {
+            return $this->notFoundResponse();
+        }
+
+        return response()->json([
+            'id' => $test->id,
+            'status' => $test->status,
+            'failure_category' => $test->failure_category,
+            'message' => $test->message,
+            'tool_count' => $test->tool_count,
+        ]);
+    }
+
+    /**
+     * The same connection-shape fields validated() already validates,
+     * minus name/scope -- a test has no identity or ownership scope of
+     * its own beyond the caller (contracts/connection-test-api.md).
+     *
+     * @return array<string, mixed>
+     */
+    private function validatedConnectionOnly(Request $request): array
+    {
+        return $request->validate([
+            'transport' => ['required', 'string', Rule::in(array_map(fn (McpTransportKind $t) => $t->value, McpTransportKind::cases()))],
+            'url' => [
+                'required_if:transport,streamable_http',
+                'nullable',
+                'string',
+                function (string $attribute, mixed $value, \Closure $fail): void {
+                    if ($value === null) {
+                        return;
+                    }
+                    $scheme = parse_url($value, PHP_URL_SCHEME);
+                    if (!$scheme || !in_array(strtolower($scheme), ['http', 'https'], true)) {
+                        $fail('The url must use the http or https scheme.');
+                    }
+                },
+            ],
+            'command' => ['required_if:transport,stdio', 'nullable', 'string'],
+            'args' => ['sometimes', 'nullable', 'array'],
+            'args.*' => ['string'],
+            'credential' => ['nullable', 'string'],
+        ]);
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function validated(Request $request): array
@@ -170,6 +301,24 @@ class McpClientServerController extends Controller
     }
 
     /**
+     * index()'s own shape: serverSummary()'s 4 fields plus each server's
+     * own connection_status/last_reachable_at/tool_count -- a distinct
+     * helper (rather than changing serverSummary() itself) because
+     * serverSummary()'s current 4-field shape is also the documented
+     * response for replaceCredential(), which must stay unchanged.
+     *
+     * @return array<string, mixed>
+     */
+    private function serverSummaryWithStatus(McpClientServer $server, ?McpClientServerStatus $status): array
+    {
+        return $this->serverSummary($server) + [
+            'connection_status' => $status->connection_status ?? 'unknown',
+            'last_reachable_at' => $status->last_reachable_at ?? null,
+            'tool_count' => $status->tool_count ?? 0,
+        ];
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function serverDetail(McpClientServer $server): array
@@ -197,6 +346,7 @@ class McpClientServerController extends Controller
                 'last_error' => $status->last_error ?? null,
                 'tool_count' => $status->tool_count ?? 0,
                 'refresh_finished_at' => $status->refresh_finished_at ?? null,
+                'last_reachable_at' => $status->last_reachable_at ?? null,
             ],
             'tools' => $tools,
         ];
