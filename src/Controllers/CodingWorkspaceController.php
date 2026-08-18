@@ -181,27 +181,41 @@ class CodingWorkspaceController extends Controller
         }
 
         $resolvedPath = $validation['resolved_path'];
+        $resolvedIdentity = $validation['resolved_identity'] ?? null;
 
-        if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
+        // Nothing else runs between an approved location and opening it --
+        // everything from here on acts on the open handle, never on the
+        // path string again.
+        $this->beforeResolvedPathOpen($resolvedPath);
+
+        $handle = @fopen($resolvedPath, 'rb');
+        if ($handle === false) {
             return response()->json(['error' => 'not found'], 422);
         }
 
-        if ($this->filePolicy->isOversized($resolvedPath)) {
-            $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+        $actual = @fstat($handle);
+        if ($actual === false) {
+            fclose($handle);
 
-            $handle = @fopen($resolvedPath, 'rb');
-            if ($handle === false) {
-                return response()->json(['error' => 'not found'], 422);
-            }
+            return response()->json(['error' => 'not found'], 422);
+        }
 
+        if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
+            fclose($handle);
+
+            return $this->containmentFailureResponse('outside the registered project');
+        }
+
+        $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+        $size = $actual['size'];
+
+        if ($size > $threshold) {
             $sample = @fread($handle, $threshold);
             fclose($handle);
 
             if ($sample === false) {
                 return response()->json(['error' => 'not found'], 422);
             }
-
-            $size = filesize($resolvedPath);
 
             if ($this->filePolicy->isBinary($sample)) {
                 return response()->json([
@@ -221,7 +235,10 @@ class CodingWorkspaceController extends Controller
             ], 200);
         }
 
-        $content = @file_get_contents($resolvedPath);
+        rewind($handle);
+        $content = @stream_get_contents($handle);
+        fclose($handle);
+
         if ($content === false) {
             return response()->json(['error' => 'not found'], 422);
         }
@@ -266,7 +283,31 @@ class CodingWorkspaceController extends Controller
             return $this->containmentFailureResponse($validation['reason'] ?? 'invalid path');
         }
 
-        $written = @file_put_contents($validation['resolved_path'], $validated['content']);
+        $resolvedPath = $validation['resolved_path'];
+        $resolvedIdentity = $validation['resolved_identity'] ?? null;
+
+        $this->beforeResolvedPathOpen($resolvedPath);
+
+        // Create-or-open, no truncate yet -- an overwrite's identity is
+        // verified against the handle before a single byte is written.
+        $handle = @fopen($resolvedPath, 'cb');
+        if ($handle === false) {
+            return response()->json(['error' => 'could not write file'], 422);
+        }
+
+        if ($resolvedIdentity !== null) {
+            $actual = @fstat($handle);
+            if ($actual === false || !$this->identityMatches($actual, $resolvedIdentity)) {
+                fclose($handle);
+
+                return $this->containmentFailureResponse('outside the registered project');
+            }
+        }
+
+        ftruncate($handle, 0);
+        $written = @fwrite($handle, $validated['content']);
+        fclose($handle);
+
         if ($written === false) {
             return response()->json(['error' => 'could not write file'], 422);
         }
@@ -300,9 +341,32 @@ class CodingWorkspaceController extends Controller
         }
 
         $resolvedPath = $validation['resolved_path'];
+        $resolvedIdentity = $validation['resolved_identity'] ?? null;
 
-        if (!is_file($resolvedPath)) {
+        $this->beforeResolvedPathOpen($resolvedPath);
+
+        // Opened only to pin/verify identity via fstat() -- content is
+        // never read. unlink() itself still has to act on the path, not
+        // this handle -- PHP has no fd-based delete primitive -- so this
+        // operation's guarantee is honestly narrower than readFile's/
+        // writeFile's: it is bounded to "the wrong in-workspace entry
+        // could be removed," never "outside content exposed," since
+        // unlink() never dereferences a symlink to remove its target, only
+        // the directory entry it was given.
+        $handle = @fopen($resolvedPath, 'rb');
+        if ($handle === false) {
             return response()->json(['error' => 'not found'], 422);
+        }
+
+        $actual = @fstat($handle);
+        fclose($handle);
+
+        if ($actual === false) {
+            return response()->json(['error' => 'not found'], 422);
+        }
+
+        if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
+            return $this->containmentFailureResponse('outside the registered project');
         }
 
         $deleted = @unlink($resolvedPath);
@@ -436,6 +500,27 @@ class CodingWorkspaceController extends Controller
     private function containmentFailureResponse(string $reason): JsonResponse
     {
         return response()->json(['error' => $reason], 422);
+    }
+
+    /**
+     * A no-op hook every production caller runs straight through,
+     * positioned as the last thing that happens between an approved
+     * location and the fopen() that follows it. It exists purely so a
+     * test can simulate the on-disk location being swapped out from
+     * under an already-approved path in that narrow window -- production
+     * code never overrides it.
+     */
+    protected function beforeResolvedPathOpen(string $resolvedPath): void
+    {
+    }
+
+    /**
+     * Compares a freshly-fstat()'d handle's {dev, ino} against the
+     * fingerprint PathContainment::validate() captured at approval time.
+     */
+    private function identityMatches(array $actualStat, array $resolvedIdentity): bool
+    {
+        return $actualStat['dev'] === $resolvedIdentity['dev'] && $actualStat['ino'] === $resolvedIdentity['ino'];
     }
 
     /**

@@ -248,6 +248,137 @@ class PathContainmentAdversarialTest extends TestCase
         );
     }
 
+    // -----------------------------------------------------------------
+    // A symlink already sitting at a write target
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_symlink_at_a_write_target_is_refused_and_the_outside_file_is_never_overwritten(): void
+    {
+        $secretPath = $this->outsideDir.'/secret-write.txt';
+        file_put_contents($secretPath, 'ORIGINAL OUTSIDE CONTENT');
+
+        $project = $this->registerProject($this->projectDir);
+
+        $linkPath = $this->projectDir.'/write-target.txt';
+        symlink($secretPath, $linkPath);
+        $this->assertTrue(is_link($linkPath), 'fixture sanity: the symlink must genuinely exist on disk before the request is made');
+
+        $response = $this->postJson($this->apiUrl("coding-project/{$project->id}/file"), [
+            'path' => 'write-target.txt',
+            'content' => 'OVERWRITTEN',
+        ]);
+
+        $response->assertStatus(422);
+        $this->assertSame('outside the registered project', $response->json('error'));
+        $this->assertSame(
+            'ORIGINAL OUTSIDE CONTENT',
+            file_get_contents($secretPath),
+            'the outside file reached through the symlink must be unchanged, not merely a non-200 status',
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // A hard link to a file outside the project
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_hard_link_to_an_outside_file_is_refused_on_read_and_never_leaks_its_content(): void
+    {
+        $secretPath = $this->outsideDir.'/secret-hardlink-read.txt';
+        file_put_contents($secretPath, 'TOP SECRET HARD LINK CONTENT');
+
+        $project = $this->registerProject($this->projectDir);
+
+        $linkPath = $this->projectDir.'/linked.txt';
+        link($secretPath, $linkPath);
+        $this->assertTrue(is_file($linkPath), 'fixture sanity: the hard link must genuinely exist on disk before the request is made');
+
+        $response = $this->getJson($this->apiUrl("coding-project/{$project->id}/file?path=linked.txt"));
+
+        $response->assertStatus(422);
+        $this->assertSame('outside the registered project', $response->json('error'));
+        $this->assertStringNotContainsString(
+            'TOP SECRET HARD LINK CONTENT',
+            $response->getContent(),
+            'the hard-linked file\'s content must never reach the response, mirroring the existing symlink test\'s own assertion style',
+        );
+    }
+
+    #[Test]
+    public function a_hard_link_to_an_outside_file_is_refused_on_delete_and_the_outside_file_survives_unchanged(): void
+    {
+        $secretPath = $this->outsideDir.'/secret-hardlink-delete.txt';
+        file_put_contents($secretPath, 'TOP SECRET DELETE CONTENT');
+
+        $project = $this->registerProject($this->projectDir);
+
+        $linkPath = $this->projectDir.'/linked-delete.txt';
+        link($secretPath, $linkPath);
+        $this->assertTrue(is_file($linkPath), 'fixture sanity: the hard link must genuinely exist on disk before the request is made');
+
+        $response = $this->deleteJson($this->apiUrl("coding-project/{$project->id}/file?path=linked-delete.txt"));
+
+        $response->assertStatus(422);
+        $this->assertSame('outside the registered project', $response->json('error'));
+        $this->assertTrue(is_file($secretPath), 'the outside file (the same inode via the hard link) must still exist after the refused delete');
+        $this->assertSame(
+            'TOP SECRET DELETE CONTENT',
+            file_get_contents($secretPath),
+            'the outside file\'s content must be unchanged after the refused delete -- the hard-linked entry is never unlinked',
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // An ordinary directory containing a subdirectory -- the hard-link
+    // guard must never misfire on it through the real HTTP path
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function an_ordinary_directory_with_a_subdirectory_still_lists_and_searches_normally(): void
+    {
+        mkdir($this->projectDir.'/parent-dir');
+        mkdir($this->projectDir.'/parent-dir/child-dir');
+        file_put_contents($this->projectDir.'/parent-dir/child-dir/leaf.txt', 'leaf content');
+
+        $project = $this->registerProject($this->projectDir);
+
+        $listResponse = $this->getJson($this->apiUrl("coding-project/{$project->id}/files?subpath=parent-dir"));
+        $listResponse->assertStatus(200);
+        $names = array_column($listResponse->json('entries'), 'name');
+        $this->assertContains('child-dir', $names, 'an ordinary directory containing a subdirectory must list normally, not be refused as if it were hard-linked');
+
+        $searchResponse = $this->getJson($this->apiUrl("coding-project/{$project->id}/search-files?pattern=*"));
+        $searchResponse->assertStatus(200);
+    }
+
+    // -----------------------------------------------------------------
+    // An unusual but equivalent path spelling resolves to the same
+    // content as its ordinary spelling
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function an_unusual_but_equivalent_path_spelling_resolves_to_the_same_content_as_ordinary_spelling(): void
+    {
+        mkdir($this->projectDir.'/sub');
+        file_put_contents($this->projectDir.'/sub/file.txt', 'equivalence content');
+
+        $project = $this->registerProject($this->projectDir);
+
+        $ordinary = $this->getJson($this->apiUrl("coding-project/{$project->id}/file?path=sub/file.txt"));
+        $unusualQuery = http_build_query(['path' => 'sub//./file.txt']);
+        $unusual = $this->getJson($this->apiUrl("coding-project/{$project->id}/file?{$unusualQuery}"));
+
+        $ordinary->assertStatus(200);
+        $unusual->assertStatus(200);
+        $this->assertSame('equivalence content', $ordinary->json('content'));
+        $this->assertSame(
+            $ordinary->json('content'),
+            $unusual->json('content'),
+            'a redundant-separator/./-segment spelling must resolve to, and be checked against, the same real location as its ordinary spelling',
+        );
+    }
+
     #[Test]
     public function workspace_search_service_calls_path_containment_validate_with_the_same_three_argument_shape_no_parallel_check(): void
     {
