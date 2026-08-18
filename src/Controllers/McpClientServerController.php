@@ -140,6 +140,35 @@ class McpClientServerController extends Controller
     }
 
     /**
+     * PATCH /mcp-client-server/{id}/credential -- replace only the
+     * credential column (D7, contracts/credential-replace-api.md).
+     * Validates exclusively `credential`; no other request field is even
+     * read, which is what makes FR-009's "without re-entering the
+     * server's other configuration details" a structural guarantee
+     * rather than a convention. Queues the same refresh job store()
+     * already dispatches on create, so a previously auth_failed server
+     * recovers on the very next check with no further user action
+     * (SC-003).
+     */
+    public function replaceCredential(Request $request, string $id): JsonResponse
+    {
+        $server = $this->findEligible($id);
+        if ($server === null) {
+            return $this->notFoundResponse();
+        }
+
+        $validated = $request->validate([
+            'credential' => ['required', 'string'],
+        ]);
+
+        $server->update(['credential' => $validated['credential']]);
+
+        RefreshMcpClientServerToolsJob::dispatch($server->id, 'credential_replace');
+
+        return response()->json($this->serverSummary($server));
+    }
+
+    /**
      * POST /mcp-client-server/test-connection -- start a connection test
      * without creating or touching any mcp_client_servers row (D3/D4).
      * Runs on a queue worker (D2): this endpoint only creates the

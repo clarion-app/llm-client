@@ -448,6 +448,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('mcp-client-server/{id}', [McpClientServerController::class, "show"]);
     Route::delete('mcp-client-server/{id}', [McpClientServerController::class, "destroy"]);
     Route::post('mcp-client-server/{id}/refresh', [McpClientServerController::class, "refresh"]);
+    Route::patch('mcp-client-server/{id}/credential', [McpClientServerController::class, "replaceCredential"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
