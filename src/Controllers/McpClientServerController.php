@@ -37,11 +37,22 @@ class McpClientServerController extends Controller
 
         $servers = McpClientServer::query()
             ->eligibleFor($callerUserId)
+            ->get();
+
+        // One query for every relevant status row, keyed by server_id, so
+        // this stays O(1) regardless of how many servers the caller has
+        // eligible -- never one status query per server (plan.md
+        // Performance Goals; Grounding note 1).
+        $statuses = McpClientServerStatus::query()
+            ->whereIn('server_id', $servers->pluck('id'))
             ->get()
-            ->map(fn (McpClientServer $server) => $this->serverSummary($server))
+            ->keyBy('server_id');
+
+        $summaries = $servers
+            ->map(fn (McpClientServer $server) => $this->serverSummaryWithStatus($server, $statuses->get($server->id)))
             ->values();
 
-        return response()->json($servers);
+        return response()->json($summaries);
     }
 
     /**
@@ -170,6 +181,24 @@ class McpClientServerController extends Controller
     }
 
     /**
+     * index()'s own shape: serverSummary()'s 4 fields plus each server's
+     * own connection_status/last_reachable_at/tool_count -- a distinct
+     * helper (rather than changing serverSummary() itself) because
+     * serverSummary()'s current 4-field shape is also the documented
+     * response for replaceCredential(), which must stay unchanged.
+     *
+     * @return array<string, mixed>
+     */
+    private function serverSummaryWithStatus(McpClientServer $server, ?McpClientServerStatus $status): array
+    {
+        return $this->serverSummary($server) + [
+            'connection_status' => $status->connection_status ?? 'unknown',
+            'last_reachable_at' => $status->last_reachable_at ?? null,
+            'tool_count' => $status->tool_count ?? 0,
+        ];
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function serverDetail(McpClientServer $server): array
@@ -197,6 +226,7 @@ class McpClientServerController extends Controller
                 'last_error' => $status->last_error ?? null,
                 'tool_count' => $status->tool_count ?? 0,
                 'refresh_finished_at' => $status->refresh_finished_at ?? null,
+                'last_reachable_at' => $status->last_reachable_at ?? null,
             ],
             'tools' => $tools,
         ];
