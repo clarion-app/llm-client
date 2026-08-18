@@ -1724,6 +1724,7 @@ abstract class TestCase extends BaseTestCase
                 $table->integer('tool_count')->nullable();
                 $table->timestamp('refresh_started_at')->nullable();
                 $table->timestamp('refresh_finished_at')->nullable();
+                $table->timestamp('last_reachable_at')->nullable();
                 $table->string('triggered_by')->nullable();
                 $table->timestamps();
 

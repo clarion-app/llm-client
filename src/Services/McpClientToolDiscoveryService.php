@@ -2,7 +2,6 @@
 
 namespace ClarionApp\LlmClient\Services;
 
-use ClarionApp\LlmClient\Exceptions\McpAuthenticationException;
 use ClarionApp\LlmClient\Models\McpClientServer;
 use ClarionApp\LlmClient\Models\McpClientServerStatus;
 use ClarionApp\LlmClient\Models\McpClientTool;
@@ -24,17 +23,21 @@ use Illuminate\Support\Str;
  * McpClientTool::scopeActive() excludes it from then on, while the row
  * itself -- and any invocation history attributed to it -- stays intact.
  *
- * Every outcome lands on exactly one of the four connection_status values
- * a status row can hold (reachable/unreachable/auth_failed/unknown) --
- * never an uncaught exception escaping to the caller, the same failure-
- * isolation discipline McpClientToolExecutor applies one layer down for a
- * single tool invocation.
+ * Every outcome lands on exactly one of the five connection_status values
+ * a status row can hold (reachable/unreachable/auth_failed/protocol_error/
+ * unknown) -- never an uncaught exception escaping to the caller, the
+ * same failure-isolation discipline McpClientToolExecutor applies one
+ * layer down for a single tool invocation. What a given exception means
+ * is decided in exactly one place, McpClientConnectionOutcomeClassifier,
+ * shared with TestMcpClientConnectionJob's own test-before-save path, so
+ * the two can never disagree (FR-010).
  */
 class McpClientToolDiscoveryService
 {
     public function __construct(
         private readonly McpTransportFactory $transportFactory,
         private readonly McpClientTextSanitizer $sanitizer,
+        private readonly McpClientConnectionOutcomeClassifier $classifier = new McpClientConnectionOutcomeClassifier(),
     ) {
     }
 
@@ -55,28 +58,17 @@ class McpClientToolDiscoveryService
             $transport = $this->transportFactory->for($server);
             $transport->initialize();
             $tools = $transport->listTools();
-        } catch (McpAuthenticationException $e) {
-            $status->update([
-                'connection_status' => 'auth_failed',
-                'last_error' => $e->getMessage(),
-                'tool_count' => 0,
-                'refresh_finished_at' => now(),
-            ]);
-
-            return $status->fresh();
         } catch (\Throwable $e) {
-            // Every other transport-level failure -- unreachable, timed
-            // out, or a malformed/misbehaving response -- is reported as
-            // "unreachable": the status row's own connection_status
-            // vocabulary has no separate timeout/protocol-error value,
-            // and the property it exists to preserve is "could not be
-            // used at all" vs. "has no tools", not a full taxonomy of
-            // every possible transport failure.
+            $outcome = $this->classifier->classify($e);
+
             $status->update([
-                'connection_status' => 'unreachable',
-                'last_error' => $e->getMessage(),
+                'connection_status' => $outcome->category,
+                'last_error' => $outcome->message,
                 'tool_count' => 0,
                 'refresh_finished_at' => now(),
+                // last_reachable_at is deliberately absent here -- it is
+                // never touched on any failure branch, all categories
+                // alike, so it only ever advances on an actual success.
             ]);
 
             return $status->fresh();
@@ -96,6 +88,7 @@ class McpClientToolDiscoveryService
             'last_error' => null,
             'tool_count' => $toolCount,
             'refresh_finished_at' => $refreshTimestamp,
+            'last_reachable_at' => $refreshTimestamp,
         ]);
 
         return $status->fresh();
