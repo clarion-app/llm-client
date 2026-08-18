@@ -48,6 +48,7 @@ final class Protocol
      * mode's deliberately-malformed-JSON case can be represented at all.
      *
      * @param array<string, mixed> $params
+     * @param list<string|array{name: string, description?: ?string, inputSchema?: mixed, annotations?: ?array}>|null $dynamicTools When non-null, overrides $mode's own tools() catalog for a tools/list response -- each entry is either a plain name (resolved against toolCatalog(), unchanged from before) or a full tool definition an individual test constructs directly (see resolveDynamicTools()).
      */
     public static function rawResponseBody(
         string $method,
@@ -55,7 +56,7 @@ final class Protocol
         string $mode,
         ?float $delaySeconds,
         mixed $id = 1,
-        ?array $toolNames = null,
+        ?array $dynamicTools = null,
     ): string {
         if ($mode === self::MODE_SLOW) {
             usleep((int) round(($delaySeconds ?? self::DEFAULT_SLOW_DELAY_SECONDS) * 1_000_000));
@@ -73,7 +74,7 @@ final class Protocol
 
         $result = match ($method) {
             'initialize' => self::initializeResult(),
-            'tools/list' => ['tools' => $toolNames !== null ? self::toolsForNames($toolNames) : self::tools($mode)],
+            'tools/list' => ['tools' => $dynamicTools !== null ? self::resolveDynamicTools($dynamicTools) : self::tools($mode)],
             'tools/call' => self::callToolResult($params),
             default => null,
         };
@@ -115,33 +116,57 @@ final class Protocol
     }
 
     /**
-     * The subset of toolCatalog() named by $names, in that order,
-     * ignoring any name this fixture doesn't know about. Lets a caller
-     * change which tools the SAME running fixture process currently
-     * offers -- same URL, same command, no McpClientServer row changed
-     * at all -- standing in for a real third-party server's operator
-     * updating its own tool catalog independent of anything Clarion did
-     * (US5, FR-014). Read fresh on every tools/list request rather than
-     * fixed at process start, unlike $mode.
+     * Resolves a dynamic tools/list override -- each entry is either a
+     * plain name (string, resolved against toolCatalog() exactly like a
+     * caller changing which of this fixture's own known tools it
+     * currently offers) or a full tool definition array an individual
+     * test constructs directly, with only 'name' required and
+     * 'description'/'inputSchema'/'annotations' defaulted when absent.
+     * A name this fixture doesn't recognize, or a definition array with
+     * no 'name' key, is silently dropped -- matching toolCatalog()
+     * lookup's own existing "unknown name" behavior.
      *
-     * @param list<string> $names
+     * Lets a caller change what the SAME running fixture process
+     * currently offers -- same URL, same command, no McpClientServer row
+     * changed at all -- standing in for a real third-party server's
+     * operator updating its own tool catalog, up to and including
+     * offering an arbitrary name/description/inputSchema this fixture's
+     * static catalog never defined. Read fresh on every tools/list
+     * request rather than fixed at process start, unlike $mode.
+     *
+     * @param list<string|array{name: string, description?: ?string, inputSchema?: mixed, annotations?: ?array}> $items
      * @return array<int, array{name: string, description: ?string, inputSchema: mixed, annotations: ?array}>
      */
-    public static function toolsForNames(array $names): array
+    public static function resolveDynamicTools(array $items): array
     {
         $catalog = self::toolCatalog();
 
         return array_values(array_filter(array_map(
-            fn (string $name) => $catalog[$name] ?? null,
-            $names,
+            function (string|array $item) use ($catalog) {
+                if (is_string($item)) {
+                    return $catalog[$item] ?? null;
+                }
+
+                if (!isset($item['name']) || !is_string($item['name'])) {
+                    return null;
+                }
+
+                return [
+                    'name' => $item['name'],
+                    'description' => $item['description'] ?? null,
+                    'inputSchema' => $item['inputSchema'] ?? ['type' => 'object', 'properties' => [], 'required' => []],
+                    'annotations' => $item['annotations'] ?? null,
+                ];
+            },
+            $items,
         )));
     }
 
     /**
      * Every tool this fixture knows how to describe, keyed by name --
-     * the shared source both the mode-driven tools() and the
-     * name-driven toolsForNames() draw from, so a tool's own shape only
-     * ever needs to be written once.
+     * the shared source both the mode-driven tools() and
+     * resolveDynamicTools()'s own name-lookup branch draw from, so a
+     * tool's own shape only ever needs to be written once.
      *
      * @return array<string, array{name: string, description: ?string, inputSchema: mixed, annotations: ?array}>
      */

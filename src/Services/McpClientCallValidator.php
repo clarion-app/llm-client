@@ -4,12 +4,15 @@ namespace ClarionApp\LlmClient\Services;
 
 /**
  * The CallValidatorInterface implementation for a synthesized external-
- * tool operationId. Reuses the identical fnmatch()-over-
- * config('llm-client.api_denylist') check ApiCallValidator::validate()
- * already performs for a built-in route's own resolved path, applied
- * here to the synthesized "/mcp-client/{server_id}/{tool_name}" path
- * instead -- the same configured rules, the same array, no parallel
- * denylist.
+ * tool operationId. Delegates the denylist check to DenylistMatcher::
+ * matchesAny() -- the same shared matching primitive
+ * ApiCallValidator::validate() calls for a built-in route's own resolved
+ * path -- checked here against two candidates: the synthesized
+ * "/mcp-client/{server_id}/{tool_name}" path (backward compatible with a
+ * rule written before the tool's own durable id existed) and the tool's
+ * own operationId (rename-durable, since a server can rewrite its own
+ * tool's name but never this installation's locally-generated id). A
+ * match on either candidate rejects the call.
  *
  * Every non-denied call returns STATUS_CONFIRM unconditionally: the safe
  * universal default for an action whose actual destructiveness this
@@ -25,7 +28,7 @@ namespace ClarionApp\LlmClient\Services;
 class McpClientCallValidator implements CallValidatorInterface
 {
     /**
-     * @param string $operationId The synthetic "mcp:{server_id}:{tool_name}" id -- carried only because the interface's own signature requires it; not read by this decision.
+     * @param string $operationId The synthetic "mcp:{server_id}:{tool_id}" id -- checked against the denylist as a second candidate alongside the resolved path; a match on either rejects the call.
      * @param string $method The fixed "MCP_EXTERNAL" sentinel -- not read by this decision.
      * @param string $path The synthesized "/mcp-client/{server_id}/{tool_name}" path checked against the denylist.
      * @return array{status: string, reason?: string}
@@ -35,13 +38,12 @@ class McpClientCallValidator implements CallValidatorInterface
         $denylist = config('llm-client.api_denylist', []);
         $normalizedPath = '/' . ltrim($path, '/');
 
-        foreach ($denylist as $pattern) {
-            if (fnmatch($pattern, $normalizedPath)) {
-                return [
-                    'status' => ApiCallValidator::STATUS_REJECT,
-                    'reason' => "Path is denylisted: {$normalizedPath}",
-                ];
-            }
+        $matchedPattern = DenylistMatcher::matchesAny($denylist, $normalizedPath, $operationId);
+        if ($matchedPattern !== null) {
+            return [
+                'status' => ApiCallValidator::STATUS_REJECT,
+                'reason' => "Denylisted: {$matchedPattern}",
+            ];
         }
 
         return [

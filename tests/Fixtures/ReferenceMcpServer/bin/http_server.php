@@ -50,15 +50,15 @@ if ($expectedToken !== null) {
 }
 
 // Read fresh on every request (never cached in a variable set once at
-// process start, unlike $mode above) -- this is what lets setTools()
-// change what this same running process reports mid-test.
+// process start, unlike $mode above) -- this is what lets
+// setTools()/setToolDefinitions() change what this same running process
+// reports mid-test. JSON-encoded so an entry can be either a plain name
+// or a full tool definition array (see Protocol::resolveDynamicTools()).
 $toolNames = null;
 if ($toolNamesFile !== null && is_file($toolNamesFile)) {
     $raw = file_get_contents($toolNamesFile) ?: '';
-    $toolNames = array_values(array_filter(
-        array_map('trim', explode(',', $raw)),
-        fn (string $name) => $name !== '',
-    ));
+    $decoded = json_decode($raw, true);
+    $toolNames = is_array($decoded) ? $decoded : null;
 }
 
 // Appended, never overwritten -- ReferenceMcpServer::loggedToolCalls()

@@ -42,13 +42,11 @@ class ApiCallValidator
         // Check resolved path against denylist
         $denylist = config('llm-client.api_denylist', []);
         $normalizedPath = '/' . ltrim($path, '/');
-        foreach ($denylist as $pattern) {
-            if (fnmatch($pattern, $normalizedPath)) {
-                return [
-                    'status' => self::STATUS_REJECT,
-                    'reason' => "Path is denylisted: {$normalizedPath}",
-                ];
-            }
+        if (DenylistMatcher::matchesAny($denylist, $normalizedPath) !== null) {
+            return [
+                'status' => self::STATUS_REJECT,
+                'reason' => "Path is denylisted: {$normalizedPath}",
+            ];
         }
 
         // Check if HTTP method requires confirmation

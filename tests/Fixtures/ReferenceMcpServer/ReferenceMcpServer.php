@@ -25,9 +25,11 @@ final class ReferenceMcpServer
 
     /**
      * Set only when startHttp() was given the dynamic_tools option --
-     * the path setTools() rewrites to change what this same running
-     * process reports for tools/list on its next request, without
-     * restarting the process or changing the URL a caller already holds.
+     * the path setTools()/setToolDefinitions() rewrite to change what
+     * this same running process reports for tools/list on its next
+     * request, without restarting the process or changing the URL a
+     * caller already holds. Holds JSON: a list of plain name strings, a
+     * list of full tool definition arrays, or a mix of both.
      */
     private ?string $toolNamesFile = null;
 
@@ -45,7 +47,7 @@ final class ReferenceMcpServer
      * HTTP-servable instance of the fixture. Returns the base URL a
      * StreamableHttpMcpTransport would be pointed at.
      *
-     * @param array{expected_token?: string, delay_seconds?: float, dynamic_tools?: list<string>, log_requests?: bool} $options
+     * @param array{expected_token?: string, delay_seconds?: float, dynamic_tools?: list<string|array{name: string, description?: ?string, inputSchema?: mixed, annotations?: ?array}>, log_requests?: bool} $options
      */
     public function startHttp(string $mode, array $options = []): string
     {
@@ -68,10 +70,12 @@ final class ReferenceMcpServer
         if (isset($options['dynamic_tools'])) {
             // A file rather than an env var: this process's own env is
             // fixed at spawn time, but a file is read fresh on every
-            // request (bin/http_server.php), so setTools() below can
-            // change what tools/list reports mid-test.
+            // request (bin/http_server.php), so setTools()/
+            // setToolDefinitions() below can change what tools/list
+            // reports mid-test. JSON-encoded so an entry can be either a
+            // plain name or a full tool definition array.
             $this->toolNamesFile = tempnam(sys_get_temp_dir(), 'reference_mcp_tools_');
-            file_put_contents($this->toolNamesFile, implode(',', $options['dynamic_tools']));
+            file_put_contents($this->toolNamesFile, json_encode($options['dynamic_tools']));
             $env['REFERENCE_MCP_TOOL_NAMES_FILE'] = $this->toolNamesFile;
         }
 
@@ -96,8 +100,11 @@ final class ReferenceMcpServer
     /**
      * Overwrites the tool list this same fixture process reports on its
      * next tools/list request -- the process keeps running, its URL
-     * never changes, and no McpClientServer row is touched. Requires
-     * startHttp() to have been called with the dynamic_tools option.
+     * never changes, and no McpClientServer row is touched. Each name is
+     * resolved against the fixture's own static catalog exactly as
+     * before -- this method's behavior and signature are unchanged.
+     * Requires startHttp() to have been called with the dynamic_tools
+     * option.
      *
      * @param list<string> $names
      */
@@ -107,7 +114,31 @@ final class ReferenceMcpServer
             throw new \RuntimeException('setTools() requires startHttp() to have been called with the dynamic_tools option.');
         }
 
-        file_put_contents($this->toolNamesFile, implode(',', $names));
+        file_put_contents($this->toolNamesFile, json_encode($names));
+    }
+
+    /**
+     * Overwrites the tool list this same fixture process reports on its
+     * next tools/list request with arbitrary, test-chosen tool
+     * definitions -- name, description, and inputSchema all
+     * caller-controlled, not limited to what the fixture's own static
+     * catalog already knows how to describe. Only 'name' is required per
+     * entry; 'description'/'inputSchema'/'annotations' default to null
+     * (or, for 'inputSchema', a trivial no-argument object schema) when
+     * omitted. Same file-based mechanism setTools() uses -- the process
+     * keeps running, its URL never changes, and no McpClientServer row
+     * is touched. Requires startHttp() to have been called with the
+     * dynamic_tools option.
+     *
+     * @param list<array{name: string, description?: ?string, inputSchema?: mixed, annotations?: ?array}> $definitions
+     */
+    public function setToolDefinitions(array $definitions): void
+    {
+        if ($this->toolNamesFile === null) {
+            throw new \RuntimeException('setToolDefinitions() requires startHttp() to have been called with the dynamic_tools option.');
+        }
+
+        file_put_contents($this->toolNamesFile, json_encode($definitions));
     }
 
     /**
