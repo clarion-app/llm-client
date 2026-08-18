@@ -24,6 +24,8 @@ $delayRaw = getenv('REFERENCE_MCP_DELAY_SECONDS');
 $delaySeconds = $delayRaw !== false ? (float) $delayRaw : null;
 $toolNamesFile = getenv('REFERENCE_MCP_TOOL_NAMES_FILE');
 $toolNamesFile = $toolNamesFile !== false ? $toolNamesFile : null;
+$requestLogFile = getenv('REFERENCE_MCP_REQUEST_LOG_FILE');
+$requestLogFile = $requestLogFile !== false ? $requestLogFile : null;
 
 header('Content-Type: application/json');
 
@@ -57,6 +59,18 @@ if ($toolNamesFile !== null && is_file($toolNamesFile)) {
         array_map('trim', explode(',', $raw)),
         fn (string $name) => $name !== '',
     ));
+}
+
+// Appended, never overwritten -- ReferenceMcpServer::loggedToolCalls()
+// reads this back to confirm which physical process a given call
+// actually reached, independent of what that call's own response
+// content shows.
+if ($requestLogFile !== null && $method === 'tools/call') {
+    file_put_contents(
+        $requestLogFile,
+        json_encode(['tool' => $params['name'] ?? null, 'arguments' => $params['arguments'] ?? []]) . "\n",
+        FILE_APPEND | LOCK_EX,
+    );
 }
 
 echo Protocol::rawResponseBody($method, $params, $mode, $delaySeconds, $id, $toolNames);

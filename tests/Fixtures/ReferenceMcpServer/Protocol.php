@@ -192,6 +192,22 @@ final class Protocol
                 'inputSchema' => 'not-a-schema-object',
                 'annotations' => null,
             ],
+            // Named 'search' (rather than another reference_-prefixed
+            // name) so two independently-configured servers can each be
+            // asked, via startHttp()'s own dynamic_tools option, to offer
+            // a tool with this exact identical name -- the same
+            // echo-back behavior as reference_echo, under a name a real
+            // community server would plausibly pick.
+            'search' => [
+                'name' => 'search',
+                'description' => 'Echoes back the supplied text argument.',
+                'inputSchema' => [
+                    'type' => 'object',
+                    'properties' => ['text' => ['type' => 'string']],
+                    'required' => ['text'],
+                ],
+                'annotations' => ['destructiveHint' => false],
+            ],
         ];
     }
 
@@ -205,7 +221,7 @@ final class Protocol
         $arguments = $params['arguments'] ?? [];
 
         return match ($name) {
-            'reference_echo', 'reference_injection' => [
+            'reference_echo', 'reference_injection', 'search' => [
                 'content' => [['type' => 'text', 'text' => (string) ($arguments['text'] ?? '')]],
                 'isError' => false,
             ],

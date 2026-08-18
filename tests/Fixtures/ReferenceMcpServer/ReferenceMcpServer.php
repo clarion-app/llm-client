@@ -32,11 +32,20 @@ final class ReferenceMcpServer
     private ?string $toolNamesFile = null;
 
     /**
+     * Set only when startHttp() was given the log_requests option -- the
+     * path a caller reads back via loggedToolCalls() to confirm which
+     * physical fixture process actually received a given call, the same
+     * kind of file-based side channel the dynamic_tools option already
+     * uses for setTools().
+     */
+    private ?string $requestLogFile = null;
+
+    /**
      * Start (or, for the unreachable mode, deliberately not start) an
      * HTTP-servable instance of the fixture. Returns the base URL a
      * StreamableHttpMcpTransport would be pointed at.
      *
-     * @param array{expected_token?: string, delay_seconds?: float, dynamic_tools?: list<string>} $options
+     * @param array{expected_token?: string, delay_seconds?: float, dynamic_tools?: list<string>, log_requests?: bool} $options
      */
     public function startHttp(string $mode, array $options = []): string
     {
@@ -64,6 +73,12 @@ final class ReferenceMcpServer
             $this->toolNamesFile = tempnam(sys_get_temp_dir(), 'reference_mcp_tools_');
             file_put_contents($this->toolNamesFile, implode(',', $options['dynamic_tools']));
             $env['REFERENCE_MCP_TOOL_NAMES_FILE'] = $this->toolNamesFile;
+        }
+
+        if (!empty($options['log_requests'])) {
+            $this->requestLogFile = tempnam(sys_get_temp_dir(), 'reference_mcp_requests_');
+            file_put_contents($this->requestLogFile, '');
+            $env['REFERENCE_MCP_REQUEST_LOG_FILE'] = $this->requestLogFile;
         }
 
         $this->httpProcess = new Process(
@@ -96,6 +111,35 @@ final class ReferenceMcpServer
     }
 
     /**
+     * Every tools/call request this fixture process has actually
+     * received so far, oldest first -- lets a caller confirm which
+     * physical server process a given invocation genuinely reached,
+     * independent of whatever response content that call produced.
+     * Requires startHttp() to have been called with the log_requests
+     * option.
+     *
+     * @return list<array{tool: ?string, arguments: array<string, mixed>}>
+     */
+    public function loggedToolCalls(): array
+    {
+        if ($this->requestLogFile === null) {
+            throw new \RuntimeException('loggedToolCalls() requires startHttp() to have been called with the log_requests option.');
+        }
+
+        $raw = file_get_contents($this->requestLogFile) ?: '';
+        $lines = array_values(array_filter(explode("\n", $raw), fn (string $line) => $line !== ''));
+
+        return array_map(function (string $line) {
+            $decoded = json_decode($line, true);
+
+            return [
+                'tool' => is_array($decoded) ? ($decoded['tool'] ?? null) : null,
+                'arguments' => is_array($decoded) && is_array($decoded['arguments'] ?? null) ? $decoded['arguments'] : [],
+            ];
+        }, $lines);
+    }
+
+    /**
      * Stop the HTTP-servable instance started by startHttp(), if any.
      * Safe to call even when nothing was started (the unreachable mode,
      * or a test that never called startHttp() at all).
@@ -108,6 +152,11 @@ final class ReferenceMcpServer
         if ($this->toolNamesFile !== null) {
             @unlink($this->toolNamesFile);
             $this->toolNamesFile = null;
+        }
+
+        if ($this->requestLogFile !== null) {
+            @unlink($this->requestLogFile);
+            $this->requestLogFile = null;
         }
     }
 
