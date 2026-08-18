@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use Auth;
 use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Services\PathContainment;
+use ClarionApp\LlmClient\Services\WorkspaceFilePolicy;
+use ClarionApp\LlmClient\Services\WorkspaceSearchService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
@@ -34,6 +36,12 @@ use Symfony\Component\Process\Process;
  */
 class CodingWorkspaceController extends Controller
 {
+    public function __construct(
+        private readonly WorkspaceSearchService $workspaceSearchService = new WorkspaceSearchService(),
+        private readonly WorkspaceFilePolicy $filePolicy = new WorkspaceFilePolicy(),
+    ) {
+    }
+
     /**
      * GET coding-project/{project}/files (contracts §1). Lists the
      * immediate entries (name, type file/dir) under the resolved,
@@ -74,10 +82,86 @@ class CodingWorkspaceController extends Controller
     }
 
     /**
-     * GET coding-project/{project}/file (contracts §1). Returns file
-     * content. Binary content is detected and reported distinctly —
-     * never embedded as if it were prose — since raw binary bytes cannot
-     * safely round-trip through a JSON string.
+     * GET coding-project/{project}/search-files (120-workspace-file-tools
+     * contracts §1). Query `pattern` (required, fnmatch()-shaped glob),
+     * `subpath` (optional, same containment handling as listFiles()'s own
+     * subpath). Delegates to WorkspaceSearchService — a bounded list of
+     * workspace-relative paths matching the pattern by name only.
+     */
+    public function searchFiles(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $pattern = (string) $request->query('pattern', '');
+        if ($pattern === '') {
+            return response()->json(['error' => 'pattern is required'], 422);
+        }
+
+        $subpath = (string) $request->query('subpath', '');
+
+        $result = $this->workspaceSearchService->searchFiles($codingProject, $subpath, $pattern);
+        if (!$result['valid']) {
+            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+        }
+
+        return response()->json([
+            'matches' => $result['matches'],
+            'truncated' => $result['truncated'],
+            'files_scanned' => $result['files_scanned'],
+        ], 200);
+    }
+
+    /**
+     * GET coding-project/{project}/search-content (120-workspace-file-tools
+     * contracts §2). Query `query` (required, plain case-insensitive
+     * substring term), `pattern` (optional, scopes which files' content is
+     * searched), `subpath` (optional). Delegates to WorkspaceSearchService
+     * — bounded matches with contextual line/snippet.
+     */
+    public function searchContent(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $query = (string) $request->query('query', '');
+        if ($query === '') {
+            return response()->json(['error' => 'query is required'], 422);
+        }
+
+        $subpath = (string) $request->query('subpath', '');
+        $pattern = $request->query('pattern');
+        $pattern = $pattern !== null ? (string) $pattern : null;
+
+        $result = $this->workspaceSearchService->searchContent($codingProject, $subpath, $query, $pattern);
+        if (!$result['valid']) {
+            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+        }
+
+        return response()->json([
+            'matches' => $result['matches'],
+            'truncated' => $result['truncated'],
+            'files_scanned' => $result['files_scanned'],
+            'skipped_binary_count' => $result['skipped_binary_count'],
+        ], 200);
+    }
+
+    /**
+     * GET coding-project/{project}/file (contracts §3, 120-workspace-file-tools
+     * data-model.md §3, T019). Returns file content. A file over
+     * WorkspaceFilePolicy's configured size threshold is never fully
+     * loaded into memory — only its first threshold bytes are ever read —
+     * and comes back marked truncated: true. Binary content (sniffed via
+     * WorkspaceFilePolicy::isBinary(), the same policy US1's content
+     * search already uses, so the two paths agree, FR-008) is reported
+     * distinctly, with no content key at all, never embedded as if it
+     * were prose, since raw binary bytes cannot safely round-trip through
+     * a JSON string. binary: true and truncated: true are never both
+     * present on the same result.
      */
     public function readFile(Request $request, string $project): JsonResponse
     {
@@ -102,15 +186,51 @@ class CodingWorkspaceController extends Controller
             return response()->json(['error' => 'not found'], 422);
         }
 
+        if ($this->filePolicy->isOversized($resolvedPath)) {
+            $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+
+            $handle = @fopen($resolvedPath, 'rb');
+            if ($handle === false) {
+                return response()->json(['error' => 'not found'], 422);
+            }
+
+            $sample = @fread($handle, $threshold);
+            fclose($handle);
+
+            if ($sample === false) {
+                return response()->json(['error' => 'not found'], 422);
+            }
+
+            $size = filesize($resolvedPath);
+
+            if ($this->filePolicy->isBinary($sample)) {
+                return response()->json([
+                    'path' => $path,
+                    'binary' => true,
+                    'truncated' => false,
+                    'size' => $size,
+                ], 200);
+            }
+
+            return response()->json([
+                'path' => $path,
+                'binary' => false,
+                'truncated' => true,
+                'size' => $size,
+                'content' => $sample,
+            ], 200);
+        }
+
         $content = @file_get_contents($resolvedPath);
         if ($content === false) {
             return response()->json(['error' => 'not found'], 422);
         }
 
-        if ($this->isBinaryContent($content)) {
+        if ($this->filePolicy->isBinary($content)) {
             return response()->json([
                 'path' => $path,
                 'binary' => true,
+                'truncated' => false,
                 'size' => strlen($content),
             ], 200);
         }
@@ -118,6 +238,7 @@ class CodingWorkspaceController extends Controller
         return response()->json([
             'path' => $path,
             'binary' => false,
+            'truncated' => false,
             'content' => $content,
         ], 200);
     }
@@ -342,20 +463,6 @@ class CodingWorkspaceController extends Controller
         }
 
         return $process;
-    }
-
-    /**
-     * A minimal, self-contained null-byte heuristic — deliberately not a
-     * call into ToolResultCondenser's own private isBinaryContent()
-     * (Grounding note 5/contracts §1: that service is unmodified by this
-     * feature). Only used to decide whether raw file bytes are safe to
-     * embed in a JSON response at all; ToolResultCondenser's own binary
-     * short-circuit (unmodified) still governs condensation once this
-     * response reaches the agent loop.
-     */
-    private function isBinaryContent(string $content): bool
-    {
-        return str_contains($content, "\x00");
     }
 
     /**

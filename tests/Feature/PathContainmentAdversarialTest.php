@@ -186,4 +186,88 @@ class PathContainmentAdversarialTest extends TestCase
             'a gone project directory must produce a reason distinct from an ordinary path-containment failure, checked before path resolution begins',
         );
     }
+
+    // -----------------------------------------------------------------
+    // 120-workspace-file-tools, Phase 3 (US1), T015: search-specific
+    // adversarial cases extending this file's own fixture shape (Grounding
+    // note 10) rather than a new file.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function search_content_never_follows_a_symlink_to_a_file_outside_the_project(): void
+    {
+        file_put_contents($this->outsideDir.'/secret.txt', 'TOP SECRET CONTENT');
+
+        $project = $this->registerProject($this->projectDir);
+
+        $linkPath = $this->projectDir.'/escape-link.txt';
+        symlink($this->outsideDir.'/secret.txt', $linkPath);
+        $this->assertTrue(is_link($linkPath), 'fixture sanity: the symlink must genuinely exist on disk before the request is made');
+
+        $response = $this->getJson($this->apiUrl("coding-project/{$project->id}/search-content?query=secret&pattern=*"));
+
+        $response->assertStatus(200);
+        $paths = array_column($response->json('matches'), 'path');
+        $this->assertNotContains('escape-link.txt', $paths, 'the symlinked path must never appear as a match');
+        $this->assertStringNotContainsString('TOP SECRET', $response->getContent(), 'the secret content must never reach the response, mirroring the existing symlink test\'s own assertion style');
+    }
+
+    #[Test]
+    public function search_files_with_a_traversal_subpath_is_refused_with_the_identical_reason_string(): void
+    {
+        $project = $this->registerProject($this->projectDir);
+
+        $response = $this->getJson($this->apiUrl("coding-project/{$project->id}/search-files?pattern=*&subpath=../"));
+
+        $response->assertStatus(422);
+        $this->assertSame(
+            'path traversal',
+            $response->json('error'),
+            'search must return the identical reason string every existing operation already returns for this exact input'
+        );
+    }
+
+    #[Test]
+    public function search_files_against_a_vanished_project_directory_is_refused_with_the_identical_reason_string(): void
+    {
+        $goneDir = sys_get_temp_dir().'/coding-agent-containment-gone-search-'.Str::random(12);
+        mkdir($goneDir, 0777, true);
+
+        $project = $this->registerProject($goneDir);
+
+        rmdir($goneDir);
+        $this->assertFalse(is_dir($goneDir), 'fixture sanity: the directory must genuinely be gone before the request is made');
+
+        $response = $this->getJson($this->apiUrl("coding-project/{$project->id}/search-files?pattern=*"));
+
+        $response->assertStatus(422);
+        $this->assertSame(
+            'project directory is not reachable',
+            $response->json('error'),
+            'search must return the identical distinct reason every existing operation already returns for a vanished workspace'
+        );
+    }
+
+    #[Test]
+    public function workspace_search_service_calls_path_containment_validate_with_the_same_three_argument_shape_no_parallel_check(): void
+    {
+        $source = file_get_contents(dirname(__DIR__, 2).'/src/Services/WorkspaceSearchService.php');
+        $this->assertNotFalse($source, 'fixture sanity: WorkspaceSearchService.php must be readable');
+
+        $callSitePattern = '/PathContainment::validate\(\s*\$?[\w>\-\.]+(->\w+)?,\s*\$?\w+,\s*true\s*\)/';
+
+        $this->assertMatchesRegularExpression(
+            $callSitePattern,
+            $source,
+            'WorkspaceSearchService must call PathContainment::validate() with the same three-argument shape (rootPath, candidatePath, targetMustExist) every existing call site uses, never a second/parallel containment implementation'
+        );
+
+        preg_match_all($callSitePattern, $source, $matches);
+
+        $this->assertCount(
+            4,
+            $matches[0],
+            'exactly four real call sites — one subpath check and one per-result re-check in each of searchFiles()/searchContent() — no parallel or alternate containment implementation (a bare mention in a doc comment does not count, since it takes no arguments and cannot match this argument-shaped pattern)'
+        );
+    }
 }
