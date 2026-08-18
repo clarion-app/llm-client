@@ -84,6 +84,87 @@ class ExternalToolScopeIsolationTest extends TestCase
         return $result['results'] ?? [];
     }
 
+    /**
+     * Direct-row creation of a server offering 30 currently-active,
+     * identically-worded matching tools -- mirrors
+     * ExternalToolSearchResultBoundJourneyTest's own makeServer()/
+     * makeTools() helpers, reused here to prove the per-server bound and
+     * per-user scoping compose: an oversized server owned by one user must
+     * consume none of another user's own per-server budget, since it never
+     * enters that other user's query at all.
+     *
+     * @return list<McpClientTool>
+     */
+    private function makeOversizedServerFor(User $owner, string $name, string $matchWord): array
+    {
+        $server = McpClientServer::create([
+            'name' => $name,
+            'transport' => McpTransportKind::StreamableHttp,
+            'url' => 'https://example.test/mcp',
+            'user_id' => $owner->id,
+        ]);
+
+        $seenAt = now();
+        $tools = [];
+        for ($i = 1; $i <= 30; $i++) {
+            $toolName = sprintf('%s_%02d', $matchWord, $i);
+            $tools[] = McpClientTool::create([
+                'server_id' => $server->id,
+                'synthetic_operation_id' => "mcp:{$server->id}:{$toolName}",
+                'name' => $toolName,
+                'description' => "A tool offered by {$name}.",
+                'input_schema' => ['type' => 'object', 'properties' => []],
+                'last_seen_at' => $seenAt,
+            ]);
+        }
+
+        return $tools;
+    }
+
+    #[Test]
+    public function two_users_each_owning_an_oversized_server_under_the_same_query_term_never_share_results_or_each_others_per_server_budget(): void
+    {
+        $toolsA = $this->makeOversizedServerFor($this->userA, 'User A Oversized Server', 'gizmo');
+        $toolsB = $this->makeOversizedServerFor($this->userB, 'User B Oversized Server', 'gizmo');
+
+        $resultsA = $this->searchResultsFor($this->userA, 'gizmo');
+        $resultsB = $this->searchResultsFor($this->userB, 'gizmo');
+
+        $idsA = collect($resultsA)->pluck('operationId')->all();
+        $idsB = collect($resultsB)->pluck('operationId')->all();
+
+        // Each user's own response is capped at the configured per-server
+        // limit (default 5), exactly as a lone oversized server would be.
+        $this->assertLessThanOrEqual(
+            5,
+            count($idsA),
+            'user A\'s own per-server bound must apply regardless of user B\'s separate oversized server; got: '.json_encode($resultsA),
+        );
+        $this->assertLessThanOrEqual(
+            5,
+            count($idsB),
+            'user B\'s own per-server bound must apply regardless of user A\'s separate oversized server; got: '.json_encode($resultsB),
+        );
+        $this->assertGreaterThan(0, count($idsA), 'user A must still see their own server\'s matches');
+        $this->assertGreaterThan(0, count($idsB), 'user B must still see their own server\'s matches');
+
+        // Cross-contamination: user B's tool ids never appear in user A's
+        // results and vice versa -- the other user's oversized server
+        // contributes zero results and consumes none of this user's own
+        // per-server budget.
+        $toolIdsA = collect($toolsA)->pluck('synthetic_operation_id')->all();
+        $toolIdsB = collect($toolsB)->pluck('synthetic_operation_id')->all();
+
+        $this->assertEmpty(
+            array_intersect($idsA, $toolIdsB),
+            'user A\'s search must never surface any of user B\'s oversized server\'s tools; got: '.json_encode($resultsA),
+        );
+        $this->assertEmpty(
+            array_intersect($idsB, $toolIdsA),
+            'user B\'s search must never surface any of user A\'s oversized server\'s tools; got: '.json_encode($resultsB),
+        );
+    }
+
     #[Test]
     public function a_server_scoped_to_one_users_account_never_surfaces_its_tools_to_a_different_users_search_even_when_the_query_text_would_otherwise_match(): void
     {

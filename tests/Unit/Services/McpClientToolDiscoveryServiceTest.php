@@ -413,4 +413,32 @@ class McpClientToolDiscoveryServiceTest extends TestCase
         $this->assertSame($original->id, $survivor->id, 'a transient connectivity failure must never reset a tool\'s durable id');
         $this->assertSame($original->synthetic_operation_id, $survivor->synthetic_operation_id);
     }
+
+    /**
+     * Sibling of a_tools_id_is_unchanged_across_a_successful_unreachable_successful_sequence()
+     * above -- that case proves id *stability* across a fail-then-succeed
+     * sequence but stops immediately after the successful recovery,
+     * never inspecting scopeActive() in between. This case stops right
+     * after the single failed attempt instead, and asserts the tool
+     * stays in the active/search-visible pool at that exact point --
+     * the missing half: pool *stability*, not merely id stability.
+     */
+    #[Test]
+    public function a_tool_stays_active_immediately_after_a_single_failed_discovery_attempt(): void
+    {
+        $server = $this->makeServer('https://example.test/mcp');
+        $schema = ['type' => 'object'];
+
+        $this->service($this->factoryReturning($this->mockTransport([
+            ['name' => 'search_records', 'description' => 'Searches records.', 'inputSchema' => $schema, 'annotations' => null],
+        ])))->discover($server);
+
+        \Illuminate\Support\Carbon::setTestNow(\Illuminate\Support\Carbon::now()->addSeconds(2));
+
+        $unreachableStatus = $this->service($this->factoryReturning($this->mockTransport(new \RuntimeException('connection refused'))))->discover($server);
+        $this->assertSame('unreachable', $unreachableStatus->connection_status);
+
+        $activeNames = McpClientTool::where('server_id', $server->id)->active()->pluck('name')->all();
+        $this->assertContains('search_records', $activeNames, 'a tool must remain in the active/search-visible pool immediately after an intervening failed discovery attempt, not only survive with an unchanged id');
+    }
 }

@@ -3707,6 +3707,18 @@ class AgentLoopService
      * 'type' => 'operation' wrapper every other $formatted entry already
      * carries.
      *
+     * A single server offering an unusually large matching catalog is
+     * bounded to at most mcp_client.search_result_limit_per_server (default
+     * 5) of its own matches, applied strictly after the eligibility/
+     * currency/text-match filters above -- never before them, so the bound
+     * only ever trims an excess of already-eligible, already-current,
+     * already-matching rows. The bound is per server_id, independent of
+     * every other server's own share (one server's excess never borrows
+     * another's budget), and deterministic: the query is ordered by name
+     * then id (both content-derived, never insertion order or a server's
+     * own claimed relevance), so an identical search run again keeps the
+     * identical subset.
+     *
      * @return array<int, array<string, mixed>>
      */
     private function matchingExternalToolResults(string $query, Conversation $conversation): array
@@ -3727,10 +3739,16 @@ class AgentLoopService
                     ->orWhere('description', 'like', $needle);
             })
             ->with('server')
+            ->orderBy('name')
+            ->orderBy('id')
             ->get();
+
+        $perServerLimit = (int) config('llm-client.mcp_client.search_result_limit_per_server', 5);
 
         return $tools
             ->filter(fn (\ClarionApp\LlmClient\Models\McpClientTool $tool) => $tool->server !== null)
+            ->groupBy('server_id')
+            ->flatMap(fn ($serverTools) => $serverTools->take($perServerLimit))
             ->map(fn (\ClarionApp\LlmClient\Models\McpClientTool $tool) => array_merge(
                 ['type' => 'operation'],
                 McpClientToolCatalogMerger::formatTool($tool, $tool->server),
@@ -3813,14 +3831,13 @@ class AgentLoopService
             // tool the server has since stopped offering is never
             // deleted by a refresh, only left behind by the next one
             // that didn't touch it (McpClientToolDiscoveryService's own
-            // create/update-by-natural-key reconciliation). A row with
-            // no status row for its server at all -- the seeding shape
-            // most of this feature's own tests use directly, having
-            // never gone through a real discover() run -- is left
-            // untouched here: there is no completed refresh to compare
-            // against, so there is no evidence the tool is gone.
-            $latestRefreshFinishedAt = \ClarionApp\LlmClient\Models\McpClientServerStatus::where('server_id', $externalTool->server_id)->value('refresh_finished_at');
-            if ($latestRefreshFinishedAt !== null && $externalTool->last_seen_at < $latestRefreshFinishedAt) {
+            // create/update-by-natural-key reconciliation). Delegates to
+            // McpClientTool::scopeActive() -- the same currency check
+            // matchingExternalToolResults() already applies for
+            // search_operations -- rather than an independent comparison
+            // of its own, so search and execute can never disagree about
+            // whether this exact row currently counts as offered.
+            if (!\ClarionApp\LlmClient\Models\McpClientTool::whereKey($externalTool->id)->active()->exists()) {
                 $externalTool = null;
             }
         }
