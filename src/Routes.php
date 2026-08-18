@@ -48,6 +48,7 @@ use ClarionApp\LlmClient\Controllers\CodingProjectController;
 use ClarionApp\LlmClient\Controllers\CodingWorkspaceController;
 use ClarionApp\LlmClient\Controllers\SchedulerTriggerController;
 use ClarionApp\LlmClient\Controllers\AgentStartingPointController;
+use ClarionApp\LlmClient\Controllers\McpClientServerController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -424,6 +425,17 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('scheduler-triggers/{id}', [SchedulerTriggerController::class, "show"]);
     Route::put('scheduler-triggers/{id}', [SchedulerTriggerController::class, "update"]);
     Route::delete('scheduler-triggers/{id}', [SchedulerTriggerController::class, "destroy"]);
+
+    // External MCP server configuration -- ownership resolved through
+    // McpClientServer::eligibleFor() (the same personal-or-installation-
+    // scope predicate RoleAssignment resolution already applies), with
+    // absent/foreign-owned servers 404ing the same uniform way
+    // RunController's own read endpoints already do.
+    Route::get('mcp-client-server', [McpClientServerController::class, "index"]);
+    Route::post('mcp-client-server', [McpClientServerController::class, "store"]);
+    Route::get('mcp-client-server/{id}', [McpClientServerController::class, "show"]);
+    Route::delete('mcp-client-server/{id}', [McpClientServerController::class, "destroy"]);
+    Route::post('mcp-client-server/{id}/refresh', [McpClientServerController::class, "refresh"]);
 });
 
 Broadcast::channel('Conversation.{id}', function ($user, $id) {
