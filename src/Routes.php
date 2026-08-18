@@ -408,6 +408,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('coding-project', [CodingProjectController::class, "index"]);
     Route::delete('coding-project/{id}', [CodingProjectController::class, "destroy"]);
     Route::get('coding-project/{project}/files', [CodingWorkspaceController::class, "listFiles"]);
+    Route::get('coding-project/{project}/search-files', [CodingWorkspaceController::class, "searchFiles"]);
+    Route::get('coding-project/{project}/search-content', [CodingWorkspaceController::class, "searchContent"]);
     Route::get('coding-project/{project}/file', [CodingWorkspaceController::class, "readFile"]);
     Route::post('coding-project/{project}/file', [CodingWorkspaceController::class, "writeFile"]);
     Route::delete('coding-project/{project}/file', [CodingWorkspaceController::class, "deleteFile"]);

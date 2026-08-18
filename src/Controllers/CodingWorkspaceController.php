@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use Auth;
 use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Services\PathContainment;
+use ClarionApp\LlmClient\Services\WorkspaceSearchService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
@@ -34,6 +35,10 @@ use Symfony\Component\Process\Process;
  */
 class CodingWorkspaceController extends Controller
 {
+    public function __construct(private readonly WorkspaceSearchService $workspaceSearchService = new WorkspaceSearchService())
+    {
+    }
+
     /**
      * GET coding-project/{project}/files (contracts §1). Lists the
      * immediate entries (name, type file/dir) under the resolved,
@@ -71,6 +76,75 @@ class CodingWorkspaceController extends Controller
         }
 
         return response()->json(['entries' => $entries], 200);
+    }
+
+    /**
+     * GET coding-project/{project}/search-files (120-workspace-file-tools
+     * contracts §1). Query `pattern` (required, fnmatch()-shaped glob),
+     * `subpath` (optional, same containment handling as listFiles()'s own
+     * subpath). Delegates to WorkspaceSearchService — a bounded list of
+     * workspace-relative paths matching the pattern by name only.
+     */
+    public function searchFiles(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $pattern = (string) $request->query('pattern', '');
+        if ($pattern === '') {
+            return response()->json(['error' => 'pattern is required'], 422);
+        }
+
+        $subpath = (string) $request->query('subpath', '');
+
+        $result = $this->workspaceSearchService->searchFiles($codingProject, $subpath, $pattern);
+        if (!$result['valid']) {
+            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+        }
+
+        return response()->json([
+            'matches' => $result['matches'],
+            'truncated' => $result['truncated'],
+            'files_scanned' => $result['files_scanned'],
+        ], 200);
+    }
+
+    /**
+     * GET coding-project/{project}/search-content (120-workspace-file-tools
+     * contracts §2). Query `query` (required, plain case-insensitive
+     * substring term), `pattern` (optional, scopes which files' content is
+     * searched), `subpath` (optional). Delegates to WorkspaceSearchService
+     * — bounded matches with contextual line/snippet.
+     */
+    public function searchContent(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $query = (string) $request->query('query', '');
+        if ($query === '') {
+            return response()->json(['error' => 'query is required'], 422);
+        }
+
+        $subpath = (string) $request->query('subpath', '');
+        $pattern = $request->query('pattern');
+        $pattern = $pattern !== null ? (string) $pattern : null;
+
+        $result = $this->workspaceSearchService->searchContent($codingProject, $subpath, $query, $pattern);
+        if (!$result['valid']) {
+            return $this->containmentFailureResponse($result['reason'] ?? 'invalid path');
+        }
+
+        return response()->json([
+            'matches' => $result['matches'],
+            'truncated' => $result['truncated'],
+            'files_scanned' => $result['files_scanned'],
+            'skipped_binary_count' => $result['skipped_binary_count'],
+        ], 200);
     }
 
     /**

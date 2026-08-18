@@ -969,6 +969,17 @@ return [
         // one config value, two call sites, so a file is never treated as fine
         // in one path and oversized in the other.
         'file_size_threshold_bytes' => (int) env('LLM_CLIENT_CODING_AGENT_FILE_SIZE_THRESHOLD_BYTES', 262144),
+
+        // Workspace search bounding — three independent caps, any of which
+        // sets truncated = true and stops the walk: max_results bounds
+        // response size, max_files_scanned bounds traversal work regardless
+        // of match count, max_matches_per_file keeps one huge matching file
+        // from crowding out every other file's matches.
+        'search' => [
+            'max_results' => (int) env('LLM_CLIENT_CODING_AGENT_SEARCH_MAX_RESULTS', 100),
+            'max_files_scanned' => (int) env('LLM_CLIENT_CODING_AGENT_SEARCH_MAX_FILES_SCANNED', 5000),
+            'max_matches_per_file' => (int) env('LLM_CLIENT_CODING_AGENT_SEARCH_MAX_MATCHES_PER_FILE', 5),
+        ],
     ],
 
     // Scheduler Agent — the per-action retry ceiling
