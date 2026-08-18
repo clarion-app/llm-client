@@ -996,6 +996,13 @@ return [
         // Truncation bound applied to a server-supplied tool description
         // at cache-write time.
         'description_max_length' => (int) env('LLM_CLIENT_MCP_CLIENT_DESCRIPTION_MAX_LENGTH', 500),
+
+        // Maximum number of one server's own matching tools a single
+        // search_operations call may surface, independent of how many
+        // other servers or built-in operations also match -- so one
+        // high-volume server can never crowd out every other source in
+        // the same response.
+        'search_result_limit_per_server' => (int) env('LLM_CLIENT_MCP_CLIENT_SEARCH_RESULT_LIMIT_PER_SERVER', 5),
     ],
 ];
 
