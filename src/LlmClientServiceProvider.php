@@ -131,6 +131,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\AgentKindsCommand::class,
                 \ClarionApp\LlmClient\Commands\EvaluateSchedulerTriggersCommand::class,
                 \ClarionApp\LlmClient\Commands\RefreshStaleMcpClientServersCommand::class,
+                \ClarionApp\LlmClient\Commands\PurgeMcpClientConnectionTestsCommand::class,
             ]);
         }
 
@@ -247,6 +248,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // sessions without a live call on the search path itself.
             $schedule->command('llm-client:refresh-external-mcp-tools')
                 ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Purge expired MCP client connection-test rows hourly --
+            // tighter than the run-trace purge's own ->daily(), since
+            // this table's rows are credential-bearing scratch state with
+            // a much shorter default retention (1 hour) than a durable
+            // audit trail should be allowed to linger.
+            $schedule->command('llm-client:purge-mcp-connection-tests')
+                ->hourly()
                 ->withoutOverlapping();
         });
 

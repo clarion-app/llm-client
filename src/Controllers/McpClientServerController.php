@@ -4,6 +4,8 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Jobs\RefreshMcpClientServerToolsJob;
+use ClarionApp\LlmClient\Jobs\TestMcpClientConnectionJob;
+use ClarionApp\LlmClient\Models\McpClientConnectionTest;
 use ClarionApp\LlmClient\Models\McpClientServer;
 use ClarionApp\LlmClient\Models\McpClientServerStatus;
 use ClarionApp\LlmClient\Models\McpClientTool;
@@ -135,6 +137,95 @@ class McpClientServerController extends Controller
         RefreshMcpClientServerToolsJob::dispatch($server->id, 'manual');
 
         return response()->json($this->serverDetail($server->fresh()));
+    }
+
+    /**
+     * POST /mcp-client-server/test-connection -- start a connection test
+     * without creating or touching any mcp_client_servers row (D3/D4).
+     * Runs on a queue worker (D2): this endpoint only creates the
+     * tracking row and dispatches the job; it never itself calls
+     * McpTransportFactory.
+     */
+    public function testConnection(Request $request): JsonResponse
+    {
+        $validated = $this->validatedConnectionOnly($request);
+
+        $test = McpClientConnectionTest::create([
+            'user_id' => Auth::user()->id,
+            'transport' => $validated['transport'],
+            'url' => $validated['url'] ?? null,
+            'command' => $validated['command'] ?? null,
+            'args' => $validated['args'] ?? null,
+            'credential' => $validated['credential'] ?? null,
+            'status' => 'pending',
+        ]);
+
+        TestMcpClientConnectionJob::dispatch($test->id);
+
+        return response()->json([
+            'id' => $test->id,
+            'status' => 'pending',
+        ], 202);
+    }
+
+    /**
+     * GET /mcp-client-server/test-connection/{id} -- polled by the
+     * frontend until status leaves pending. Scoped to the caller the
+     * same way every other read in this controller is (findEligible()'s
+     * pattern) -- an absent or foreign-owned test id is a uniform 404,
+     * never a distinguishing 403.
+     */
+    public function showTestConnection(Request $request, string $id): JsonResponse
+    {
+        $callerUserId = Auth::user()->id;
+
+        $test = McpClientConnectionTest::where('id', $id)
+            ->where('user_id', $callerUserId)
+            ->first();
+
+        if ($test === null) {
+            return $this->notFoundResponse();
+        }
+
+        return response()->json([
+            'id' => $test->id,
+            'status' => $test->status,
+            'failure_category' => $test->failure_category,
+            'message' => $test->message,
+            'tool_count' => $test->tool_count,
+        ]);
+    }
+
+    /**
+     * The same connection-shape fields validated() already validates,
+     * minus name/scope -- a test has no identity or ownership scope of
+     * its own beyond the caller (contracts/connection-test-api.md).
+     *
+     * @return array<string, mixed>
+     */
+    private function validatedConnectionOnly(Request $request): array
+    {
+        return $request->validate([
+            'transport' => ['required', 'string', Rule::in(array_map(fn (McpTransportKind $t) => $t->value, McpTransportKind::cases()))],
+            'url' => [
+                'required_if:transport,streamable_http',
+                'nullable',
+                'string',
+                function (string $attribute, mixed $value, \Closure $fail): void {
+                    if ($value === null) {
+                        return;
+                    }
+                    $scheme = parse_url($value, PHP_URL_SCHEME);
+                    if (!$scheme || !in_array(strtolower($scheme), ['http', 'https'], true)) {
+                        $fail('The url must use the http or https scheme.');
+                    }
+                },
+            ],
+            'command' => ['required_if:transport,stdio', 'nullable', 'string'],
+            'args' => ['sometimes', 'nullable', 'array'],
+            'args.*' => ['string'],
+            'credential' => ['nullable', 'string'],
+        ]);
     }
 
     /**

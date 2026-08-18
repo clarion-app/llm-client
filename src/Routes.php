@@ -433,6 +433,18 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     // RunController's own read endpoints already do.
     Route::get('mcp-client-server', [McpClientServerController::class, "index"]);
     Route::post('mcp-client-server', [McpClientServerController::class, "store"]);
+
+    // Registered before the {id}-parameterized routes below so the
+    // literal "test-connection" segment is never captured as {id} --
+    // both new routes here are unambiguous by segment count alone (the
+    // POST route has one segment where store() has zero and refresh()'s
+    // {id}/refresh has two; the GET route has two segments where show()
+    // has one), but registration order still matches this controller's
+    // own established literal-before-parameterized convention and is
+    // verified directly by McpClientServerConnectionTestScopeTest.
+    Route::post('mcp-client-server/test-connection', [McpClientServerController::class, "testConnection"]);
+    Route::get('mcp-client-server/test-connection/{id}', [McpClientServerController::class, "showTestConnection"]);
+
     Route::get('mcp-client-server/{id}', [McpClientServerController::class, "show"]);
     Route::delete('mcp-client-server/{id}', [McpClientServerController::class, "destroy"]);
     Route::post('mcp-client-server/{id}/refresh', [McpClientServerController::class, "refresh"]);
