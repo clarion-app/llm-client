@@ -26,6 +26,8 @@ class CodingProject extends Model
     protected $fillable = [
         'user_id', 'name', 'root_path', 'test_command', 'confirmation_relaxed',
         'command_allowlist', 'network_enabled',
+        'time_limit_override_seconds', 'memory_limit_override_mb', 'cpu_limit_override',
+        'pids_limit_override', 'disk_limit_override_mb', 'output_cap_override_bytes',
     ];
     protected $table = 'coding_projects';
 
@@ -38,8 +40,19 @@ class CodingProject extends Model
     // D7): network_enabled, default false -- read exactly once per
     // runCommand() invocation by DockerCommandExecutor, never consulted
     // by any confirmation/allowlist code path.
+    // 124-command-limit-controls, US1 (data-model.md §1): six per-workspace
+    // resource-limit overrides. cpu_limit_override is deliberately left
+    // uncast (stays string|null), mirroring command_cpu_limit's own
+    // (string) read in DockerCommandExecutor::run() -- Docker's --cpus
+    // accepts fractional values ("0.5") an integer/float cast would
+    // corrupt or round.
     protected $casts = [
         'command_allowlist' => 'array',
         'network_enabled' => 'boolean',
+        'time_limit_override_seconds' => 'integer',
+        'memory_limit_override_mb' => 'integer',
+        'pids_limit_override' => 'integer',
+        'disk_limit_override_mb' => 'integer',
+        'output_cap_override_bytes' => 'integer',
     ];
 }

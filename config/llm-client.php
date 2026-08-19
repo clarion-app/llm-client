@@ -987,6 +987,14 @@ return [
         'command_pids_limit' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_PIDS_LIMIT', 128),
         'command_output_cap_bytes' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_OUTPUT_CAP_BYTES', 262144),
 
+        // 124-command-limit-controls, US1/US2 (research.md R5). Installation-
+        // wide default for how much disk space (in MB) a single command's
+        // workspace may grow by during one invocation, measured as a
+        // baseline-excluded delta (Phase 4 wires enforcement) -- needed now
+        // as ResourceLimitResolver's fallback for a workspace with no
+        // disk_limit_override_mb override set.
+        'command_disk_limit_mb' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_DISK_LIMIT_MB', 512),
+
         // How long (in seconds of elapsed wall-clock time) a command must
         // still be running before DockerCommandExecutor starts emitting
         // CommandExecutionProgress "still running" heartbeats (FR-013) --

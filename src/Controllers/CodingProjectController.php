@@ -233,6 +233,69 @@ class CodingProjectController extends Controller
         return response()->json($project, 200);
     }
 
+    /**
+     * PATCH coding-project/{id}/resource-limits (124-command-limit-
+     * controls, US1, contracts/resource-limits.md §1). Each of the six
+     * override keys is validated and applied independently -- a subset of
+     * keys may be sent, and each is nullable: an explicit `null` clears
+     * that one override (FR-004), while a key entirely ABSENT from the
+     * request body leaves that column (set or unset) completely untouched.
+     *
+     * This distinction is why $request->has($key) is used per key rather
+     * than $request->filled() (which would treat "present with null" the
+     * same as "absent" -- exactly the partial-update semantic this
+     * endpoint must not collapse) and rather than a single
+     * $request->validate() over the whole body assigned wholesale (which
+     * would have no way to distinguish "not sent" from "sent as null").
+     * Ownership-checked identically to updateConfirmationSetting()/
+     * updateCommandAllowlist()/updateNetworkPolicy(). Never listed in
+     * coding.yaml's tools.allow, matching this controller's other
+     * human-only actions -- raising or lowering a workspace's own limits
+     * is a human, operator-level action (spec.md Assumptions).
+     */
+    public function updateResourceLimits(Request $request, string $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'time_limit_override_seconds' => 'nullable|integer|min:1',
+            'memory_limit_override_mb' => 'nullable|integer|min:1',
+            'cpu_limit_override' => 'nullable|regex:/^\d+(\.\d+)?$/',
+            'pids_limit_override' => 'nullable|integer|min:1',
+            'disk_limit_override_mb' => 'nullable|integer|min:1',
+            'output_cap_override_bytes' => 'nullable|integer|min:1',
+        ]);
+
+        $project = CodingProject::where('id', $id)
+            ->where('user_id', Auth::id())
+            ->first();
+
+        if ($project === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        foreach ([
+            'time_limit_override_seconds',
+            'memory_limit_override_mb',
+            'cpu_limit_override',
+            'pids_limit_override',
+            'disk_limit_override_mb',
+            'output_cap_override_bytes',
+        ] as $key) {
+            // $request->has($key) is true both for a present non-null
+            // value AND for a present explicit null -- exactly the "was
+            // this key sent at all" check this partial-update contract
+            // needs. $request->filled($key) would be false for an
+            // explicit null too, indistinguishable from "absent" -- the
+            // one bug this endpoint must never have (FR-003/FR-004).
+            if ($request->has($key)) {
+                $project->{$key} = $validated[$key] ?? null;
+            }
+        }
+
+        $project->save();
+
+        return response()->json($project, 200);
+    }
+
     private function notFoundResponse(string $error, string $code): JsonResponse
     {
         return response()->json([

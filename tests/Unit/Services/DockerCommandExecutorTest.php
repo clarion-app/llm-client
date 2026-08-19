@@ -150,7 +150,15 @@ class DockerCommandExecutorTest extends TestCase
         $runCommandA = $this->capturedDockerRunCommand('/srv/workspaces/proj-1', 'echo hello');
         $runCommandB = $this->capturedDockerRunCommand('/srv/workspaces/proj-1', 'echo hello');
 
-        $this->assertContains('--rm', $runCommandA);
+        // 124-command-limit-controls, US3 (research.md R3a): --rm is no
+        // longer used at all -- a direct test confirmed a --rm container
+        // is already gone ("no such object") by the time docker inspect
+        // could ever run afterward to detect an OOM kill, so every exit
+        // path now issues its own explicit, unconditional docker rm -f
+        // instead (uniqueness/no-reuse-across-invocations is still
+        // guaranteed by the fresh --name below, --rm was never load-
+        // bearing for that property).
+        $this->assertNotContains('--rm', $runCommandA, '--rm must no longer be used -- cleanup is now always an explicit docker rm -f on every exit path');
 
         $namePositionsA = array_keys($runCommandA, '--name', true);
         $this->assertCount(1, $namePositionsA);
@@ -255,7 +263,17 @@ class DockerCommandExecutorTest extends TestCase
         $calledWith = null;
 
         $factory = function (array $command) use (&$calledWith) {
-            if ($command[1] === 'version') {
+            // 124-command-limit-controls, US2/US3: the disk-usage baseline
+            // `du` call, the version precheck, and the container-id/OOM
+            // `docker inspect` and `docker rm -f` cleanup calls all now
+            // happen around the single "docker run" invocation this
+            // test's strict setTimeout() expectation targets -- routing
+            // every one of them here, distinctly, keeps that expectation
+            // on exactly one mock instance (a fresh mock is created on
+            // every "else" call below, so any of these being (wrongly)
+            // routed there would attach the SAME strict expectation to an
+            // instance setTimeout() is never actually called on).
+            if ($command[0] === 'du' || $command[1] !== 'run') {
                 return $this->fakeProcess(0, '', '');
             }
 
@@ -411,6 +429,144 @@ class DockerCommandExecutorTest extends TestCase
         $this->assertSame('bridge', $runCommand[$networkPositions[0] + 1], 'network_enabled = true must construct --network bridge');
     }
 
+    // -----------------------------------------------------------------
+    // 124-command-limit-controls, US1, T010 (contracts/resource-limits.md
+    // §2): run()'s signature now accepts the six resolved limit values as
+    // explicit arguments. When a passed-in argument differs from the
+    // corresponding config default, the constructed flags/setTimeout()
+    // call must reflect the PASSED-IN value -- proving genuine threading,
+    // not silent ignoring of the new arguments. Written before T014
+    // lands -- expected to FAIL red (the extra arguments are currently
+    // accepted by PHP but never consulted, so the constructed command
+    // still reflects the config defaults).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function passed_in_resolved_memory_cpu_and_pids_arguments_override_the_config_defaults_in_the_constructed_flags(): void
+    {
+        config([
+            'llm-client.coding_agent.command_memory_limit_mb' => 256,
+            'llm-client.coding_agent.command_cpu_limit' => '1.0',
+            'llm-client.coding_agent.command_pids_limit' => 128,
+        ]);
+
+        $captured = null;
+        $factory = function (array $cmd) use (&$captured) {
+            if ($cmd[1] === 'run') {
+                $captured = $cmd;
+
+                return $this->fakeProcess(0, '', '');
+            }
+
+            // 124-command-limit-controls, US2/US3: du baseline, version
+            // precheck, docker inspect, and docker rm -f cleanup calls --
+            // none of which is the single "docker run" invocation this
+            // test captures.
+            return $this->fakeProcess(0, '', '');
+        };
+
+        $executor = new DockerCommandExecutor($factory);
+        $executor->run(
+            '/srv/workspaces/proj-1',
+            'echo hello',
+            null,
+            null,
+            false,
+            999,
+            999,
+            '3.5',
+            999,
+            999999,
+            999,
+        );
+
+        $this->assertNotNull($captured, 'the docker run invocation was never constructed');
+
+        $memoryPositions = array_keys($captured, '--memory', true);
+        $this->assertCount(1, $memoryPositions);
+        $this->assertSame('999m', $captured[$memoryPositions[0] + 1], 'the PASSED-IN memory limit (999) must be reflected, not the config default (256)');
+
+        $memorySwapPositions = array_keys($captured, '--memory-swap', true);
+        $this->assertSame('999m', $captured[$memorySwapPositions[0] + 1], 'memory-swap must track the PASSED-IN memory value too');
+
+        $cpusPositions = array_keys($captured, '--cpus', true);
+        $this->assertCount(1, $cpusPositions);
+        $this->assertSame('3.5', $captured[$cpusPositions[0] + 1], 'the PASSED-IN cpu limit (3.5) must be reflected, not the config default (1.0)');
+
+        $pidsLimitPositions = array_keys($captured, '--pids-limit', true);
+        $this->assertCount(1, $pidsLimitPositions);
+        $this->assertSame('999', $captured[$pidsLimitPositions[0] + 1], 'the PASSED-IN pids limit (999) must be reflected, not the config default (128)');
+    }
+
+    #[Test]
+    public function passed_in_time_limit_argument_overrides_the_config_default_in_process_set_timeout(): void
+    {
+        config(['llm-client.coding_agent.command_timeout_seconds' => 60]);
+
+        $calledWith = null;
+
+        $factory = function (array $command) use (&$calledWith) {
+            // 124-command-limit-controls, US2/US3: same reasoning as
+            // process_set_timeout_is_wired_from_the_configured_command_timeout_seconds
+            // above -- every non-"docker run" call (du baseline, version
+            // precheck, docker inspect, docker rm -f) must be routed here,
+            // distinctly, so the strict setTimeout() expectation below
+            // lands on exactly the one mock instance it is actually
+            // called on.
+            if ($command[0] === 'du' || $command[1] !== 'run') {
+                return $this->fakeProcess(0, '', '');
+            }
+
+            $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
+            $process->shouldReceive('setTimeout')->once()->withArgs(function ($value) use (&$calledWith) {
+                $calledWith = $value;
+
+                return true;
+            })->andReturnSelf();
+            $process->shouldReceive('start')->andReturnNull();
+            $process->shouldReceive('isRunning')->andReturn(false);
+            $process->shouldReceive('getExitCode')->andReturn(0);
+
+            return $process;
+        };
+
+        $executor = new DockerCommandExecutor($factory);
+        $executor->run('/srv/workspaces/proj-1', 'echo hi', null, null, false, 999);
+
+        $this->assertSame(999.0, (float) $calledWith, 'Process::setTimeout() must reflect the PASSED-IN time limit (999), not the config default (60)');
+    }
+
+    #[Test]
+    public function passed_in_output_cap_argument_overrides_the_config_default_when_bounding_captured_output(): void
+    {
+        config(['llm-client.coding_agent.command_output_cap_bytes' => 262144]);
+
+        $oversizedChunk = str_repeat('X', 50);
+
+        $factory = function (array $command) use ($oversizedChunk) {
+            if ($command[1] === 'version') {
+                return $this->fakeProcess(0, '', '');
+            }
+
+            $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
+            $process->shouldReceive('start')->andReturnNull();
+            $process->shouldReceive('isRunning')->andReturn(true, false);
+            $process->shouldReceive('checkTimeout')->andReturnNull();
+            $process->shouldReceive('getIncrementalOutput')->andReturn($oversizedChunk, '');
+            $process->shouldReceive('getIncrementalErrorOutput')->andReturn('', '');
+            $process->shouldReceive('getExitCode')->andReturn(0);
+
+            return $process;
+        };
+
+        $executor = new DockerCommandExecutor($factory);
+        $result = $executor->run('/srv/workspaces/proj-1', 'yes | head -c 999999999', null, null, false, null, null, null, null, 20);
+
+        $this->assertTrue($result['output_truncated']);
+        $this->assertSame(20, strlen($result['stdout']), 'the PASSED-IN output cap (20) must bound stdout, not the config default (262144)');
+        $this->assertSame(str_repeat('X', 20), $result['stdout']);
+    }
+
     /**
      * @return list<string>
      */
@@ -419,12 +575,20 @@ class DockerCommandExecutorTest extends TestCase
         $captured = null;
 
         $factory = function (array $cmd) use (&$captured) {
-            if ($cmd[1] === 'version') {
+            if ($cmd[1] === 'run') {
+                $captured = $cmd;
+
                 return $this->fakeProcess(0, '', '');
             }
 
-            $captured = $cmd;
-
+            // 124-command-limit-controls, US2/US3: the disk-usage baseline
+            // `du` call, the version precheck, and the container-id/OOM
+            // `docker inspect` and `docker rm -f` cleanup calls all now
+            // happen around the single "docker run" invocation this
+            // helper exists to capture -- none of them may ever be
+            // mistaken for it (previously, ANY non-version call was
+            // (wrongly) captured, which broke the moment more than one
+            // such call existed).
             return $this->fakeProcess(0, '', '');
         };
 

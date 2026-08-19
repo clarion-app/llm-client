@@ -200,6 +200,17 @@ abstract class TestCase extends BaseTestCase
                 // 2026_08_18_000007_add_network_enabled_to_coding_projects_table.php
                 // exactly.
                 $table->boolean('network_enabled')->default(false);
+                // 124-command-limit-controls, US1 (data-model.md §1) — six
+                // per-workspace resource-limit overrides, mirroring
+                // 2026_08_18_00000{8,9}/2026_08_18_00001{0,1,2,3}'s own
+                // migrations exactly. cpu_limit_override is deliberately a
+                // string column, never numeric.
+                $table->integer('time_limit_override_seconds')->nullable();
+                $table->integer('memory_limit_override_mb')->nullable();
+                $table->string('cpu_limit_override')->nullable();
+                $table->integer('pids_limit_override')->nullable();
+                $table->integer('disk_limit_override_mb')->nullable();
+                $table->integer('output_cap_override_bytes')->nullable();
                 $table->timestamps();
                 $table->softDeletes();
 
