@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Models\CodingWorkspaceChange;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\DockerCommandExecutor;
 use ClarionApp\LlmClient\Services\PathContainment;
+use ClarionApp\LlmClient\Services\ResourceLimitResolver;
 use ClarionApp\LlmClient\Services\WorkspaceChangeRecorder;
 use ClarionApp\LlmClient\Services\WorkspaceFilePolicy;
 use ClarionApp\LlmClient\Services\WorkspaceRefusalRecorder;
@@ -49,6 +50,7 @@ class CodingWorkspaceController extends Controller
         private readonly WorkspaceRefusalRecorder $refusalRecorder = new WorkspaceRefusalRecorder(),
         private readonly WorkspaceChangeRecorder $changeRecorder = new WorkspaceChangeRecorder(),
         private readonly DockerCommandExecutor $dockerCommandExecutor = new DockerCommandExecutor(),
+        private readonly ResourceLimitResolver $resourceLimitResolver = new ResourceLimitResolver(),
     ) {
     }
 
@@ -601,12 +603,25 @@ class CodingWorkspaceController extends Controller
         // workspace must never rewrite this row).
         $networkEnabled = (bool) $codingProject->network_enabled;
 
+        // 124-command-limit-controls, US1 (contracts/resource-limits.md
+        // §2): resolved exactly once, immediately before the executor
+        // call -- the same "read exactly once, immediately before flag
+        // construction" discipline network_enabled already established
+        // above, now applied to all six resource limits.
+        $resolvedLimits = $this->resourceLimitResolver->resolve($codingProject);
+
         $result = $this->dockerCommandExecutor->run(
             $codingProject->root_path,
             $command,
             $codingProject->id,
             (string) Auth::id(),
             $networkEnabled,
+            $resolvedLimits['time_limit_seconds'],
+            $resolvedLimits['memory_limit_mb'],
+            $resolvedLimits['cpu_limit'],
+            $resolvedLimits['pids_limit'],
+            $resolvedLimits['output_cap_bytes'],
+            $resolvedLimits['disk_limit_mb'],
         );
 
         $status = $result['status'];

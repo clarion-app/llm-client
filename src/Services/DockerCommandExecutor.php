@@ -103,12 +103,32 @@ class DockerCommandExecutor
      *     reason?: string,
      * }
      */
+    /**
+     * 124-command-limit-controls, US1 (contracts/resource-limits.md §2):
+     * the six trailing parameters below are the resolved, effective
+     * per-workspace limits (ResourceLimitResolver::resolve()) -- passed
+     * explicitly by the caller rather than read from config() inside this
+     * method. Each defaults to null, falling back to the same config()
+     * default this method always used, so existing callers that do not
+     * yet resolve a workspace's overrides (in particular this class's own
+     * unit tests) are unaffected; a caller that DOES pass an explicit
+     * value always wins over the config default. $diskLimitMb is unused
+     * by this method's own logic today -- disk-limit enforcement is wired
+     * in a later phase; the signature only changes once for this whole
+     * feature.
+     */
     public function run(
         string $rootPath,
         string $command,
         ?string $codingProjectId = null,
         ?string $userId = null,
         bool $networkEnabled = false,
+        ?int $timeLimitSeconds = null,
+        ?int $memoryLimitMb = null,
+        ?string $cpuLimit = null,
+        ?int $pidsLimit = null,
+        ?int $outputCapBytes = null,
+        ?int $diskLimitMb = null,
     ): array {
         $reachability = $this->checkReachable();
         if (!$reachability['reachable']) {
@@ -124,12 +144,12 @@ class DockerCommandExecutor
 
         $containerName = 'coding-cmd-'.(string) Str::uuid();
         $image = (string) config('llm-client.coding_agent.command_image', 'alpine:latest');
-        $memoryLimitMb = (int) config('llm-client.coding_agent.command_memory_limit_mb', 256);
-        $memoryLimit = $memoryLimitMb.'m';
-        $cpuLimit = (string) config('llm-client.coding_agent.command_cpu_limit', '1.0');
-        $pidsLimit = (int) config('llm-client.coding_agent.command_pids_limit', 128);
-        $timeoutSeconds = (int) config('llm-client.coding_agent.command_timeout_seconds', 60);
-        $outputCapBytes = (int) config('llm-client.coding_agent.command_output_cap_bytes', 262144);
+        $resolvedMemoryLimitMb = $memoryLimitMb ?? (int) config('llm-client.coding_agent.command_memory_limit_mb', 256);
+        $memoryLimit = $resolvedMemoryLimitMb.'m';
+        $resolvedCpuLimit = $cpuLimit ?? (string) config('llm-client.coding_agent.command_cpu_limit', '1.0');
+        $resolvedPidsLimit = $pidsLimit ?? (int) config('llm-client.coding_agent.command_pids_limit', 128);
+        $timeoutSeconds = $timeLimitSeconds ?? (int) config('llm-client.coding_agent.command_timeout_seconds', 60);
+        $resolvedOutputCapBytes = $outputCapBytes ?? (int) config('llm-client.coding_agent.command_output_cap_bytes', 262144);
         $broadcastAfterSeconds = max(0, (int) config('llm-client.coding_agent.command_progress_broadcast_after_seconds', 5));
 
         $dockerRunCommand = [
@@ -156,8 +176,8 @@ class DockerCommandExecutor
             // stated memory cap via swap.
             '--memory', $memoryLimit,
             '--memory-swap', $memoryLimit,
-            '--cpus', $cpuLimit,
-            '--pids-limit', (string) $pidsLimit,
+            '--cpus', $resolvedCpuLimit,
+            '--pids-limit', (string) $resolvedPidsLimit,
             '--workdir', self::CONTAINER_WORKSPACE_PATH,
             $image,
             'sh', '-c', $command,
@@ -178,8 +198,8 @@ class DockerCommandExecutor
             while ($process->isRunning()) {
                 $process->checkTimeout();
 
-                $this->appendCapped($stdout, $truncated, (string) $process->getIncrementalOutput(), $outputCapBytes);
-                $this->appendCapped($stderr, $truncated, (string) $process->getIncrementalErrorOutput(), $outputCapBytes);
+                $this->appendCapped($stdout, $truncated, (string) $process->getIncrementalOutput(), $resolvedOutputCapBytes);
+                $this->appendCapped($stderr, $truncated, (string) $process->getIncrementalErrorOutput(), $resolvedOutputCapBytes);
 
                 $elapsedSeconds = (int) floor(microtime(true) - $startedAt);
                 if ($elapsedSeconds >= $nextBroadcastAtSeconds) {
@@ -192,8 +212,8 @@ class DockerCommandExecutor
 
             // The process ended on its own -- capture whatever incremental
             // output arrived between the last loop check and process exit.
-            $this->appendCapped($stdout, $truncated, (string) $process->getIncrementalOutput(), $outputCapBytes);
-            $this->appendCapped($stderr, $truncated, (string) $process->getIncrementalErrorOutput(), $outputCapBytes);
+            $this->appendCapped($stdout, $truncated, (string) $process->getIncrementalOutput(), $resolvedOutputCapBytes);
+            $this->appendCapped($stderr, $truncated, (string) $process->getIncrementalErrorOutput(), $resolvedOutputCapBytes);
         } catch (ProcessTimedOutException $e) {
             $this->killContainer($containerName);
 
