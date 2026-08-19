@@ -959,6 +959,23 @@ return [
         // timed_out = true, never a fourth ambiguous state.
         'test_timeout_seconds' => (int) env('LLM_CLIENT_CODING_AGENT_TEST_TIMEOUT_SECONDS', 120),
 
+        // 123-sandboxed-shell-execution, US1 (research.md D2). The
+        // explicit internal-HTTP-call timeout for runCommand's own
+        // McpToolExecutor::executeHttpCall() call site -- closes the exact
+        // gap runTests()'s own call site still has (Laravel's HTTP client
+        // 30s default, left unfixed there deliberately, per this
+        // feature's tasks.md Grounding note 2). Sized well under the
+        // existing 300s confirmation-wait ceiling.
+        'command_timeout_seconds' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_TIMEOUT_SECONDS', 60),
+
+        // 123-sandboxed-shell-execution, US1 (research.md D1a). The base
+        // image every sandboxed command container runs -- deliberately
+        // small and generic; this feature does not manage or install
+        // language toolchains (spec.md Assumptions), so a project whose
+        // command needs tooling this image lacks reports that as an
+        // ordinary nonzero exit, not a could_not_run-style ambiguity.
+        'command_image' => (string) env('LLM_CLIENT_CODING_AGENT_COMMAND_IMAGE', 'alpine:latest'),
+
         // How many distinct files a single run may touch (writeFile/deleteFile)
         // before the next new file triggers a scope-surfacing confirmation
         // instead of the ordinary per-file one.

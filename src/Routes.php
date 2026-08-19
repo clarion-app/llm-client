@@ -417,6 +417,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('coding-project/{project}/git-status', [CodingWorkspaceController::class, "gitStatus"]);
     Route::get('coding-project/{project}/git-diff', [CodingWorkspaceController::class, "gitDiff"]);
     Route::post('coding-project/{project}/run-tests', [CodingWorkspaceController::class, "runTests"]);
+    Route::post('coding-project/{project}/run-command', [CodingWorkspaceController::class, "runCommand"]);
     Route::get('coding-project/{project}/changes', [CodingWorkspaceController::class, "changes"]);
 
     // Scheduler Agent -- human-driven trigger registration, CRUD scoped

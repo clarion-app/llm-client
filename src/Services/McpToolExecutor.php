@@ -178,8 +178,18 @@ class McpToolExecutor
      * of Authorization/Accept, which always win if a caller somehow
      * collides with either name. Every existing call site's outgoing
      * request shape is completely unchanged, since it defaults to empty.
+     *
+     * $timeoutSeconds (123-sandboxed-shell-execution, US1, research.md D2)
+     * is applied to the outgoing Http:: client only when non-null --
+     * every existing call site (which never passes it) keeps Laravel's
+     * HTTP client at its own 30s default, completely unchanged. This is
+     * the exact HTTP-call-timeout gap CodingWorkspaceController::
+     * runTests()'s own call site still has (deliberately left unfixed
+     * there, per this feature's tasks.md Grounding note 2) -- only the new
+     * runCommand call site passes this explicitly, sized from its own
+     * configured wall-clock limit.
      */
-    public function executeHttpCall(string $method, string $path, array $query, array $body, McpSession $session, array $extraHeaders = []): array
+    public function executeHttpCall(string $method, string $path, array $query, array $body, McpSession $session, array $extraHeaders = [], ?int $timeoutSeconds = null): array
     {
         $user = User::find($session->user_id);
         if (!$user) {
@@ -201,6 +211,10 @@ class McpToolExecutor
             'Authorization' => 'Bearer ' . $accessToken,
             'Accept' => 'application/json',
         ]))->withoutVerifying();
+
+        if ($timeoutSeconds !== null) {
+            $httpClient = $httpClient->timeout($timeoutSeconds);
+        }
 
         try {
             $response = match ($method) {

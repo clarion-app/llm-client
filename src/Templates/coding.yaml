@@ -66,6 +66,7 @@ tools:
     - clarionApp.llmClient.codingWorkspace.writeFile
     - clarionApp.llmClient.codingWorkspace.deleteFile
     - clarionApp.llmClient.codingWorkspace.runTests
+    - clarionApp.llmClient.codingWorkspace.runCommand
   deny: []
 safety:
   confirmation_required:

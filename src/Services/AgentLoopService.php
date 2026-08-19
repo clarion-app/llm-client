@@ -90,6 +90,19 @@ class AgentLoopService
     public const CODING_WORKSPACE_WRITE_FILE_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.writeFile';
     public const CODING_WORKSPACE_DELETE_FILE_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.deleteFile';
 
+    /**
+     * 123-sandboxed-shell-execution, US1 (contracts/run-command.md,
+     * research.md D2/D9). Named alongside the two mutation operationIds
+     * above wherever this file's dispatch seams key off them: the
+     * X-Llm-Client-Conversation-Id header-attachment condition
+     * (executeApiCall()), the explicit internal-HTTP-call timeout (D2,
+     * T017), and the untrusted-content output wrapping (D9, T018). Phase
+     * 4 (US2) additionally adds this operationId to the
+     * confirmation-relaxation check's operationId condition
+     * (handleExecuteOperation()) -- not yet done as of this story.
+     */
+    public const CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.runCommand';
+
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
@@ -4171,6 +4184,40 @@ class AgentLoopService
         ];
     }
 
+    /**
+     * 123-sandboxed-shell-execution, US1 (research.md D9, contracts/
+     * run-command.md §2). Replaces a runCommand result's `stdout`/`stderr`
+     * with a single combined, untrusted-content-wrapped `output` field
+     * (CommandOutputPromptBuilder -- new, command-appropriate wording, not
+     * a reuse of untrustedResponseBlock()'s eval-scoring-specific text).
+     * Every other key (status, command, exit_code, timed_out,
+     * output_truncated, network_enabled, duration_ms, reason) is passed
+     * through completely unchanged -- structured metadata is never
+     * wrapped, only the free-text output.
+     *
+     * Static and pure, mirroring buildPageTextEnvelope()'s own shape, so
+     * it can be exercised directly without constructing the (heavy)
+     * AgentLoopService.
+     *
+     * @param  array<string, mixed>  $decoded
+     * @return array<string, mixed>
+     */
+    public static function buildCommandOutputEnvelope(array $decoded): array
+    {
+        $stdout = (string) ($decoded['stdout'] ?? '');
+        $stderr = (string) ($decoded['stderr'] ?? '');
+        $combined = "stdout:\n{$stdout}\n\nstderr:\n{$stderr}";
+
+        $blockBuilder = new CommandOutputPromptBuilder();
+        $wrapped = $blockBuilder->untrustedCommandOutputBlock($combined);
+
+        $envelope = $decoded;
+        unset($envelope['stdout'], $envelope['stderr']);
+        $envelope['output'] = $wrapped;
+
+        return $envelope;
+    }
+
     public function executeApiCall(string $operationId, string $method, string $pathTemplate, array $params, Conversation $conversation): string
     {
         // research.md D3: the branch that matters most — execute_operation
@@ -4192,28 +4239,46 @@ class AgentLoopService
 
         // 122-workspace-browser-ui, US3 (research.md D5): threads the
         // triggering conversation's identity across this genuine outgoing
-        // HTTP hop, narrowly, only for the two coding-workspace mutation
-        // operations whose controller methods need it to attribute a
-        // change record -- every other operation id's outgoing call shape
-        // is completely unchanged. The receiving controller independently
-        // re-verifies this header against Auth::id()-owned data before
-        // trusting it for anything; a caller who forged this header on a
-        // direct (non-agent) request gains nothing, since only this exact
-        // internal call site ever attaches it.
+        // HTTP hop, narrowly, only for the coding-workspace mutation/
+        // command operations whose controller methods need it to
+        // attribute a change/execution record -- every other operation
+        // id's outgoing call shape is completely unchanged. The receiving
+        // controller independently re-verifies this header against
+        // Auth::id()-owned data before trusting it for anything; a caller
+        // who forged this header on a direct (non-agent) request gains
+        // nothing, since only this exact internal call site ever attaches
+        // it. 123-sandboxed-shell-execution, US1 extends this condition to
+        // the runCommand operationId, so CodingWorkspaceController::
+        // resolveAttribution() actually receives the header for a command
+        // execution's own audit row.
         $extraHeaders = [];
         if ($operationId === self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
-            || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID) {
+            || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID) {
             $extraHeaders['X-Llm-Client-Conversation-Id'] = (string) $conversation->id;
         }
 
+        // 123-sandboxed-shell-execution, US1 (research.md D2): the
+        // runCommand operationId's own internal HTTP call carries an
+        // explicit timeout sized from its own configured wall-clock
+        // limit -- closing the exact gap runTests()'s own call site still
+        // has (Grounding note 2's decision, held unchanged: runTests()
+        // itself is not touched by this feature). Every other operation
+        // id leaves this null, so McpToolExecutor::executeHttpCall()
+        // applies no explicit timeout for them, unchanged.
+        $commandTimeoutSeconds = null;
+        if ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID) {
+            $commandTimeoutSeconds = (int) config('llm-client.coding_agent.command_timeout_seconds', 60);
+        }
+
         // Every other operation id's call keeps the exact 5-argument shape
-        // it always had -- $extraHeaders is only ever actually passed
-        // (as a genuine 6th argument) for the two coding-workspace
-        // mutation operations above, so no other call site's signature is
-        // observably different from before this feature.
-        $result = empty($extraHeaders)
+        // it always had -- $extraHeaders/$commandTimeoutSeconds are only
+        // ever actually non-default for the coding-workspace mutation/
+        // command operations above, so no other call site's observable
+        // behavior is different from before this feature.
+        $result = (empty($extraHeaders) && $commandTimeoutSeconds === null)
             ? $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session)
-            : $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session, $extraHeaders);
+            : $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session, $extraHeaders, $commandTimeoutSeconds);
         $this->lastOperationDispatchOutcome = $result;
         $raw = $this->extractResultContent($result);
 
@@ -4248,6 +4313,28 @@ class AgentLoopService
             $envelope = self::buildPageTextEnvelope($url, null, $raw, $conversation->id, $this->toolResultCondenser);
 
             return json_encode($envelope, JSON_UNESCAPED_SLASHES);
+        }
+
+        // 123-sandboxed-shell-execution, US1 (research.md D9, FR-014,
+        // contracts/run-command.md §2): a command's combined stdout/stderr
+        // is untrusted content -- wrapped in an explicit delimiter block
+        // (CommandOutputPromptBuilder, deliberately NOT a reuse of
+        // untrustedResponseBlock()'s eval-scoring-specific wording) before
+        // the tool result reaches the model. Structured fields (status,
+        // exit_code, timed_out, output_truncated) are left as plain,
+        // unwrapped JSON -- only the free-text output is ever wrapped.
+        // The controller's own HTTP response (contracts §1) is completely
+        // unaffected -- this transformation happens only here, at the
+        // same tool-result layer PAGE_TEXT_OPERATION_ID's envelope above
+        // already occupies.
+        if ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID) {
+            $decodedForCommand = json_decode($raw, true);
+            if (is_array($decodedForCommand)) {
+                return json_encode(
+                    self::buildCommandOutputEnvelope($decodedForCommand),
+                    JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE,
+                );
+            }
         }
 
         return $raw;
