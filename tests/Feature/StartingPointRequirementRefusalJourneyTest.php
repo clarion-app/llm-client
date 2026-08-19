@@ -86,7 +86,7 @@ class StartingPointRequirementRefusalJourneyTest extends TestCase
 
     /**
      * Registers every operation coding.yaml's tools.allow depends on --
-     * its three named codingWorkspace operationIds plus one bare GET, via
+     * its four named codingWorkspace operationIds plus one bare GET, via
      * conversations.index -- the same set CodingAgentProvisionerTest's own
      * seedCodingCatalog() registers for ensureForUser().
      */
@@ -112,6 +112,11 @@ class StartingPointRequirementRefusalJourneyTest extends TestCase
                 'path' => '/api/coding-project/{project}/run-command',
                 'method' => 'post',
                 'summary' => "Run a shell command in a registered project's sandboxed workspace",
+            ],
+            'clarionApp.llmClient.codingWorkspace.runCode' => [
+                'path' => '/api/coding-project/{project}/run-code',
+                'method' => 'post',
+                'summary' => "Run a code snippet in a registered project's sandboxed workspace",
             ],
             'clarionApp.llmClient.conversations.index' => [
                 'path' => '/api/conversations',

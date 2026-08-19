@@ -242,6 +242,11 @@ YAML;
                 'method' => 'post',
                 'summary' => "Run a shell command in a registered project's sandboxed workspace",
             ],
+            'clarionApp.llmClient.codingWorkspace.runCode' => [
+                'path' => '/api/coding-project/{project}/run-code',
+                'method' => 'post',
+                'summary' => "Run a code snippet in a registered project's sandboxed workspace",
+            ],
         ]);
 
         $parser = new AgentDefinitionParser();

@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Models\CodingWorkspaceChange;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\CommandChangeDetector;
 use ClarionApp\LlmClient\Services\DockerCommandExecutor;
+use ClarionApp\LlmClient\Services\LanguageRuntime;
 use ClarionApp\LlmClient\Services\PathContainment;
 use ClarionApp\LlmClient\Services\ResourceLimitResolver;
 use ClarionApp\LlmClient\Services\WorkspaceChangeRecorder;
@@ -53,6 +54,7 @@ class CodingWorkspaceController extends Controller
         private readonly DockerCommandExecutor $dockerCommandExecutor = new DockerCommandExecutor(),
         private readonly ResourceLimitResolver $resourceLimitResolver = new ResourceLimitResolver(),
         private readonly CommandChangeDetector $changeDetector = new CommandChangeDetector(),
+        private readonly LanguageRuntime $languageRuntime = new LanguageRuntime(),
     ) {
     }
 
@@ -721,6 +723,219 @@ class CodingWorkspaceController extends Controller
         }
 
         return response()->json($responseBody, 200);
+    }
+
+    /**
+     * POST coding-project/{project}/run-code (125-language-runtime-execution,
+     * US1, contracts/run-code.md §1, Grounding notes 5/8). Reuses
+     * runCommand()'s exact flow -- findOwnedProject()/root-reachability/
+     * ResourceLimitResolver/changeDetector+changeRecorder/resolveAttribution()
+     * -- unmodified in every step except: the request carries
+     * {language, code} instead of {command}; a recognized-language guard
+     * runs before the executor is ever called (422, no audit row); the
+     * submitted code is passed as DockerCommandExecutor::run()'s trailing
+     * $stdin argument instead of being embedded as the shell command
+     * itself; a language-unavailable-detection step translates the raw
+     * executor result when the fused availability guard's sentinel fires;
+     * and the audit row/response body carry language+code (the `command`
+     * column stores the code text) instead of a bare command.
+     */
+    public function runCode(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $containment = PathContainment::validate($codingProject->root_path, '.', true);
+        if (!$containment['valid'] && ($containment['reason'] ?? null) === 'project directory is not reachable') {
+            $this->refusalRecorder->record($codingProject, 'run_code', $containment['reason']);
+
+            return response()->json([
+                'error' => 'outside the registered project',
+                'code' => 'workspace_boundary_refusal',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'language' => 'required|string',
+            'code' => 'required|string',
+        ]);
+        $language = $validated['language'];
+        $code = $validated['code'];
+
+        if (!$this->languageRuntime->isRecognized($language)) {
+            return response()->json([
+                'error' => "unrecognized language '{$language}'",
+                'code' => 'language_unrecognized',
+                'language' => $language,
+            ], 422);
+        }
+
+        $networkEnabled = (bool) $codingProject->network_enabled;
+
+        $resolvedLimits = $this->resourceLimitResolver->resolve($codingProject);
+
+        $before = $this->changeDetector->snapshot($codingProject->root_path);
+
+        $result = $this->dockerCommandExecutor->run(
+            $codingProject->root_path,
+            $this->languageRuntime->buildExecutionCommand($language),
+            $codingProject->id,
+            (string) Auth::id(),
+            $networkEnabled,
+            $resolvedLimits['time_limit_seconds'],
+            $resolvedLimits['memory_limit_mb'],
+            $resolvedLimits['cpu_limit'],
+            $resolvedLimits['pids_limit'],
+            $resolvedLimits['output_cap_bytes'],
+            $resolvedLimits['disk_limit_mb'],
+            $code,
+        );
+
+        $after = $this->changeDetector->snapshot($codingProject->root_path);
+
+        $status = $result['status'];
+        $exitCode = $result['exit_code'] ?? null;
+        $timedOut = $result['timed_out'] ?? false;
+        $stdout = $result['stdout'] ?? null;
+        $stderr = $result['stderr'] ?? null;
+        $outputTruncated = $result['output_truncated'] ?? false;
+        $durationMs = $result['duration_ms'] ?? null;
+        $reason = $result['reason'] ?? null;
+
+        // Grounding note 8: a fused-guard sentinel on stderr with exit 127
+        // is the raw executor's own honest report of a genuinely absent
+        // runtime -- translated here, at the caller, into a dedicated
+        // status the response/audit row both reflect. The internal
+        // sentinel text itself is never leaked to the caller.
+        if ($exitCode === 127 && trim((string) ($stderr ?? '')) === LanguageRuntime::LANGUAGE_UNAVAILABLE_SENTINEL) {
+            $status = 'language_unavailable';
+            $exitCode = null;
+            $stdout = null;
+            $stderr = null;
+            $reason = "{$language} is not available in this workspace's configured sandbox image";
+        }
+
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+        foreach ($this->changeDetector->diff($before, $after) as $change) {
+            $newContent = null;
+            $newSize = null;
+
+            if ($change['operation'] !== 'deleted') {
+                $absolutePath = rtrim($codingProject->root_path, '/').'/'.$change['path'];
+                clearstatcache(true, $absolutePath);
+                $stat = @stat($absolutePath);
+                if ($stat !== false) {
+                    $newSize = (int) $stat['size'];
+                    $sample = @file_get_contents($absolutePath, false, null, 0, $threshold);
+                    $newContent = $sample === false ? null : $sample;
+                }
+            }
+
+            $this->changeRecorder->record(
+                $codingProject,
+                $change['path'],
+                $change['operation'],
+                null,
+                null,
+                $newContent,
+                $newSize,
+                $attribution['agent_id'],
+                $attribution['agent_name'],
+                $attribution['conversation_id'],
+            );
+        }
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $code,
+            'language' => $language,
+            'status' => $status,
+            'exit_code' => $exitCode,
+            'timed_out' => $timedOut,
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+            'output_truncated' => $outputTruncated,
+            'network_enabled' => $networkEnabled,
+            'duration_ms' => $durationMs,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        $responseBody = [
+            'status' => $status,
+            'language' => $language,
+            'code' => $code,
+            'exit_code' => $exitCode,
+            'timed_out' => $timedOut,
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+            'output_truncated' => $outputTruncated,
+            'network_enabled' => $networkEnabled,
+            'duration_ms' => $durationMs,
+        ];
+
+        if (($status === 'sandbox_unavailable' || $status === 'language_unavailable') && $reason !== null) {
+            $responseBody['reason'] = $reason;
+        }
+
+        return response()->json($responseBody, 200);
+    }
+
+    /**
+     * GET coding-project/{project}/languages
+     * (125-language-runtime-execution, US2, contracts/language-availability.md
+     * §1, research.md D4). A real probe, not a fixed or assumed list
+     * (FR-005): reuses DockerCommandExecutor::run() exactly as
+     * runCommand()/runCode() do, with
+     * LanguageRuntime::buildAvailabilityProbeCommand()'s output as the
+     * command and no $stdin -- a `command -v` probe is not subject to a
+     * workspace's demanding-work resource overrides, so no
+     * ResourceLimitResolver call is made here. A sandbox_unavailable
+     * result is propagated unchanged, the same shape runCommand()/
+     * runCode() already use. This method executes no command against the
+     * workspace's own files and produces no side effect, so -- unlike
+     * runCommand()/runCode() -- it writes no CodingCommandExecution row
+     * under any outcome (data-model.md §3).
+     */
+    public function languages(string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $result = $this->dockerCommandExecutor->run(
+            $codingProject->root_path,
+            $this->languageRuntime->buildAvailabilityProbeCommand(),
+            $codingProject->id,
+            (string) Auth::id(),
+            false,
+        );
+
+        if (($result['status'] ?? null) === 'sandbox_unavailable') {
+            return response()->json([
+                'status' => 'sandbox_unavailable',
+                'reason' => $result['reason'] ?? null,
+            ], 200);
+        }
+
+        $availability = $this->languageRuntime->parseAvailabilityOutput((string) ($result['stdout'] ?? ''));
+
+        $languages = [];
+        foreach (LanguageRuntime::RECOGNIZED_LANGUAGES as $name => $spec) {
+            $languages[] = [
+                'name' => $name,
+                'available' => $availability[$name] ?? false,
+            ];
+        }
+
+        return response()->json(['languages' => $languages], 200);
     }
 
     /**

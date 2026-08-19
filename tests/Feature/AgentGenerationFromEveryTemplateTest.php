@@ -27,7 +27,7 @@ use Tests\TestCase;
  * Each slug's operation catalog is seeded exactly as its own
  * *AgentProvisionerTest seeds it for ensureForUser() -- the `coding`
  * template names explicit operationIds in tools.allow, so it needs the
- * three coding-workspace operations; `research` and `data` each allow a
+ * four coding-workspace operations; `research` and `data` each allow a
  * bare GET verb (research additionally needs the fetchPage.* glob to
  * resolve); `scheduler`'s tools.allow/safety.* lists are all empty, so
  * the catalog is still seeded with zero operations rather than left
@@ -127,6 +127,11 @@ class AgentGenerationFromEveryTemplateTest extends TestCase
                     'path' => '/api/coding-project/{project}/run-command',
                     'method' => 'post',
                     'summary' => "Run a shell command in a registered project's sandboxed workspace",
+                ],
+                'clarionApp.llmClient.codingWorkspace.runCode' => [
+                    'path' => '/api/coding-project/{project}/run-code',
+                    'method' => 'post',
+                    'summary' => "Run a code snippet in a registered project's sandboxed workspace",
                 ],
                 ...$conversationsIndex,
             ]);
