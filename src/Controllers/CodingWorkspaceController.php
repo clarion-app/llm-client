@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Models\CodingCommandExecution;
 use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Models\CodingWorkspaceChange;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Services\CommandChangeDetector;
 use ClarionApp\LlmClient\Services\DockerCommandExecutor;
 use ClarionApp\LlmClient\Services\PathContainment;
 use ClarionApp\LlmClient\Services\ResourceLimitResolver;
@@ -51,6 +52,7 @@ class CodingWorkspaceController extends Controller
         private readonly WorkspaceChangeRecorder $changeRecorder = new WorkspaceChangeRecorder(),
         private readonly DockerCommandExecutor $dockerCommandExecutor = new DockerCommandExecutor(),
         private readonly ResourceLimitResolver $resourceLimitResolver = new ResourceLimitResolver(),
+        private readonly CommandChangeDetector $changeDetector = new CommandChangeDetector(),
     ) {
     }
 
@@ -610,6 +612,16 @@ class CodingWorkspaceController extends Controller
         // above, now applied to all six resource limits.
         $resolvedLimits = $this->resourceLimitResolver->resolve($codingProject);
 
+        // 124-command-limit-controls, US4 (data-model.md §3, research.md
+        // R4): a before/after snapshot pair bracketing the executor call,
+        // taken UNCONDITIONALLY regardless of the eventual $result['status']
+        // -- completed, stopped_timeout, stopped_disk_limit, stopped_oom,
+        // and stopped_pids_limit are all diffed identically (FR-011). No
+        // status branch is ever consulted before deciding whether to
+        // snapshot; the diff below naturally produces an empty change list
+        // when the command never actually touched the filesystem.
+        $before = $this->changeDetector->snapshot($codingProject->root_path);
+
         $result = $this->dockerCommandExecutor->run(
             $codingProject->root_path,
             $command,
@@ -624,6 +636,8 @@ class CodingWorkspaceController extends Controller
             $resolvedLimits['disk_limit_mb'],
         );
 
+        $after = $this->changeDetector->snapshot($codingProject->root_path);
+
         $status = $result['status'];
         $exitCode = $result['exit_code'] ?? null;
         $timedOut = $result['timed_out'] ?? false;
@@ -633,6 +647,45 @@ class CodingWorkspaceController extends Controller
         $durationMs = $result['duration_ms'] ?? null;
 
         $attribution = $this->resolveAttribution($request, $codingProject);
+
+        // 124-command-limit-controls, US4 (contracts/command-file-changes.md,
+        // FR-010/FR-011): the same attribution this method already resolved
+        // for the CodingCommandExecution row below is reused here -- no
+        // second, parallel attribution mechanism. Each changed path is
+        // written through the existing, unmodified WorkspaceChangeRecorder,
+        // with oldContent/oldSize null (research.md R4 §4's one honest,
+        // disclosed asymmetry with writeFile()/deleteFile()) and
+        // newContent/newSize read fresh from disk, capped identically to
+        // every other content-bearing path in this controller.
+        $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+        foreach ($this->changeDetector->diff($before, $after) as $change) {
+            $newContent = null;
+            $newSize = null;
+
+            if ($change['operation'] !== 'deleted') {
+                $absolutePath = rtrim($codingProject->root_path, '/').'/'.$change['path'];
+                clearstatcache(true, $absolutePath);
+                $stat = @stat($absolutePath);
+                if ($stat !== false) {
+                    $newSize = (int) $stat['size'];
+                    $sample = @file_get_contents($absolutePath, false, null, 0, $threshold);
+                    $newContent = $sample === false ? null : $sample;
+                }
+            }
+
+            $this->changeRecorder->record(
+                $codingProject,
+                $change['path'],
+                $change['operation'],
+                null,
+                null,
+                $newContent,
+                $newSize,
+                $attribution['agent_id'],
+                $attribution['agent_name'],
+                $attribution['conversation_id'],
+            );
+        }
 
         CodingCommandExecution::create([
             'coding_project_id' => $codingProject->id,
