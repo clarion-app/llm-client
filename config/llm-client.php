@@ -980,6 +980,15 @@ return [
             'max_files_scanned' => (int) env('LLM_CLIENT_CODING_AGENT_SEARCH_MAX_FILES_SCANNED', 5000),
             'max_matches_per_file' => (int) env('LLM_CLIENT_CODING_AGENT_SEARCH_MAX_MATCHES_PER_FILE', 5),
         ],
+
+        // 122-workspace-browser-ui, US3 (research.md D2, FR-012). How long
+        // a coding_workspace_changes row survives before
+        // PurgeExpiredWorkspaceChangesCommand purges it -- deliberately
+        // its own, independently configured key, structurally unrelated
+        // to run_trace.retention_days (90-day default) below, so a future
+        // change to that unrelated key can never silently shorten this
+        // one's retention window.
+        'change_record_retention_days' => (int) env('LLM_CLIENT_CODING_AGENT_CHANGE_RECORD_RETENTION_DAYS', 365),
     ],
 
     // Scheduler Agent — the per-action retry ceiling

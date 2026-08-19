@@ -217,6 +217,40 @@ abstract class TestCase extends BaseTestCase
             });
         }
 
+        // coding_workspace_changes table (122-workspace-browser-ui, US3,
+        // data-model.md §1) — mirrors
+        // 2026_08_18_000004_create_coding_workspace_changes_table.php
+        // exactly, including the created_at useCurrent() default, which is
+        // load-bearing here too: CodingWorkspaceChange sets
+        // $timestamps = false and never passes created_at explicitly.
+        if (!Schema::hasTable('coding_workspace_changes')) {
+            Schema::create('coding_workspace_changes', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('coding_project_id');
+                $table->uuid('user_id');
+                $table->string('root_path');
+                $table->string('path');
+                $table->string('operation');
+                $table->longText('old_content')->nullable();
+                $table->boolean('old_content_truncated')->default(false);
+                $table->boolean('old_binary')->default(false);
+                $table->unsignedBigInteger('old_size')->nullable();
+                $table->longText('new_content')->nullable();
+                $table->boolean('new_content_truncated')->default(false);
+                $table->boolean('new_binary')->default(false);
+                $table->unsignedBigInteger('new_size')->nullable();
+                $table->uuid('agent_id')->nullable();
+                $table->string('agent_name')->nullable();
+                $table->uuid('conversation_id')->nullable();
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index('coding_project_id');
+                $table->index('user_id');
+                $table->index('conversation_id');
+                $table->index(['coding_project_id', 'created_at']);
+            });
+        }
+
         // scheduler_triggers table — the SQLite counterpart of
         // create_scheduler_triggers_table. Kept column-for-column in step with
         // that migration: a divergence between the two is exactly the class of

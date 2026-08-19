@@ -132,6 +132,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\EvaluateSchedulerTriggersCommand::class,
                 \ClarionApp\LlmClient\Commands\RefreshStaleMcpClientServersCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeMcpClientConnectionTestsCommand::class,
+                \ClarionApp\LlmClient\Commands\PurgeExpiredWorkspaceChangesCommand::class,
             ]);
         }
 
@@ -221,6 +222,16 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
 
             // Purge expired agent run traces daily.
             $schedule->command('llm-client:purge-run-traces')
+                ->daily()
+                ->withoutOverlapping();
+
+            // Purge expired coding workspace change records daily
+            // (122-workspace-browser-ui, US3, research.md D2) --
+            // scheduled alongside the run-trace purge above but
+            // structurally independent of it: its own config key
+            // (coding_agent.change_record_retention_days), its own
+            // command class, its own table.
+            $schedule->command('llm-client:purge-workspace-changes')
                 ->daily()
                 ->withoutOverlapping();
 

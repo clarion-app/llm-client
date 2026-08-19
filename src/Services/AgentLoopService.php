@@ -4189,7 +4189,31 @@ class AgentLoopService
 
         $session = $this->getOrCreateSession($conversation);
         $resolved = $this->toolExecutor->extractArguments($params, $pathTemplate);
-        $result = $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session);
+
+        // 122-workspace-browser-ui, US3 (research.md D5): threads the
+        // triggering conversation's identity across this genuine outgoing
+        // HTTP hop, narrowly, only for the two coding-workspace mutation
+        // operations whose controller methods need it to attribute a
+        // change record -- every other operation id's outgoing call shape
+        // is completely unchanged. The receiving controller independently
+        // re-verifies this header against Auth::id()-owned data before
+        // trusting it for anything; a caller who forged this header on a
+        // direct (non-agent) request gains nothing, since only this exact
+        // internal call site ever attaches it.
+        $extraHeaders = [];
+        if ($operationId === self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID) {
+            $extraHeaders['X-Llm-Client-Conversation-Id'] = (string) $conversation->id;
+        }
+
+        // Every other operation id's call keeps the exact 5-argument shape
+        // it always had -- $extraHeaders is only ever actually passed
+        // (as a genuine 6th argument) for the two coding-workspace
+        // mutation operations above, so no other call site's signature is
+        // observably different from before this feature.
+        $result = empty($extraHeaders)
+            ? $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session)
+            : $this->toolExecutor->executeHttpCall($method, $resolved['path'], $resolved['query'], $resolved['body'], $session, $extraHeaders);
         $this->lastOperationDispatchOutcome = $result;
         $raw = $this->extractResultContent($result);
 

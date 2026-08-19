@@ -172,7 +172,14 @@ class McpToolExecutor
         ];
     }
 
-    public function executeHttpCall(string $method, string $path, array $query, array $body, McpSession $session): array
+    /**
+     * $extraHeaders (122-workspace-browser-ui, US3, research.md D5) is
+     * additive only -- merged into the outgoing request's headers, on top
+     * of Authorization/Accept, which always win if a caller somehow
+     * collides with either name. Every existing call site's outgoing
+     * request shape is completely unchanged, since it defaults to empty.
+     */
+    public function executeHttpCall(string $method, string $path, array $query, array $body, McpSession $session, array $extraHeaders = []): array
     {
         $user = User::find($session->user_id);
         if (!$user) {
@@ -190,10 +197,10 @@ class McpToolExecutor
             $url .= '?' . http_build_query($query);
         }
 
-        $httpClient = Http::withHeaders([
+        $httpClient = Http::withHeaders(array_merge($extraHeaders, [
             'Authorization' => 'Bearer ' . $accessToken,
             'Accept' => 'application/json',
-        ])->withoutVerifying();
+        ]))->withoutVerifying();
 
         try {
             $response = match ($method) {
