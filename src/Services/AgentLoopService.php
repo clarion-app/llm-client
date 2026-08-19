@@ -114,6 +114,42 @@ class AgentLoopService
      */
     public const CODING_WORKSPACE_RUN_CODE_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.runCode';
 
+    /**
+     * 126-git-operations-confirmation, Foundational (Grounding notes 9-10).
+     * Four new operationIds, one per mutating git action, each eventually
+     * wired into its own story's dispatch seams:
+     *
+     * - CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID (US4): create/switch a
+     *   branch.
+     * - CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID (US2): stage and commit.
+     * - CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID (US5): amend or
+     *   reset history.
+     * - CODING_WORKSPACE_GIT_PUSH_OPERATION_ID (US3): publish to a remote.
+     *
+     * Each of the four eventually participates in the STATUS_CONFIRM
+     * dispatch branch (L4032 as of this writing) and its own new arm of
+     * gitOperationConfirmationPreview() (created in US2, extended by
+     * US3-US5) -- exactly one shared confirmation mechanism, not four
+     * parallel ones. Unlike CODING_WORKSPACE_RUN_CODE_OPERATION_ID above,
+     * none of the four is ever added to the confirmation_relaxed bypass
+     * (L3931-3943) or the command_allowlist bypass (L3960-3974) -- a git
+     * mutation is never eligible for either bypass, no matter how a
+     * project's tools.allow/safety config is set (research.md D10). None
+     * of the four is ever threaded through commandTimeoutSeconds
+     * (L4388-4392) or buildCommandOutputEnvelope() (L4450-4459) either:
+     * both are RUN_COMMAND/RUN_CODE-only concerns for wrapping a
+     * long-running subprocess's raw stdout/stderr, and no git response
+     * shape in this feature's contracts carries that pair -- deliberately
+     * left unwidened for these four, not an oversight.
+     */
+    public const CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.gitBranch';
+
+    public const CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.gitCommit';
+
+    public const CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.gitRewriteHistory';
+
+    public const CODING_WORKSPACE_GIT_PUSH_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.gitPush';
+
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
