@@ -255,6 +255,15 @@ class DockerCommandExecutorTest extends TestCase
         $calledWith = null;
 
         $factory = function (array $command) use (&$calledWith) {
+            // 124-command-limit-controls, US2: the disk-usage baseline
+            // `du` call now precedes every "docker run" invocation -- it
+            // must be answered here too, distinctly from the main process
+            // mock below, or it would (wrongly) be treated as the main
+            // invocation and never have setTimeout() called on it at all.
+            if ($command[0] === 'du') {
+                return $this->fakeProcess(0, '', '');
+            }
+
             if ($command[1] === 'version') {
                 return $this->fakeProcess(0, '', '');
             }
@@ -484,6 +493,13 @@ class DockerCommandExecutorTest extends TestCase
         $calledWith = null;
 
         $factory = function (array $command) use (&$calledWith) {
+            // 124-command-limit-controls, US2: same disk-usage-baseline
+            // du call as above -- must be answered distinctly from the
+            // main "docker run" invocation.
+            if ($command[0] === 'du') {
+                return $this->fakeProcess(0, '', '');
+            }
+
             if ($command[1] === 'version') {
                 return $this->fakeProcess(0, '', '');
             }

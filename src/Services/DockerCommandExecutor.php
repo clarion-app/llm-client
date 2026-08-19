@@ -150,6 +150,7 @@ class DockerCommandExecutor
         $resolvedPidsLimit = $pidsLimit ?? (int) config('llm-client.coding_agent.command_pids_limit', 128);
         $timeoutSeconds = $timeLimitSeconds ?? (int) config('llm-client.coding_agent.command_timeout_seconds', 60);
         $resolvedOutputCapBytes = $outputCapBytes ?? (int) config('llm-client.coding_agent.command_output_cap_bytes', 262144);
+        $resolvedDiskLimitMb = $diskLimitMb ?? (int) config('llm-client.coding_agent.command_disk_limit_mb', 512);
         $broadcastAfterSeconds = max(0, (int) config('llm-client.coding_agent.command_progress_broadcast_after_seconds', 5));
 
         $dockerRunCommand = [
@@ -183,6 +184,17 @@ class DockerCommandExecutor
             'sh', '-c', $command,
         ];
 
+        // 124-command-limit-controls, US2 (research.md R2): measured
+        // BEFORE `docker run` starts, over the bind-mounted workspace root
+        // only -- this is the baseline every later delta is measured
+        // against, which is exactly what excludes space already used by
+        // files that existed in the workspace beforehand (spec.md Edge
+        // Case). A null baseline (du unreachable/unparseable) disables the
+        // disk-limit check for this whole invocation -- a best-effort
+        // mechanism, never allowed to turn an unrelated measurement
+        // failure into a false stop.
+        $diskUsageBaselineBytes = $this->measureDiskUsageBytes($rootPath);
+
         $process = $this->makeProcess($dockerRunCommand);
         $process->setTimeout($timeoutSeconds > 0 ? $timeoutSeconds : null);
 
@@ -205,6 +217,49 @@ class DockerCommandExecutor
                 if ($elapsedSeconds >= $nextBroadcastAtSeconds) {
                     $this->broadcastProgress($codingProjectId, $userId, $elapsedSeconds);
                     $nextBroadcastAtSeconds = $elapsedSeconds + max(1, $broadcastAfterSeconds);
+
+                    // US2 (research.md R2/R3c): re-measured on this SAME
+                    // coarser-cadence accumulator the progress-heartbeat
+                    // broadcast already uses -- never on every 50ms poll
+                    // tick, since a `du` call over a large tree is too
+                    // costly to run that often. Strictly AFTER
+                    // checkTimeout() above: a ProcessTimedOutException
+                    // thrown by checkTimeout() unwinds out of this loop
+                    // body entirely, so this block is never reached on a
+                    // tick where the timeout has already fired.
+                    if ($diskUsageBaselineBytes !== null) {
+                        $currentDiskUsageBytes = $this->measureDiskUsageBytes($rootPath);
+
+                        if ($currentDiskUsageBytes !== null) {
+                            $deltaBytes = $currentDiskUsageBytes - $diskUsageBaselineBytes;
+                            $diskLimitBytes = $resolvedDiskLimitMb * 1024 * 1024;
+
+                            if ($deltaBytes > $diskLimitBytes) {
+                                // FR-009/Edge Case: one final capture of
+                                // whatever output arrived since the last
+                                // loop check, mirroring the ordinary-exit
+                                // path's own trailing capture step --
+                                // output already produced is never
+                                // discarded.
+                                $this->appendCapped($stdout, $truncated, (string) $process->getIncrementalOutput(), $resolvedOutputCapBytes);
+                                $this->appendCapped($stderr, $truncated, (string) $process->getIncrementalErrorOutput(), $resolvedOutputCapBytes);
+
+                                $this->killContainer($containerName);
+
+                                $durationMs = (int) round((microtime(true) - $startedAt) * 1000);
+
+                                return [
+                                    'status' => 'stopped_disk_limit',
+                                    'exit_code' => null,
+                                    'timed_out' => false,
+                                    'stdout' => $stdout,
+                                    'stderr' => $stderr,
+                                    'output_truncated' => $truncated,
+                                    'duration_ms' => $durationMs,
+                                ];
+                            }
+                        }
+                    }
                 }
 
                 usleep(self::POLL_INTERVAL_MICROSECONDS);
@@ -343,6 +398,40 @@ class DockerCommandExecutor
                 'error' => $e->getMessage(),
             ]);
         }
+    }
+
+    /**
+     * 124-command-limit-controls, US2 (research.md R2): a plain `du -sb
+     * <path>` shell-out over the bind-mounted workspace root only -- never
+     * the container's own filesystem, which is `--read-only` plus a
+     * `--tmpfs /tmp` scratch area bounded by its own, separate mechanism.
+     * Routed through the same makeProcess()/$processFactory seam every
+     * other shell-out in this class already uses. Best-effort: any
+     * failure to run or to parse a leading byte count out of `du`'s own
+     * stdout returns null rather than throwing, so a transient
+     * measurement failure can never turn into a false stop -- the caller
+     * treats a null result as "disk-limit check unavailable for this
+     * invocation," never as "0 bytes used."
+     */
+    private function measureDiskUsageBytes(string $path): ?int
+    {
+        try {
+            $process = $this->makeProcess(['du', '-sb', $path]);
+            $process->run();
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        if ($process->getExitCode() !== 0) {
+            return null;
+        }
+
+        $output = trim((string) $process->getOutput());
+        if (!preg_match('/^(\d+)/', $output, $matches)) {
+            return null;
+        }
+
+        return (int) $matches[1];
     }
 
     /**
