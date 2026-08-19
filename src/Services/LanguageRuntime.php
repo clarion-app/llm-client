@@ -45,7 +45,19 @@ class LanguageRuntime
         $binary = self::RECOGNIZED_LANGUAGES[$language]['binary'];
         $extension = self::RECOGNIZED_LANGUAGES[$language]['extension'];
 
-        return "command -v {$binary} >/dev/null 2>&1 || { echo '".self::LANGUAGE_UNAVAILABLE_SENTINEL."' >&2; exit 127; }; cat > /tmp/snippet.{$extension} && {$binary} /tmp/snippet.{$extension}";
+        // 125-language-runtime-execution, US1 (discovered live against a
+        // real container, tests/RealDocker/LanguageExecutionTest.php's
+        // timeout case): Python's stdout is fully buffered rather than
+        // line-buffered whenever it is not attached to a TTY -- exactly
+        // the case here, since the container is never started with -t.
+        // Without this, output already printed before a timeout-kill sits
+        // in the interpreter's own unflushed buffer and is lost with the
+        // process, silently violating FR-008's "output already produced
+        // is never discarded" guarantee. PYTHONUNBUFFERED is exported
+        // unconditionally (harmless for a language whose own runtime does
+        // not recognize it) rather than branching per binary, so this
+        // stays one shared code path for every recognized language.
+        return "command -v {$binary} >/dev/null 2>&1 || { echo '".self::LANGUAGE_UNAVAILABLE_SENTINEL."' >&2; exit 127; }; export PYTHONUNBUFFERED=1; cat > /tmp/snippet.{$extension} && {$binary} /tmp/snippet.{$extension}";
     }
 
     /**

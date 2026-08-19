@@ -567,6 +567,148 @@ class DockerCommandExecutorTest extends TestCase
         $this->assertSame(str_repeat('X', 20), $result['stdout']);
     }
 
+    // -----------------------------------------------------------------
+    // 125-language-runtime-execution, US1, T008 (data-model.md §6,
+    // research.md D2): run()'s signature gains a trailing
+    // ?string $stdin = null argument. When non-null, the constructed
+    // docker run flag array carries -i/--interactive (anywhere before the
+    // image argument) and the mocked Process double's setInput() is
+    // called exactly once, with the exact stdin string, BEFORE start().
+    // When $stdin is omitted/null (every existing caller's shape today),
+    // the flag array is byte-identical to before this feature and
+    // setInput() is never called. Written before the parameter exists on
+    // run() -- expected to FAIL red (a call passing a 12th argument is a
+    // PHP ArgumentCountError today; setInput() assertions fail since the
+    // flag/call never happens).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_non_null_stdin_argument_adds_the_interactive_flag_and_calls_set_input_exactly_once_before_start(): void
+    {
+        $capturedCommand = null;
+        $setInputCalls = [];
+        $callOrder = [];
+
+        $factory = function (array $command) use (&$capturedCommand, &$setInputCalls, &$callOrder) {
+            if ($command[1] === 'version') {
+                return $this->fakeProcess(0, '', '');
+            }
+
+            if ($command[1] !== 'run') {
+                // du baseline / docker inspect / docker rm -f, none of
+                // which is the "docker run" invocation this test targets.
+                return $this->fakeProcess(0, '', '');
+            }
+
+            $capturedCommand = $command;
+
+            $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
+            $process->shouldReceive('setInput')->once()->withArgs(function ($value) use (&$setInputCalls, &$callOrder) {
+                $setInputCalls[] = $value;
+                $callOrder[] = 'setInput';
+
+                return true;
+            })->andReturnSelf();
+            $process->shouldReceive('start')->once()->andReturnUsing(function () use (&$callOrder) {
+                $callOrder[] = 'start';
+            });
+            $process->shouldReceive('isRunning')->andReturn(true, false);
+            $process->shouldReceive('checkTimeout')->andReturnNull();
+            $process->shouldReceive('getIncrementalOutput')->andReturn('', '');
+            $process->shouldReceive('getIncrementalErrorOutput')->andReturn('', '');
+            $process->shouldReceive('getExitCode')->andReturn(0);
+
+            return $process;
+        };
+
+        $executor = new DockerCommandExecutor($factory);
+        $executor->run(
+            '/srv/workspaces/proj-1',
+            'python3 /tmp/snippet.py',
+            null,
+            null,
+            false,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "print('hi')\n",
+        );
+
+        $this->assertNotNull($capturedCommand, 'the docker run invocation was never constructed');
+
+        $interactivePositions = array_merge(
+            array_keys($capturedCommand, '-i', true),
+            array_keys($capturedCommand, '--interactive', true),
+        );
+        $this->assertNotEmpty($interactivePositions, 'a non-null $stdin must add -i/--interactive to the constructed flags');
+
+        $imagePosition = array_search((string) config('llm-client.coding_agent.command_image', 'alpine:latest'), $capturedCommand, true);
+        $this->assertNotFalse($imagePosition, 'fixture sanity: the image argument must be present in the captured command');
+        foreach ($interactivePositions as $position) {
+            $this->assertLessThan($imagePosition, $position, '-i/--interactive must appear before the image argument');
+        }
+
+        $this->assertSame(["print('hi')\n"], $setInputCalls, 'setInput() must be called exactly once, with the exact $stdin string');
+        $this->assertSame(['setInput', 'start'], $callOrder, 'setInput() must be called before start()');
+    }
+
+    #[Test]
+    public function a_null_stdin_argument_leaves_the_flag_set_byte_identical_and_never_calls_set_input(): void
+    {
+        $capturedCommand = null;
+
+        $factory = function (array $command) use (&$capturedCommand) {
+            if ($command[1] === 'version') {
+                return $this->fakeProcess(0, '', '');
+            }
+
+            if ($command[1] !== 'run') {
+                return $this->fakeProcess(0, '', '');
+            }
+
+            $capturedCommand = $command;
+
+            $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
+            $process->shouldReceive('setInput')->never();
+            $process->shouldReceive('start')->once()->andReturnNull();
+            $process->shouldReceive('isRunning')->andReturn(true, false);
+            $process->shouldReceive('checkTimeout')->andReturnNull();
+            $process->shouldReceive('getIncrementalOutput')->andReturn('', '');
+            $process->shouldReceive('getIncrementalErrorOutput')->andReturn('', '');
+            $process->shouldReceive('getExitCode')->andReturn(0);
+
+            return $process;
+        };
+
+        // Every existing caller's shape: no 12th argument at all.
+        $executorOmitted = new DockerCommandExecutor($factory);
+        $executorOmitted->run('/srv/workspaces/proj-1', 'echo hello');
+
+        $this->assertNotNull($capturedCommand, 'the docker run invocation was never constructed');
+        $this->assertNotContains('-i', $capturedCommand, 'a null/omitted $stdin must never add -i');
+        $this->assertNotContains('--interactive', $capturedCommand, 'a null/omitted $stdin must never add --interactive');
+
+        // Comparison baseline: the identical call constructed with the
+        // existing capturedDockerRunCommand() helper (pre-feature shape).
+        // --name's own value is a fresh UUID on every invocation
+        // (unrelated to $stdin) -- normalized to a placeholder on both
+        // sides before comparing so this assertion targets the flag SET,
+        // not container-name randomness.
+        $baseline = $this->capturedDockerRunCommand('/srv/workspaces/proj-1', 'echo hello');
+        $normalize = function (array $command): array {
+            $namePositions = array_keys($command, '--name', true);
+            if ($namePositions !== []) {
+                $command[$namePositions[0] + 1] = '<name>';
+            }
+
+            return $command;
+        };
+        $this->assertSame($normalize($baseline), $normalize($capturedCommand), 'the flag array for a null $stdin must be byte-identical to the pre-feature shape (--name value excluded, always a fresh UUID)');
+    }
+
     /**
      * @return list<string>
      */

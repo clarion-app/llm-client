@@ -62,7 +62,14 @@ class LanguageRuntimeTest extends TestCase
     {
         $runtime = new LanguageRuntime();
 
-        $expected = "command -v python3 >/dev/null 2>&1 || { echo '".LanguageRuntime::LANGUAGE_UNAVAILABLE_SENTINEL."' >&2; exit 127; }; cat > /tmp/snippet.py && python3 /tmp/snippet.py";
+        // PYTHONUNBUFFERED=1 is exported unconditionally, before the
+        // stdin-to-file step, for every recognized language -- discovered
+        // live (tests/RealDocker/LanguageExecutionTest.php's timeout
+        // case): Python fully buffers stdout when it is not attached to a
+        // TTY, which this container never is, so output already printed
+        // before a timeout-kill would otherwise be lost with the process,
+        // violating FR-008.
+        $expected = "command -v python3 >/dev/null 2>&1 || { echo '".LanguageRuntime::LANGUAGE_UNAVAILABLE_SENTINEL."' >&2; exit 127; }; export PYTHONUNBUFFERED=1; cat > /tmp/snippet.py && python3 /tmp/snippet.py";
 
         $this->assertSame($expected, $runtime->buildExecutionCommand('python'));
     }
@@ -72,7 +79,10 @@ class LanguageRuntimeTest extends TestCase
     {
         $runtime = new LanguageRuntime();
 
-        $expected = "command -v node >/dev/null 2>&1 || { echo '".LanguageRuntime::LANGUAGE_UNAVAILABLE_SENTINEL."' >&2; exit 127; }; cat > /tmp/snippet.js && node /tmp/snippet.js";
+        // The same unconditional PYTHONUNBUFFERED export appears here too
+        // -- a no-op for node's own runtime, kept as one shared code path
+        // rather than branching per binary.
+        $expected = "command -v node >/dev/null 2>&1 || { echo '".LanguageRuntime::LANGUAGE_UNAVAILABLE_SENTINEL."' >&2; exit 127; }; export PYTHONUNBUFFERED=1; cat > /tmp/snippet.js && node /tmp/snippet.js";
 
         $this->assertSame($expected, $runtime->buildExecutionCommand('javascript'));
     }

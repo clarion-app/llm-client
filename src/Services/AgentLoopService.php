@@ -103,6 +103,17 @@ class AgentLoopService
      */
     public const CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.runCommand';
 
+    /**
+     * 125-language-runtime-execution, US1 (Grounding note 10). Widens
+     * exactly four of the seven CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+     * dispatch branches above (extraHeaders, commandTimeoutSeconds, the
+     * confirmation_type ternary, buildCommandOutputEnvelope()) to also
+     * match runCode -- the confirmation_relaxed bypass, the
+     * command_allowlist bypass, and recordDeclinedCommandExecution() are
+     * deliberately NOT widened (contracts/run-code.md §3).
+     */
+    public const CODING_WORKSPACE_RUN_CODE_OPERATION_ID = 'clarionApp.llmClient.codingWorkspace.runCode';
+
     private McpToolRegistry $toolRegistry;
     private McpToolExecutor $toolExecutor;
     private OperationCache $operationCache;
@@ -4064,7 +4075,8 @@ class AgentLoopService
             // the actual command" guarantee.
             return json_encode([
                 '__requires_confirmation' => true,
-                'confirmation_type' => $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+                'confirmation_type' => ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+                        || $operationId === self::CODING_WORKSPACE_RUN_CODE_OPERATION_ID)
                     ? 'coding_workspace_command'
                     : 'api_call',
                 'operationId' => $operationId,
@@ -4360,7 +4372,8 @@ class AgentLoopService
         $extraHeaders = [];
         if ($operationId === self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID
-            || $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID) {
+            || $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_RUN_CODE_OPERATION_ID) {
             $extraHeaders['X-Llm-Client-Conversation-Id'] = (string) $conversation->id;
         }
 
@@ -4373,7 +4386,8 @@ class AgentLoopService
         // id leaves this null, so McpToolExecutor::executeHttpCall()
         // applies no explicit timeout for them, unchanged.
         $commandTimeoutSeconds = null;
-        if ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID) {
+        if ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_RUN_CODE_OPERATION_ID) {
             $commandTimeoutSeconds = (int) config('llm-client.coding_agent.command_timeout_seconds', 60);
         }
 
@@ -4433,7 +4447,8 @@ class AgentLoopService
         // unaffected -- this transformation happens only here, at the
         // same tool-result layer PAGE_TEXT_OPERATION_ID's envelope above
         // already occupies.
-        if ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID) {
+        if ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_RUN_CODE_OPERATION_ID) {
             $decodedForCommand = json_decode($raw, true);
             if (is_array($decodedForCommand)) {
                 return json_encode(

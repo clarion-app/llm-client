@@ -148,6 +148,7 @@ class DockerCommandExecutor
         ?int $pidsLimit = null,
         ?int $outputCapBytes = null,
         ?int $diskLimitMb = null,
+        ?string $stdin = null,
     ): array {
         $reachability = $this->checkReachable();
         if (!$reachability['reachable']) {
@@ -197,6 +198,7 @@ class DockerCommandExecutor
             '--memory-swap', $memoryLimit,
             '--cpus', $resolvedCpuLimit,
             '--pids-limit', (string) $resolvedPidsLimit,
+            ...($stdin !== null ? ['-i', '--interactive'] : []),
             '--workdir', self::CONTAINER_WORKSPACE_PATH,
             $image,
             'sh', '-c', $command,
@@ -215,6 +217,9 @@ class DockerCommandExecutor
 
         $process = $this->makeProcess($dockerRunCommand);
         $process->setTimeout($timeoutSeconds > 0 ? $timeoutSeconds : null);
+        if ($stdin !== null) {
+            $process->setInput($stdin);
+        }
 
         $startedAt = microtime(true);
         $stdout = '';

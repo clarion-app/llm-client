@@ -20,8 +20,14 @@ use Illuminate\Database\Eloquent\Model;
  * CodingWorkspaceChange's own "structurally incapable of being
  * cascade-deleted or blocked by any other table's own lifecycle" shape.
  *
- * `status` is one of completed/stopped_timeout/sandbox_unavailable/refused
- * (data-model.md §3a) -- never a fifth, ambiguous state.
+ * `status` is one of completed/stopped_timeout/sandbox_unavailable/refused/
+ * language_unavailable (data-model.md §3a) -- never a fifth (or sixth),
+ * ambiguous state.
+ *
+ * 125-language-runtime-execution, US1 (data-model.md §1): one row per
+ * `runCommand()`/`runCode()` invocation -- for a `runCode()` row, `language`
+ * is set to the submitted, recognized language identifier and `command`
+ * holds the submitted code text, not a shell command.
  */
 class CodingCommandExecution extends Model
 {
@@ -46,6 +52,7 @@ class CodingCommandExecution extends Model
         'agent_id',
         'agent_name',
         'conversation_id',
+        'language',
     ];
 
     protected $casts = [

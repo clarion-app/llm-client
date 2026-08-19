@@ -293,6 +293,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('agent_id')->nullable();
                 $table->string('agent_name')->nullable();
                 $table->uuid('conversation_id')->nullable();
+                $table->string('language')->nullable();
                 $table->timestamp('created_at')->useCurrent();
 
                 $table->index('coding_project_id');
