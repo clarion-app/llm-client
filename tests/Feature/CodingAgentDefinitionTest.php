@@ -63,6 +63,7 @@ class CodingAgentDefinitionTest extends TestCase
             'clarionApp.llmClient.codingWorkspace.writeFile' => ['path' => '/api/coding-project/{project}/file', 'method' => 'post'],
             'clarionApp.llmClient.codingWorkspace.deleteFile' => ['path' => '/api/coding-project/{project}/file', 'method' => 'delete'],
             'clarionApp.llmClient.codingWorkspace.runTests' => ['path' => '/api/coding-project/{project}/run-tests', 'method' => 'post'],
+            'clarionApp.llmClient.codingWorkspace.runCommand' => ['path' => '/api/coding-project/{project}/run-command', 'method' => 'post'],
             'clarionApp.llmClient.codingProject.store' => ['path' => '/api/coding-project', 'method' => 'post'],
             'clarionApp.llmClient.codingProject.index' => ['path' => '/api/coding-project', 'method' => 'get'],
             'clarionApp.llmClient.codingProject.destroy' => ['path' => '/api/coding-project/{id}', 'method' => 'delete'],

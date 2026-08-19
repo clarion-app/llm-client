@@ -5,9 +5,11 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use Auth;
 use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\CodingCommandExecution;
 use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Models\CodingWorkspaceChange;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Services\DockerCommandExecutor;
 use ClarionApp\LlmClient\Services\PathContainment;
 use ClarionApp\LlmClient\Services\WorkspaceChangeRecorder;
 use ClarionApp\LlmClient\Services\WorkspaceFilePolicy;
@@ -46,6 +48,7 @@ class CodingWorkspaceController extends Controller
         private readonly WorkspaceFilePolicy $filePolicy = new WorkspaceFilePolicy(),
         private readonly WorkspaceRefusalRecorder $refusalRecorder = new WorkspaceRefusalRecorder(),
         private readonly WorkspaceChangeRecorder $changeRecorder = new WorkspaceChangeRecorder(),
+        private readonly DockerCommandExecutor $dockerCommandExecutor = new DockerCommandExecutor(),
     ) {
     }
 
@@ -534,6 +537,122 @@ class CodingWorkspaceController extends Controller
             'stdout' => $process->getOutput(),
             'stderr' => $process->getErrorOutput(),
         ], 200);
+    }
+
+    /**
+     * POST coding-project/{project}/run-command (123-sandboxed-shell-
+     * execution, US1, contracts/run-command.md §1). Runs an arbitrary
+     * shell command inside a genuinely isolated Docker container, scoped
+     * to this project's workspace root, via DockerCommandExecutor --
+     * never Process::fromShellCommandline() directly, unlike runTests(),
+     * whose own narrow pre-configured-test-command capability this
+     * feature does not change (tasks.md Grounding note 2).
+     *
+     * Ordering: ownership (404) -- root-reachability (dedicated 403, NOT
+     * containmentFailureResponse()) -- command validation (422) -- the
+     * actual run -- the durable CodingCommandExecution audit row -- the
+     * 200 response.
+     *
+     * `network_enabled` is read once from the workspace's own column and
+     * used both for the container's `--network` flag and the audit row,
+     * so a later policy change never rewrites what an already-run
+     * command could actually reach.
+     */
+    public function runCommand(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        // Root-reachability check reusing PathContainment::validate()'s
+        // "project directory is not reachable" guard (Grounding note 7) --
+        // the candidate path itself is irrelevant here (a command is not
+        // scoped to any sub-path the way a file operation is), so a
+        // deliberately inert '.' is passed; only the first, unconditional
+        // is_dir($rootPath) guard is ever consulted for this check.
+        $containment = PathContainment::validate($codingProject->root_path, '.', true);
+        if (!$containment['valid'] && ($containment['reason'] ?? null) === 'project directory is not reachable') {
+            // Grounding note 6: recorded via a direct
+            // WorkspaceRefusalRecorder::record() call for the durable
+            // audit write, but returned via this small, dedicated
+            // response builder -- NOT containmentFailureResponse(),
+            // whose 422/no-code shape stays completely unchanged for the
+            // six existing methods that use it.
+            $this->refusalRecorder->record($codingProject, 'run_command', $containment['reason']);
+
+            return response()->json([
+                'error' => 'outside the registered project',
+                'code' => 'workspace_boundary_refusal',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'command' => 'required|string',
+        ]);
+        $command = $validated['command'];
+
+        // US4 (research.md D7): the workspace's network_enabled column is
+        // read exactly once per invocation, immediately before this
+        // executor call -- the same value is used both to construct the
+        // --network flag and to record what that specific run's
+        // CodingCommandExecution row actually reflects (data-model.md §3's
+        // historical-snapshot guarantee: a LATER policy change on this
+        // workspace must never rewrite this row).
+        $networkEnabled = (bool) $codingProject->network_enabled;
+
+        $result = $this->dockerCommandExecutor->run(
+            $codingProject->root_path,
+            $command,
+            $codingProject->id,
+            (string) Auth::id(),
+            $networkEnabled,
+        );
+
+        $status = $result['status'];
+        $exitCode = $result['exit_code'] ?? null;
+        $timedOut = $result['timed_out'] ?? false;
+        $stdout = $result['stdout'] ?? null;
+        $stderr = $result['stderr'] ?? null;
+        $outputTruncated = $result['output_truncated'] ?? false;
+        $durationMs = $result['duration_ms'] ?? null;
+
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $command,
+            'status' => $status,
+            'exit_code' => $exitCode,
+            'timed_out' => $timedOut,
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+            'output_truncated' => $outputTruncated,
+            'network_enabled' => $networkEnabled,
+            'duration_ms' => $durationMs,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        $responseBody = [
+            'status' => $status,
+            'command' => $command,
+            'exit_code' => $exitCode,
+            'timed_out' => $timedOut,
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+            'output_truncated' => $outputTruncated,
+            'network_enabled' => $networkEnabled,
+            'duration_ms' => $durationMs,
+        ];
+
+        if ($status === 'sandbox_unavailable' && isset($result['reason'])) {
+            $responseBody['reason'] = $result['reason'];
+        }
+
+        return response()->json($responseBody, 200);
     }
 
     /**

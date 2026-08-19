@@ -408,6 +408,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('coding-project', [CodingProjectController::class, "index"]);
     Route::delete('coding-project/{id}', [CodingProjectController::class, "destroy"]);
     Route::patch('coding-project/{id}/confirmation-setting', [CodingProjectController::class, "updateConfirmationSetting"]);
+    Route::patch('coding-project/{id}/command-allowlist', [CodingProjectController::class, "updateCommandAllowlist"]);
+    Route::patch('coding-project/{id}/network-policy', [CodingProjectController::class, "updateNetworkPolicy"]);
     Route::get('coding-project/{project}/files', [CodingWorkspaceController::class, "listFiles"]);
     Route::get('coding-project/{project}/search-files', [CodingWorkspaceController::class, "searchFiles"]);
     Route::get('coding-project/{project}/search-content', [CodingWorkspaceController::class, "searchContent"]);
@@ -417,6 +419,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('coding-project/{project}/git-status', [CodingWorkspaceController::class, "gitStatus"]);
     Route::get('coding-project/{project}/git-diff', [CodingWorkspaceController::class, "gitDiff"]);
     Route::post('coding-project/{project}/run-tests', [CodingWorkspaceController::class, "runTests"]);
+    Route::post('coding-project/{project}/run-command', [CodingWorkspaceController::class, "runCommand"]);
     Route::get('coding-project/{project}/changes', [CodingWorkspaceController::class, "changes"]);
 
     // Scheduler Agent -- human-driven trigger registration, CRUD scoped

@@ -107,6 +107,11 @@ class EveryGeneratedAgentPassesValidationTest extends TestCase
                     'method' => 'post',
                     'summary' => "Run a registered project's own test command",
                 ],
+                'clarionApp.llmClient.codingWorkspace.runCommand' => [
+                    'path' => '/api/coding-project/{project}/run-command',
+                    'method' => 'post',
+                    'summary' => "Run a shell command in a registered project's sandboxed workspace",
+                ],
                 ...$conversationsIndex,
             ]);
 

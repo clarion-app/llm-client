@@ -17,6 +17,9 @@
         <testsuite name="RealDatabase">
             <directory>tests/RealDatabase</directory>
         </testsuite>
+        <testsuite name="RealDocker">
+            <directory>tests/RealDocker</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>

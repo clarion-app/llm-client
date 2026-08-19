@@ -192,6 +192,14 @@ abstract class TestCase extends BaseTestCase
                 // 2026_08_18_000003_add_confirmation_relaxed_to_coding_projects_table.php
                 // exactly.
                 $table->boolean('confirmation_relaxed')->default(false);
+                // 123-sandboxed-shell-execution, US2 — mirrors
+                // 2026_08_18_000006_add_command_allowlist_to_coding_projects_table.php
+                // exactly.
+                $table->json('command_allowlist')->nullable();
+                // 123-sandboxed-shell-execution, US4 — mirrors
+                // 2026_08_18_000007_add_network_enabled_to_coding_projects_table.php
+                // exactly.
+                $table->boolean('network_enabled')->default(false);
                 $table->timestamps();
                 $table->softDeletes();
 
@@ -239,6 +247,38 @@ abstract class TestCase extends BaseTestCase
                 $table->boolean('new_content_truncated')->default(false);
                 $table->boolean('new_binary')->default(false);
                 $table->unsignedBigInteger('new_size')->nullable();
+                $table->uuid('agent_id')->nullable();
+                $table->string('agent_name')->nullable();
+                $table->uuid('conversation_id')->nullable();
+                $table->timestamp('created_at')->useCurrent();
+
+                $table->index('coding_project_id');
+                $table->index('user_id');
+                $table->index('conversation_id');
+                $table->index(['coding_project_id', 'created_at']);
+            });
+        }
+
+        // coding_command_executions table (123-sandboxed-shell-execution,
+        // US1, data-model.md §3) -- mirrors
+        // 2026_08_18_000005_create_coding_command_executions_table.php
+        // exactly, including the created_at useCurrent() default, which is
+        // load-bearing here too: CodingCommandExecution sets
+        // $timestamps = false and never passes created_at explicitly.
+        if (!Schema::hasTable('coding_command_executions')) {
+            Schema::create('coding_command_executions', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('coding_project_id');
+                $table->uuid('user_id');
+                $table->text('command');
+                $table->string('status');
+                $table->integer('exit_code')->nullable();
+                $table->boolean('timed_out')->default(false);
+                $table->longText('stdout')->nullable();
+                $table->longText('stderr')->nullable();
+                $table->boolean('output_truncated')->default(false);
+                $table->boolean('network_enabled');
+                $table->integer('duration_ms')->nullable();
                 $table->uuid('agent_id')->nullable();
                 $table->string('agent_name')->nullable();
                 $table->uuid('conversation_id')->nullable();
