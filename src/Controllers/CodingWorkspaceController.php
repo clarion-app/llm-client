@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Models\CodingWorkspaceChange;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\CommandChangeDetector;
 use ClarionApp\LlmClient\Services\DockerCommandExecutor;
+use ClarionApp\LlmClient\Services\GitOperationInspector;
 use ClarionApp\LlmClient\Services\LanguageRuntime;
 use ClarionApp\LlmClient\Services\PathContainment;
 use ClarionApp\LlmClient\Services\ResourceLimitResolver;
@@ -55,6 +56,7 @@ class CodingWorkspaceController extends Controller
         private readonly ResourceLimitResolver $resourceLimitResolver = new ResourceLimitResolver(),
         private readonly CommandChangeDetector $changeDetector = new CommandChangeDetector(),
         private readonly LanguageRuntime $languageRuntime = new LanguageRuntime(),
+        private readonly GitOperationInspector $gitOperationInspector = new GitOperationInspector(),
     ) {
     }
 
@@ -981,6 +983,93 @@ class CodingWorkspaceController extends Controller
             'is_git_repo' => true,
             'diff' => $process->getOutput(),
         ], 200);
+    }
+
+    /**
+     * GET coding-project/{project}/git-log?limit= (126-git-operations-
+     * confirmation, US1, contracts/git-inspection.md §3, Grounding
+     * note 6). `isGitRepository()` is checked directly, as its own first
+     * step -- never via runGitCommand()'s null-collapse, which cannot
+     * distinguish "not a repository" from "a real, empty repository's
+     * `git log` genuinely failing with zero commits" (the latter degrades
+     * to `entries: []`, never to `is_git_repo: false`).
+     */
+    public function gitLog(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json(['is_git_repo' => false], 200);
+        }
+
+        $limit = $this->gitLogLimit($request);
+
+        $process = $this->runGitCommand($codingProject->root_path, [
+            'git', 'log', '-n', (string) $limit, '--date=iso-strict', '--format=%H|%h|%an|%ad|%s',
+        ]);
+
+        return response()->json([
+            'is_git_repo' => true,
+            'entries' => $this->parseGitLogOutput($process?->getOutput() ?? ''),
+        ], 200);
+    }
+
+    /**
+     * Clamps the `limit` query param against the configured default/max
+     * (contracts §3): a non-numeric or non-positive value floors at the
+     * default, anything above the max clamps to the max.
+     */
+    private function gitLogLimit(Request $request): int
+    {
+        $default = (int) config('llm-client.coding_agent.git.log_default_limit', 50);
+        $max = (int) config('llm-client.coding_agent.git.log_max_limit', 200);
+
+        $raw = $request->query('limit');
+
+        if (!is_numeric($raw)) {
+            return $default;
+        }
+
+        $limit = (int) $raw;
+
+        if ($limit <= 0) {
+            return $default;
+        }
+
+        return min($limit, $max);
+    }
+
+    /**
+     * Parses `git log --format=%H|%h|%an|%ad|%s` output line-by-line. A
+     * bounded `explode(..., 5)` guards against a pathological commit
+     * subject that itself contains a `|`. Empty/missing output (including
+     * a `git log` that failed outright, e.g. a real empty repository with
+     * zero commits) yields an empty list, never an error.
+     */
+    private function parseGitLogOutput(string $output): array
+    {
+        $entries = [];
+
+        foreach (preg_split('/\R/', $output) as $line) {
+            if ($line === '') {
+                continue;
+            }
+
+            [$hash, $shortHash, $author, $date, $subject] = array_pad(explode('|', $line, 5), 5, '');
+
+            $entries[] = [
+                'hash' => $hash,
+                'short_hash' => $shortHash,
+                'author' => $author,
+                'date' => $date,
+                'subject' => $subject,
+            ];
+        }
+
+        return $entries;
     }
 
     /**

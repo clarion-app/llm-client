@@ -419,6 +419,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::delete('coding-project/{project}/file', [CodingWorkspaceController::class, "deleteFile"]);
     Route::get('coding-project/{project}/git-status', [CodingWorkspaceController::class, "gitStatus"]);
     Route::get('coding-project/{project}/git-diff', [CodingWorkspaceController::class, "gitDiff"]);
+    Route::get('coding-project/{project}/git-log', [CodingWorkspaceController::class, "gitLog"]);
     Route::post('coding-project/{project}/run-tests', [CodingWorkspaceController::class, "runTests"]);
     Route::post('coding-project/{project}/run-command', [CodingWorkspaceController::class, "runCommand"]);
     Route::post('coding-project/{project}/run-code', [CodingWorkspaceController::class, "runCode"]);
