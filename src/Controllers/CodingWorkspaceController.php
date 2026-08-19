@@ -4,8 +4,12 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use Auth;
+use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\CodingProject;
+use ClarionApp\LlmClient\Models\CodingWorkspaceChange;
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\PathContainment;
+use ClarionApp\LlmClient\Services\WorkspaceChangeRecorder;
 use ClarionApp\LlmClient\Services\WorkspaceFilePolicy;
 use ClarionApp\LlmClient\Services\WorkspaceRefusalRecorder;
 use ClarionApp\LlmClient\Services\WorkspaceSearchService;
@@ -41,6 +45,7 @@ class CodingWorkspaceController extends Controller
         private readonly WorkspaceSearchService $workspaceSearchService = new WorkspaceSearchService(),
         private readonly WorkspaceFilePolicy $filePolicy = new WorkspaceFilePolicy(),
         private readonly WorkspaceRefusalRecorder $refusalRecorder = new WorkspaceRefusalRecorder(),
+        private readonly WorkspaceChangeRecorder $changeRecorder = new WorkspaceChangeRecorder(),
     ) {
     }
 
@@ -290,22 +295,68 @@ class CodingWorkspaceController extends Controller
 
         $this->beforeResolvedPathOpen($resolvedPath);
 
+        // 122-workspace-browser-ui, US3 (research.md D6): checked
+        // immediately before the create-or-open below, whose 'c' mode
+        // itself creates the file as a side effect if absent -- so this
+        // is the last point at which "did this write create a new file,
+        // or overwrite one that was already there" can still be
+        // answered. Purely a change-record labelling signal (created vs
+        // modified), never a security/identity decision -- the identity
+        // check below is unaffected and unchanged.
+        $existedBefore = is_file($resolvedPath);
+
         // Create-or-open, no truncate yet -- an overwrite's identity is
         // verified against the handle before a single byte is written.
-        $handle = @fopen($resolvedPath, 'cb');
+        // 122-workspace-browser-ui, US3 (research.md D6): 'c+b', not the
+        // prior write-only 'cb' -- the same handle must now also be
+        // readable to capture old content before it's overwritten.
+        $handle = @fopen($resolvedPath, 'c+b');
         if ($handle === false) {
             return response()->json(['error' => 'could not write file'], 422);
         }
 
-        if ($resolvedIdentity !== null) {
-            $actual = @fstat($handle);
-            if ($actual === false || !$this->identityMatches($actual, $resolvedIdentity)) {
-                fclose($handle);
+        // 122-workspace-browser-ui, US3 (research.md D6): fstat()'d
+        // unconditionally now, whether or not $resolvedIdentity !== null,
+        // so its pre-write size (and, below, its pre-write content) is
+        // always known for the change record -- the prior code only
+        // fstat()'d when an identity fingerprint existed to compare
+        // against. The identity check's own timing/ordering relative to
+        // fopen() is unchanged: it still runs immediately after fstat(),
+        // before a single byte is written.
+        $actual = @fstat($handle);
+        if ($actual === false) {
+            fclose($handle);
 
-                return $this->containmentFailureResponse($codingProject, 'write_file', 'outside the registered project');
-            }
+            return response()->json(['error' => 'could not write file'], 422);
         }
 
+        if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
+            fclose($handle);
+
+            return $this->containmentFailureResponse($codingProject, 'write_file', 'outside the registered project');
+        }
+
+        $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+
+        // Old content, read from the same already-open, already-identity-
+        // verified handle -- before a single byte is overwritten --
+        // bounded to $threshold bytes exactly like readFile()'s own
+        // oversized-file sampling, so a huge pre-existing file is never
+        // fully loaded into memory just to capture "what it used to say."
+        $oldContent = null;
+        $oldSize = null;
+        if ($existedBefore) {
+            $sample = @stream_get_contents($handle, $threshold);
+            $oldContent = $sample === false ? null : $sample;
+            $oldSize = $actual['size'];
+        }
+
+        // The read above (when $existedBefore) advances the handle's
+        // position past byte 0 -- ftruncate() does not itself move it
+        // back, so without this rewind() the subsequent fwrite() would
+        // resume at the read's end position, leaving a gap of NUL bytes
+        // at the start of the file instead of overwriting it cleanly.
+        rewind($handle);
         ftruncate($handle, 0);
         $written = @fwrite($handle, $validated['content']);
         fclose($handle);
@@ -313,6 +364,21 @@ class CodingWorkspaceController extends Controller
         if ($written === false) {
             return response()->json(['error' => 'could not write file'], 422);
         }
+
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $this->changeRecorder->record(
+            $codingProject,
+            $validated['path'],
+            $existedBefore ? 'modified' : 'created',
+            $oldContent,
+            $oldSize,
+            substr($validated['content'], 0, $threshold),
+            $written,
+            $attribution['agent_id'],
+            $attribution['agent_name'],
+            $attribution['conversation_id'],
+        );
 
         return response()->json([
             'path' => $validated['path'],
@@ -347,34 +413,69 @@ class CodingWorkspaceController extends Controller
 
         $this->beforeResolvedPathOpen($resolvedPath);
 
-        // Opened only to pin/verify identity via fstat() -- content is
-        // never read. unlink() itself still has to act on the path, not
-        // this handle -- PHP has no fd-based delete primitive -- so this
-        // operation's guarantee is honestly narrower than readFile's/
-        // writeFile's: it is bounded to "the wrong in-workspace entry
-        // could be removed," never "outside content exposed," since
-        // unlink() never dereferences a symlink to remove its target, only
-        // the directory entry it was given.
+        // Opened to pin/verify identity via fstat() and (122-workspace-
+        // browser-ui, US3, research.md D6) to capture the file's
+        // pre-deletion content for the change record -- a deliberate,
+        // necessary widening of this method's I/O profile for this
+        // feature; the prior "content is never read" posture was a
+        // correct, deliberate spec-121 scope choice made before this
+        // feature existed to need deleted-file content at all. unlink()
+        // itself still has to act on the path, not this handle -- PHP has
+        // no fd-based delete primitive -- so this operation's identity
+        // guarantee is honestly narrower than readFile's/writeFile's: it
+        // is bounded to "the wrong in-workspace entry could be removed,"
+        // never "outside content exposed," since unlink() never
+        // dereferences a symlink to remove its target, only the directory
+        // entry it was given.
         $handle = @fopen($resolvedPath, 'rb');
         if ($handle === false) {
             return response()->json(['error' => 'not found'], 422);
         }
 
         $actual = @fstat($handle);
-        fclose($handle);
 
         if ($actual === false) {
+            fclose($handle);
+
             return response()->json(['error' => 'not found'], 422);
         }
 
         if ($resolvedIdentity !== null && !$this->identityMatches($actual, $resolvedIdentity)) {
+            fclose($handle);
+
             return $this->containmentFailureResponse($codingProject, 'delete_file', 'outside the registered project');
         }
+
+        // Content is read only once identity is already confirmed --
+        // before the handle is closed and before unlink() runs (research.md
+        // D6) -- bounded to the same threshold every other content-bearing
+        // path in this package uses.
+        $threshold = (int) config('llm-client.coding_agent.file_size_threshold_bytes');
+        $sample = @stream_get_contents($handle, $threshold);
+        $oldContent = $sample === false ? null : $sample;
+        $oldSize = $actual['size'];
+
+        fclose($handle);
 
         $deleted = @unlink($resolvedPath);
         if (!$deleted) {
             return response()->json(['error' => 'could not delete file'], 422);
         }
+
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $this->changeRecorder->record(
+            $codingProject,
+            $path,
+            'deleted',
+            $oldContent,
+            $oldSize,
+            null,
+            null,
+            $attribution['agent_id'],
+            $attribution['agent_name'],
+            $attribution['conversation_id'],
+        );
 
         return response()->json([
             'path' => $path,
@@ -478,6 +579,140 @@ class CodingWorkspaceController extends Controller
             'is_git_repo' => true,
             'diff' => $process->getOutput(),
         ], 200);
+    }
+
+    /**
+     * GET coding-project/{project}/changes (122-workspace-browser-ui,
+     * US3, contracts/workspace-change-history-api.md, research.md D7,
+     * FR-008/FR-009/FR-010/FR-011). Ownership is looked up via
+     * CodingProject::withTrashed() -- DELIBERATELY, not findOwnedProject()
+     * -- the one exception on this controller, so a removed workspace's
+     * change history stays reviewable (FR-011). This must never be
+     * "fixed" to match this controller's other methods; doing so would
+     * silently reintroduce the exact gap D7 exists to close.
+     */
+    public function changes(Request $request, string $project): JsonResponse
+    {
+        $codingProject = CodingProject::withTrashed()
+            ->where('id', $project)
+            ->where('user_id', Auth::id())
+            ->first();
+
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        [$page, $perPage] = $this->paginationParams($request, 50, 100);
+
+        $query = CodingWorkspaceChange::where('coding_project_id', $codingProject->id)
+            ->orderBy('created_at', 'desc');
+
+        $total = $query->count();
+
+        $changes = $query->forPage($page, $perPage)
+            ->get()
+            ->map(fn (CodingWorkspaceChange $change) => [
+                'id' => $change->id,
+                'path' => $change->path,
+                'operation' => $change->operation,
+                'old_content' => $change->old_content,
+                'old_content_truncated' => (bool) $change->old_content_truncated,
+                'old_binary' => (bool) $change->old_binary,
+                'old_size' => $change->old_size,
+                'new_content' => $change->new_content,
+                'new_content_truncated' => (bool) $change->new_content_truncated,
+                'new_binary' => (bool) $change->new_binary,
+                'new_size' => $change->new_size,
+                'agent_id' => $change->agent_id,
+                'agent_name' => $change->agent_name,
+                'conversation_id' => $change->conversation_id,
+                'created_at' => $change->created_at,
+            ])
+            ->values()
+            ->all();
+
+        return response()->json($this->envelope($changes, $total, $page, $perPage), 200);
+    }
+
+    /**
+     * Resolve `page`/`per_page` query params against a per-endpoint
+     * default and cap (122-workspace-browser-ui T006 decision -- mirrors
+     * only CodingProjectController::paginationParams()'s/RunController's
+     * floor/cap/default *logic*, not any shared envelope shape; this
+     * controller has no cross-controller pagination helper to extract
+     * into).
+     *
+     * @return array{0: int, 1: int} [page, perPage]
+     */
+    private function paginationParams(Request $request, int $default, int $cap): array
+    {
+        $page = max(1, (int) $request->input('page', 1));
+
+        $perPage = (int) $request->input('per_page', $default);
+        if ($perPage < 1) {
+            $perPage = $default;
+        }
+        $perPage = min($perPage, $cap);
+
+        return [$page, $perPage];
+    }
+
+    /**
+     * The flat `{data, total, page, per_page}` envelope T006 settled on
+     * for this feature's list endpoints -- deliberately NOT
+     * RunController::envelope()'s nested `{data, meta: {...}}` shape.
+     */
+    private function envelope(array $data, int $total, int $page, int $perPage): array
+    {
+        return [
+            'data' => $data,
+            'total' => $total,
+            'page' => $page,
+            'per_page' => $perPage,
+        ];
+    }
+
+    /**
+     * research.md D5: the X-Llm-Client-Conversation-Id header (attached
+     * only by AgentLoopService::executeApiCall(), only for the two
+     * coding-workspace mutation operation ids) is trusted for change-
+     * record attribution only after being independently re-verified
+     * against Auth::id()-owned data — this controller's own established
+     * "belt-and-suspenders, neither check trusts the other" posture. Any
+     * verification failure (header absent, conversation not found,
+     * conversation not owned by the caller, conversation bound to a
+     * different project) degrades to an entirely unattributed (null)
+     * result — it never blocks or alters the mutation itself, which has
+     * already succeeded by the time this runs.
+     *
+     * @return array{agent_id: ?string, agent_name: ?string, conversation_id: ?string}
+     */
+    private function resolveAttribution(Request $request, CodingProject $codingProject): array
+    {
+        $unattributed = ['agent_id' => null, 'agent_name' => null, 'conversation_id' => null];
+
+        $conversationId = $request->header('X-Llm-Client-Conversation-Id');
+        if (!is_string($conversationId) || $conversationId === '') {
+            return $unattributed;
+        }
+
+        $conversation = Conversation::find($conversationId);
+        if ($conversation === null
+            || (string) $conversation->user_id !== (string) Auth::id()
+            || (string) $conversation->coding_project_id !== (string) $codingProject->id) {
+            return $unattributed;
+        }
+
+        $agentName = null;
+        if ($conversation->agent_id !== null) {
+            $agentName = Agent::where('id', $conversation->agent_id)->value('name');
+        }
+
+        return [
+            'agent_id' => $conversation->agent_id,
+            'agent_name' => $agentName,
+            'conversation_id' => $conversation->id,
+        ];
     }
 
     /**

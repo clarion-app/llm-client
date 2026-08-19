@@ -184,4 +184,49 @@ class WorkspaceBrowserCrossUserIsolationTest extends TestCase
         $this->assertTrue($theirIds->contains($theirs->id));
         $this->assertFalse($theirIds->contains($mine->id), 'my workspace must never appear in another user\'s list');
     }
+
+    // -----------------------------------------------------------------
+    // 122-workspace-browser-ui, US3, T043 (mutation checklist row 6's
+    // second half): changes() against a foreign-owned workspace -- both
+    // still-registered and removed -- must be indistinguishable from a
+    // genuinely nonexistent id.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function get_changes_against_a_foreign_owned_workspace_returns_the_same_404_shape_as_a_nonexistent_id(): void
+    {
+        $foreign = CodingProject::create([
+            'user_id' => $this->otherUser->id,
+            'name' => 'Not Yours',
+            'root_path' => $this->projectDir,
+            'test_command' => null,
+        ]);
+
+        $foreignResponse = $this->actingAs($this->user)->getJson($this->apiUrl("coding-project/{$foreign->id}/changes"));
+        $absentResponse = $this->actingAs($this->user)->getJson($this->apiUrl('coding-project/'.$this->nonexistentId().'/changes'));
+
+        $this->assertUniformNotFound($foreignResponse);
+        $this->assertUniformNotFound($absentResponse);
+        $this->assertSame($absentResponse->json(), $foreignResponse->json());
+    }
+
+    #[Test]
+    public function get_changes_against_a_foreign_owned_and_since_removed_workspace_still_returns_the_same_404_shape(): void
+    {
+        $foreign = CodingProject::create([
+            'user_id' => $this->otherUser->id,
+            'name' => 'Not Yours, And Removed',
+            'root_path' => $this->projectDir,
+            'test_command' => null,
+        ]);
+        $foreign->delete();
+
+        // withTrashed() (research.md D7) is scoped by user_id too -- a
+        // removed workspace belonging to a different user must still
+        // never resolve for this caller, exactly like the still-registered
+        // case above.
+        $foreignResponse = $this->actingAs($this->user)->getJson($this->apiUrl("coding-project/{$foreign->id}/changes"));
+
+        $this->assertUniformNotFound($foreignResponse);
+    }
 }
