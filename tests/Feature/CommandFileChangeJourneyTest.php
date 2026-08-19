@@ -371,4 +371,61 @@ class CommandFileChangeJourneyTest extends TestCase
         $this->assertSame('modified', $second['operation']);
         $this->assertSame('first pass content, now with substantially more appended data', $second['new_content']);
     }
+
+    // -----------------------------------------------------------------
+    // Truncation/binary classification parity with writeFile()'s own
+    // call site (contracts/command-file-changes.md §1): the same
+    // file_size_threshold_bytes cap and the same binary classification
+    // must apply to a command-driven change, not only to one made
+    // through the workspace's own dedicated file tools.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_file_written_past_the_configured_threshold_is_flagged_truncated_with_content_capped_to_the_threshold(): void
+    {
+        config(['llm-client.coding_agent.file_size_threshold_bytes' => 10]);
+
+        $fullContent = str_repeat('a', 500);
+        $this->queueExecutorResult($this->completedResult(), function () use ($fullContent) {
+            file_put_contents($this->projectDir.'/large.txt', $fullContent);
+        });
+
+        $this->runCommand()->assertStatus(200);
+
+        $rows = $this->changeHistory();
+        $this->assertCount(1, $rows);
+
+        $row = $rows[0];
+        $this->assertSame('large.txt', $row['path']);
+        $this->assertSame(500, $row['new_size'], 'the true, uncapped size must still be recorded');
+        $this->assertTrue($row['new_content_truncated'], 'content past the threshold must be flagged truncated, exactly like writeFile()\'s own call site');
+        $this->assertSame(str_repeat('a', 10), $row['new_content'], 'stored content must be capped to the threshold, never the full 500 bytes');
+        $this->assertFalse($row['new_binary']);
+    }
+
+    #[Test]
+    public function a_binary_file_written_by_a_command_is_classified_binary_with_content_suppressed(): void
+    {
+        config(['llm-client.coding_agent.file_size_threshold_bytes' => 262144]);
+
+        // A null byte marks this binary under WorkspaceFilePolicy::isBinary()
+        // -- the same policy writeFile()'s own call site is classified
+        // against.
+        $binaryContent = "\x00binary-content-from-a-command";
+        $this->queueExecutorResult($this->completedResult(), function () use ($binaryContent) {
+            file_put_contents($this->projectDir.'/binary.dat', $binaryContent);
+        });
+
+        $this->runCommand()->assertStatus(200);
+
+        $rows = $this->changeHistory();
+        $this->assertCount(1, $rows);
+
+        $row = $rows[0];
+        $this->assertSame('binary.dat', $row['path']);
+        $this->assertTrue($row['new_binary'], 'binary content written by a command must be classified binary, exactly like writeFile()\'s own call site');
+        $this->assertNull($row['new_content'], 'binary content must never be stored');
+        $this->assertFalse($row['new_content_truncated'], 'binary and truncated must never both be true for the same side');
+        $this->assertSame(strlen($binaryContent), $row['new_size'], 'the actual size is still recorded even when content is suppressed');
+    }
 }
