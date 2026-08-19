@@ -888,6 +888,57 @@ class CodingWorkspaceController extends Controller
     }
 
     /**
+     * GET coding-project/{project}/languages
+     * (125-language-runtime-execution, US2, contracts/language-availability.md
+     * §1, research.md D4). A real probe, not a fixed or assumed list
+     * (FR-005): reuses DockerCommandExecutor::run() exactly as
+     * runCommand()/runCode() do, with
+     * LanguageRuntime::buildAvailabilityProbeCommand()'s output as the
+     * command and no $stdin -- a `command -v` probe is not subject to a
+     * workspace's demanding-work resource overrides, so no
+     * ResourceLimitResolver call is made here. A sandbox_unavailable
+     * result is propagated unchanged, the same shape runCommand()/
+     * runCode() already use. This method executes no command against the
+     * workspace's own files and produces no side effect, so -- unlike
+     * runCommand()/runCode() -- it writes no CodingCommandExecution row
+     * under any outcome (data-model.md §3).
+     */
+    public function languages(string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $result = $this->dockerCommandExecutor->run(
+            $codingProject->root_path,
+            $this->languageRuntime->buildAvailabilityProbeCommand(),
+            $codingProject->id,
+            (string) Auth::id(),
+            false,
+        );
+
+        if (($result['status'] ?? null) === 'sandbox_unavailable') {
+            return response()->json([
+                'status' => 'sandbox_unavailable',
+                'reason' => $result['reason'] ?? null,
+            ], 200);
+        }
+
+        $availability = $this->languageRuntime->parseAvailabilityOutput((string) ($result['stdout'] ?? ''));
+
+        $languages = [];
+        foreach (LanguageRuntime::RECOGNIZED_LANGUAGES as $name => $spec) {
+            $languages[] = [
+                'name' => $name,
+                'available' => $availability[$name] ?? false,
+            ];
+        }
+
+        return response()->json(['languages' => $languages], 200);
+    }
+
+    /**
      * GET coding-project/{project}/git-status (contracts §1, D6).
      * `{is_git_repo: false}` when `.git`/the `git` binary is unavailable —
      * never an error.

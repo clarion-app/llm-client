@@ -80,7 +80,14 @@ class LanguageRuntime
     /**
      * Parses buildAvailabilityProbeCommand()'s stdout back into
      * {python: bool, javascript: bool}, tolerant of trailing whitespace
-     * and blank lines.
+     * and blank lines -- and, discovered only against a real container
+     * (tests/RealDocker/LanguageAvailabilityProbeTest.php; no hand-written
+     * stdout fixture reproduces this), tolerant of a leading, colon-free
+     * line too: on success `command -v <binary>` itself prints the
+     * resolved binary path to stdout before the `&&`-chained echo runs,
+     * so a real probe's stdout is two lines per available language, not
+     * one. Any line without a `name:status` shape is simply not a probe
+     * result and is skipped rather than parsed.
      *
      * @return array<string, bool>
      */
@@ -95,7 +102,12 @@ class LanguageRuntime
                 continue;
             }
 
-            [$name, $status] = explode(':', $line, 2);
+            $parts = explode(':', $line, 2);
+            if (count($parts) !== 2) {
+                continue;
+            }
+
+            [$name, $status] = $parts;
             $result[$name] = trim($status) === 'available';
         }
 

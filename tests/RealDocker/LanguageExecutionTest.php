@@ -110,7 +110,22 @@ class LanguageExecutionTest extends TestCase
      */
     private function dockerPsNames(string $namePrefix): array
     {
-        $process = new Process(['docker', 'ps', '-a', '--filter', 'name='.$namePrefix, '--format', '{{.Names}}']);
+        // Deliberately `docker ps` (running only), not `-a` (which also
+        // lists stopped/created containers) -- matching every sibling
+        // RealDocker file's identical helper (OomKillDetectionTest,
+        // PidsLimitDetectionTest, ResourceLimitEnforcementTest,
+        // DiskLimitEnforcementTest) exactly. The blanket 'coding-cmd-'
+        // prefix this method is called with is shared by scratch
+        // containers those sibling files create for unrelated purposes
+        // (e.g. 'coding-cmd-concurrency-test-<random>'); an `-a` scan run
+        // anywhere near them in the same suite can catch one mid-teardown
+        // -- stopped but not yet removed -- and misreport it as "still
+        // running", a cross-test false positive rather than a real
+        // production leak. Production cleanup (DockerCommandExecutor::
+        // killContainer/removeContainer) unconditionally issues `docker
+        // kill` then `docker rm -f` on every exit path, so a running-only
+        // check is sufficient to prove "no container left running".
+        $process = new Process(['docker', 'ps', '--filter', 'name='.$namePrefix, '--format', '{{.Names}}']);
         $process->run();
 
         $output = trim($process->getOutput());
