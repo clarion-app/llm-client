@@ -409,6 +409,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::delete('coding-project/{id}', [CodingProjectController::class, "destroy"]);
     Route::patch('coding-project/{id}/confirmation-setting', [CodingProjectController::class, "updateConfirmationSetting"]);
     Route::patch('coding-project/{id}/command-allowlist', [CodingProjectController::class, "updateCommandAllowlist"]);
+    Route::patch('coding-project/{id}/network-policy', [CodingProjectController::class, "updateNetworkPolicy"]);
     Route::get('coding-project/{project}/files', [CodingWorkspaceController::class, "listFiles"]);
     Route::get('coding-project/{project}/search-files', [CodingWorkspaceController::class, "searchFiles"]);
     Route::get('coding-project/{project}/search-content', [CodingWorkspaceController::class, "searchContent"]);

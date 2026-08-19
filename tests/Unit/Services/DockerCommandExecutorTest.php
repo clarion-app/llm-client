@@ -382,10 +382,39 @@ class DockerCommandExecutorTest extends TestCase
         $this->assertSame(str_repeat('X', 20), $result['stdout'], 'the bytes captured before the cap must be preserved, never discarded');
     }
 
+    // -----------------------------------------------------------------
+    // T042 (US4, research.md D7): the --network flag, driven from a
+    // networkEnabled argument the controller (Phase 6/T047) sources from
+    // CodingProject.network_enabled -- this class itself has no
+    // knowledge of CodingProject at all, only the boolean it is handed.
+    // Written before the flag is constructed -- expected to FAIL red
+    // (no --network flag appears in the invocation at all).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function the_constructed_invocation_carries_network_none_by_default(): void
+    {
+        $runCommand = $this->capturedDockerRunCommand('/srv/workspaces/proj-1', 'echo hello');
+
+        $networkPositions = array_keys($runCommand, '--network', true);
+        $this->assertCount(1, $networkPositions, 'exactly one --network flag must be present');
+        $this->assertSame('none', $runCommand[$networkPositions[0] + 1], 'network_enabled defaults to false, which must construct --network none');
+    }
+
+    #[Test]
+    public function the_constructed_invocation_carries_network_bridge_when_network_enabled_is_true(): void
+    {
+        $runCommand = $this->capturedDockerRunCommand('/srv/workspaces/proj-1', 'echo hello', true);
+
+        $networkPositions = array_keys($runCommand, '--network', true);
+        $this->assertCount(1, $networkPositions, 'exactly one --network flag must be present');
+        $this->assertSame('bridge', $runCommand[$networkPositions[0] + 1], 'network_enabled = true must construct --network bridge');
+    }
+
     /**
      * @return list<string>
      */
-    private function capturedDockerRunCommand(string $rootPath, string $command): array
+    private function capturedDockerRunCommand(string $rootPath, string $command, bool $networkEnabled = false): array
     {
         $captured = null;
 
@@ -400,7 +429,7 @@ class DockerCommandExecutorTest extends TestCase
         };
 
         $executor = new DockerCommandExecutor($factory);
-        $executor->run($rootPath, $command);
+        $executor->run($rootPath, $command, null, null, $networkEnabled);
 
         $this->assertNotNull($captured, 'the docker run invocation was never constructed');
 

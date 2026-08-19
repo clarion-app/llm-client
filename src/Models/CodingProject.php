@@ -25,7 +25,7 @@ class CodingProject extends Model
 
     protected $fillable = [
         'user_id', 'name', 'root_path', 'test_command', 'confirmation_relaxed',
-        'command_allowlist',
+        'command_allowlist', 'network_enabled',
     ];
     protected $table = 'coding_projects';
 
@@ -33,7 +33,13 @@ class CodingProject extends Model
     // array of pattern strings. A null column value casts to null, not
     // []; CommandAllowlistMatcher treats null and [] identically wherever
     // it consults this column, so no accessor override is needed here.
+    //
+    // 123-sandboxed-shell-execution, US4 (data-model.md §1, research.md
+    // D7): network_enabled, default false -- read exactly once per
+    // runCommand() invocation by DockerCommandExecutor, never consulted
+    // by any confirmation/allowlist code path.
     protected $casts = [
         'command_allowlist' => 'array',
+        'network_enabled' => 'boolean',
     ];
 }

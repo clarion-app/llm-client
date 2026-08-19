@@ -202,6 +202,37 @@ class CodingProjectController extends Controller
         return response()->json($project, 200);
     }
 
+    /**
+     * PATCH coding-project/{id}/network-policy (123-sandboxed-shell-
+     * execution, US4, contracts/network-policy.md §1, research.md D7).
+     * `true` allows commands run in this workspace to reach the network
+     * (FR-012); `false` (the default) denies it (FR-011). Ownership-
+     * checked identically to updateConfirmationSetting()/
+     * updateCommandAllowlist(). Never listed in coding.yaml's
+     * tools.allow, matching this controller's other human-only actions
+     * -- a human, not an agent, decides whether a workspace may reach
+     * the network.
+     */
+    public function updateNetworkPolicy(Request $request, string $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'network_enabled' => 'required|boolean',
+        ]);
+
+        $project = CodingProject::where('id', $id)
+            ->where('user_id', Auth::id())
+            ->first();
+
+        if ($project === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $project->network_enabled = $validated['network_enabled'];
+        $project->save();
+
+        return response()->json($project, 200);
+    }
+
     private function notFoundResponse(string $error, string $code): JsonResponse
     {
         return response()->json([

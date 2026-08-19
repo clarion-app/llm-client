@@ -548,14 +548,15 @@ class CodingWorkspaceController extends Controller
      * whose own narrow pre-configured-test-command capability this
      * feature does not change (tasks.md Grounding note 2).
      *
-     * Ordering (tasks.md T016): ownership (404) -- root-reachability
-     * (dedicated 403, Grounding note 6's resolved decision, NOT
+     * Ordering: ownership (404) -- root-reachability (dedicated 403, NOT
      * containmentFailureResponse()) -- command validation (422) -- the
      * actual run -- the durable CodingCommandExecution audit row -- the
      * 200 response.
      *
-     * `network_enabled` is hardcoded false for now; Phase 6/T047 replaces
-     * this with the real per-workspace column once it exists.
+     * `network_enabled` is read once from the workspace's own column and
+     * used both for the container's `--network` flag and the audit row,
+     * so a later policy change never rewrites what an already-run
+     * command could actually reach.
      */
     public function runCommand(Request $request, string $project): JsonResponse
     {
@@ -591,11 +592,21 @@ class CodingWorkspaceController extends Controller
         ]);
         $command = $validated['command'];
 
+        // US4 (research.md D7): the workspace's network_enabled column is
+        // read exactly once per invocation, immediately before this
+        // executor call -- the same value is used both to construct the
+        // --network flag and to record what that specific run's
+        // CodingCommandExecution row actually reflects (data-model.md §3's
+        // historical-snapshot guarantee: a LATER policy change on this
+        // workspace must never rewrite this row).
+        $networkEnabled = (bool) $codingProject->network_enabled;
+
         $result = $this->dockerCommandExecutor->run(
             $codingProject->root_path,
             $command,
             $codingProject->id,
             (string) Auth::id(),
+            $networkEnabled,
         );
 
         $status = $result['status'];
@@ -605,7 +616,6 @@ class CodingWorkspaceController extends Controller
         $stderr = $result['stderr'] ?? null;
         $outputTruncated = $result['output_truncated'] ?? false;
         $durationMs = $result['duration_ms'] ?? null;
-        $networkEnabled = false;
 
         $attribution = $this->resolveAttribution($request, $codingProject);
 

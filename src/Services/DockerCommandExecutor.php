@@ -21,9 +21,9 @@ use Symfony\Component\Process\Process;
  * --read-only + --tmpfs /tmp, --security-opt no-new-privileges,
  * --rm + a fresh --name per call, plus (US3, FR-009) --memory and
  * --memory-swap set to the SAME configured value (never a larger swap
- * ceiling), --cpus, and --pids-limit. The --network flag is deliberately
- * NOT built here -- US4/Phase 6 appends it without altering what this
- * class already constructs.
+ * ceiling), --cpus, and --pids-limit, plus (US4, FR-011/FR-012,
+ * research.md D7) --network none by default / --network bridge only when
+ * the caller's networkEnabled argument is true.
  *
  * The `docker run` invocation is always wrapped in a Symfony Process
  * (mirroring CodingWorkspaceController::runTests()'s own
@@ -78,6 +78,12 @@ class DockerCommandExecutor
      *   the seam tests/RealDocker/DockerUnavailableFallbackTest.php uses
      *   to point at a genuinely invalid Docker socket without mutating the
      *   whole test run's global environment.
+     *
+     * US4 (research.md D7): the run() method itself takes the workspace's
+     * network_enabled boolean as a plain argument -- this class has no
+     * knowledge of CodingProject at all, only the boolean the caller
+     * (CodingWorkspaceController::runCommand()) hands it, read exactly
+     * once from the column immediately before this flag set is built.
      */
     public function __construct(
         private readonly ?\Closure $processFactory = null,
@@ -102,6 +108,7 @@ class DockerCommandExecutor
         string $command,
         ?string $codingProjectId = null,
         ?string $userId = null,
+        bool $networkEnabled = false,
     ): array {
         $reachability = $this->checkReachable();
         if (!$reachability['reachable']) {
@@ -133,6 +140,16 @@ class DockerCommandExecutor
             '--read-only',
             '--tmpfs', '/tmp',
             '--security-opt', 'no-new-privileges',
+            // US4, FR-011/FR-012/research.md D7 -- 'none' by default, and
+            // only 'bridge' (Docker's own standard default network) when
+            // the workspace's own network_enabled column is true. This
+            // column is never consulted anywhere in the confirmation/
+            // allowlist stack (ApiCallValidator,
+            // AgentLoopService::isConfirmationRequired(),
+            // CommandAllowlistMatcher) -- it is a resource-isolation
+            // boundary, completely independent of the confirmation
+            // decision.
+            '--network', $networkEnabled ? 'bridge' : 'none',
             // US3, FR-009/research.md D1a -- --memory-swap is deliberately
             // set to the SAME value as --memory: without this, Docker
             // silently allows the container to consume up to 2x the

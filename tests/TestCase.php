@@ -196,6 +196,10 @@ abstract class TestCase extends BaseTestCase
                 // 2026_08_18_000006_add_command_allowlist_to_coding_projects_table.php
                 // exactly.
                 $table->json('command_allowlist')->nullable();
+                // 123-sandboxed-shell-execution, US4 — mirrors
+                // 2026_08_18_000007_add_network_enabled_to_coding_projects_table.php
+                // exactly.
+                $table->boolean('network_enabled')->default(false);
                 $table->timestamps();
                 $table->softDeletes();
 
