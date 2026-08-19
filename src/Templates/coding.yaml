@@ -72,4 +72,5 @@ safety:
   confirmation_required:
     - clarionApp.llmClient.codingWorkspace.writeFile
     - clarionApp.llmClient.codingWorkspace.deleteFile
+    - clarionApp.llmClient.codingWorkspace.runCommand
   denylist: []

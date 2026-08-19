@@ -192,6 +192,10 @@ abstract class TestCase extends BaseTestCase
                 // 2026_08_18_000003_add_confirmation_relaxed_to_coding_projects_table.php
                 // exactly.
                 $table->boolean('confirmation_relaxed')->default(false);
+                // 123-sandboxed-shell-execution, US2 — mirrors
+                // 2026_08_18_000006_add_command_allowlist_to_coding_projects_table.php
+                // exactly.
+                $table->json('command_allowlist')->nullable();
                 $table->timestamps();
                 $table->softDeletes();
 

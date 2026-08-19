@@ -23,6 +23,17 @@ class CodingProject extends Model
 {
     use HasFactory, EloquentMultiChainBridge, SoftDeletes;
 
-    protected $fillable = ['user_id', 'name', 'root_path', 'test_command', 'confirmation_relaxed'];
+    protected $fillable = [
+        'user_id', 'name', 'root_path', 'test_command', 'confirmation_relaxed',
+        'command_allowlist',
+    ];
     protected $table = 'coding_projects';
+
+    // 123-sandboxed-shell-execution, US2 (data-model.md §1): a flat JSON
+    // array of pattern strings. A null column value casts to null, not
+    // []; CommandAllowlistMatcher treats null and [] identically wherever
+    // it consults this column, so no accessor override is needed here.
+    protected $casts = [
+        'command_allowlist' => 'array',
+    ];
 }

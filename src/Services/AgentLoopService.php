@@ -621,6 +621,8 @@ class AgentLoopService
             $toolData['tool_results'] = [
                 ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'],
             ];
+
+            $this->recordDeclinedCommandExecution($pending, $conversation);
         }
 
         // 112-coding-agent (US1, data-model.md §6): resolve the inbound
@@ -2198,6 +2200,8 @@ class AgentLoopService
             $toolData['tool_results'] = [
                 ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'],
             ];
+
+            $this->recordDeclinedCommandExecution($pending, $conversation);
         }
 
         // Resolve inbound paused action (T029c). Already-instrumented tool
@@ -3914,7 +3918,8 @@ class AgentLoopService
         // relaxation has no code path through which the boundary check or
         // refusal recording become visible to it.
         if (($operationId === self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
-            || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID)
+            || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID)
             && $validation['status'] === ApiCallValidator::STATUS_CONFIRM) {
             $relaxedProjectId = $params['path']['project'] ?? null;
             $codingProject = $relaxedProjectId !== null
@@ -3922,6 +3927,37 @@ class AgentLoopService
                 : null;
 
             if ($codingProject !== null && $codingProject->confirmation_relaxed) {
+                $validation['status'] = ApiCallValidator::STATUS_ALLOW;
+            }
+        }
+
+        // 123-sandboxed-shell-execution, US2 (FR-004/FR-006, contracts/
+        // command-allowlist.md §2): a second, independent path to
+        // STATUS_ALLOW for runCommand only -- a command matching the
+        // workspace's own command_allowlist runs without prompting even
+        // when confirmation_relaxed was never set. Checked in the same
+        // seam, immediately after the relaxation check above, so either
+        // mechanism alone is sufficient; this never requires both (an
+        // allowlist match on a project with confirmation_relaxed still
+        // false, or vice versa, each independently reach STATUS_ALLOW).
+        // Reuses the same $params['path']['project'] lookup pattern as
+        // the relaxation check above -- no new query shape. Never
+        // consulted by PathContainment/WorkspaceRefusalRecorder,
+        // mirroring confirmation_relaxed's own identical guarantee: an
+        // allowlisted command still passes through the unmodified
+        // containment check exactly as before.
+        if ($operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+            && $validation['status'] === ApiCallValidator::STATUS_CONFIRM) {
+            $allowlistProjectId = $params['path']['project'] ?? null;
+            $allowlistProject = $allowlistProjectId !== null
+                ? \ClarionApp\LlmClient\Models\CodingProject::find($allowlistProjectId)
+                : null;
+
+            $requestedCommand = $params['body']['command'] ?? null;
+
+            if ($allowlistProject !== null
+                && is_string($requestedCommand)
+                && (new CommandAllowlistMatcher())->matches($allowlistProject->command_allowlist, $requestedCommand)) {
                 $validation['status'] = ApiCallValidator::STATUS_ALLOW;
             }
         }
@@ -4016,10 +4052,21 @@ class AgentLoopService
                 ]);
             }
 
-            // Return a special marker — the stream handler will detect this and suspend
+            // Return a special marker — the stream handler will detect this and suspend.
+            // 123-sandboxed-shell-execution, US2 (contracts/run-command.md
+            // §1): runCommand carries its own confirmation_type, distinct
+            // from the generic 'api_call' every other confirm-required
+            // operation still uses, so the confirming UI can show the
+            // command-specific prompt. The actual command text itself is
+            // already carried verbatim in 'parameters' (params['body']
+            // ['command']) exactly like every other operation's arguments
+            // -- no separate top-level field is needed for FR-003's "show
+            // the actual command" guarantee.
             return json_encode([
                 '__requires_confirmation' => true,
-                'confirmation_type' => 'api_call',
+                'confirmation_type' => $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
+                    ? 'coding_workspace_command'
+                    : 'api_call',
                 'operationId' => $operationId,
                 'method' => $method,
                 'path' => $pathTemplate,
@@ -4152,6 +4199,65 @@ class AgentLoopService
         }
 
         return json_encode(['operationId' => $operationId, 'path' => $path]);
+    }
+
+    /**
+     * 123-sandboxed-shell-execution, US2, T029 (data-model.md §3a's
+     * `refused` status). Called from the declined-confirmation branch of
+     * both resume() and resumeSync(), scoped narrowly to runCommand --
+     * every other declined operationId (writeFile/deleteFile/scope_surface/
+     * declarative_memory/external_tool) is a silent no-op here, exactly
+     * as before this feature. This table's ONLY source for a `refused`
+     * row: the separate, pre-existing coding_workspace_refusals table
+     * (the workspace-root-unreachable case recorded by
+     * CodingWorkspaceController::runCommand() itself, Phase 3/T016) is a
+     * different table for a different, unrelated case and is never
+     * touched here.
+     *
+     * $pending is the pause marker's own stored shape ({operationId,
+     * arguments, ...}) -- 'arguments' carries the confirmed call's
+     * {path, query, body} parameters, the same shape
+     * codingWorkspaceChangeActionContent() reads from, one level up
+     * (executeApiCall()'s own $params argument).
+     */
+    private function recordDeclinedCommandExecution(array $pending, Conversation $conversation): void
+    {
+        if (($pending['operationId'] ?? null) !== self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID) {
+            return;
+        }
+
+        $arguments = $pending['arguments'] ?? [];
+        $projectId = $arguments['path']['project'] ?? null;
+        $command = $arguments['body']['command'] ?? null;
+
+        if ($projectId === null || !is_string($command)) {
+            return;
+        }
+
+        $agentName = $conversation->agent_id !== null
+            ? Agent::where('id', $conversation->agent_id)->value('name')
+            : null;
+
+        // network_enabled is hardcoded false here, mirroring
+        // CodingWorkspaceController::runCommand()'s own identical
+        // placeholder (Phase 3/T016) -- Phase 6/T047 replaces both with
+        // a real CodingProject.network_enabled column read.
+        \ClarionApp\LlmClient\Models\CodingCommandExecution::create([
+            'coding_project_id' => $projectId,
+            'user_id' => $conversation->user_id,
+            'command' => $command,
+            'status' => 'refused',
+            'exit_code' => null,
+            'timed_out' => false,
+            'stdout' => null,
+            'stderr' => null,
+            'output_truncated' => false,
+            'network_enabled' => false,
+            'duration_ms' => null,
+            'agent_id' => $conversation->agent_id,
+            'agent_name' => $agentName,
+            'conversation_id' => $conversation->id,
+        ]);
     }
 
     /**
