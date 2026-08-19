@@ -79,6 +79,25 @@ class DockerCommandExecutorLimitPriorityTest extends TestCase
         return $process;
     }
 
+    /**
+     * A Mockery double standing in for the Symfony Process a genuine
+     * `docker inspect <name> --format ...` call would produce -- explicit
+     * concrete stubs for run()/getExitCode()/getOutput() (never relying on
+     * shouldIgnoreMissing()'s own type-coerced defaults), so
+     * DockerCommandExecutor's own container-id resolution (and, on the
+     * ordinary-exit path, its OOMKilled inspection) sees a real,
+     * well-formed value rather than an empty string every time.
+     */
+    private function fakeInspectProcess(string $output): Process
+    {
+        $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
+        $process->shouldReceive('run')->andReturn(0);
+        $process->shouldReceive('getExitCode')->andReturn(0);
+        $process->shouldReceive('getOutput')->andReturn($output);
+
+        return $process;
+    }
+
     // -----------------------------------------------------------------
     // 1. A simulated disk-usage delta exceeding the configured limit ->
     //    the existing killContainer() sequence (kill then rm), status
@@ -119,6 +138,16 @@ class DockerCommandExecutorLimitPriorityTest extends TestCase
 
             if ($command[1] === 'kill' || $command[1] === 'rm') {
                 return $this->fakeKillOrRmProcess();
+            }
+
+            // 124-command-limit-controls, US3 (T030): the container-id
+            // resolution `docker inspect ... --format '{{.Id}}'` call now
+            // fires right after start(), before this test's disk check
+            // ever gets a chance to fire -- routed here explicitly so it
+            // never falls through to (and is mistaken for) the main
+            // "docker run" invocation below.
+            if ($command[1] === 'inspect') {
+                return $this->fakeInspectProcess('');
             }
 
             // The main "docker run" invocation -- stays "running" across
@@ -210,6 +239,18 @@ class DockerCommandExecutorLimitPriorityTest extends TestCase
                 return $this->fakeKillOrRmProcess();
             }
 
+            // 124-command-limit-controls, US3 (T030): routed explicitly,
+            // same reasoning as the disk-priority case above -- this must
+            // never fall through to the main "docker run" branch below,
+            // which (uniquely in this test) captures a by-reference
+            // `$mainProcessRef` used to construct the simulated
+            // ProcessTimedOutException; letting the container-id inspect
+            // call reach that branch would overwrite the reference with
+            // the wrong mock.
+            if ($command[1] === 'inspect') {
+                return $this->fakeInspectProcess('');
+            }
+
             $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
             $process->shouldReceive('start')->andReturnNull();
             $process->shouldReceive('isRunning')->andReturn(true, true);
@@ -248,5 +289,190 @@ class DockerCommandExecutorLimitPriorityTest extends TestCase
         $this->assertTrue($result['timed_out'] ?? false);
 
         $this->assertSame(1, $duCallCount, 'only the pre-run baseline du call may have happened -- the in-loop, breach-simulating du re-check must never be reached once checkTimeout() has already thrown on that same tick');
+    }
+
+    // -----------------------------------------------------------------
+    // 3. (T025, US3) A simulated pids-limit breach ALONE (no timeout, no
+    //    disk breach) -> the executor's own proactive kill fires,
+    //    status stopped_pids_limit, exit_code null (research.md R3b).
+    //    Uses the NEW $pidsCurrentReader constructor seam, mirroring
+    //    $processFactory's own shape -- no real cgroup filesystem read.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_pids_limit_breach_alone_with_no_timeout_or_disk_breach_proactively_kills_the_container_and_reports_stopped_pids_limit(): void
+    {
+        config(['llm-client.coding_agent.command_progress_broadcast_after_seconds' => 0]);
+
+        $calls = [];
+        $duCallCount = 0;
+        $pidsReaderCallCount = 0;
+        $containerId = str_repeat('a1', 32); // 64 hex chars, mirrors a real container id's shape
+
+        $processFactory = function (array $command) use (&$calls, &$duCallCount, $containerId) {
+            $calls[] = $command;
+
+            if ($command[0] === 'du') {
+                $duCallCount++;
+
+                // Baseline and every re-measurement report 0 bytes written
+                // -- no disk breach anywhere near being met in this test,
+                // which is proving the pids check in isolation.
+                return $this->fakeDuProcess(0);
+            }
+
+            if ($command[1] === 'version') {
+                return $this->fakeDockerVersionProcess();
+            }
+
+            if ($command[1] === 'kill' || $command[1] === 'rm') {
+                return $this->fakeKillOrRmProcess();
+            }
+
+            if ($command[1] === 'inspect') {
+                return $this->fakeInspectProcess($containerId);
+            }
+
+            // The main "docker run" invocation -- stays "running" across
+            // several poll ticks, no timeout condition anywhere near
+            // being met, no natural exit reached before the pids check
+            // has a genuine chance to fire.
+            $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
+            $process->shouldReceive('start')->andReturnNull();
+            $process->shouldReceive('isRunning')->andReturn(true, true, true, false);
+            $process->shouldReceive('checkTimeout')->andReturnNull();
+            $process->shouldReceive('getIncrementalOutput')->andReturn('before the breach', '', '', '');
+            $process->shouldReceive('getIncrementalErrorOutput')->andReturn('', '', '', '');
+            $process->shouldReceive('getExitCode')->andReturn(0);
+
+            return $process;
+        };
+
+        $pidsCurrentReader = function (string $receivedContainerId) use (&$pidsReaderCallCount, $containerId) {
+            $pidsReaderCallCount++;
+            $this->assertSame($containerId, $receivedContainerId, 'the reader must be invoked with the container id resolved via docker inspect --format {{.Id}}');
+
+            // Comfortably past the 10-process limit this test configures
+            // below.
+            return 15;
+        };
+
+        $executor = new DockerCommandExecutor($processFactory, null, $pidsCurrentReader);
+
+        $result = $executor->run(
+            '/srv/workspaces/proj-1',
+            'i=0; while [ $i -lt 1000 ]; do sleep 60 & i=$((i+1)); done; wait',
+            null,
+            null,
+            false,
+            null,
+            null,
+            null,
+            10, // pidsLimit
+            null,
+            null, // diskLimitMb -- default, never breached (du always reports 0)
+        );
+
+        $this->assertSame('stopped_pids_limit', $result['status']);
+        $this->assertNull($result['exit_code'], 'a proactively-killed pids-limit stop has no exit code of its own to report, matching stopped_disk_limit\'s/stopped_timeout\'s existing convention');
+        $this->assertFalse($result['timed_out'] ?? false);
+        $this->assertIsInt($result['duration_ms']);
+
+        $this->assertGreaterThan(0, $pidsReaderCallCount, 'the pids reader must genuinely have been consulted for this to be a real proof, not a vacuous one');
+
+        $subcommands = array_map(fn ($c) => $c[0] === 'du' ? 'du' : ($c[1] ?? null), $calls);
+        $this->assertContains('kill', $subcommands, 'the existing killContainer() sequence must have been used to stop the container');
+        $this->assertContains('rm', $subcommands, 'the existing killContainer() sequence must have been used to stop the container');
+    }
+
+    // -----------------------------------------------------------------
+    // 4. (T025, US3) A simulated disk-delta breach AND a simulated
+    //    pids-limit breach on the SAME tick -> disk wins (research.md
+    //    R3c's full three-way order: timeout, then disk, then pids). The
+    //    pids reader must never even be consulted once the disk check has
+    //    already triggered a kill on that tick -- proving genuine
+    //    short-circuit, not a coincidental status.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_simultaneous_disk_and_pids_limit_breach_on_the_same_tick_resolves_to_stopped_disk_limit_never_stopped_pids_limit(): void
+    {
+        config(['llm-client.coding_agent.command_progress_broadcast_after_seconds' => 0]);
+
+        $calls = [];
+        $duCallCount = 0;
+        $pidsReaderCallCount = 0;
+        $containerId = str_repeat('b2', 32);
+
+        $processFactory = function (array $command) use (&$calls, &$duCallCount, $containerId) {
+            $calls[] = $command;
+
+            if ($command[0] === 'du') {
+                $duCallCount++;
+
+                // Every du call after the baseline simulates 20MB written
+                // -- comfortably past the 5MB limit this test configures
+                // below.
+                $bytes = $duCallCount === 1 ? 0 : 20 * 1024 * 1024;
+
+                return $this->fakeDuProcess($bytes);
+            }
+
+            if ($command[1] === 'version') {
+                return $this->fakeDockerVersionProcess();
+            }
+
+            if ($command[1] === 'kill' || $command[1] === 'rm') {
+                return $this->fakeKillOrRmProcess();
+            }
+
+            if ($command[1] === 'inspect') {
+                return $this->fakeInspectProcess($containerId);
+            }
+
+            $process = Mockery::mock(Process::class)->shouldIgnoreMissing();
+            $process->shouldReceive('start')->andReturnNull();
+            $process->shouldReceive('isRunning')->andReturn(true, true, true, false);
+            $process->shouldReceive('checkTimeout')->andReturnNull();
+            $process->shouldReceive('getIncrementalOutput')->andReturn('before the breach', '', '', '');
+            $process->shouldReceive('getIncrementalErrorOutput')->andReturn('', '', '', '');
+            $process->shouldReceive('getExitCode')->andReturn(0);
+
+            return $process;
+        };
+
+        $pidsCurrentReader = function (string $receivedContainerId) use (&$pidsReaderCallCount) {
+            $pidsReaderCallCount++;
+
+            // Also comfortably past the 10-process limit -- if the pids
+            // check were EVER reached on this same tick, it would
+            // (wrongly) win over the disk breach.
+            return 15;
+        };
+
+        $executor = new DockerCommandExecutor($processFactory, null, $pidsCurrentReader);
+
+        $result = $executor->run(
+            '/srv/workspaces/proj-1',
+            'dd if=/dev/zero of=big.bin bs=1M count=50',
+            null,
+            null,
+            false,
+            null,
+            null,
+            null,
+            10, // pidsLimit
+            null,
+            5, // diskLimitMb
+        );
+
+        $this->assertSame('stopped_disk_limit', $result['status'], 'disk must win over pids when both are breached on the same tick -- research.md R3c\'s fixed timeout-then-disk-then-pids order');
+        $this->assertNull($result['exit_code']);
+
+        $this->assertSame(0, $pidsReaderCallCount, 'the pids reader must never be consulted once the disk check has already triggered a kill on this same tick -- proving genuine short-circuit precedence, not merely a coincidental status');
+
+        $subcommands = array_map(fn ($c) => $c[0] === 'du' ? 'du' : ($c[1] ?? null), $calls);
+        $this->assertContains('kill', $subcommands);
+        $this->assertContains('rm', $subcommands);
     }
 }

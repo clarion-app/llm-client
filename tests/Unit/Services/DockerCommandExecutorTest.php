@@ -150,7 +150,15 @@ class DockerCommandExecutorTest extends TestCase
         $runCommandA = $this->capturedDockerRunCommand('/srv/workspaces/proj-1', 'echo hello');
         $runCommandB = $this->capturedDockerRunCommand('/srv/workspaces/proj-1', 'echo hello');
 
-        $this->assertContains('--rm', $runCommandA);
+        // 124-command-limit-controls, US3 (research.md R3a): --rm is no
+        // longer used at all -- a direct test confirmed a --rm container
+        // is already gone ("no such object") by the time docker inspect
+        // could ever run afterward to detect an OOM kill, so every exit
+        // path now issues its own explicit, unconditional docker rm -f
+        // instead (uniqueness/no-reuse-across-invocations is still
+        // guaranteed by the fresh --name below, --rm was never load-
+        // bearing for that property).
+        $this->assertNotContains('--rm', $runCommandA, '--rm must no longer be used -- cleanup is now always an explicit docker rm -f on every exit path');
 
         $namePositionsA = array_keys($runCommandA, '--name', true);
         $this->assertCount(1, $namePositionsA);
@@ -255,16 +263,17 @@ class DockerCommandExecutorTest extends TestCase
         $calledWith = null;
 
         $factory = function (array $command) use (&$calledWith) {
-            // 124-command-limit-controls, US2: the disk-usage baseline
-            // `du` call now precedes every "docker run" invocation -- it
-            // must be answered here too, distinctly from the main process
-            // mock below, or it would (wrongly) be treated as the main
-            // invocation and never have setTimeout() called on it at all.
-            if ($command[0] === 'du') {
-                return $this->fakeProcess(0, '', '');
-            }
-
-            if ($command[1] === 'version') {
+            // 124-command-limit-controls, US2/US3: the disk-usage baseline
+            // `du` call, the version precheck, and the container-id/OOM
+            // `docker inspect` and `docker rm -f` cleanup calls all now
+            // happen around the single "docker run" invocation this
+            // test's strict setTimeout() expectation targets -- routing
+            // every one of them here, distinctly, keeps that expectation
+            // on exactly one mock instance (a fresh mock is created on
+            // every "else" call below, so any of these being (wrongly)
+            // routed there would attach the SAME strict expectation to an
+            // instance setTimeout() is never actually called on).
+            if ($command[0] === 'du' || $command[1] !== 'run') {
                 return $this->fakeProcess(0, '', '');
             }
 
@@ -443,12 +452,16 @@ class DockerCommandExecutorTest extends TestCase
 
         $captured = null;
         $factory = function (array $cmd) use (&$captured) {
-            if ($cmd[1] === 'version') {
+            if ($cmd[1] === 'run') {
+                $captured = $cmd;
+
                 return $this->fakeProcess(0, '', '');
             }
 
-            $captured = $cmd;
-
+            // 124-command-limit-controls, US2/US3: du baseline, version
+            // precheck, docker inspect, and docker rm -f cleanup calls --
+            // none of which is the single "docker run" invocation this
+            // test captures.
             return $this->fakeProcess(0, '', '');
         };
 
@@ -493,14 +506,14 @@ class DockerCommandExecutorTest extends TestCase
         $calledWith = null;
 
         $factory = function (array $command) use (&$calledWith) {
-            // 124-command-limit-controls, US2: same disk-usage-baseline
-            // du call as above -- must be answered distinctly from the
-            // main "docker run" invocation.
-            if ($command[0] === 'du') {
-                return $this->fakeProcess(0, '', '');
-            }
-
-            if ($command[1] === 'version') {
+            // 124-command-limit-controls, US2/US3: same reasoning as
+            // process_set_timeout_is_wired_from_the_configured_command_timeout_seconds
+            // above -- every non-"docker run" call (du baseline, version
+            // precheck, docker inspect, docker rm -f) must be routed here,
+            // distinctly, so the strict setTimeout() expectation below
+            // lands on exactly the one mock instance it is actually
+            // called on.
+            if ($command[0] === 'du' || $command[1] !== 'run') {
                 return $this->fakeProcess(0, '', '');
             }
 
@@ -562,12 +575,20 @@ class DockerCommandExecutorTest extends TestCase
         $captured = null;
 
         $factory = function (array $cmd) use (&$captured) {
-            if ($cmd[1] === 'version') {
+            if ($cmd[1] === 'run') {
+                $captured = $cmd;
+
                 return $this->fakeProcess(0, '', '');
             }
 
-            $captured = $cmd;
-
+            // 124-command-limit-controls, US2/US3: the disk-usage baseline
+            // `du` call, the version precheck, and the container-id/OOM
+            // `docker inspect` and `docker rm -f` cleanup calls all now
+            // happen around the single "docker run" invocation this
+            // helper exists to capture -- none of them may ever be
+            // mistaken for it (previously, ANY non-version call was
+            // (wrongly) captured, which broke the moment more than one
+            // such call existed).
             return $this->fakeProcess(0, '', '');
         };
 

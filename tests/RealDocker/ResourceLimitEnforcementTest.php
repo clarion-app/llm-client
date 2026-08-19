@@ -172,12 +172,12 @@ class ResourceLimitEnforcementTest extends TestCase
         ]);
 
         $response->assertStatus(200);
-        $this->assertSame('completed', $response->json('status'), 'the container itself must have run and been killed by the kernel -- never stopped_timeout (the OOM kill must occur well within the 30s wall-clock budget) and never sandbox_unavailable');
+        $this->assertSame('stopped_oom', $response->json('status'), '124-command-limit-controls, US3 (FR-007): an OOM-killed command must be reported specifically as such, distinct from completed/stopped_timeout/sandbox_unavailable -- detected via docker inspect\'s State.OOMKilled after the process exited (research.md R3a), only possible once --rm is dropped from the constructed flag set');
         $this->assertNotSame(0, $response->json('exit_code'), 'an OOM-killed process must never report a clean zero exit');
         $this->assertGreaterThanOrEqual(128, $response->json('exit_code'), 'an OOM kill must produce a signal-derived (>=128) exit code, not an ordinary shell failure code');
 
         $stillRunning = $this->dockerPsNames('coding-cmd-');
-        $this->assertEmpty($stillRunning, 'the OOM-killed container must not still be running (its own --rm cleanup should have completed)');
+        $this->assertEmpty($stillRunning, 'the OOM-killed container must not still be running -- now cleaned up via an explicit docker rm -f on every exit path, since --rm is no longer used at all');
     }
 
     // -----------------------------------------------------------------
