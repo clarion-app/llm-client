@@ -976,6 +976,23 @@ return [
         // ordinary nonzero exit, not a could_not_run-style ambiguity.
         'command_image' => (string) env('LLM_CLIENT_CODING_AGENT_COMMAND_IMAGE', 'alpine:latest'),
 
+        // 123-sandboxed-shell-execution, US3 (research.md D1a/D4, FR-009/
+        // FR-010/FR-013). Resource-limit and bounding defaults every
+        // sandboxed command container runs under -- --memory and
+        // --memory-swap are always set to this SAME value (never a larger
+        // swap ceiling), closing the "swap doubles the effective cap" gap
+        // D1a names explicitly.
+        'command_memory_limit_mb' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_MEMORY_LIMIT_MB', 256),
+        'command_cpu_limit' => (string) env('LLM_CLIENT_CODING_AGENT_COMMAND_CPU_LIMIT', '1.0'),
+        'command_pids_limit' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_PIDS_LIMIT', 128),
+        'command_output_cap_bytes' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_OUTPUT_CAP_BYTES', 262144),
+
+        // How long (in seconds of elapsed wall-clock time) a command must
+        // still be running before DockerCommandExecutor starts emitting
+        // CommandExecutionProgress "still running" heartbeats (FR-013) --
+        // a short-lived command never fires one at all.
+        'command_progress_broadcast_after_seconds' => (int) env('LLM_CLIENT_CODING_AGENT_COMMAND_PROGRESS_BROADCAST_AFTER_SECONDS', 5),
+
         // How many distinct files a single run may touch (writeFile/deleteFile)
         // before the next new file triggers a scope-surfacing confirmation
         // instead of the ordinary per-file one.

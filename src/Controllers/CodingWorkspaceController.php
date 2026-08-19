@@ -591,7 +591,12 @@ class CodingWorkspaceController extends Controller
         ]);
         $command = $validated['command'];
 
-        $result = $this->dockerCommandExecutor->run($codingProject->root_path, $command);
+        $result = $this->dockerCommandExecutor->run(
+            $codingProject->root_path,
+            $command,
+            $codingProject->id,
+            (string) Auth::id(),
+        );
 
         $status = $result['status'];
         $exitCode = $result['exit_code'] ?? null;

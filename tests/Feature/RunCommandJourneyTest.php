@@ -245,6 +245,47 @@ class RunCommandJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------
+    // T033 (US3, FR-010, quickstart Scenario 3.2): the controller passes
+    // an already-capped, already-marked-truncated executor result
+    // through unchanged, never re-expanding or re-truncating it itself --
+    // DockerCommandExecutor's own real-cap enforcement is proven
+    // separately (tests/Unit/Services/DockerCommandExecutorTest.php's
+    // T032 cases and, against a real container,
+    // tests/RealDocker/ResourceLimitEnforcementTest.php).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function oversized_output_reported_by_the_executor_is_passed_through_as_truncated_and_bounded_to_the_cap(): void
+    {
+        $project = $this->registerProject($this->projectDir);
+
+        $cap = (int) config('llm-client.coding_agent.command_output_cap_bytes', 262144);
+        $cappedStdout = str_repeat('x', $cap);
+
+        $this->bindFakeExecutor([
+            'status' => 'completed',
+            'exit_code' => 0,
+            'timed_out' => false,
+            'stdout' => $cappedStdout,
+            'stderr' => '',
+            'output_truncated' => true,
+            'duration_ms' => 500,
+        ]);
+
+        $response = $this->postJson($this->apiUrl("coding-project/{$project->id}/run-command"), [
+            'command' => 'yes | head -c 999999999',
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'status' => 'completed',
+            'output_truncated' => true,
+        ]);
+        $this->assertSame($cap, strlen((string) $response->json('stdout')), 'the reported stdout must be bounded to the configured cap');
+        $this->assertLessThan(999999999, strlen((string) $response->json('stdout')), 'the reported stdout must never be the full oversized content');
+    }
+
+    // -----------------------------------------------------------------
     // Validation (422)
     // -----------------------------------------------------------------
 
