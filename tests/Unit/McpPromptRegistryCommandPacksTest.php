@@ -599,4 +599,84 @@ MD;
         $this->assertNotNull($copilotResult, 'the copilot-agent: prefix must resolve directly to the intra-workspace loser');
         $this->assertSame($copilotBody, $copilotResult['messages'][0]['content']['text']);
     }
+
+    // -----------------------------------------------------------------
+    // Phase 7 (US5), T032 -- per-file isolation proven one layer up,
+    // through the actual McpPromptRegistry merge (Phase 3's iteration
+    // over $result->commands), not only at the CommandPackLoader layer
+    // in isolation (already proven there by CommandPackLoaderTest's own
+    // per-file-isolation case). A zero-byte file, and separately a file
+    // with an unterminated/malformed frontmatter block, must both be
+    // silently absent from getPrompts() -- genuinely absent, not listed
+    // with an error marker -- while every valid sibling file in the
+    // same directory stays listed and invocable, unaffected.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_zero_byte_file_and_a_malformed_frontmatter_file_are_silently_absent_from_getprompts_while_valid_siblings_stay_listed_and_invocable(): void
+    {
+        $this->mockPackages([]);
+
+        $projectDir = $this->makeProjectDir();
+        $this->write($projectDir, '.claude/commands/a.md', <<<'MD'
+---
+description: Command A.
+---
+This is command A.
+MD);
+        $this->write($projectDir, '.claude/commands/b.md', <<<'MD'
+---
+description: Command B.
+---
+This is command B.
+MD);
+        $this->write($projectDir, '.claude/commands/c.md', '');
+
+        $project = $this->makeProject($projectDir);
+        $registry = new McpPromptRegistry();
+
+        $result = $registry->getPrompts(cursor: null, codingProjectId: $project->id, userId: $project->user_id);
+        $names = array_column($result['prompts'], 'name');
+
+        $this->assertContains('a', $names);
+        $this->assertContains('b', $names);
+        $this->assertNotContains('c', $names, 'a zero-byte file must never produce a listed entry, error-marked or otherwise');
+
+        $promptA = $registry->getPrompt('a', [], codingProjectId: $project->id, userId: $project->user_id);
+        $promptB = $registry->getPrompt('b', [], codingProjectId: $project->id, userId: $project->user_id);
+        $this->assertNotNull($promptA, '"a" must remain invocable despite the sibling zero-byte file');
+        $this->assertNotNull($promptB, '"b" must remain invocable despite the sibling zero-byte file');
+        $this->assertStringContainsString('This is command A.', $promptA['messages'][0]['content']['text']);
+        $this->assertStringContainsString('This is command B.', $promptB['messages'][0]['content']['text']);
+
+        $this->assertNull(
+            $registry->getPrompt('c', [], codingProjectId: $project->id, userId: $project->user_id),
+            'a zero-byte file must never resolve as invocable either'
+        );
+
+        // Add a second, differently-broken file (unterminated/malformed
+        // frontmatter block) -- must not affect a or b, and must not
+        // produce an entry of its own.
+        $this->write($projectDir, '.claude/commands/d.md', "---\nnot: [valid, yaml:\n---\nbody");
+
+        $result = $registry->getPrompts(cursor: null, codingProjectId: $project->id, userId: $project->user_id);
+        $names = array_column($result['prompts'], 'name');
+
+        $this->assertContains('a', $names, '"a" must remain listed after adding the malformed-frontmatter sibling');
+        $this->assertContains('b', $names, '"b" must remain listed after adding the malformed-frontmatter sibling');
+        $this->assertNotContains('c', $names);
+        $this->assertNotContains('d', $names, 'a malformed-frontmatter file must never produce a listed entry, error-marked or otherwise');
+
+        $promptA = $registry->getPrompt('a', [], codingProjectId: $project->id, userId: $project->user_id);
+        $promptB = $registry->getPrompt('b', [], codingProjectId: $project->id, userId: $project->user_id);
+        $this->assertNotNull($promptA, '"a" must remain invocable after adding the malformed-frontmatter sibling');
+        $this->assertNotNull($promptB, '"b" must remain invocable after adding the malformed-frontmatter sibling');
+        $this->assertStringContainsString('This is command A.', $promptA['messages'][0]['content']['text']);
+        $this->assertStringContainsString('This is command B.', $promptB['messages'][0]['content']['text']);
+
+        $this->assertNull(
+            $registry->getPrompt('d', [], codingProjectId: $project->id, userId: $project->user_id),
+            'a malformed-frontmatter file must never resolve as invocable'
+        );
+    }
 }
