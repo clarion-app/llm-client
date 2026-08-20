@@ -423,6 +423,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('coding-project/{project}/git-commit', [CodingWorkspaceController::class, "gitCommit"]);
     Route::post('coding-project/{project}/git-push', [CodingWorkspaceController::class, "gitPush"]);
     Route::post('coding-project/{project}/git-branch', [CodingWorkspaceController::class, "gitBranch"]);
+    Route::post('coding-project/{project}/git-rewrite-history', [CodingWorkspaceController::class, "gitRewriteHistory"]);
     Route::post('coding-project/{project}/run-tests', [CodingWorkspaceController::class, "runTests"]);
     Route::post('coding-project/{project}/run-command', [CodingWorkspaceController::class, "runCommand"]);
     Route::post('coding-project/{project}/run-code', [CodingWorkspaceController::class, "runCode"]);

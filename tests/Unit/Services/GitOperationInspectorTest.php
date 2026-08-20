@@ -575,4 +575,188 @@ class GitOperationInspectorTest extends TestCase
         $this->assertFalse($result['ok'] ?? true);
         $this->assertSame('git_not_a_repository', $result['code'] ?? null);
     }
+
+    // ---------------------------------------------------------------
+    // previewRewriteHistory() -- Phase 7/US5, data-model.md §5, research.md
+    // D7, contracts/git-rewrite-history.md. A successful result carries
+    // `commits_removed_from_branch: [{hash, short_hash, subject,
+    // published}]`, `uncommitted_changes_would_be_discarded`, and
+    // `discarded_paths` -- the exact field names contracts/git-rewrite-
+    // history.md and data-model.md §2 use (Grounding note 17: canonical
+    // over §5's own `target_hash`/`commits_removed`/`discards_uncommitted`
+    // shorthand, which is drift).
+    //
+    // Two independently-computed warnings (D7): (1) commits removed from
+    // the branch is computed identically for all three modes, since reset
+    // always moves the branch pointer regardless of what happens to the
+    // working tree; (2) uncommitted work discarded is computed ONLY for
+    // reset_hard against a genuinely dirty tree beforehand -- reset_soft/
+    // reset_mixed never touch working-tree content, and a clean-tree
+    // reset_hard has nothing to discard either.
+    // ---------------------------------------------------------------
+
+    /**
+     * Builds a repo with a base commit plus two further commits ahead of
+     * it (so `target: "HEAD~2"` resolves to the base), then an uncommitted
+     * edit to the same already-tracked file -- the shared fixture every
+     * case below that needs "two commits ahead of a base, plus a dirty
+     * tree" starts from.
+     *
+     * @return array{repoPath: string, baseHash: string, secondHash: string, thirdHash: string}
+     */
+    private function createRepoWithTwoCommitsAheadAndADirtyTree(): array
+    {
+        $repoPath = $this->createGitRepo();
+
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Base commit'], $repoPath);
+        $baseHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Second commit'], $repoPath);
+        $secondHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\nthree\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Third commit'], $repoPath);
+        $thirdHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        // An uncommitted edit to the same already-tracked file -- the
+        // dirty-tree state every reset_hard-discard case needs.
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\nthree\nuncommitted\n");
+
+        return compact('repoPath', 'baseHash', 'secondHash', 'thirdHash');
+    }
+
+    #[Test]
+    public function commits_removed_from_branch_is_identical_across_all_three_modes_against_the_same_target(): void
+    {
+        ['repoPath' => $repoPath, 'secondHash' => $secondHash, 'thirdHash' => $thirdHash]
+            = $this->createRepoWithTwoCommitsAheadAndADirtyTree();
+
+        $soft = $this->inspector()->previewRewriteHistory($repoPath, 'reset_soft', 'HEAD~2');
+        $mixed = $this->inspector()->previewRewriteHistory($repoPath, 'reset_mixed', 'HEAD~2');
+        $hard = $this->inspector()->previewRewriteHistory($repoPath, 'reset_hard', 'HEAD~2');
+
+        $this->assertTrue($soft['ok'] ?? null);
+        $this->assertTrue($mixed['ok'] ?? null);
+        $this->assertTrue($hard['ok'] ?? null);
+
+        $expected = [$secondHash, $thirdHash];
+        $softHashes = array_column($soft['commits_removed_from_branch'] ?? [], 'hash');
+        $mixedHashes = array_column($mixed['commits_removed_from_branch'] ?? [], 'hash');
+        $hardHashes = array_column($hard['commits_removed_from_branch'] ?? [], 'hash');
+
+        $this->assertEqualsCanonicalizing($expected, $softHashes, 'reset_soft must report the same removed commits as every other mode');
+        $this->assertEqualsCanonicalizing($expected, $mixedHashes, 'reset_mixed must report the same removed commits as every other mode');
+        $this->assertEqualsCanonicalizing($expected, $hardHashes, 'reset_hard must report the same removed commits as every other mode');
+    }
+
+    #[Test]
+    public function uncommitted_changes_would_be_discarded_is_populated_only_for_reset_hard_against_a_dirty_tree(): void
+    {
+        ['repoPath' => $repoPath] = $this->createRepoWithTwoCommitsAheadAndADirtyTree();
+
+        $soft = $this->inspector()->previewRewriteHistory($repoPath, 'reset_soft', 'HEAD~2');
+        $mixed = $this->inspector()->previewRewriteHistory($repoPath, 'reset_mixed', 'HEAD~2');
+        $hard = $this->inspector()->previewRewriteHistory($repoPath, 'reset_hard', 'HEAD~2');
+
+        $this->assertFalse($soft['uncommitted_changes_would_be_discarded'] ?? null, 'reset_soft never touches working-tree content');
+        $this->assertSame([], $soft['discarded_paths'] ?? null);
+
+        $this->assertFalse($mixed['uncommitted_changes_would_be_discarded'] ?? null, 'reset_mixed never touches working-tree content');
+        $this->assertSame([], $mixed['discarded_paths'] ?? null);
+
+        $this->assertTrue($hard['uncommitted_changes_would_be_discarded'] ?? null, 'reset_hard against a genuinely dirty tree must warn of discard');
+        $this->assertSame(['file.txt'], $hard['discarded_paths'] ?? null);
+    }
+
+    #[Test]
+    public function a_clean_tree_reset_hard_reports_no_discard_at_all(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Base commit'], $repoPath);
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Second commit'], $repoPath);
+        // No further edits -- the tree is clean.
+
+        $result = $this->inspector()->previewRewriteHistory($repoPath, 'reset_hard', 'HEAD~1');
+
+        $this->assertTrue($result['ok'] ?? null);
+        $this->assertFalse($result['uncommitted_changes_would_be_discarded'] ?? null, 'a clean tree has nothing for reset_hard to discard, even in reset_hard mode');
+        $this->assertSame([], $result['discarded_paths'] ?? null);
+    }
+
+    #[Test]
+    public function a_removed_commit_already_pushed_is_flagged_published_distinctly_from_a_never_pushed_one(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Base commit'], $repoPath);
+        $baseHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        $barePath = $this->createBareRemote();
+        $this->runGit(['remote', 'add', 'origin', 'file://'.$barePath], $repoPath);
+
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Published commit'], $repoPath);
+        $publishedHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        $branch = $this->currentBranch($repoPath);
+        // Pushes the published commit to the bare remote directly -- this
+        // also updates the local repo's own remote-tracking ref
+        // (refs/remotes/origin/<branch>), which `published` is computed
+        // against.
+        $this->pushToBareRemote($repoPath, $barePath, $branch);
+
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\nthree\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Unpublished commit'], $repoPath);
+        $unpublishedHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        $result = $this->inspector()->previewRewriteHistory($repoPath, 'reset_soft', $baseHash);
+
+        $this->assertTrue($result['ok'] ?? null);
+        $byHash = [];
+        foreach ($result['commits_removed_from_branch'] ?? [] as $entry) {
+            $byHash[$entry['hash']] = $entry;
+        }
+
+        $this->assertArrayHasKey($publishedHash, $byHash);
+        $this->assertArrayHasKey($unpublishedHash, $byHash);
+        $this->assertTrue($byHash[$publishedHash]['published'] ?? null, 'a removed commit already on the remote-tracking ref must be flagged published');
+        $this->assertFalse($byHash[$unpublishedHash]['published'] ?? null, 'a removed commit never pushed anywhere must be flagged unpublished, in the same result set');
+    }
+
+    #[Test]
+    public function preview_rewrite_history_with_an_unresolvable_target_reports_an_invalid_reference(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        $result = $this->inspector()->previewRewriteHistory($repoPath, 'reset_hard', 'no-such-ref-at-all');
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_invalid_reference', $result['code'] ?? null);
+    }
+
+    #[Test]
+    public function preview_rewrite_history_against_a_non_git_directory_reports_not_a_repository(): void
+    {
+        $plainPath = $this->createPlainDirectory();
+
+        $result = $this->inspector()->previewRewriteHistory($plainPath, 'reset_hard', 'HEAD');
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_not_a_repository', $result['code'] ?? null);
+    }
 }

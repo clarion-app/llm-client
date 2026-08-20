@@ -63,6 +63,7 @@ class CodingAgentDefinitionTest extends TestCase
             'clarionApp.llmClient.codingWorkspace.gitCommit' => ['path' => '/api/coding-project/{project}/git-commit', 'method' => 'post'],
             'clarionApp.llmClient.codingWorkspace.gitPush' => ['path' => '/api/coding-project/{project}/git-push', 'method' => 'post'],
             'clarionApp.llmClient.codingWorkspace.gitBranch' => ['path' => '/api/coding-project/{project}/git-branch', 'method' => 'post'],
+            'clarionApp.llmClient.codingWorkspace.gitRewriteHistory' => ['path' => '/api/coding-project/{project}/git-rewrite-history', 'method' => 'post'],
             'clarionApp.llmClient.codingWorkspace.writeFile' => ['path' => '/api/coding-project/{project}/file', 'method' => 'post'],
             'clarionApp.llmClient.codingWorkspace.deleteFile' => ['path' => '/api/coding-project/{project}/file', 'method' => 'delete'],
             'clarionApp.llmClient.codingWorkspace.runTests' => ['path' => '/api/coding-project/{project}/run-tests', 'method' => 'post'],

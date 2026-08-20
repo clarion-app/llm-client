@@ -1750,6 +1750,21 @@ class AgentLoopService
 
                                 $confirmationPayload['branch_name'] = $pendingConfirmation['branch_name'];
                                 $confirmationPayload['start_point_resolved'] = $pendingConfirmation['start_point_resolved'];
+                            } elseif ($confirmationType === 'git_rewrite_history') {
+                                // 126-git-operations-confirmation, US5: the
+                                // same "extra fields alongside the common
+                                // envelope" widening, now for
+                                // git_rewrite_history's own
+                                // commits_removed_from_branch/
+                                // uncommitted_changes_would_be_discarded/
+                                // discarded_paths (data-model.md §2).
+                                $pendingConfirmation['commits_removed_from_branch'] = $decoded['commits_removed_from_branch'] ?? [];
+                                $pendingConfirmation['uncommitted_changes_would_be_discarded'] = $decoded['uncommitted_changes_would_be_discarded'] ?? null;
+                                $pendingConfirmation['discarded_paths'] = $decoded['discarded_paths'] ?? [];
+
+                                $confirmationPayload['commits_removed_from_branch'] = $pendingConfirmation['commits_removed_from_branch'];
+                                $confirmationPayload['uncommitted_changes_would_be_discarded'] = $pendingConfirmation['uncommitted_changes_would_be_discarded'];
+                                $confirmationPayload['discarded_paths'] = $pendingConfirmation['discarded_paths'];
                             }
                         }
 
@@ -2653,6 +2668,18 @@ class AgentLoopService
 
                             $confirmationPayload['branch_name'] = $pendingConfirmation['branch_name'];
                             $confirmationPayload['start_point_resolved'] = $pendingConfirmation['start_point_resolved'];
+                        } elseif ($confirmationType === 'git_rewrite_history') {
+                            // See run()'s identical branch, immediately
+                            // above the same relative point in that
+                            // sibling method (126-git-operations-
+                            // confirmation, US5).
+                            $pendingConfirmation['commits_removed_from_branch'] = $decoded['commits_removed_from_branch'] ?? [];
+                            $pendingConfirmation['uncommitted_changes_would_be_discarded'] = $decoded['uncommitted_changes_would_be_discarded'] ?? null;
+                            $pendingConfirmation['discarded_paths'] = $decoded['discarded_paths'] ?? [];
+
+                            $confirmationPayload['commits_removed_from_branch'] = $pendingConfirmation['commits_removed_from_branch'];
+                            $confirmationPayload['uncommitted_changes_would_be_discarded'] = $pendingConfirmation['uncommitted_changes_would_be_discarded'];
+                            $confirmationPayload['discarded_paths'] = $pendingConfirmation['discarded_paths'];
                         }
                     }
 
@@ -4332,8 +4359,8 @@ class AgentLoopService
     {
         if ($operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
             && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID
-            && $operationId !== self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
-            // gitRewriteHistory -- not wired until its own later story.
+            && $operationId !== self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID) {
             return null;
         }
 
@@ -4356,6 +4383,10 @@ class AgentLoopService
 
         if ($operationId === self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
             return $this->gitBranchConfirmationPreview($project, $method, $pathTemplate, $params);
+        }
+
+        if ($operationId === self::CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID) {
+            return $this->gitRewriteHistoryConfirmationPreview($project, $method, $pathTemplate, $params);
         }
 
         $requestedPaths = $params['body']['paths'] ?? null;
@@ -4498,6 +4529,74 @@ class AgentLoopService
     }
 
     /**
+     * 126-git-operations-confirmation, US5 (research.md D6/D7, contracts/
+     * git-rewrite-history.md §1): the gitRewriteHistory arm of
+     * gitOperationConfirmationPreview() above, split out the same way
+     * gitPushConfirmationPreview()/gitBranchConfirmationPreview() are.
+     * `mode` is checked against the three recognized `git reset` modes
+     * before `GitOperationInspector::previewRewriteHistory()` is ever
+     * called -- a request naming anything else is refused as a plain,
+     * unaudited {error, code} JSON string, malformed and never audited,
+     * mirroring 125's own unrecognized-language precedent (research.md
+     * D4/D5). `git_not_a_repository`/`git_invalid_reference` (and any
+     * other GitOperationInspector::previewRewriteHistory() refusal) are
+     * returned the same way -- no confirmation is ever constructed for a
+     * reset that cannot possibly succeed. A successful preview builds the
+     * git_rewrite_history-typed marker (data-model.md §2), with
+     * `parameters.body.target` PINNED to the resolved hash -- approving
+     * this exact prompt later resets to exactly that commit, even if the
+     * repository's HEAD moves while the confirmation is pending (D6).
+     */
+    private function gitRewriteHistoryConfirmationPreview(\ClarionApp\LlmClient\Models\CodingProject $project, string $method, string $pathTemplate, array $params): string
+    {
+        $requestedMode = $params['body']['mode'] ?? null;
+        $requestedTarget = $params['body']['target'] ?? null;
+
+        if (!is_string($requestedMode) || !in_array($requestedMode, ['reset_soft', 'reset_mixed', 'reset_hard'], true)) {
+            return json_encode([
+                'error' => 'mode must be one of reset_soft, reset_mixed, reset_hard.',
+                'code' => 'git_invalid_mode',
+            ]);
+        }
+
+        if (!is_string($requestedTarget) || $requestedTarget === '') {
+            return json_encode([
+                'error' => 'A target reference is required.',
+                'code' => 'git_invalid_reference',
+            ]);
+        }
+
+        $preview = $this->gitOperationInspector->previewRewriteHistory(
+            $project->root_path,
+            $requestedMode,
+            $requestedTarget,
+        );
+
+        if (!($preview['ok'] ?? false)) {
+            return json_encode([
+                'error' => $preview['reason'] ?? 'Could not reset this branch.',
+                'code' => $preview['code'] ?? 'git_invalid_reference',
+            ]);
+        }
+
+        $pinnedParams = $params;
+        $pinnedParams['body']['mode'] = $requestedMode;
+        $pinnedParams['body']['target'] = $preview['target_resolved'];
+
+        return json_encode([
+            '__requires_confirmation' => true,
+            'confirmation_type' => 'git_rewrite_history',
+            'operationId' => self::CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID,
+            'method' => $method,
+            'path' => $pathTemplate,
+            'parameters' => $pinnedParams,
+            'commits_removed_from_branch' => $preview['commits_removed_from_branch'],
+            'uncommitted_changes_would_be_discarded' => $preview['uncommitted_changes_would_be_discarded'],
+            'discarded_paths' => $preview['discarded_paths'],
+        ]);
+    }
+
+    /**
      * The coding-workspace project-binding guard (112-coding-agent,
      * Foundational, D2, data-model.md §4). `$params` is the raw
      * `execute_operation` tool-call `parameters` argument (the
@@ -4603,7 +4702,8 @@ class AgentLoopService
         if ($operationId !== self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
             && $operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
             && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID
-            && $operationId !== self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
+            && $operationId !== self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID) {
             return;
         }
 
@@ -4643,6 +4743,16 @@ class AgentLoopService
             }
 
             $command = "git branch {$name} {$resolvedStartPoint}";
+        } elseif ($operationId === self::CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID) {
+            $mode = $arguments['body']['mode'] ?? null;
+            $target = $arguments['body']['target'] ?? null;
+
+            if (!is_string($mode) || !is_string($target)) {
+                return;
+            }
+
+            $flag = str_replace('reset_', '--', $mode);
+            $command = "git reset {$flag} {$target}";
         } else {
             $command = $arguments['body']['command'] ?? null;
 
@@ -4785,7 +4895,8 @@ class AgentLoopService
             || $operationId === self::CODING_WORKSPACE_RUN_CODE_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID
-            || $operationId === self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
+            || $operationId === self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID) {
             $extraHeaders['X-Llm-Client-Conversation-Id'] = (string) $conversation->id;
         }
 

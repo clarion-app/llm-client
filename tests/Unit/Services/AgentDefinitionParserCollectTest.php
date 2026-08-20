@@ -262,6 +262,11 @@ YAML;
                 'method' => 'post',
                 'summary' => "Create a new branch in a registered project",
             ],
+            'clarionApp.llmClient.codingWorkspace.gitRewriteHistory' => [
+                'path' => '/api/coding-project/{project}/git-rewrite-history',
+                'method' => 'post',
+                'summary' => "Reset the branch pointer, optionally discarding uncommitted changes",
+            ],
         ]);
 
         $parser = new AgentDefinitionParser();

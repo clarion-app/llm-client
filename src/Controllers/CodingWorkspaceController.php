@@ -1385,6 +1385,127 @@ class CodingWorkspaceController extends Controller
     }
 
     /**
+     * POST coding-project/{project}/git-rewrite-history (126-git-operations-
+     * confirmation, US5, contracts/git-rewrite-history.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like gitCommit()/gitPush()/
+     * gitBranch() above.
+     *
+     * Named `gitRewriteHistory()` -- the auto-generated operation catalog
+     * derives each route's operationId from its controller method name
+     * (gitBranch()'s own docblock above explains why), and
+     * `CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID` is
+     * `clarionApp.llmClient.codingWorkspace.gitRewriteHistory`.
+     *
+     * `mode` is restricted to the three recognized `git reset` modes at
+     * validation time -- a request naming anything else never reaches
+     * `GitOperationInspector::previewRewriteHistory()` at all, mirroring
+     * 125's own unrecognized-language precedent (malformed, unaudited
+     * `422`). `GitOperationInspector::previewRewriteHistory()` is then
+     * called a second time here, immediately before executing (Grounding
+     * note 5's belt-and-suspenders posture, mirrored from gitCommit()/
+     * gitPush()/gitBranch()): for an approved confirmation, `target` is
+     * already the pinned, resolved hash (research.md D6), so re-resolving
+     * it here against that exact hash is a no-op; a direct call that never
+     * went through a confirmation at all still gets a fresh, correct
+     * resolution the same way the confirmation preview itself would have
+     * produced.
+     */
+    public function gitRewriteHistory(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'mode' => 'required|string|in:reset_soft,reset_mixed,reset_hard',
+            'target' => 'required|string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewRewriteHistory(
+            $codingProject->root_path,
+            $validated['mode'],
+            $validated['target'],
+        );
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Could not reset this branch.',
+                'code' => $preview['code'] ?? 'git_invalid_reference',
+            ], 422);
+        }
+
+        $resolvedTarget = $preview['target_resolved'];
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $previousHeadProcess = $this->runGitCommandCapturingResult($codingProject->root_path, ['git', 'rev-parse', 'HEAD']);
+        $previousHead = ($previousHeadProcess !== null && $previousHeadProcess->isSuccessful()) ? trim($previousHeadProcess->getOutput()) : null;
+
+        $resetFlag = str_replace('reset_', '--', $validated['mode']);
+        $resetProcess = $this->runGitCommandCapturingResult(
+            $codingProject->root_path,
+            ['git', 'reset', $resetFlag, $resolvedTarget],
+        );
+        $succeeded = $resetProcess !== null && $resetProcess->isSuccessful();
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildRewriteHistoryCommandString($validated['mode'], $resolvedTarget),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $resetProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $resetProcess?->getOutput(),
+            'stderr' => $resetProcess?->getErrorOutput(),
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'git command failed',
+                'code' => 'git_command_failed',
+                'stderr' => $resetProcess?->getErrorOutput() ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'mode' => $validated['mode'],
+            'target' => $resolvedTarget,
+            'previous_head' => $previousHead,
+            'new_head' => $resolvedTarget,
+        ], 200);
+    }
+
+    /**
+     * The human-readable reconstruction of a reset invocation -- shared by
+     * the executed-and-recorded row above and mirrored by
+     * AgentLoopService::recordDeclinedCommandExecution()'s own
+     * gitRewriteHistory branch for a declined one (contracts/git-rewrite-
+     * history.md's Declined section). No sanitization is needed here
+     * (research.md D8) -- a reset mode and a resolved commit hash never
+     * carry a credential.
+     */
+    private function buildRewriteHistoryCommandString(string $mode, string $resolvedTarget): string
+    {
+        $flag = str_replace('reset_', '--', $mode);
+
+        return "git reset {$flag} {$resolvedTarget}";
+    }
+
+    /**
      * Clamps the `limit` query param against the configured default/max
      * (contracts §3): a non-numeric or non-positive value floors at the
      * default, anything above the max clamps to the max.

@@ -465,6 +465,118 @@ class GitOperationInspector
     }
 
     /**
+     * 126-git-operations-confirmation, US5 (data-model.md §5, research.md
+     * D7, contracts/git-rewrite-history.md §1, Grounding note 17 -- the
+     * field names below match §2/contracts, not §5's own `target_hash`/
+     * `commits_removed`/`discards_uncommitted` shorthand). Order:
+     * not-a-repository -> `$target` must resolve to a real commit
+     * (`git_invalid_reference`) -> a successful result carries
+     * `commits_removed_from_branch` (computed identically for all three
+     * modes -- a reset always moves the branch pointer backward regardless
+     * of what happens to the working tree) and
+     * `uncommitted_changes_would_be_discarded`/`discarded_paths` (computed
+     * ONLY for `reset_hard` against a genuinely dirty tree -- `reset_soft`/
+     * `reset_mixed` never touch working-tree content, and a clean-tree
+     * `reset_hard` correctly reports nothing to discard either).
+     *
+     * `$mode` itself is not validated here -- any string other than
+     * `'reset_hard'` is simply treated as never discarding, mirroring every
+     * other `preview*()` method's stance that request-shape validation
+     * (e.g. `mode` restricted to the three recognized values) is a caller
+     * concern, not this stateless service's.
+     *
+     * @return array{ok: bool, code?: string, reason?: string, target_resolved?: string, commits_removed_from_branch?: array<int, array{hash: string, short_hash: string, subject: string, published: bool}>, uncommitted_changes_would_be_discarded?: bool, discarded_paths?: string[]}
+     */
+    public function previewRewriteHistory(string $rootPath, string $mode, string $target): array
+    {
+        if (!$this->isGitRepository($rootPath)) {
+            return [
+                'ok' => false,
+                'code' => 'git_not_a_repository',
+                'reason' => 'This project is not a git repository.',
+            ];
+        }
+
+        $resolvedTarget = $this->resolveLocalRef($rootPath, $target);
+
+        if ($resolvedTarget === null) {
+            return [
+                'ok' => false,
+                'code' => 'git_invalid_reference',
+                'reason' => 'Could not resolve the target for this reset.',
+            ];
+        }
+
+        $discardedPaths = $mode === 'reset_hard' ? $this->changedOrUntrackedPaths($rootPath) : [];
+
+        return [
+            'ok' => true,
+            'target_resolved' => $resolvedTarget,
+            'commits_removed_from_branch' => $this->commitsRemovedFromBranch($rootPath, $resolvedTarget),
+            'uncommitted_changes_would_be_discarded' => !empty($discardedPaths),
+            'discarded_paths' => $discardedPaths,
+        ];
+    }
+
+    /**
+     * The commits reachable from `HEAD` but not from `$targetHash` --
+     * exactly the commits a reset to `$targetHash` would remove from the
+     * branch, computed identically regardless of which reset mode was
+     * requested (D7). Each entry's `published` flag is `true` when the
+     * commit appears in `git branch -r --contains <hash>`'s output (any
+     * remote-tracking branch at all), distinguishing locally-only history
+     * from history already shared to a remote.
+     *
+     * @return array<int, array{hash: string, short_hash: string, subject: string, published: bool}>
+     */
+    private function commitsRemovedFromBranch(string $rootPath, string $targetHash): array
+    {
+        $process = new Process(['git', 'log', "{$targetHash}..HEAD", '--format=%H|%h|%s'], $rootPath);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return [];
+        }
+
+        $trimmedOutput = trim($process->getOutput());
+        if ($trimmedOutput === '') {
+            return [];
+        }
+
+        $commits = [];
+        foreach (preg_split('/\R/', $trimmedOutput) as $line) {
+            if ($line === '') {
+                continue;
+            }
+
+            [$hash, $shortHash, $subject] = array_pad(explode('|', $line, 3), 3, '');
+            $commits[] = [
+                'hash' => $hash,
+                'short_hash' => $shortHash,
+                'subject' => $subject,
+                'published' => $this->isCommitPublished($rootPath, $hash),
+            ];
+        }
+
+        return $commits;
+    }
+
+    /**
+     * `git branch -r --contains <hash>` -- true when $hash appears on at
+     * least one remote-tracking branch (regardless of which remote), false
+     * when it appears on none (including when the repository has no
+     * remote-tracking branches at all). Never a `git fetch`, so this
+     * repository's own remote-tracking refs are never written to.
+     */
+    private function isCommitPublished(string $rootPath, string $hash): bool
+    {
+        $process = new Process(['git', 'branch', '-r', '--contains', $hash], $rootPath);
+        $process->run();
+
+        return $process->isSuccessful() && trim($process->getOutput()) !== '';
+    }
+
+    /**
      * True when $path, resolved against $rootPath (an absolute path taken
      * as-is; a relative one resolved against the root), normalizes to
      * somewhere outside $rootPath itself. A manual '.'/'..' collapse
