@@ -9,6 +9,17 @@ use Mockery;
 
 use PHPUnit\Framework\Attributes\Test;
 
+/**
+ * 128-project-command-indexing (Phase 7/US5, collateral fix): every
+ * OperationsSearchService construction below now passes an explicit third
+ * constructor argument (the project-command cap) alongside $defaultLimit.
+ * This file extends plain PHPUnit\Framework\TestCase with no Laravel
+ * container/config bound, and the new parameter falls back to config()
+ * exactly as $defaultLimit already does -- so, exactly like $defaultLimit,
+ * it must always be passed explicitly here rather than relying on the
+ * config() fallback, which would throw BindingResolutionException outside
+ * a booted container.
+ */
 class OperationsSearchServiceTest extends TestCase
 {
     protected function tearDown(): void
@@ -61,7 +72,7 @@ class OperationsSearchServiceTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         $results = $service->search('create a contact');
 
         $this->assertCount(2, $results);
@@ -87,7 +98,7 @@ class OperationsSearchServiceTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         $results = $service->search('something');
 
         $this->assertIsArray($results);
@@ -110,7 +121,7 @@ class OperationsSearchServiceTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         $results = $service->search('xyz nonmatching query');
 
         $this->assertIsArray($results);
@@ -133,7 +144,7 @@ class OperationsSearchServiceTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         // 128-project-command-indexing inserted a new $codingProjectId
         // parameter before $limit (contracts/operations-search-service.md's
         // Signature section: "a breaking positional-argument change for any
@@ -163,7 +174,7 @@ class OperationsSearchServiceTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        $service = new OperationsSearchService($dbMock, 20);
+        $service = new OperationsSearchService($dbMock, 20, 5);
         $results = $service->search('test');
 
         $this->assertIsArray($results);
@@ -181,7 +192,7 @@ class OperationsSearchServiceTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('getSchemaBuilder')->once()->andReturn($schemaBuilderMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         $this->assertTrue($service->tableExists());
     }
 
@@ -197,7 +208,7 @@ class OperationsSearchServiceTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('getSchemaBuilder')->once()->andReturn($schemaBuilderMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         $this->assertFalse($service->tableExists());
     }
 

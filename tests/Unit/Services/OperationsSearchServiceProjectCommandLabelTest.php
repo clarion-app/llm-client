@@ -52,7 +52,9 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
      * Builds a query mock with the pre-feature expectations
      * (select/whereRaw/orderByRaw/limit/get) already wired, returning the
      * given rows verbatim -- exactly as
-     * tests/Unit/OperationsSearchServiceTest.php's own fixtures do.
+     * tests/Unit/OperationsSearchServiceTest.php's own fixtures do. Used
+     * only by this file's unscoped cases, whose query shape is unchanged
+     * by Phase 7 (contracts/operations-search-service.md postcondition 1).
      */
     private function queryMockReturning(string $query, int $limit, array $rows): \Mockery\MockInterface
     {
@@ -78,6 +80,57 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
         return $queryMock;
     }
 
+    /**
+     * 128-project-command-indexing (Phase 7/US5, collateral fix): a scoped
+     * search() call no longer issues a single query with a
+     * whereNull/orWhere('coding_project_id') predicate -- research.md D6 /
+     * contracts/operations-search-service.md postcondition 3 replace it with
+     * two independently-capped queries (builtin/global rows, and this
+     * workspace's own project_command rows), merged and sorted by relevance
+     * in PHP. This file's own subject is row-shape pass-through fidelity,
+     * not the two-query split itself (OperationsSearchServiceScopingTest
+     * owns that), so the two query mocks below are wired loosely -- only
+     * the row each query returns is asserted, via its own $rows -- and
+     * built to mirror OperationsSearchServiceScopingTest::twoQueryScopedMocks()
+     * exactly, since both files' fixtures must match the same production
+     * query shape.
+     *
+     * @return array{0: \Mockery\MockInterface, 1: \Mockery\MockInterface} [builtinQueryMock, projectQueryMock]
+     */
+    private function twoQueryMocksReturning(
+        string $query,
+        int $limit,
+        int $projectCommandCap,
+        string $codingProjectId,
+        array $builtinRows,
+        array $projectRows
+    ): array {
+        $builtinCollectionMock = Mockery::mock();
+        $builtinCollectionMock->shouldReceive('toArray')->once()->andReturn($builtinRows);
+
+        $builtinQueryMock = Mockery::mock();
+        $builtinQueryMock->shouldReceive('select')->once()->andReturnSelf();
+        $builtinQueryMock->shouldReceive('whereRaw')->once()->andReturnSelf();
+        $builtinQueryMock->shouldReceive('where')->with('type', '!=', 'project_command')->once()->andReturnSelf();
+        $builtinQueryMock->shouldReceive('orderByRaw')->once()->andReturnSelf();
+        $builtinQueryMock->shouldReceive('limit')->with($limit)->once()->andReturnSelf();
+        $builtinQueryMock->shouldReceive('get')->once()->andReturn($builtinCollectionMock);
+
+        $projectCollectionMock = Mockery::mock();
+        $projectCollectionMock->shouldReceive('toArray')->once()->andReturn($projectRows);
+
+        $projectQueryMock = Mockery::mock();
+        $projectQueryMock->shouldReceive('select')->once()->andReturnSelf();
+        $projectQueryMock->shouldReceive('whereRaw')->once()->andReturnSelf();
+        $projectQueryMock->shouldReceive('where')->with('type', 'project_command')->once()->andReturnSelf();
+        $projectQueryMock->shouldReceive('where')->with('coding_project_id', $codingProjectId)->once()->andReturnSelf();
+        $projectQueryMock->shouldReceive('orderByRaw')->once()->andReturnSelf();
+        $projectQueryMock->shouldReceive('limit')->with(min($limit, $projectCommandCap))->once()->andReturnSelf();
+        $projectQueryMock->shouldReceive('get')->once()->andReturn($projectCollectionMock);
+
+        return [$builtinQueryMock, $projectQueryMock];
+    }
+
     #[Test]
     public function a_project_command_row_carries_type_summary_and_content_through_untouched(): void
     {
@@ -91,18 +144,27 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
             'path' => null,
             'paramSchema' => null,
             'promptContent' => 'Run the deploy script for $ARGUMENTS and report the result.',
+            'relevanceScore' => 8.0,
         ];
 
-        $queryMock = $this->queryMockReturning('deploy the branch', 10, [$projectCommandRow]);
-        // A scoped call adds the whereNull/orWhere coding_project_id
-        // predicate (OperationsSearchServiceScopingTest owns asserting its
-        // exact shape) -- this file only needs the mock to accept the call.
-        $queryMock->shouldReceive('where')->once()->andReturnSelf();
+        // 128-project-command-indexing (Phase 7/US5, collateral fix): a
+        // scoped call now runs two independently-capped queries instead of
+        // one (research.md D6) -- the builtin/global leg returns nothing
+        // here, the project leg returns this row.
+        [$builtinQueryMock, $projectQueryMock] = $this->twoQueryMocksReturning(
+            'deploy the branch',
+            limit: 10,
+            projectCommandCap: 5,
+            codingProjectId: 'coding-project-abc',
+            builtinRows: [],
+            projectRows: [$projectCommandRow]
+        );
 
         $dbMock = Mockery::mock(ConnectionInterface::class);
-        $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
+        $dbMock->shouldReceive('table')->with('operation_search_index')->twice()
+            ->andReturn($builtinQueryMock, $projectQueryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
 
         // 128-project-command-indexing (Phase 4/US2 fix): a 'project_command'
         // row can now only ever legitimately survive search() when the call
@@ -160,7 +222,7 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         $results = $service->search('create a contact');
 
         $this->assertCount(1, $results);
@@ -200,7 +262,7 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
         $results = $service->search('evening scene');
 
         $this->assertCount(1, $results);
@@ -229,6 +291,15 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
             'path' => null,
             'paramSchema' => null,
             'promptContent' => 'Project deploy instructions.',
+            // 128-project-command-indexing (Phase 7/US5, collateral fix):
+            // the merged, scored result set is now sorted by relevanceScore
+            // descending (research.md D6) rather than concatenated
+            // query-by-query, so this row is given a higher score than
+            // $builtinRow below to keep this test's own expected ordering
+            // (project row first, builtin row second) -- the property under
+            // test (each row keeps its own type/operationId independently)
+            // is otherwise unchanged.
+            'relevanceScore' => 9.0,
         ];
         $builtinRow = (object) [
             'operationId' => 'deploy',
@@ -239,18 +310,27 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
             'path' => '/api/deploy',
             'paramSchema' => null,
             'promptContent' => null,
+            'relevanceScore' => 5.0,
         ];
 
-        $queryMock = $this->queryMockReturning('deploy', 10, [$projectCommandRow, $builtinRow]);
-        // A scoped call adds the whereNull/orWhere coding_project_id
-        // predicate (OperationsSearchServiceScopingTest owns asserting its
-        // exact shape) -- this file only needs the mock to accept the call.
-        $queryMock->shouldReceive('where')->once()->andReturnSelf();
+        // 128-project-command-indexing (Phase 7/US5, collateral fix): a
+        // scoped call now runs two independently-capped queries instead of
+        // one -- the builtin/global leg returns $builtinRow, the project leg
+        // returns $projectCommandRow.
+        [$builtinQueryMock, $projectQueryMock] = $this->twoQueryMocksReturning(
+            'deploy',
+            limit: 10,
+            projectCommandCap: 5,
+            codingProjectId: 'coding-project-xyz',
+            builtinRows: [$builtinRow],
+            projectRows: [$projectCommandRow]
+        );
 
         $dbMock = Mockery::mock(ConnectionInterface::class);
-        $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
+        $dbMock->shouldReceive('table')->with('operation_search_index')->twice()
+            ->andReturn($builtinQueryMock, $projectQueryMock);
 
-        $service = new OperationsSearchService($dbMock, 10);
+        $service = new OperationsSearchService($dbMock, 10, 5);
 
         // 128-project-command-indexing (Phase 4/US2 fix): same reasoning as
         // the single-row case above -- a 'project_command' row only ever
