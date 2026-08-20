@@ -102,6 +102,33 @@ class SkillsLayoutGapJourneyTest extends TestCase
             );
         }
 
+        // Per-name absence alone is too weak: a scanner pointed at the
+        // wrong directory could still find files there and derive a
+        // garbled name for them (e.g. from applying command-file naming
+        // logic to an unrelated directory structure) that happens not to
+        // match any $expectedName, passing every check above while still
+        // having discovered something it should not have. Every prompt
+        // this registry emits carries a 'source' of either 'builtin' or
+        // 'project' (McpPromptRegistry::collectAllPrompts()), and that tag
+        // survives collision resolution even when a losing entry's name is
+        // rewritten to a 'copilot-agent:'-prefixed alternate. So assert
+        // directly on the source tag: a real Claude-target project must
+        // yield zero 'project'-sourced entries at all, regardless of what
+        // name CommandPackLoader assigned them.
+        $projectSourcedEntries = array_values(array_filter(
+            $listing['prompts'],
+            fn (array $p) => ($p['source'] ?? null) === 'project'
+        ));
+
+        $this->assertCount(
+            0,
+            $projectSourcedEntries,
+            'expected zero project-sourced entries in getPrompts()\'s listing -- a real Claude-target project '
+            . 'never creates .claude/commands, so CommandPackLoader must discover NOTHING at all from this '
+            . 'project, not merely avoid the specific expected names (found: '
+            . json_encode(array_map(fn (array $p) => $p['name'], $projectSourcedEntries)) . ')'
+        );
+
         $claudeCommandsDir = rtrim($this->fixture->rootPath, '/').'/.claude/commands';
         $this->assertDirectoryDoesNotExist(
             $claudeCommandsDir,
