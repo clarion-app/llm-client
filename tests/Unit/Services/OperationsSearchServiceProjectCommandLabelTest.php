@@ -94,12 +94,27 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
         ];
 
         $queryMock = $this->queryMockReturning('deploy the branch', 10, [$projectCommandRow]);
+        // A scoped call adds the whereNull/orWhere coding_project_id
+        // predicate (OperationsSearchServiceScopingTest owns asserting its
+        // exact shape) -- this file only needs the mock to accept the call.
+        $queryMock->shouldReceive('where')->once()->andReturnSelf();
 
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
         $service = new OperationsSearchService($dbMock, 10);
-        $results = $service->search('deploy the branch');
+
+        // 128-project-command-indexing (Phase 4/US2 fix): a 'project_command'
+        // row can now only ever legitimately survive search() when the call
+        // is scoped to that row's own workspace -- an unscoped call filters
+        // any such row out (contracts/operations-search-service.md
+        // postcondition 1, FR-003). This test's own subject is field
+        // pass-through fidelity for a project-command row, not the scoping
+        // predicate itself (OperationsSearchServiceScopingTest owns that),
+        // so the call is scoped to the row's own coding_project_id here --
+        // the only realistic scenario in which this row shape is ever
+        // actually returned.
+        $results = $service->search('deploy the branch', 'coding-project-abc');
 
         $this->assertCount(1, $results);
         $row = $results[0];
@@ -227,12 +242,22 @@ class OperationsSearchServiceProjectCommandLabelTest extends TestCase
         ];
 
         $queryMock = $this->queryMockReturning('deploy', 10, [$projectCommandRow, $builtinRow]);
+        // A scoped call adds the whereNull/orWhere coding_project_id
+        // predicate (OperationsSearchServiceScopingTest owns asserting its
+        // exact shape) -- this file only needs the mock to accept the call.
+        $queryMock->shouldReceive('where')->once()->andReturnSelf();
 
         $dbMock = Mockery::mock(ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
         $service = new OperationsSearchService($dbMock, 10);
-        $results = $service->search('deploy');
+
+        // 128-project-command-indexing (Phase 4/US2 fix): same reasoning as
+        // the single-row case above -- a 'project_command' row only ever
+        // legitimately survives a search scoped to its own workspace, so
+        // this mixed-set fixture is scoped to the project-command row's own
+        // coding_project_id.
+        $results = $service->search('deploy', 'coding-project-xyz');
 
         $this->assertCount(2, $results);
         $this->assertSame('project_command', $results[0]->type);

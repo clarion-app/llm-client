@@ -186,7 +186,7 @@ class ProjectCommandSearchJourneyTest extends TestCase
             function (string $query, ?string $codingProjectId = null, ?int $limit = null) {
                 $term = strtolower(explode(' ', $query)[0] ?? $query);
 
-                return DB::table('operation_search_index')
+                $queryBuilder = DB::table('operation_search_index')
                     ->select(
                         'operation_id as operationId',
                         'package_name',
@@ -200,10 +200,40 @@ class ProjectCommandSearchJourneyTest extends TestCase
                     ->where(function ($q) use ($term) {
                         $q->where('searchable_text', 'like', "%{$term}%")
                             ->orWhere('summary', 'like', "%{$term}%");
-                    })
+                    });
+
+                // Mirrors OperationsSearchService::search()'s own scoping
+                // predicate exactly (src/Services/OperationsSearchService.php,
+                // 128-project-command-indexing Phase 4/US2 fix): a scoped
+                // search adds the whereNull/orWhere coding_project_id
+                // predicate; an unscoped search adds no such SQL predicate
+                // at all but filters any type = 'project_command' row out
+                // of the fetched result set in PHP, after get(), so it
+                // never reaches the caller (FR-003, US2 Acceptance
+                // Scenario 3). This fake is deliberately kept behaviorally
+                // faithful to the real implementation's scoping branch, so
+                // this journey-level test is genuinely affected by the
+                // same fix the real service has, rather than masking the
+                // guarantee behind an idealized double.
+                if ($codingProjectId !== null) {
+                    $queryBuilder->where(function ($q) use ($codingProjectId) {
+                        $q->whereNull('coding_project_id')->orWhere('coding_project_id', $codingProjectId);
+                    });
+                }
+
+                $rows = $queryBuilder
                     ->orderBy('operation_id')
                     ->get()
                     ->toArray();
+
+                if ($codingProjectId === null) {
+                    $rows = array_values(array_filter(
+                        $rows,
+                        fn ($row) => ($row->type ?? null) !== 'project_command'
+                    ));
+                }
+
+                return $rows;
             }
         );
 
@@ -379,5 +409,151 @@ MD);
         // -- the project entry's operationId decomposes to this project's
         // id plus "deploy", never bare "deploy" (data-model.md §2).
         $this->assertSame("{$project->id}:deploy", $projectEntries[0]['operationId'] ?? $projectEntries[0]['id'] ?? null);
+    }
+
+    // -----------------------------------------------------------------
+    // 128-project-command-indexing, Phase 4 (US2), T022.
+    //
+    // Cross-workspace search isolation (quickstart Scenario 2). Two
+    // CodingProject fixtures A and B, owned by the SAME user -- only A
+    // has a "deploy" command. B's own command ("ship.md") is deliberately
+    // written so its description/content also contains the word "deploy",
+    // making any of these isolation assertions genuinely meaningful (a
+    // scoping leak would have something real to leak) rather than
+    // vacuously true because the two workspaces' content never overlaps.
+    // -----------------------------------------------------------------
+
+    /**
+     * @return array{0: CodingProject, 1: CodingProject} [$projectA, $projectB]
+     */
+    private function makeTwoWorkspaceFixture(): array
+    {
+        $dirA = $this->makeProjectDir();
+        $this->write($dirA, '.claude/commands/deploy.md', <<<'MD'
+---
+description: Deploy the current branch
+---
+Run the deployment pipeline for the current branch and report the outcome.
+MD);
+        $projectA = $this->makeProject($dirA);
+
+        $dirB = $this->makeProjectDir();
+        $this->write($dirB, '.claude/commands/ship.md', <<<'MD'
+---
+description: Build and deploy container images
+---
+Build the project's container images and deploy them to the internal registry.
+MD);
+        $projectB = $this->makeProject($dirB);
+
+        Artisan::call('llm-client:reindex-project-commands');
+
+        return [$projectA, $projectB];
+    }
+
+    private function makeConversation(?string $codingProjectId): Conversation
+    {
+        return Conversation::create([
+            'user_id' => $this->user->id,
+            'title' => 'project command search journey (US2)',
+            'coding_project_id' => $codingProjectId,
+        ]);
+    }
+
+    /** @return list<string> operationId of every 'project_command'-typed result row */
+    private function projectCommandOperationIds(array $results): array
+    {
+        return array_values(array_map(
+            fn ($r) => $r['operationId'] ?? $r['id'] ?? null,
+            array_filter($results, fn ($r) => ($r['type'] ?? null) === 'project_command')
+        ));
+    }
+
+    #[Test]
+    public function a_search_scoped_to_workspace_b_never_returns_workspace_as_command(): void
+    {
+        [$projectA, $projectB] = $this->makeTwoWorkspaceFixture();
+        $this->bindPlainTextSearch();
+
+        $conversation = $this->makeConversation($projectB->id);
+        $raw = $this->callSearchOperations($conversation, 'deploy');
+        $projectIds = $this->projectCommandOperationIds($this->decodeResults($raw));
+
+        $this->assertNotContains(
+            "{$projectA->id}:deploy",
+            $projectIds,
+            "workspace A's deploy command must never appear in a search scoped to workspace B: ".$raw
+        );
+    }
+
+    #[Test]
+    public function the_same_query_scoped_to_workspace_a_returns_its_own_deploy_command(): void
+    {
+        [$projectA, $projectB] = $this->makeTwoWorkspaceFixture();
+        $this->bindPlainTextSearch();
+
+        $conversation = $this->makeConversation($projectA->id);
+        $raw = $this->callSearchOperations($conversation, 'deploy');
+        $projectIds = $this->projectCommandOperationIds($this->decodeResults($raw));
+
+        $this->assertContains(
+            "{$projectA->id}:deploy",
+            $projectIds,
+            "workspace A's own deploy command must appear in a search scoped to workspace A: ".$raw
+        );
+    }
+
+    /**
+     * AS3 -- and the "IMPORTANT" gap this phase's own task instructions
+     * call out explicitly: OperationsSearchService::search($query, null)
+     * currently applies NO coding_project_id/type predicate at all --
+     * byte-for-byte the pre-feature, fully-unscoped query. That was
+     * harmless before this feature existed (no type = 'project_command'
+     * rows existed to leak), but such rows now genuinely exist in the
+     * index, so an unscoped search CAN surface one if its text matches --
+     * contradicting this scenario's own "matching this method's
+     * pre-feature output exactly" requirement. This case is expected to
+     * be genuinely RED against the current implementation, proving the
+     * gap concretely rather than assuming it from the design.
+     */
+    #[Test]
+    public function an_unscoped_search_never_returns_any_workspaces_project_command_matching_pre_feature_output(): void
+    {
+        [$projectA, $projectB] = $this->makeTwoWorkspaceFixture();
+        $this->bindPlainTextSearch();
+
+        $conversation = $this->makeConversation(null);
+        $raw = $this->callSearchOperations($conversation, 'deploy');
+        $results = $this->decodeResults($raw);
+
+        $projectEntries = array_values(array_filter($results, fn ($r) => ($r['type'] ?? null) === 'project_command'));
+
+        $this->assertEmpty(
+            $projectEntries,
+            'an unscoped search (coding_project_id = null) must return built-ins only, matching this '
+            .'method\'s pre-feature output exactly -- no project_command row of any kind: '.$raw
+        );
+    }
+
+    #[Test]
+    public function back_to_back_searches_scoped_to_different_workspaces_each_observe_only_their_own_rows(): void
+    {
+        [$projectA, $projectB] = $this->makeTwoWorkspaceFixture();
+        $this->bindPlainTextSearch();
+
+        $conversationA = $this->makeConversation($projectA->id);
+        $conversationB = $this->makeConversation($projectB->id);
+
+        $rawA = $this->callSearchOperations($conversationA, 'deploy');
+        $rawB = $this->callSearchOperations($conversationB, 'deploy');
+
+        $projectIdsA = $this->projectCommandOperationIds($this->decodeResults($rawA));
+        $projectIdsB = $this->projectCommandOperationIds($this->decodeResults($rawB));
+
+        $this->assertContains("{$projectA->id}:deploy", $projectIdsA, 'A-scoped search must see its own command: '.$rawA);
+        $this->assertNotContains("{$projectB->id}:ship", $projectIdsA, "A-scoped search must never see B's command: ".$rawA);
+
+        $this->assertContains("{$projectB->id}:ship", $projectIdsB, 'B-scoped search must see its own command: '.$rawB);
+        $this->assertNotContains("{$projectA->id}:deploy", $projectIdsB, "B-scoped search must never see A's command: ".$rawB);
     }
 }

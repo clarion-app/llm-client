@@ -191,4 +191,105 @@ MD);
             .json_encode(array_map(fn ($r) => ['operationId' => $r->operationId, 'type' => $r->type], $results))
         );
     }
+
+    /**
+     * 128-project-command-indexing, Phase 4 (US2), T025.
+     *
+     * Workspace B's command is seeded with content that repeats the query
+     * terms heavily, so it genuinely out-ranks workspace A's own command
+     * under real MATCH/AGAINST scoring -- proving the scoping predicate
+     * itself, not merely relevance ordering, is what excludes it. A single
+     * unscoped LIMIT-based query could otherwise let a higher-ranked
+     * foreign row slip through before any PHP-side filter ever ran; this
+     * test rules that out by seeding B to deliberately win the ranking and
+     * confirming it still never appears in a search scoped to A.
+     *
+     * This is a scoped call ($codingProjectId = $projectA->id, never
+     * null), so unlike T022's AS3 case in the Feature-level journey test
+     * it exercises OperationsSearchService::search()'s already-correct
+     * non-null branch -- expected, and confirmed, to already pass with no
+     * production code change.
+     */
+    #[Test]
+    public function a_higher_ranked_foreign_workspace_command_is_still_excluded_by_the_scoping_predicate(): void
+    {
+        $this->assertReady();
+
+        $dirA = $this->makeProjectDir();
+        $this->write($dirA, '.claude/commands/deploy.md', <<<'MD'
+---
+description: Deploy the current branch
+---
+Run the deployment pipeline for the current branch and report the outcome.
+MD);
+        $projectA = $this->makeProject($dirA);
+
+        $dirB = $this->makeProjectDir();
+        // Deliberately repeats "deploy"/"branch" many times so this
+        // command's searchable_text out-ranks workspace A's own command
+        // under real MATCH/AGAINST relevance scoring for the same query.
+        $this->write($dirB, '.claude/commands/ship.md', <<<'MD'
+---
+description: Deploy branch deploy branch deploy branch deploy branch deploy branch
+---
+Deploy the branch. Deploy the branch. Deploy the branch. Deploy the branch. Deploy
+the branch. Deploy the branch deploy branch deploy branch deploy branch deploy branch.
+MD);
+        $projectB = $this->makeProject($dirB);
+
+        $exitCode = Artisan::call('llm-client:reindex-project-commands');
+        $this->assertSame(
+            0,
+            $exitCode,
+            'llm-client:reindex-project-commands must exit successfully: '.Artisan::output()
+        );
+
+        $rowA = DB::table('operation_search_index')
+            ->where('type', 'project_command')->where('coding_project_id', $projectA->id)->first();
+        $rowB = DB::table('operation_search_index')
+            ->where('type', 'project_command')->where('coding_project_id', $projectB->id)->first();
+        $this->assertNotNull($rowA, "workspace A's command must be indexed");
+        $this->assertNotNull($rowB, "workspace B's command must be indexed");
+
+        // Confirm B genuinely out-ranks A under real relevance scoring for
+        // this query, unscoped -- otherwise this test would not be
+        // proving what it claims to prove.
+        $unscopedRanked = DB::table('operation_search_index')
+            ->select('operation_id as operationId')
+            ->whereRaw('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE)', ['deploy the branch'])
+            ->orderByRaw('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE) DESC', ['deploy the branch'])
+            ->get();
+        $rankedIds = $unscopedRanked->pluck('operationId')->values()->all();
+        $posA = array_search("{$projectA->id}:deploy", $rankedIds, true);
+        $posB = array_search("{$projectB->id}:ship", $rankedIds, true);
+        $this->assertNotFalse($posA, "workspace A's row must appear in the unscoped ranked results");
+        $this->assertNotFalse($posB, "workspace B's row must appear in the unscoped ranked results");
+        $this->assertLessThan(
+            $posA,
+            $posB,
+            "workspace B's command must genuinely out-rank workspace A's command for this test to prove anything: ".
+            json_encode($rankedIds)
+        );
+
+        $service = new OperationsSearchService();
+        $resultsScopedToA = $service->search('deploy the branch', $projectA->id);
+
+        $foreignEntries = array_values(array_filter(
+            $resultsScopedToA,
+            fn ($row) => $row->operationId === "{$projectB->id}:ship"
+        ));
+
+        $this->assertEmpty(
+            $foreignEntries,
+            "workspace B's higher-ranked command must never appear in a search scoped to workspace A, ".
+            'even though it out-ranks A\'s own command: '
+            .json_encode(array_map(fn ($r) => ['operationId' => $r->operationId, 'type' => $r->type], $resultsScopedToA))
+        );
+
+        $ownEntries = array_values(array_filter(
+            $resultsScopedToA,
+            fn ($row) => $row->operationId === "{$projectA->id}:deploy"
+        ));
+        $this->assertNotEmpty($ownEntries, "workspace A's own command must still appear in its own scoped search");
+    }
 }

@@ -65,6 +65,24 @@ class OperationsSearchService
             ->get()
             ->toArray();
 
+        if ($codingProjectId === null) {
+            // 128-project-command-indexing (Phase 4/US2, contracts/
+            // operations-search-service.md postcondition 1): an unscoped
+            // search must build the exact same select/whereRaw/orderByRaw/
+            // limit query chain as before this feature -- no additional
+            // where() call of any kind (OperationsSearchServiceScopingTest
+            // asserts this at the query-builder level). A type =
+            // 'project_command' row can still be present in the raw result
+            // set (nothing in the query restricts it), so it is filtered
+            // out here, in PHP, after fetch -- never returned to a caller
+            // with no workspace in scope (FR-003, US2 Acceptance Scenario
+            // 3).
+            $results = array_values(array_filter(
+                $results,
+                fn ($row) => ($row->type ?? null) !== 'project_command'
+            ));
+        }
+
         return $results;
     }
 

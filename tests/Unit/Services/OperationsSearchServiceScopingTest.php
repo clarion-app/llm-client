@@ -162,4 +162,40 @@ class OperationsSearchServiceScopingTest extends TestCase
         $this->assertIsArray($resultsAlpha);
         $this->assertIsArray($resultsBeta);
     }
+
+    /**
+     * 128-project-command-indexing, Phase 4 (US2), T021.
+     *
+     * Extends the Foundational coverage above with the one shape T021 asks
+     * for that was not already present: an unscoped search performed
+     * immediately after a scoped search on the same service instance must
+     * still add no coding_project_id predicate of any kind -- proving the
+     * unscoped branch carries no leftover state from the immediately
+     * preceding scoped call (the other T021 bullet, two independently-bound
+     * scoped calls back-to-back, is already covered above by
+     * two_scoped_searches_on_the_same_service_instance_produce_independently_correct_bound_parameters(),
+     * which predates this phase and was found already green).
+     */
+    #[Test]
+    public function an_unscoped_search_still_adds_no_where_clause_when_it_immediately_follows_a_scoped_search_on_the_same_instance(): void
+    {
+        $queryMockScoped = $this->baseQueryMock('deploy', 10);
+        $this->expectScopingWhere($queryMockScoped, 'project-alpha');
+
+        $queryMockUnscoped = $this->baseQueryMock('deploy', 10);
+        // No where() expectation is registered at all -- an unexpected call
+        // to it on this bare Mockery::mock() double fails the test, exactly
+        // as the bare-omitted-argument case above does.
+
+        $dbMock = Mockery::mock(ConnectionInterface::class);
+        $dbMock->shouldReceive('table')->with('operation_search_index')->twice()->andReturn($queryMockScoped, $queryMockUnscoped);
+
+        $service = new OperationsSearchService($dbMock, 10);
+
+        $scopedResults = $service->search('deploy', 'project-alpha');
+        $unscopedResults = $service->search('deploy');
+
+        $this->assertIsArray($scopedResults);
+        $this->assertIsArray($unscopedResults);
+    }
 }
