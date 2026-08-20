@@ -76,6 +76,7 @@ tools:
     - clarionApp.llmClient.codingWorkspace.runCode
     - clarionApp.llmClient.codingWorkspace.gitCommit
     - clarionApp.llmClient.codingWorkspace.gitPush
+    - clarionApp.llmClient.codingWorkspace.gitBranch
   deny: []
 safety:
   confirmation_required:
@@ -85,4 +86,5 @@ safety:
     - clarionApp.llmClient.codingWorkspace.runCode
     - clarionApp.llmClient.codingWorkspace.gitCommit
     - clarionApp.llmClient.codingWorkspace.gitPush
+    - clarionApp.llmClient.codingWorkspace.gitBranch
   denylist: []

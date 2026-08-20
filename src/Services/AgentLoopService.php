@@ -1739,6 +1739,17 @@ class AgentLoopService
                                 $confirmationPayload['remote_url_sanitized'] = $pendingConfirmation['remote_url_sanitized'];
                                 $confirmationPayload['commits_ahead'] = $pendingConfirmation['commits_ahead'];
                                 $confirmationPayload['creates_remote_branch'] = $pendingConfirmation['creates_remote_branch'];
+                            } elseif ($confirmationType === 'git_branch') {
+                                // 126-git-operations-confirmation, US4: the
+                                // same "extra fields alongside the common
+                                // envelope" widening, now for git_branch's
+                                // own branch_name/start_point_resolved
+                                // (data-model.md §2).
+                                $pendingConfirmation['branch_name'] = $decoded['branch_name'] ?? null;
+                                $pendingConfirmation['start_point_resolved'] = $decoded['start_point_resolved'] ?? null;
+
+                                $confirmationPayload['branch_name'] = $pendingConfirmation['branch_name'];
+                                $confirmationPayload['start_point_resolved'] = $pendingConfirmation['start_point_resolved'];
                             }
                         }
 
@@ -2632,6 +2643,16 @@ class AgentLoopService
                             $confirmationPayload['remote_url_sanitized'] = $pendingConfirmation['remote_url_sanitized'];
                             $confirmationPayload['commits_ahead'] = $pendingConfirmation['commits_ahead'];
                             $confirmationPayload['creates_remote_branch'] = $pendingConfirmation['creates_remote_branch'];
+                        } elseif ($confirmationType === 'git_branch') {
+                            // See run()'s identical branch, immediately
+                            // above the same relative point in that
+                            // sibling method (126-git-operations-
+                            // confirmation, US4).
+                            $pendingConfirmation['branch_name'] = $decoded['branch_name'] ?? null;
+                            $pendingConfirmation['start_point_resolved'] = $decoded['start_point_resolved'] ?? null;
+
+                            $confirmationPayload['branch_name'] = $pendingConfirmation['branch_name'];
+                            $confirmationPayload['start_point_resolved'] = $pendingConfirmation['start_point_resolved'];
                         }
                     }
 
@@ -4310,9 +4331,9 @@ class AgentLoopService
     private function gitOperationConfirmationPreview(string $operationId, string $method, string $pathTemplate, array $params): ?string
     {
         if ($operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
-            && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
-            // gitBranch/gitRewriteHistory -- not wired until their own
-            // later stories.
+            && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
+            // gitRewriteHistory -- not wired until its own later story.
             return null;
         }
 
@@ -4331,6 +4352,10 @@ class AgentLoopService
 
         if ($operationId === self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
             return $this->gitPushConfirmationPreview($project, $method, $pathTemplate, $params);
+        }
+
+        if ($operationId === self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
+            return $this->gitBranchConfirmationPreview($project, $method, $pathTemplate, $params);
         }
 
         $requestedPaths = $params['body']['paths'] ?? null;
@@ -4412,6 +4437,63 @@ class AgentLoopService
             'remote_url_sanitized' => $preview['remote_url_sanitized'],
             'commits_ahead' => $preview['commits_ahead'],
             'creates_remote_branch' => $preview['creates_remote_branch'],
+        ]);
+    }
+
+    /**
+     * 126-git-operations-confirmation, US4 (research.md D6, contracts/
+     * git-branch.md §1): the gitBranch arm of
+     * gitOperationConfirmationPreview() above, split out the same way
+     * gitPushConfirmationPreview() is. `git_not_a_repository` ->
+     * `git_invalid_reference` -> `git_branch_already_exists` (and any
+     * other GitOperationInspector::previewCreateBranch() refusal) are
+     * returned as a plain, unaudited {error, code} JSON string, never as a
+     * confirmation marker -- no confirmation is ever constructed for a
+     * branch creation that cannot possibly succeed (D4/D5/D6). A
+     * successful preview builds the git_branch-typed marker (data-model.md
+     * §2), with `parameters.body.start_point` PINNED to the resolved
+     * hash -- approving this exact prompt later creates the branch from
+     * exactly that commit, even if the repository's HEAD moves while the
+     * confirmation is pending (D6).
+     */
+    private function gitBranchConfirmationPreview(\ClarionApp\LlmClient\Models\CodingProject $project, string $method, string $pathTemplate, array $params): string
+    {
+        $requestedName = $params['body']['name'] ?? null;
+        $requestedStartPoint = $params['body']['start_point'] ?? null;
+
+        if (!is_string($requestedName) || $requestedName === '') {
+            return json_encode([
+                'error' => 'A branch name is required.',
+                'code' => 'git_invalid_reference',
+            ]);
+        }
+
+        $preview = $this->gitOperationInspector->previewCreateBranch(
+            $project->root_path,
+            $requestedName,
+            is_string($requestedStartPoint) ? $requestedStartPoint : null,
+        );
+
+        if (!($preview['ok'] ?? false)) {
+            return json_encode([
+                'error' => $preview['reason'] ?? 'Could not create branch.',
+                'code' => $preview['code'] ?? 'git_invalid_reference',
+            ]);
+        }
+
+        $pinnedParams = $params;
+        $pinnedParams['body']['name'] = $preview['branch_name'];
+        $pinnedParams['body']['start_point'] = $preview['start_point_resolved']['hash'];
+
+        return json_encode([
+            '__requires_confirmation' => true,
+            'confirmation_type' => 'git_branch',
+            'operationId' => self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID,
+            'method' => $method,
+            'path' => $pathTemplate,
+            'parameters' => $pinnedParams,
+            'branch_name' => $preview['branch_name'],
+            'start_point_resolved' => $preview['start_point_resolved'],
         ]);
     }
 
@@ -4520,7 +4602,8 @@ class AgentLoopService
 
         if ($operationId !== self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
             && $operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
-            && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
+            && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
             return;
         }
 
@@ -4551,6 +4634,15 @@ class AgentLoopService
 
             $sanitizedRemote = $this->gitOperationInspector->sanitizeRemoteUrl($remote);
             $command = "git push {$sanitizedRemote} {$pinnedHead}:refs/heads/{$branch}";
+        } elseif ($operationId === self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
+            $name = $arguments['body']['name'] ?? null;
+            $resolvedStartPoint = $arguments['body']['start_point'] ?? null;
+
+            if (!is_string($name) || !is_string($resolvedStartPoint)) {
+                return;
+            }
+
+            $command = "git branch {$name} {$resolvedStartPoint}";
         } else {
             $command = $arguments['body']['command'] ?? null;
 
@@ -4684,15 +4776,16 @@ class AgentLoopService
         // execution's own audit row. 126-git-operations-confirmation, US2
         // (Grounding note 10) extends it again to gitCommit, for the
         // identical reason -- its own resolveAttribution() call needs
-        // this header too. US3 extends it once more to gitPush, for the
-        // same reason.
+        // this header too. US3 extends it once more to gitPush, and US4
+        // once more to gitBranch, for the same reason.
         $extraHeaders = [];
         if ($operationId === self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_RUN_CODE_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
-            || $operationId === self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
+            || $operationId === self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID) {
             $extraHeaders['X-Llm-Client-Conversation-Id'] = (string) $conversation->id;
         }
 

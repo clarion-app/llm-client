@@ -34,43 +34,45 @@ use Symfony\Component\Process\Process;
 use Tests\TestCase;
 
 /**
- * 126-git-operations-confirmation, US2 (P1) 🎯 MVP of the confirmable
- * half, T017 (contracts/git-commit.md, quickstart Scenario 2).
+ * 126-git-operations-confirmation, US4 (P2), T031 (contracts/git-branch.md,
+ * quickstart Scenario 3).
  *
- * Two combined techniques, mirroring two existing precedent files:
+ * Same two combined techniques GitCommitConfirmationJourneyTest.php and
+ * GitPublishConfirmationJourneyTest.php already established:
  *
- * - The confirmation-pause and decline halves (cases 1, 2, 5) drive the
- *   real, provisioned `coding` agent through
+ * - The confirmation-pause, decline, and pre-confirmation-refusal halves
+ *   (cases 1, 2, 4, 5) drive the real, provisioned `coding` agent through
  *   AgentLoopService::run()/resumeSync() with a mocked LlmProvider
- *   producing a scripted gitCommit tool call —
+ *   producing a scripted gitBranch tool call --
  *   AgentLoopServiceRunCodeConfirmationTest.php's own "drive the confirm
  *   branch directly" heavy-fixture technique. No HTTP call is ever
  *   dispatched for these cases (Http::assertNothingSent()), since a
  *   pause or a pre-confirmation refusal both stop strictly before
  *   executeApiCall() ever runs.
  *
- * - The executed (approved) halves (cases 3, 4) and the ownership check
+ * - The executed (approved) half (case 3) and the ownership check
  *   (case 6) drive the real, registered
- *   `POST coding-project/{project}/git-commit` route directly via
- *   postJson() — RunCommandJourneyTest.php's own controller-level
- *   technique exactly, submitting the same {message, paths} body a real
- *   approval would resubmit and asserting on the real git repository
- *   state the controller produced.
+ *   `POST coding-project/{project}/git-branch` route directly via
+ *   postJson() -- RunCommandJourneyTest.php's own controller-level
+ *   technique exactly, submitting the same {name, start_point} body a
+ *   real approval would resubmit (start_point already the pinned,
+ *   resolved hash -- research.md D6) and asserting on the real git
+ *   repository state the controller produced.
  *
  * Every fixture repository is a real, throwaway `git init`'d temp
  * directory (Grounding note 7's convention, mirroring
- * GitOperationInspectorTest.php exactly) — never a mocked git
+ * GitOperationInspectorTest.php exactly) -- never a mocked git
  * invocation, never Docker.
  *
- * Written before CodingWorkspaceController::gitCommit(),
- * AgentLoopService::gitOperationConfirmationPreview(), the git-commit
- * route, and coding.yaml's gitCommit entries all exist — expected to
- * FAIL red (a gitCommit tool call never pauses at all today, since
- * nothing recognizes CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID as
- * confirmation-required or even as a known operation; POST
- * .../git-commit 404s as an unregistered route) until T018-T022 land.
+ * Written before CodingWorkspaceController::gitBranch(),
+ * AgentLoopService::gitOperationConfirmationPreview()'s gitBranch branch,
+ * the git-branch route, and coding.yaml's gitBranch entries all exist --
+ * expected to FAIL red (a gitBranch tool call never pauses at all today,
+ * since nothing recognizes CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID as
+ * confirmation-required or even as a known/permitted operation; POST
+ * .../git-branch 404s as an unregistered route) until T032-T034 land.
  */
-class GitCommitConfirmationJourneyTest extends TestCase
+class GitBranchConfirmationJourneyTest extends TestCase
 {
     private User $user;
 
@@ -153,13 +155,13 @@ class GitCommitConfirmationJourneyTest extends TestCase
     }
 
     // ---------------------------------------------------------------
-    // Real, throwaway git repo fixture — Grounding note 7's convention,
+    // Real, throwaway git repo fixture -- Grounding note 7's convention,
     // mirroring GitOperationInspectorTest.php exactly.
     // ---------------------------------------------------------------
 
     private function createGitRepo(): string
     {
-        $repoPath = sys_get_temp_dir().'/git_commit_confirm_test_'.Str::random(12);
+        $repoPath = sys_get_temp_dir().'/git_branch_confirm_test_'.Str::random(12);
         mkdir($repoPath, 0777, true);
         $this->tmpDirs[] = $repoPath;
 
@@ -187,6 +189,19 @@ class GitCommitConfirmationJourneyTest extends TestCase
         return $process->getOutput();
     }
 
+    /**
+     * Runs a git command WITHOUT requiring success -- used for
+     * `git show-ref --verify --quiet`, whose whole point is a non-zero
+     * exit code when the ref does not exist.
+     */
+    private function gitExitCode(string $cwd, array $args): int
+    {
+        $process = new Process(array_merge(['git'], $args), $cwd);
+        $process->run();
+
+        return $process->getExitCode();
+    }
+
     private function removeDirectory(string $dir): void
     {
         foreach (scandir($dir) ?: [] as $item) {
@@ -204,10 +219,9 @@ class GitCommitConfirmationJourneyTest extends TestCase
     }
 
     // ---------------------------------------------------------------
-    // Operation-catalog / provisioning scaffolding — mirrors
-    // CommandExecutionConfirmationJourneyTest.php /
-    // AgentLoopServiceRunCodeConfirmationTest.php exactly, extended with
-    // gitCommit.
+    // Operation-catalog / provisioning scaffolding -- mirrors
+    // GitCommitConfirmationJourneyTest.php exactly, extended with
+    // gitBranch.
     // ---------------------------------------------------------------
 
     private function seedOperationCatalog(): void
@@ -275,7 +289,7 @@ class GitCommitConfirmationJourneyTest extends TestCase
     {
         return CodingProject::create([
             'user_id' => ($owner ?? $this->user)->id,
-            'name' => 'git commit confirmation project',
+            'name' => 'git branch confirmation project',
             'root_path' => $rootPath,
             'test_command' => null,
         ]);
@@ -329,15 +343,15 @@ class GitCommitConfirmationJourneyTest extends TestCase
         return ['choices' => [['message' => ['content' => '', 'tool_calls' => $calls]]]];
     }
 
-    private function gitCommitCall(CodingProject $project, string $message, ?array $paths, string $callId): array
+    private function gitBranchCall(CodingProject $project, string $name, ?string $startPoint, string $callId): array
     {
-        $body = ['message' => $message];
-        if ($paths !== null) {
-            $body['paths'] = $paths;
+        $body = ['name' => $name];
+        if ($startPoint !== null) {
+            $body['start_point'] = $startPoint;
         }
 
         return $this->toolCall('execute_operation', [
-            'operationId' => AgentLoopService::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID,
+            'operationId' => AgentLoopService::CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID,
             'parameters' => [
                 'path' => ['project' => $project->id],
                 'body' => $body,
@@ -350,282 +364,16 @@ class GitCommitConfirmationJourneyTest extends TestCase
         return '/api/clarion-app/llm-client/'.$suffix;
     }
 
-    // -----------------------------------------------------------------
-    // (1) Proposing a commit with no paths against a repo with two
-    // modified files -- confirmation_type: git_commit, files names
-    // exactly those two files, diff_stat summarizes the real diff, and
-    // nothing has happened yet (AS1, FR-004).
-    // -----------------------------------------------------------------
-
-    #[Test]
-    public function proposing_a_commit_with_no_paths_names_the_two_modified_files_and_leaves_history_untouched(): void
-    {
-        $this->seedOperationCatalog();
-        $this->actingAs($this->user, 'api');
-
-        $repoPath = $this->createGitRepo();
-        file_put_contents($repoPath.'/one.txt', "one\n");
-        file_put_contents($repoPath.'/two.txt', "two\n");
-        $this->runGit(['add', '.'], $repoPath);
-        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
-
-        file_put_contents($repoPath.'/one.txt', "one changed\n");
-        file_put_contents($repoPath.'/two.txt', "two changed\n");
-
-        $expectedHash = trim($this->shellGit($repoPath, ['rev-parse', 'HEAD']));
-
-        $project = $this->registerProject($repoPath);
-        $conversation = $this->makeConversation($this->agent(), $project);
-
-        $service = $this->service([
-            $this->toolCallReply([$this->gitCommitCall($project, 'Update files', null, 'call_commit_1')]),
-        ]);
-
-        $result = $service->run($conversation->fresh(), 'Please commit the changes.');
-
-        $this->assertSame('confirmation_required', $result['status'], 'a gitCommit operation must pause for confirmation, not run immediately');
-
-        $confirmation = $result['confirmation'] ?? [];
-        $this->assertSame('git_commit', $confirmation['confirmation_type'] ?? null, 'the marker must carry the dedicated git_commit confirmation_type, not the generic api_call');
-        $this->assertEqualsCanonicalizing(
-            ['one.txt', 'two.txt'],
-            $confirmation['files'] ?? null,
-            'the confirmation must name exactly the two changed files'
-        );
-        $this->assertNotEmpty($confirmation['diff_stat'] ?? null, 'the confirmation must carry a real diff_stat summary');
-
-        $afterHash = trim($this->shellGit($repoPath, ['rev-parse', 'HEAD']));
-        $this->assertSame($expectedHash, $afterHash, 'git log -1 (HEAD) must be completely unchanged -- nothing has happened yet');
-
-        Http::assertNothingSent();
-        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $project->id)->count(), 'nothing must have run yet');
-    }
-
-    // -----------------------------------------------------------------
-    // (2) Decline -- git status --porcelain still shows the same two
-    // files changed, git log -1 unchanged, a status: 'refused'
-    // CodingCommandExecution row exists with a reconstructed command
-    // text (AS2, research.md D9).
-    // -----------------------------------------------------------------
-
-    #[Test]
-    public function declining_a_pending_commit_leaves_git_history_untouched_and_writes_a_refused_row(): void
-    {
-        $this->seedOperationCatalog();
-        $this->actingAs($this->user, 'api');
-
-        $repoPath = $this->createGitRepo();
-        file_put_contents($repoPath.'/one.txt', "one\n");
-        file_put_contents($repoPath.'/two.txt', "two\n");
-        $this->runGit(['add', '.'], $repoPath);
-        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
-
-        file_put_contents($repoPath.'/one.txt', "one changed\n");
-        file_put_contents($repoPath.'/two.txt', "two changed\n");
-
-        $expectedHash = trim($this->shellGit($repoPath, ['rev-parse', 'HEAD']));
-        $expectedStatus = $this->shellGit($repoPath, ['status', '--porcelain=v1']);
-
-        $project = $this->registerProject($repoPath);
-        $conversation = $this->makeConversation($this->agent(), $project);
-
-        $service = $this->service([
-            $this->toolCallReply([$this->gitCommitCall($project, 'Update files', ['one.txt', 'two.txt'], 'call_commit_decline')]),
-            $this->plainReply('Understood, the commit was not made.'),
-        ]);
-
-        $result = $service->run($conversation->fresh(), 'Please commit the changes.');
-        $message = Message::find($result['message_id']);
-
-        $final = $service->resumeSync($conversation->fresh(), $message, false);
-
-        $this->assertSame('completed', $final['status']);
-        Http::assertNothingSent();
-
-        $afterHash = trim($this->shellGit($repoPath, ['rev-parse', 'HEAD']));
-        $afterStatus = $this->shellGit($repoPath, ['status', '--porcelain=v1']);
-        $this->assertSame($expectedHash, $afterHash, 'declining must never advance HEAD');
-        $this->assertSame($expectedStatus, $afterStatus, 'declining must never change git status --porcelain');
-
-        $row = CodingCommandExecution::where('coding_project_id', $project->id)->first();
-        $this->assertNotNull($row, 'a refused execution row must be written on decline');
-        $this->assertSame('refused', $row->status);
-        $this->assertStringStartsWith('git commit -m "Update files" --', $row->command, 'the reconstructed command text must name the commit message');
-        $this->assertStringContainsString('one.txt', $row->command);
-        $this->assertStringContainsString('two.txt', $row->command);
-    }
-
-    // -----------------------------------------------------------------
-    // (3) Approve the same pending call -- git show --stat HEAD matches
-    // the confirmation's files/diff_stat exactly; the two files no
-    // longer appear in git status --porcelain (AS3).
-    //
-    // Driven directly against the real, registered git-commit route
-    // (RunCommandJourneyTest.php's controller-level technique) with the
-    // exact {message, paths} body a real approval resubmits.
-    // -----------------------------------------------------------------
-
-    #[Test]
-    public function approving_the_pending_commit_produces_a_commit_matching_the_confirmation_and_clears_the_working_tree(): void
-    {
-        $this->actingAs($this->user, 'api');
-
-        $repoPath = $this->createGitRepo();
-        file_put_contents($repoPath.'/one.txt', "one\n");
-        file_put_contents($repoPath.'/two.txt', "two\n");
-        $this->runGit(['add', '.'], $repoPath);
-        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
-
-        file_put_contents($repoPath.'/one.txt', "one changed\n");
-        file_put_contents($repoPath.'/two.txt', "two changed\n");
-
-        $project = $this->registerProject($repoPath);
-
-        $response = $this->postJson($this->apiUrl("coding-project/{$project->id}/git-commit"), [
-            'message' => 'Update files',
-            'paths' => ['one.txt', 'two.txt'],
-        ]);
-
-        $response->assertStatus(200);
-        $response->assertJson([
-            'committed' => true,
-            'message' => 'Update files',
-        ]);
-        $this->assertEqualsCanonicalizing(['one.txt', 'two.txt'], $response->json('files'));
-
-        $newHash = trim($this->shellGit($repoPath, ['rev-parse', 'HEAD']));
-        $this->assertSame($newHash, $response->json('hash'), 'the response hash must be the actual new HEAD');
-
-        $showStat = $this->shellGit($repoPath, ['show', '--stat', 'HEAD']);
-        $this->assertStringContainsString('one.txt', $showStat);
-        $this->assertStringContainsString('two.txt', $showStat);
-
-        $status = $this->shellGit($repoPath, ['status', '--porcelain=v1']);
-        $this->assertStringNotContainsString('one.txt', $status, 'one.txt must no longer show as changed');
-        $this->assertStringNotContainsString('two.txt', $status, 'two.txt must no longer show as changed');
-    }
-
-    // -----------------------------------------------------------------
-    // (4) MUTATION-RELEVANT (pinning, quickstart Scenario 2.4): a THIRD,
-    // unrelated file changes between confirmation and approval -- the
-    // resulting commit still contains only the originally-described two
-    // files; the third file remains uncommitted afterward.
-    // -----------------------------------------------------------------
-
-    #[Test]
-    public function a_third_file_changed_between_confirmation_and_approval_is_never_included_in_the_resulting_commit(): void
-    {
-        $this->actingAs($this->user, 'api');
-
-        $repoPath = $this->createGitRepo();
-        file_put_contents($repoPath.'/one.txt', "one\n");
-        file_put_contents($repoPath.'/two.txt', "two\n");
-        file_put_contents($repoPath.'/three.txt', "three\n");
-        $this->runGit(['add', '.'], $repoPath);
-        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
-
-        file_put_contents($repoPath.'/one.txt', "one changed\n");
-        file_put_contents($repoPath.'/two.txt', "two changed\n");
-
-        // The confirmation was built (paths pinned) at this point,
-        // describing only one.txt/two.txt -- three.txt was untouched and
-        // never part of it.
-        $pinnedPaths = ['one.txt', 'two.txt'];
-
-        // A THIRD, unrelated file changes after the confirmation was
-        // shown, before approval arrives.
-        file_put_contents($repoPath.'/three.txt', "three changed\n");
-
-        $project = $this->registerProject($repoPath);
-
-        $response = $this->postJson($this->apiUrl("coding-project/{$project->id}/git-commit"), [
-            'message' => 'Update files',
-            'paths' => $pinnedPaths,
-        ]);
-
-        $response->assertStatus(200);
-        $this->assertEqualsCanonicalizing($pinnedPaths, $response->json('files'));
-
-        $showStat = $this->shellGit($repoPath, ['show', '--stat', 'HEAD']);
-        $this->assertStringContainsString('one.txt', $showStat);
-        $this->assertStringContainsString('two.txt', $showStat);
-        $this->assertStringNotContainsString('three.txt', $showStat, 'the third, unrelated file must never be swept into the commit');
-
-        $status = $this->shellGit($repoPath, ['status', '--porcelain=v1']);
-        $this->assertStringContainsString('three.txt', $status, 'the third file must remain uncommitted afterward');
-    }
-
-    // -----------------------------------------------------------------
-    // (5) Not-a-repo and nothing-to-commit -- both refused before any
-    // confirmation is ever constructed, neither writes a
-    // CodingCommandExecution row.
-    // -----------------------------------------------------------------
-
-    #[Test]
-    public function a_not_a_repository_project_is_refused_before_any_confirmation_with_no_row_written(): void
-    {
-        $this->seedOperationCatalog();
-        $this->actingAs($this->user, 'api');
-
-        $plainDir = sys_get_temp_dir().'/git_commit_confirm_plain_'.Str::random(12);
-        mkdir($plainDir, 0777, true);
-        $this->tmpDirs[] = $plainDir;
-        $notARepoProject = $this->registerProject($plainDir);
-
-        $conversation = $this->makeConversation($this->agent(), $notARepoProject);
-        $service = $this->service([
-            $this->toolCallReply([$this->gitCommitCall($notARepoProject, 'Update files', null, 'call_not_a_repo')]),
-            $this->plainReply('There is no git repository here.'),
-        ]);
-        $result = $service->run($conversation->fresh(), 'Please commit the changes.');
-
-        $this->assertSame('completed', $result['status'], 'a not-a-repository refusal must never pause for confirmation');
-        $this->assertStringContainsString(
-            'git_not_a_repository',
-            $this->toolResultContentFor($conversation, 'call_not_a_repo'),
-            'the tool result fed back to the model must carry the specific git_not_a_repository refusal code, not a generic operation-rejected error'
-        );
-        Http::assertNothingSent();
-        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $notARepoProject->id)->count());
-    }
-
-    #[Test]
-    public function a_clean_tree_is_refused_as_nothing_to_commit_before_any_confirmation_with_no_row_written(): void
-    {
-        $this->seedOperationCatalog();
-        $this->actingAs($this->user, 'api');
-
-        $cleanRepo = $this->createGitRepo();
-        file_put_contents($cleanRepo.'/only.txt', "only\n");
-        $this->runGit(['add', 'only.txt'], $cleanRepo);
-        $this->runGit(['commit', '-m', 'Initial commit'], $cleanRepo);
-
-        $cleanProject = $this->registerProject($cleanRepo);
-        $conversation = $this->makeConversation($this->agent(), $cleanProject);
-        $service = $this->service([
-            $this->toolCallReply([$this->gitCommitCall($cleanProject, 'Update files', null, 'call_nothing_to_commit')]),
-            $this->plainReply('There is nothing to commit.'),
-        ]);
-        $result = $service->run($conversation->fresh(), 'Please commit the changes.');
-
-        $this->assertSame('completed', $result['status'], 'a nothing-to-commit refusal must never pause for confirmation');
-        $this->assertStringContainsString(
-            'git_nothing_to_commit',
-            $this->toolResultContentFor($conversation, 'call_nothing_to_commit'),
-            'the tool result fed back to the model must carry the specific git_nothing_to_commit refusal code, not a generic operation-rejected error'
-        );
-        Http::assertNothingSent();
-        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $cleanProject->id)->count());
-    }
-
     /**
      * Reads back the raw tool-result content the agent loop fed to the
      * model for a specific tool_call_id -- used to pin the SPECIFIC
-     * refusal code (e.g. git_not_a_repository) a pre-confirmation refusal
-     * must carry, distinguishing it from today's generic "operation not
-     * permitted" rejection (gitCommit is not yet in coding.yaml's
-     * tools.allow at all) which would otherwise make a bare
-     * status==='completed' assertion pass for the wrong reason.
+     * refusal code (e.g. git_branch_already_exists) a pre-confirmation
+     * refusal must carry, distinguishing it from today's generic
+     * "operation not permitted" rejection (gitBranch is not yet in
+     * coding.yaml's tools.allow at all) which would otherwise make a
+     * bare status==='completed' assertion pass for the wrong reason.
+     * Mirrors GitCommitConfirmationJourneyTest.php's own identical
+     * helper.
      */
     private function toolResultContentFor(Conversation $conversation, string $toolCallId): string
     {
@@ -647,11 +395,242 @@ class GitCommitConfirmationJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------
+    // (1) Proposing {name: "feature/x"} with no start_point -- the
+    // marker names feature/x and start_point_resolved.hash equal to the
+    // repo's current HEAD (AS1).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function proposing_a_branch_with_no_start_point_names_it_and_pins_the_current_head(): void
+    {
+        $this->seedOperationCatalog();
+        $this->actingAs($this->user, 'api');
+
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+        $headHash = trim($this->shellGit($repoPath, ['rev-parse', 'HEAD']));
+
+        $project = $this->registerProject($repoPath);
+        $conversation = $this->makeConversation($this->agent(), $project);
+
+        $service = $this->service([
+            $this->toolCallReply([$this->gitBranchCall($project, 'feature/x', null, 'call_branch_1')]),
+        ]);
+
+        $result = $service->run($conversation->fresh(), 'Please create a branch called feature/x.');
+
+        $this->assertSame('confirmation_required', $result['status'], 'a gitBranch operation must pause for confirmation, not run immediately');
+
+        $confirmation = $result['confirmation'] ?? [];
+        $this->assertSame('git_branch', $confirmation['confirmation_type'] ?? null, 'the marker must carry the dedicated git_branch confirmation_type, not the generic api_call');
+        $this->assertSame('feature/x', $confirmation['branch_name'] ?? null, 'the marker must name the proposed branch');
+        $this->assertSame(
+            $headHash,
+            $confirmation['start_point_resolved']['hash'] ?? null,
+            'omitting start_point must resolve to and pin the repo\'s current HEAD (AS1, D6)'
+        );
+
+        // Nothing has happened yet -- the branch must not exist at all.
+        $exitCode = $this->gitExitCode($repoPath, ['show-ref', '--verify', '--quiet', 'refs/heads/feature/x']);
+        $this->assertNotSame(0, $exitCode, 'proposing the branch must never create it before approval');
+        Http::assertNothingSent();
+        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $project->id)->count(), 'nothing must have run yet');
+    }
+
+    // -----------------------------------------------------------------
+    // (2) Decline -- git show-ref --verify --quiet refs/heads/feature/x
+    // still fails afterward (AS2).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function declining_a_pending_branch_leaves_it_uncreated_and_writes_a_refused_row(): void
+    {
+        $this->seedOperationCatalog();
+        $this->actingAs($this->user, 'api');
+
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        $project = $this->registerProject($repoPath);
+        $conversation = $this->makeConversation($this->agent(), $project);
+
+        $service = $this->service([
+            $this->toolCallReply([$this->gitBranchCall($project, 'feature/decline', null, 'call_branch_decline')]),
+            $this->plainReply('Understood, the branch was not created.'),
+        ]);
+
+        $result = $service->run($conversation->fresh(), 'Please create a branch called feature/decline.');
+        $message = Message::find($result['message_id']);
+
+        $final = $service->resumeSync($conversation->fresh(), $message, false);
+
+        $this->assertSame('completed', $final['status']);
+        Http::assertNothingSent();
+
+        $exitCode = $this->gitExitCode($repoPath, ['show-ref', '--verify', '--quiet', 'refs/heads/feature/decline']);
+        $this->assertNotSame(0, $exitCode, 'declining must never create the branch -- show-ref must still fail');
+
+        $row = CodingCommandExecution::where('coding_project_id', $project->id)->first();
+        $this->assertNotNull($row, 'a refused execution row must be written on decline');
+        $this->assertSame('refused', $row->status);
+        $this->assertStringContainsString('feature/decline', $row->command);
+    }
+
+    // -----------------------------------------------------------------
+    // (3) Approve -- git rev-parse feature/x equals the hash shown in
+    // the confirmation (AS3).
+    //
+    // Driven directly against the real, registered git-branch route
+    // (RunCommandJourneyTest.php's controller-level technique) with the
+    // exact {name, start_point} body a real approval resubmits --
+    // start_point already the pinned, resolved hash (D6).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function approving_the_pending_branch_creates_it_at_exactly_the_pinned_start_point(): void
+    {
+        $this->actingAs($this->user, 'api');
+
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+        $headHash = trim($this->shellGit($repoPath, ['rev-parse', 'HEAD']));
+
+        $project = $this->registerProject($repoPath);
+
+        $response = $this->postJson($this->apiUrl("coding-project/{$project->id}/git-branch"), [
+            'name' => 'feature/approve',
+            'start_point' => $headHash,
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'branch' => 'feature/approve',
+            'created' => true,
+            'start_point' => $headHash,
+        ]);
+
+        $actualHash = trim($this->shellGit($repoPath, ['rev-parse', 'feature/approve']));
+        $this->assertSame($headHash, $actualHash, 'the created branch must point at exactly the hash shown in the confirmation');
+    }
+
+    // -----------------------------------------------------------------
+    // (4) A name that already exists -- refused before any confirmation
+    // is ever shown, code: 'git_branch_already_exists'.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_branch_name_that_already_exists_is_refused_before_any_confirmation_with_no_row_written(): void
+    {
+        $this->seedOperationCatalog();
+        $this->actingAs($this->user, 'api');
+
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+        $this->runGit(['branch', 'already-exists'], $repoPath);
+
+        $project = $this->registerProject($repoPath);
+        $conversation = $this->makeConversation($this->agent(), $project);
+
+        $service = $this->service([
+            $this->toolCallReply([$this->gitBranchCall($project, 'already-exists', null, 'call_branch_exists')]),
+            $this->plainReply('That branch already exists.'),
+        ]);
+        $result = $service->run($conversation->fresh(), 'Please create a branch called already-exists.');
+
+        $this->assertSame('completed', $result['status'], 'an already-exists refusal must never pause for confirmation');
+        $this->assertStringContainsString(
+            'git_branch_already_exists',
+            $this->toolResultContentFor($conversation, 'call_branch_exists'),
+            'the tool result fed back to the model must carry the specific git_branch_already_exists refusal code, not a generic operation-rejected error'
+        );
+        Http::assertNothingSent();
+        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $project->id)->count());
+    }
+
+    // -----------------------------------------------------------------
+    // (5) Not-a-repo, and an unresolvable start_point -- each refused
+    // before confirmation with its own distinct code.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_not_a_repository_project_is_refused_before_any_confirmation_with_no_row_written(): void
+    {
+        $this->seedOperationCatalog();
+        $this->actingAs($this->user, 'api');
+
+        $plainDir = sys_get_temp_dir().'/git_branch_confirm_plain_'.Str::random(12);
+        mkdir($plainDir, 0777, true);
+        $this->tmpDirs[] = $plainDir;
+        $notARepoProject = $this->registerProject($plainDir);
+
+        $conversation = $this->makeConversation($this->agent(), $notARepoProject);
+        $service = $this->service([
+            $this->toolCallReply([$this->gitBranchCall($notARepoProject, 'feature/not-a-repo', null, 'call_branch_not_a_repo')]),
+            $this->plainReply('There is no git repository here.'),
+        ]);
+        $result = $service->run($conversation->fresh(), 'Please create a branch called feature/not-a-repo.');
+
+        $this->assertSame('completed', $result['status'], 'a not-a-repository refusal must never pause for confirmation');
+        $content = $this->toolResultContentFor($conversation, 'call_branch_not_a_repo');
+        $this->assertStringContainsString(
+            'git_not_a_repository',
+            $content,
+            'the tool result fed back to the model must carry the specific git_not_a_repository refusal code, not a generic operation-rejected error'
+        );
+        Http::assertNothingSent();
+        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $notARepoProject->id)->count());
+    }
+
+    #[Test]
+    public function an_unresolvable_start_point_is_refused_as_an_invalid_reference_before_any_confirmation_with_no_row_written(): void
+    {
+        $this->seedOperationCatalog();
+        $this->actingAs($this->user, 'api');
+
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        $project = $this->registerProject($repoPath);
+        $conversation = $this->makeConversation($this->agent(), $project);
+
+        $service = $this->service([
+            $this->toolCallReply([$this->gitBranchCall($project, 'feature/bad-ref', 'no-such-ref-at-all', 'call_branch_bad_ref')]),
+            $this->plainReply('That starting point does not exist.'),
+        ]);
+        $result = $service->run($conversation->fresh(), 'Please create a branch called feature/bad-ref from no-such-ref-at-all.');
+
+        $this->assertSame('completed', $result['status'], 'an invalid-reference refusal must never pause for confirmation');
+        $content = $this->toolResultContentFor($conversation, 'call_branch_bad_ref');
+        $this->assertStringContainsString(
+            'git_invalid_reference',
+            $content,
+            'the tool result fed back to the model must carry the specific git_invalid_reference refusal code'
+        );
+        $this->assertStringNotContainsString(
+            'git_not_a_repository',
+            $content,
+            'an unresolvable start_point must never be conflated with the not-a-repository refusal'
+        );
+        Http::assertNothingSent();
+        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $project->id)->count());
+    }
+
+    // -----------------------------------------------------------------
     // (6) 404 for an absent/foreign-owned project id.
     // -----------------------------------------------------------------
 
     #[Test]
-    public function git_commit_404s_for_an_absent_or_foreign_owned_project(): void
+    public function git_branch_404s_for_an_absent_or_foreign_owned_project(): void
     {
         $this->actingAs($this->user, 'api');
 
@@ -661,12 +640,12 @@ class GitCommitConfirmationJourneyTest extends TestCase
         $notFound = ['error' => 'Coding project not found', 'code' => 'coding_project_not_found'];
         $absentId = (string) Str::uuid();
 
-        $this->postJson($this->apiUrl("coding-project/{$foreignProject->id}/git-commit"), [
-            'message' => 'Update files',
+        $this->postJson($this->apiUrl("coding-project/{$foreignProject->id}/git-branch"), [
+            'name' => 'feature/foreign',
         ])->assertStatus(404)->assertJson($notFound);
 
-        $this->postJson($this->apiUrl("coding-project/{$absentId}/git-commit"), [
-            'message' => 'Update files',
+        $this->postJson($this->apiUrl("coding-project/{$absentId}/git-branch"), [
+            'name' => 'feature/absent',
         ])->assertStatus(404)->assertJson($notFound);
     }
 }

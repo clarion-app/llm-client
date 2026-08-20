@@ -143,6 +143,11 @@ class AgentGenerationFromEveryTemplateTest extends TestCase
                     'method' => 'post',
                     'summary' => "Publish committed changes to a registered project's configured remote",
                 ],
+                'clarionApp.llmClient.codingWorkspace.gitBranch' => [
+                    'path' => '/api/coding-project/{project}/git-branch',
+                    'method' => 'post',
+                    'summary' => "Create a new branch in a registered project",
+                ],
                 ...$conversationsIndex,
             ]);
 

@@ -1269,6 +1269,122 @@ class CodingWorkspaceController extends Controller
     }
 
     /**
+     * POST coding-project/{project}/git-branch (126-git-operations-
+     * confirmation, US4, contracts/git-branch.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like gitCommit()/gitPush()
+     * above.
+     *
+     * Named `gitBranch()`, not `gitCreateBranch()` -- the auto-generated
+     * operation catalog (Dedoc\Scramble, via ApiManager::getOperations())
+     * derives each route's operationId from its controller method name,
+     * and every sibling git operation here already relies on that exact
+     * match (`gitCommit()` -> `...codingWorkspace.gitCommit`, `gitPush()`
+     * -> `...codingWorkspace.gitPush`); a method named `gitCreateBranch()`
+     * would leave `clarionApp.llmClient.codingWorkspace.gitBranch` --
+     * the operationId `coding.yaml`, the
+     * `CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID` constant, and
+     * contracts/git-branch.md all actually use -- unresolvable in the
+     * live catalog.
+     *
+     * `GitOperationInspector::previewCreateBranch()` is called a second
+     * time here, immediately before executing (Grounding note 5's
+     * belt-and-suspenders posture, mirrored from gitCommit()/gitPush()):
+     * `start_point` is taken from the request body as-is -- for an
+     * approved confirmation this is already the pinned, resolved hash
+     * (research.md D6), so re-resolving it here against that exact hash
+     * is a no-op; a direct call that never went through a confirmation at
+     * all (e.g. an omitted `start_point`) still gets a fresh, correct
+     * resolution the same way the confirmation preview itself would have
+     * produced.
+     */
+    public function gitBranch(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'name' => 'required|string',
+            'start_point' => 'nullable|string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewCreateBranch(
+            $codingProject->root_path,
+            $validated['name'],
+            $validated['start_point'] ?? null,
+        );
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Could not create branch.',
+                'code' => $preview['code'] ?? 'git_invalid_reference',
+            ], 422);
+        }
+
+        $resolvedHash = $preview['start_point_resolved']['hash'];
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $branchProcess = $this->runGitCommandCapturingResult(
+            $codingProject->root_path,
+            ['git', 'branch', $validated['name'], $resolvedHash],
+        );
+        $succeeded = $branchProcess !== null && $branchProcess->isSuccessful();
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildCreateBranchCommandString($validated['name'], $resolvedHash),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $branchProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $branchProcess?->getOutput(),
+            'stderr' => $branchProcess?->getErrorOutput(),
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'could not create branch',
+                'code' => 'git_command_failed',
+                'stderr' => $branchProcess?->getErrorOutput() ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'branch' => $validated['name'],
+            'created' => true,
+            'start_point' => $resolvedHash,
+        ], 200);
+    }
+
+    /**
+     * The human-readable reconstruction of a branch-creation invocation --
+     * shared by the executed-and-recorded row above and mirrored by
+     * AgentLoopService::recordDeclinedCommandExecution()'s own gitBranch
+     * branch for a declined one (data-model.md §3, contracts/git-branch.md's
+     * Declined section). No sanitization is needed here (research.md D8) --
+     * a branch name and a resolved commit hash never carry a credential.
+     */
+    private function buildCreateBranchCommandString(string $name, string $resolvedStartPoint): string
+    {
+        return "git branch {$name} {$resolvedStartPoint}";
+    }
+
+    /**
      * Clamps the `limit` query param against the configured default/max
      * (contracts §3): a non-numeric or non-positive value floors at the
      * default, anything above the max clamps to the max.

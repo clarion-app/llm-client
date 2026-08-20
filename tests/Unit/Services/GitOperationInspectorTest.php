@@ -472,4 +472,107 @@ class GitOperationInspectorTest extends TestCase
             'commits_ahead must now list only the single commit made after the remote already had the branch'
         );
     }
+
+    // ---------------------------------------------------------------
+    // previewCreateBranch() -- Phase 6/US4, data-model.md §5, contracts/
+    // git-branch.md. A successful result carries `branch_name` and
+    // `start_point_resolved: {hash, short_hash, subject}` -- the exact
+    // extra-field shape contracts/git-branch.md's confirmation marker
+    // uses (Grounding note 17: §2/contracts are canonical over §5's own
+    // `start_point_hash`/`start_point_subject` shorthand, which is drift
+    // -- previewCommit/previewPush were already implemented against
+    // §2/contracts' field names in Phases 4/5, not §5's table).
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function preview_create_branch_with_omitted_start_point_resolves_to_the_repos_current_head(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+        $headHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+        $headShortHash = trim($this->runGit(['rev-parse', '--short', 'HEAD'], $repoPath)->getOutput());
+        $headSubject = trim($this->runGit(['log', '-1', '--format=%s'], $repoPath)->getOutput());
+
+        $result = $this->inspector()->previewCreateBranch($repoPath, 'feature/x', null);
+
+        $this->assertTrue($result['ok'] ?? null, 'omitting start_point against a valid repo must succeed');
+        $this->assertSame('feature/x', $result['branch_name'] ?? null);
+        $this->assertSame(
+            $headHash,
+            $result['start_point_resolved']['hash'] ?? null,
+            'an omitted start_point must resolve to the repo\'s current HEAD, not some other ref'
+        );
+        $this->assertSame($headShortHash, $result['start_point_resolved']['short_hash'] ?? null);
+        $this->assertSame($headSubject, $result['start_point_resolved']['subject'] ?? null);
+    }
+
+    #[Test]
+    public function preview_create_branch_with_an_explicit_start_point_resolves_that_specific_commit_not_head(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'First commit'], $repoPath);
+        $firstHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+        $firstShortHash = trim($this->runGit(['rev-parse', '--short', 'HEAD'], $repoPath)->getOutput());
+
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Second commit'], $repoPath);
+        $secondHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        $result = $this->inspector()->previewCreateBranch($repoPath, 'feature/y', $firstHash);
+
+        $this->assertTrue($result['ok'] ?? null);
+        $this->assertSame(
+            $firstHash,
+            $result['start_point_resolved']['hash'] ?? null,
+            'an explicit start_point must resolve to that specific commit, never HEAD (the second commit)'
+        );
+        $this->assertNotSame($secondHash, $result['start_point_resolved']['hash'] ?? null);
+        $this->assertSame($firstShortHash, $result['start_point_resolved']['short_hash'] ?? null);
+        $this->assertSame('First commit', $result['start_point_resolved']['subject'] ?? null);
+    }
+
+    #[Test]
+    public function preview_create_branch_with_an_unresolvable_start_point_reports_an_invalid_reference(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        $result = $this->inspector()->previewCreateBranch($repoPath, 'feature/z', 'no-such-ref-at-all');
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_invalid_reference', $result['code'] ?? null);
+    }
+
+    #[Test]
+    public function preview_create_branch_with_a_name_that_already_exists_reports_branch_already_exists(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+        $this->runGit(['branch', 'already-exists'], $repoPath);
+
+        $result = $this->inspector()->previewCreateBranch($repoPath, 'already-exists', null);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_branch_already_exists', $result['code'] ?? null);
+    }
+
+    #[Test]
+    public function preview_create_branch_against_a_non_git_directory_reports_not_a_repository(): void
+    {
+        $plainPath = $this->createPlainDirectory();
+
+        $result = $this->inspector()->previewCreateBranch($plainPath, 'feature/x', null);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_not_a_repository', $result['code'] ?? null);
+    }
 }

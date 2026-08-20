@@ -317,6 +317,94 @@ class GitOperationInspector
     }
 
     /**
+     * 126-git-operations-confirmation, US4 (data-model.md §5, contracts/
+     * git-branch.md §1, Grounding note 17 -- the field names below match
+     * §2/contracts, not §5's own `start_point_hash`/`start_point_subject`
+     * shorthand). Order: not-a-repository -> the resolved start point
+     * (defaulting to HEAD when `$startPoint` is omitted) must resolve to a
+     * real commit (`git_invalid_reference`) -> `$name` must not already
+     * name an existing local branch (`git_branch_already_exists`) -> a
+     * successful result carries `branch_name` and `start_point_resolved`
+     * (the exact hash/short_hash/subject a caller pins into a later,
+     * approved `git branch` call -- D6).
+     *
+     * @return array{ok: bool, code?: string, reason?: string, branch_name?: string, start_point_resolved?: array{hash: string, short_hash: string, subject: string}}
+     */
+    public function previewCreateBranch(string $rootPath, string $name, ?string $startPoint): array
+    {
+        if (!$this->isGitRepository($rootPath)) {
+            return [
+                'ok' => false,
+                'code' => 'git_not_a_repository',
+                'reason' => 'This project is not a git repository.',
+            ];
+        }
+
+        $requestedStartPoint = ($startPoint !== null && $startPoint !== '') ? $startPoint : 'HEAD';
+        $resolvedHash = $this->resolveLocalRef($rootPath, $requestedStartPoint);
+
+        if ($resolvedHash === null) {
+            return [
+                'ok' => false,
+                'code' => 'git_invalid_reference',
+                'reason' => 'Could not resolve the starting point for the new branch.',
+            ];
+        }
+
+        if ($this->localBranchExists($rootPath, $name)) {
+            return [
+                'ok' => false,
+                'code' => 'git_branch_already_exists',
+                'reason' => 'A branch with this name already exists.',
+            ];
+        }
+
+        return [
+            'ok' => true,
+            'branch_name' => $name,
+            'start_point_resolved' => $this->describeCommit($rootPath, $resolvedHash),
+        ];
+    }
+
+    /**
+     * `git show-ref --verify --quiet refs/heads/<name>` -- true only when a
+     * local branch by exactly this name already exists.
+     */
+    private function localBranchExists(string $rootPath, string $name): bool
+    {
+        $process = new Process(['git', 'show-ref', '--verify', '--quiet', 'refs/heads/'.$name], $rootPath);
+        $process->run();
+
+        return $process->isSuccessful();
+    }
+
+    /**
+     * The {hash, short_hash, subject} triple for an already-resolved
+     * commit -- the same shape commitsAhead() derives per-commit, here for
+     * exactly one already-known hash.
+     *
+     * @return array{hash: string, short_hash: string, subject: string}
+     */
+    private function describeCommit(string $rootPath, string $hash): array
+    {
+        $process = new Process(['git', 'log', '-1', '--format=%H|%h|%s', $hash], $rootPath);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return ['hash' => $hash, 'short_hash' => $hash, 'subject' => ''];
+        }
+
+        $line = trim($process->getOutput());
+        [$fullHash, $shortHash, $subject] = array_pad(explode('|', $line, 3), 3, '');
+
+        return [
+            'hash' => $fullHash !== '' ? $fullHash : $hash,
+            'short_hash' => $shortHash,
+            'subject' => $subject,
+        ];
+    }
+
+    /**
      * A read-only `git ls-remote <remoteName> refs/heads/<branchName>` --
      * never a `git fetch`, so this repository's own remote-tracking refs
      * are never written to. Null when the branch does not exist on the
