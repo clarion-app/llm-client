@@ -57,7 +57,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
     {
         $mockRegistry = Mockery::mock(McpPromptRegistry::class);
         $mockRegistry->shouldReceive('getPrompts')
-            ->with(null)
+            ->with(null, null, $this->userId)
             ->once()
             ->andReturn([
                 'prompts' => [
@@ -87,7 +87,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
     {
         $mockRegistry = Mockery::mock(McpPromptRegistry::class);
         $mockRegistry->shouldReceive('getPrompt')
-            ->with('wizlights_listOperations', ['command' => 'turn on lights'])
+            ->with('wizlights_listOperations', ['command' => 'turn on lights'], null, $this->userId)
             ->once()
             ->andReturn([
                 'description' => 'Guidance for discovering wizlights tools',
@@ -122,7 +122,7 @@ class McpProtocolHandlerPromptsResourcesTest extends TestCase
     {
         $mockRegistry = Mockery::mock(McpPromptRegistry::class);
         $mockRegistry->shouldReceive('getPrompt')
-            ->with('nonexistent_prompt', [])
+            ->with('nonexistent_prompt', [], null, $this->userId)
             ->once()
             ->andReturn(null);
 

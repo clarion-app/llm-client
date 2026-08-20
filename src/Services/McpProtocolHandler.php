@@ -71,9 +71,9 @@ class McpProtocolHandler
             case 'tools/call':
                 return $this->handleToolsCall($params, $id, $session);
             case 'prompts/list':
-                return $this->handlePromptsList($params, $id);
+                return $this->handlePromptsList($params, $id, $session);
             case 'prompts/get':
-                return $this->handlePromptsGet($params, $id);
+                return $this->handlePromptsGet($params, $id, $session);
             case 'resources/list':
                 return $this->handleResourcesList($params, $id, $session);
             case 'resources/templates/list':
@@ -192,12 +192,13 @@ class McpProtocolHandler
         return $this->sessionManager->validateSession($sessionId, $userId);
     }
 
-    public function handlePromptsList(array $params, ?int $id): array
+    public function handlePromptsList(array $params, ?int $id, $session): array
     {
         $promptRegistry = app(McpPromptRegistry::class);
         $cursor = $params['cursor'] ?? null;
+        $codingProjectId = $params['_codingProjectId'] ?? null;
 
-        $result = $promptRegistry->getPrompts($cursor);
+        $result = $promptRegistry->getPrompts($cursor, $codingProjectId, $session->user_id);
 
         return [
             'jsonrpc' => '2.0',
@@ -206,7 +207,7 @@ class McpProtocolHandler
         ];
     }
 
-    public function handlePromptsGet(array $params, ?int $id): array
+    public function handlePromptsGet(array $params, ?int $id, $session): array
     {
         $promptRegistry = app(McpPromptRegistry::class);
         $name = $params['name'] ?? null;
@@ -216,7 +217,8 @@ class McpProtocolHandler
         }
 
         $arguments = $params['arguments'] ?? [];
-        $result = $promptRegistry->getPrompt($name, $arguments);
+        $codingProjectId = $params['_codingProjectId'] ?? null;
+        $result = $promptRegistry->getPrompt($name, $arguments, $codingProjectId, $session->user_id);
 
         if ($result === null) {
             return $this->errorResponse($id, -32602, "Prompt not found: {$name}");
