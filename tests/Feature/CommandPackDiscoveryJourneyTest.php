@@ -5,6 +5,8 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 use ClarionApp\Backend\ClarionPackageServiceProvider;
 use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Models\McpSession;
+use ClarionApp\LlmClient\Services\CommandPackLoader;
+use ClarionApp\LlmClient\Services\McpPromptRegistry;
 use ClarionApp\LlmClient\Services\McpProtocolHandler;
 use ClarionApp\LlmClient\Services\McpSessionManager;
 use Illuminate\Http\Request;
@@ -12,6 +14,7 @@ use Illuminate\Support\Str;
 use Mockery;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
+use ZipArchive;
 
 /**
  * 127-command-packs, Phase 3 (US1), T014 (tasks.md; quickstart.md Scenario
@@ -148,6 +151,59 @@ class CommandPackDiscoveryJourneyTest extends TestCase
         @rmdir($dir);
     }
 
+    /**
+     * 127-command-packs, Phase 4 (US2), T019: extracts the five real,
+     * unmodified Spec-Kit 0.8.10 workflow command templates
+     * (templates/commands/{specify,clarify,plan,tasks,implement}.md) byte-
+     * for-byte out of the cached release zip and places them at
+     * .claude/commands/speckit.<name>.md inside $projectDir -- this
+     * "speckit." prefix/location mirrors this repository's own convention
+     * (Grounding note 12), not spec-kit 0.8.10's current literal
+     * `specify init --ai claude` output shape (which now writes
+     * .claude/skills/ instead; that gap is explicitly out of scope for this
+     * feature, research.md D1).
+     *
+     * Reads directly from the zip via ZipArchive rather than pasting the
+     * (multi-KB, real-world) file contents into this test's source, so the
+     * fixture is guaranteed byte-identical to the cached release artifact
+     * with no transcription step in between.
+     *
+     * @return list<string> absolute paths of the five fixture files written
+     */
+    private function installSpecKitFixture(string $projectDir): array
+    {
+        $zipPath = '/home/tim/Downloads/spec-kit-0.8.10.zip';
+
+        $this->assertFileExists(
+            $zipPath,
+            'the cached spec-kit-0.8.10.zip fixture source is required for this test and was not found'
+        );
+
+        $zip = new ZipArchive();
+        $opened = $zip->open($zipPath);
+        $this->assertTrue($opened === true, "failed to open {$zipPath} as a zip archive");
+
+        $names = ['specify', 'clarify', 'plan', 'tasks', 'implement'];
+        $written = [];
+
+        foreach ($names as $name) {
+            $entryPath = "spec-kit-0.8.10/templates/commands/{$name}.md";
+            $content = $zip->getFromName($entryPath);
+
+            $this->assertNotFalse($content, "could not extract {$entryPath} from {$zipPath}");
+
+            $destination = $projectDir."/.claude/commands/speckit.{$name}.md";
+            @mkdir(dirname($destination), 0777, true);
+            file_put_contents($destination, $content);
+
+            $written[] = $destination;
+        }
+
+        $zip->close();
+
+        return $written;
+    }
+
     private function makeProject(string $rootPath): CodingProject
     {
         return CodingProject::create([
@@ -241,5 +297,68 @@ MD);
         $this->assertStringContainsString('Add dark mode to the settings screen', $text);
         $this->assertStringContainsString('--- END ARGUMENT TEXT ---', $text);
         $this->assertStringContainsString('Please summarize the following:', $text);
+    }
+
+    // -----------------------------------------------------------------
+    // 127-command-packs, Phase 4 (US2), T020: an unmodified Spec-Kit
+    // 0.8.10-initialized layout is discoverable and invocable with zero
+    // conversion, zero side effects, and zero Spec-Kit-specific code path
+    // (quickstart.md Scenario 2).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function an_unmodified_spec_kit_layout_is_discoverable_and_invocable_with_no_side_effects_and_no_special_casing(): void
+    {
+        $projectDir = $this->makeProjectDir();
+        $fixtureFiles = $this->installSpecKitFixture($projectDir);
+        $project = $this->makeProject($projectDir);
+
+        $checksumsBefore = array_map(fn (string $path) => md5_file($path), $fixtureFiles);
+
+        // --- AS1 (SC-001): all five discovered, correctly named, no problems.
+        $loader = new CommandPackLoader();
+        $result = $loader->discover($project);
+
+        $names = array_map(fn ($template) => $template->name, $result->commands);
+        sort($names);
+
+        $this->assertSame(
+            ['speckit.clarify', 'speckit.implement', 'speckit.plan', 'speckit.specify', 'speckit.tasks'],
+            $names,
+            'all five real Spec-Kit command files must be discovered under their speckit.<name> names, and only those five'
+        );
+        $this->assertSame(
+            [],
+            $result->problems,
+            'the real handoffs:/scripts: frontmatter keys must not cause any parse failure'
+        );
+
+        // --- "no file in the workspace altered as a precondition" (AS1):
+        // byte-identical before/after discover().
+        $checksumsAfter = array_map(fn (string $path) => md5_file($path), $fixtureFiles);
+        $this->assertSame(
+            $checksumsBefore,
+            $checksumsAfter,
+            'discover() must never write to, move, or reformat any fixture file'
+        );
+
+        // --- AS2: invocation resolves through the exact same code path
+        // Scenario 1's summarize command used -- no Spec-Kit-specific
+        // branch anywhere in production code.
+        $registry = new McpPromptRegistry();
+        $response = $registry->getPrompt(
+            'speckit.plan',
+            ['command' => 'Plan the auth feature'],
+            codingProjectId: $project->id,
+            userId: $this->userId,
+        );
+
+        $this->assertNotNull($response, 'speckit.plan must resolve exactly like any other project-defined command');
+        $text = $response['messages'][0]['content']['text'];
+
+        $this->assertStringContainsString('--- BEGIN ARGUMENT TEXT ---', $text);
+        $this->assertStringContainsString('Plan the auth feature', $text);
+        $this->assertStringContainsString('--- END ARGUMENT TEXT ---', $text);
+        $this->assertStringContainsString('You **MUST** consider the user input before proceeding', $text);
     }
 }
