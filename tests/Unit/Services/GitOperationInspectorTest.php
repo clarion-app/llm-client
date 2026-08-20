@@ -395,6 +395,30 @@ class GitOperationInspectorTest extends TestCase
     }
 
     #[Test]
+    public function preview_push_against_a_non_git_directory_reports_not_a_repository(): void
+    {
+        // 126-git-operations-confirmation, Polish (T047 reconciliation
+        // finding): previewCommit()/previewCreateBranch()/
+        // previewRewriteHistory() each already had a dedicated
+        // not-a-repository unit test above -- previewPush() did not, so
+        // quickstart's own mutation checklist row 1 ("remove the
+        // is_git_repo pre-check from gitCommit/gitBranch/
+        // gitRewriteHistory/gitPush") had no automated case actually
+        // exercising the gitPush quarter of that claim. previewPush()'s
+        // own not-a-repository check runs before network_enabled is even
+        // read (matching every other precondition here), so a plain
+        // (non-git) directory refuses identically regardless of the
+        // project's network policy.
+        $plainPath = $this->createPlainDirectory();
+        $project = new CodingProject(['root_path' => $plainPath, 'network_enabled' => true]);
+
+        $result = (new GitOperationInspector())->previewPush($project, null, null);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_not_a_repository', $result['code'] ?? null);
+    }
+
+    #[Test]
     public function preview_push_happy_path_reports_a_sanitized_remote_url_and_creates_remote_branch_true_when_the_remote_branch_does_not_yet_exist(): void
     {
         $repoPath = $this->createGitRepo();

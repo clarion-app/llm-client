@@ -653,6 +653,45 @@ class GitPublishConfirmationJourneyTest extends TestCase
     }
 
     // -----------------------------------------------------------------
+    // Not-a-repo -- refused before any confirmation, no
+    // CodingCommandExecution row (mirrors GitCommitConfirmationJourneyTest.
+    // php/GitBranchConfirmationJourneyTest.php/
+    // GitRewriteHistoryConfirmationJourneyTest.php's own identically-named
+    // case; added during Polish (T047 reconciliation) -- this file did not
+    // previously have one, so quickstart's mutation checklist row 1 had no
+    // automated case for the gitPush quarter of its own claim).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_not_a_repository_project_is_refused_before_any_confirmation_with_no_row_written(): void
+    {
+        $this->seedOperationCatalog();
+        $this->actingAs($this->user, 'api');
+        $this->fakeCodingWorkspaceHttp();
+
+        $plainDir = sys_get_temp_dir().'/git_publish_confirm_plain_'.Str::random(12);
+        mkdir($plainDir, 0777, true);
+        $this->tmpDirs[] = $plainDir;
+        $notARepoProject = $this->registerProject($plainDir, null, true);
+
+        $conversation = $this->makeConversation($this->agent(), $notARepoProject);
+        $service = $this->service([
+            $this->toolCallReply([$this->gitPushCall($notARepoProject, 'origin', 'main', 'call_push_not_a_repo')]),
+            $this->plainReply('There is no git repository here.'),
+        ]);
+        $result = $service->run($conversation->fresh(), 'Please push the changes.');
+
+        $this->assertSame('completed', $result['status'], 'a not-a-repository refusal must never pause for confirmation');
+        $this->assertStringContainsString(
+            'git_not_a_repository',
+            $this->toolResultContentFor($conversation, 'call_push_not_a_repo'),
+            'the tool result fed back to the model must carry the specific git_not_a_repository refusal code, not a generic operation-rejected error'
+        );
+        Http::assertNothingSent();
+        $this->assertSame(0, DB::table('coding_command_executions')->where('coding_project_id', $notARepoProject->id)->count());
+    }
+
+    // -----------------------------------------------------------------
     // (5): network_enabled: false -- refused before any confirmation,
     // code: 'git_publish_disabled', no CodingCommandExecution row
     // (research.md D5).
