@@ -11,6 +11,7 @@ use ClarionApp\LlmClient\Models\CodingWorkspaceChange;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\CommandChangeDetector;
 use ClarionApp\LlmClient\Services\DockerCommandExecutor;
+use ClarionApp\LlmClient\Services\GitOperationInspector;
 use ClarionApp\LlmClient\Services\LanguageRuntime;
 use ClarionApp\LlmClient\Services\PathContainment;
 use ClarionApp\LlmClient\Services\ResourceLimitResolver;
@@ -55,6 +56,7 @@ class CodingWorkspaceController extends Controller
         private readonly ResourceLimitResolver $resourceLimitResolver = new ResourceLimitResolver(),
         private readonly CommandChangeDetector $changeDetector = new CommandChangeDetector(),
         private readonly LanguageRuntime $languageRuntime = new LanguageRuntime(),
+        private readonly GitOperationInspector $gitOperationInspector = new GitOperationInspector(),
     ) {
     }
 
@@ -984,6 +986,581 @@ class CodingWorkspaceController extends Controller
     }
 
     /**
+     * GET coding-project/{project}/git-log?limit= (126-git-operations-
+     * confirmation, US1, contracts/git-inspection.md §3, Grounding
+     * note 6). `isGitRepository()` is checked directly, as its own first
+     * step -- never via runGitCommand()'s null-collapse, which cannot
+     * distinguish "not a repository" from "a real, empty repository's
+     * `git log` genuinely failing with zero commits" (the latter degrades
+     * to `entries: []`, never to `is_git_repo: false`).
+     */
+    public function gitLog(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json(['is_git_repo' => false], 200);
+        }
+
+        $limit = $this->gitLogLimit($request);
+
+        $process = $this->runGitCommand($codingProject->root_path, [
+            'git', 'log', '-n', (string) $limit, '--date=iso-strict', '--format=%H|%h|%an|%ad|%s',
+        ]);
+
+        return response()->json([
+            'is_git_repo' => true,
+            'entries' => $this->parseGitLogOutput($process?->getOutput() ?? ''),
+        ], 200);
+    }
+
+    /**
+     * POST coding-project/{project}/git-commit (126-git-operations-
+     * confirmation, US2, contracts/git-commit.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like every other confirmed
+     * mutation on this controller.
+     *
+     * `GitOperationInspector::previewCommit()` is called a second time
+     * here, immediately before executing (Grounding note 5's
+     * belt-and-suspenders posture -- neither layer trusts the other):
+     * called WITH whatever `paths` this request actually carries, never
+     * with `null`, so a request that resubmits the confirmation's own
+     * pinned list gets back exactly that list again (never a fresh scan
+     * that could pick up an unrelated change made while the confirmation
+     * was pending -- research.md D6). A request that omits `paths`
+     * entirely (e.g. a direct, non-agent-driven call) still gets a fresh,
+     * correct resolution the same way the confirmation preview itself
+     * would have produced.
+     */
+    public function gitCommit(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'message' => 'required|string',
+            'paths' => 'nullable|array',
+            'paths.*' => 'string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewCommit($codingProject->root_path, $validated['paths'] ?? null);
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Nothing to commit.',
+                'code' => $preview['code'] ?? 'git_nothing_to_commit',
+            ], 422);
+        }
+
+        $files = $preview['files'];
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $addProcess = $this->runGitCommandCapturingResult($codingProject->root_path, array_merge(['git', 'add', '--'], $files));
+        $commitProcess = ($addProcess !== null && $addProcess->isSuccessful())
+            ? $this->runGitCommandCapturingResult($codingProject->root_path, ['git', 'commit', '-m', $validated['message']])
+            : null;
+
+        $succeeded = $commitProcess !== null && $commitProcess->isSuccessful();
+        $failedProcess = $commitProcess ?? $addProcess;
+
+        $hash = null;
+        if ($succeeded) {
+            $hashProcess = $this->runGitCommandCapturingResult($codingProject->root_path, ['git', 'rev-parse', 'HEAD']);
+            $hash = ($hashProcess !== null && $hashProcess->isSuccessful()) ? trim($hashProcess->getOutput()) : null;
+        }
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildCommitCommandString($validated['message'], $files),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $failedProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $failedProcess?->getOutput(),
+            'stderr' => $failedProcess?->getErrorOutput(),
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'git command failed',
+                'code' => 'git_command_failed',
+                'stderr' => $failedProcess?->getErrorOutput() ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'committed' => true,
+            'hash' => $hash,
+            'message' => $validated['message'],
+            'files' => $files,
+        ], 200);
+    }
+
+    /**
+     * The human-readable, sanitized (research.md D8 -- a commit message
+     * and plain file paths never carry a credential, so no sanitization
+     * is actually needed here beyond quoting) reconstruction of a commit
+     * invocation, shared by the executed-and-recorded row above and
+     * mirrored by AgentLoopService::recordDeclinedCommandExecution()'s
+     * own gitCommit branch for a declined one (data-model.md §3,
+     * contracts/git-commit.md's Declined section).
+     *
+     * @param  string[]  $files
+     */
+    private function buildCommitCommandString(string $message, array $files): string
+    {
+        return 'git commit -m "'.addslashes($message).'" -- '.implode(' ', $files);
+    }
+
+    /**
+     * POST coding-project/{project}/git-push (126-git-operations-
+     * confirmation, US3, contracts/git-publish.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like gitCommit() above.
+     *
+     * `GitOperationInspector::previewPush()` is called a second time here,
+     * immediately before executing (Grounding note 5's belt-and-suspenders
+     * posture, mirrored from gitCommit()): re-derives `remote`/`branch`/
+     * `remote_url_sanitized`/`creates_remote_branch` fresh, from whatever
+     * this request actually carries. `pinned_head` (research.md D6) is
+     * taken from the request body when present -- the exact commit an
+     * already-approved confirmation named -- and only falls back to a
+     * freshly-resolved local HEAD for a direct call that never went
+     * through a confirmation at all.
+     */
+    public function gitPush(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'remote' => 'nullable|string',
+            'branch' => 'nullable|string',
+            'pinned_head' => 'nullable|string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewPush($codingProject, $validated['remote'] ?? null, $validated['branch'] ?? null);
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Publishing refused.',
+                'code' => $preview['code'] ?? 'git_publish_disabled',
+            ], 422);
+        }
+
+        $remote = $preview['remote'];
+        $branch = $preview['branch'];
+        $requestedPinnedHead = $validated['pinned_head'] ?? null;
+        $pinnedHead = (is_string($requestedPinnedHead) && $requestedPinnedHead !== '') ? $requestedPinnedHead : $preview['pinned_head'];
+
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $previousRemoteHead = $this->remoteBranchHeadHash($codingProject->root_path, $remote, $branch);
+
+        $pushProcess = $this->runGitCommandCapturingResult(
+            $codingProject->root_path,
+            ['git', 'push', $remote, "{$pinnedHead}:refs/heads/{$branch}"],
+        );
+        $succeeded = $pushProcess !== null && $pushProcess->isSuccessful();
+        $sanitizedStderr = $pushProcess !== null
+            ? $this->gitOperationInspector->sanitizeRemoteUrl($pushProcess->getErrorOutput())
+            : null;
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildPushCommandString($remote, $pinnedHead, $branch),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $pushProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $pushProcess?->getOutput(),
+            'stderr' => $sanitizedStderr,
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'push rejected',
+                'code' => 'git_push_rejected',
+                'stderr' => $sanitizedStderr ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'pushed' => true,
+            'remote' => $remote,
+            'branch' => $branch,
+            'remote_url_sanitized' => $preview['remote_url_sanitized'],
+            'previous_remote_head' => $previousRemoteHead,
+            'new_remote_head' => $pinnedHead,
+        ], 200);
+    }
+
+    /**
+     * The human-readable, D8-sanitized reconstruction of a push invocation
+     * -- shared by the executed-and-recorded row above and mirrored by
+     * AgentLoopService::recordDeclinedCommandExecution()'s own gitPush
+     * branch for a declined one. `$remote` is sanitized defensively in
+     * case a caller passed a literal, credential-bearing URL instead of a
+     * configured remote name.
+     */
+    private function buildPushCommandString(string $remote, string $pinnedHead, string $branch): string
+    {
+        $sanitizedRemote = $this->gitOperationInspector->sanitizeRemoteUrl($remote);
+
+        return "git push {$sanitizedRemote} {$pinnedHead}:refs/heads/{$branch}";
+    }
+
+    /**
+     * A read-only `git ls-remote <remote> refs/heads/<branch>` -- the
+     * remote branch's hash immediately before this request's own push, so
+     * the response can report `previous_remote_head` honestly. Null when
+     * the branch does not exist on the remote yet (this push creates it).
+     */
+    private function remoteBranchHeadHash(string $rootPath, string $remote, string $branch): ?string
+    {
+        $process = $this->runGitCommandCapturingResult($rootPath, ['git', 'ls-remote', $remote, 'refs/heads/'.$branch]);
+        if ($process === null || !$process->isSuccessful()) {
+            return null;
+        }
+
+        $output = trim($process->getOutput());
+        if ($output === '') {
+            return null;
+        }
+
+        $firstLine = strtok($output, "\r\n");
+        $parts = preg_split('/\s+/', $firstLine ?: '', 2);
+
+        return $parts[0] ?? null;
+    }
+
+    /**
+     * POST coding-project/{project}/git-branch (126-git-operations-
+     * confirmation, US4, contracts/git-branch.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like gitCommit()/gitPush()
+     * above.
+     *
+     * Named `gitBranch()`, not `gitCreateBranch()` -- the auto-generated
+     * operation catalog (Dedoc\Scramble, via ApiManager::getOperations())
+     * derives each route's operationId from its controller method name,
+     * and every sibling git operation here already relies on that exact
+     * match (`gitCommit()` -> `...codingWorkspace.gitCommit`, `gitPush()`
+     * -> `...codingWorkspace.gitPush`); a method named `gitCreateBranch()`
+     * would leave `clarionApp.llmClient.codingWorkspace.gitBranch` --
+     * the operationId `coding.yaml`, the
+     * `CODING_WORKSPACE_GIT_BRANCH_OPERATION_ID` constant, and
+     * contracts/git-branch.md all actually use -- unresolvable in the
+     * live catalog.
+     *
+     * `GitOperationInspector::previewCreateBranch()` is called a second
+     * time here, immediately before executing (Grounding note 5's
+     * belt-and-suspenders posture, mirrored from gitCommit()/gitPush()):
+     * `start_point` is taken from the request body as-is -- for an
+     * approved confirmation this is already the pinned, resolved hash
+     * (research.md D6), so re-resolving it here against that exact hash
+     * is a no-op; a direct call that never went through a confirmation at
+     * all (e.g. an omitted `start_point`) still gets a fresh, correct
+     * resolution the same way the confirmation preview itself would have
+     * produced.
+     */
+    public function gitBranch(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'name' => 'required|string',
+            'start_point' => 'nullable|string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewCreateBranch(
+            $codingProject->root_path,
+            $validated['name'],
+            $validated['start_point'] ?? null,
+        );
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Could not create branch.',
+                'code' => $preview['code'] ?? 'git_invalid_reference',
+            ], 422);
+        }
+
+        $resolvedHash = $preview['start_point_resolved']['hash'];
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $branchProcess = $this->runGitCommandCapturingResult(
+            $codingProject->root_path,
+            ['git', 'branch', $validated['name'], $resolvedHash],
+        );
+        $succeeded = $branchProcess !== null && $branchProcess->isSuccessful();
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildCreateBranchCommandString($validated['name'], $resolvedHash),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $branchProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $branchProcess?->getOutput(),
+            'stderr' => $branchProcess?->getErrorOutput(),
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'could not create branch',
+                'code' => 'git_command_failed',
+                'stderr' => $branchProcess?->getErrorOutput() ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'branch' => $validated['name'],
+            'created' => true,
+            'start_point' => $resolvedHash,
+        ], 200);
+    }
+
+    /**
+     * The human-readable reconstruction of a branch-creation invocation --
+     * shared by the executed-and-recorded row above and mirrored by
+     * AgentLoopService::recordDeclinedCommandExecution()'s own gitBranch
+     * branch for a declined one (data-model.md §3, contracts/git-branch.md's
+     * Declined section). No sanitization is needed here (research.md D8) --
+     * a branch name and a resolved commit hash never carry a credential.
+     */
+    private function buildCreateBranchCommandString(string $name, string $resolvedStartPoint): string
+    {
+        return "git branch {$name} {$resolvedStartPoint}";
+    }
+
+    /**
+     * POST coding-project/{project}/git-rewrite-history (126-git-operations-
+     * confirmation, US5, contracts/git-rewrite-history.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like gitCommit()/gitPush()/
+     * gitBranch() above.
+     *
+     * Named `gitRewriteHistory()` -- the auto-generated operation catalog
+     * derives each route's operationId from its controller method name
+     * (gitBranch()'s own docblock above explains why), and
+     * `CODING_WORKSPACE_GIT_REWRITE_HISTORY_OPERATION_ID` is
+     * `clarionApp.llmClient.codingWorkspace.gitRewriteHistory`.
+     *
+     * `mode` is restricted to the three recognized `git reset` modes at
+     * validation time -- a request naming anything else never reaches
+     * `GitOperationInspector::previewRewriteHistory()` at all, mirroring
+     * 125's own unrecognized-language precedent (malformed, unaudited
+     * `422`). `GitOperationInspector::previewRewriteHistory()` is then
+     * called a second time here, immediately before executing (Grounding
+     * note 5's belt-and-suspenders posture, mirrored from gitCommit()/
+     * gitPush()/gitBranch()): for an approved confirmation, `target` is
+     * already the pinned, resolved hash (research.md D6), so re-resolving
+     * it here against that exact hash is a no-op; a direct call that never
+     * went through a confirmation at all still gets a fresh, correct
+     * resolution the same way the confirmation preview itself would have
+     * produced.
+     */
+    public function gitRewriteHistory(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'mode' => 'required|string|in:reset_soft,reset_mixed,reset_hard',
+            'target' => 'required|string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewRewriteHistory(
+            $codingProject->root_path,
+            $validated['mode'],
+            $validated['target'],
+        );
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Could not reset this branch.',
+                'code' => $preview['code'] ?? 'git_invalid_reference',
+            ], 422);
+        }
+
+        $resolvedTarget = $preview['target_resolved'];
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $previousHeadProcess = $this->runGitCommandCapturingResult($codingProject->root_path, ['git', 'rev-parse', 'HEAD']);
+        $previousHead = ($previousHeadProcess !== null && $previousHeadProcess->isSuccessful()) ? trim($previousHeadProcess->getOutput()) : null;
+
+        $resetFlag = str_replace('reset_', '--', $validated['mode']);
+        $resetProcess = $this->runGitCommandCapturingResult(
+            $codingProject->root_path,
+            ['git', 'reset', $resetFlag, $resolvedTarget],
+        );
+        $succeeded = $resetProcess !== null && $resetProcess->isSuccessful();
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildRewriteHistoryCommandString($validated['mode'], $resolvedTarget),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $resetProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $resetProcess?->getOutput(),
+            'stderr' => $resetProcess?->getErrorOutput(),
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'git command failed',
+                'code' => 'git_command_failed',
+                'stderr' => $resetProcess?->getErrorOutput() ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'mode' => $validated['mode'],
+            'target' => $resolvedTarget,
+            'previous_head' => $previousHead,
+            'new_head' => $resolvedTarget,
+        ], 200);
+    }
+
+    /**
+     * The human-readable reconstruction of a reset invocation -- shared by
+     * the executed-and-recorded row above and mirrored by
+     * AgentLoopService::recordDeclinedCommandExecution()'s own
+     * gitRewriteHistory branch for a declined one (contracts/git-rewrite-
+     * history.md's Declined section). No sanitization is needed here
+     * (research.md D8) -- a reset mode and a resolved commit hash never
+     * carry a credential.
+     */
+    private function buildRewriteHistoryCommandString(string $mode, string $resolvedTarget): string
+    {
+        $flag = str_replace('reset_', '--', $mode);
+
+        return "git reset {$flag} {$resolvedTarget}";
+    }
+
+    /**
+     * Clamps the `limit` query param against the configured default/max
+     * (contracts §3): a non-numeric or non-positive value floors at the
+     * default, anything above the max clamps to the max.
+     */
+    private function gitLogLimit(Request $request): int
+    {
+        $default = (int) config('llm-client.coding_agent.git.log_default_limit', 50);
+        $max = (int) config('llm-client.coding_agent.git.log_max_limit', 200);
+
+        $raw = $request->query('limit');
+
+        if (!is_numeric($raw)) {
+            return $default;
+        }
+
+        $limit = (int) $raw;
+
+        if ($limit <= 0) {
+            return $default;
+        }
+
+        return min($limit, $max);
+    }
+
+    /**
+     * Parses `git log --format=%H|%h|%an|%ad|%s` output line-by-line. A
+     * bounded `explode(..., 5)` guards against a pathological commit
+     * subject that itself contains a `|`. Empty/missing output (including
+     * a `git log` that failed outright, e.g. a real empty repository with
+     * zero commits) yields an empty list, never an error.
+     */
+    private function parseGitLogOutput(string $output): array
+    {
+        $entries = [];
+
+        foreach (preg_split('/\R/', $output) as $line) {
+            if ($line === '') {
+                continue;
+            }
+
+            [$hash, $shortHash, $author, $date, $subject] = array_pad(explode('|', $line, 5), 5, '');
+
+            $entries[] = [
+                'hash' => $hash,
+                'short_hash' => $shortHash,
+                'author' => $author,
+                'date' => $date,
+                'subject' => $subject,
+            ];
+        }
+
+        return $entries;
+    }
+
+    /**
      * GET coding-project/{project}/changes (122-workspace-browser-ui,
      * US3, contracts/workspace-change-history-api.md, research.md D7,
      * FR-008/FR-009/FR-010/FR-011). Ownership is looked up via
@@ -1191,6 +1768,34 @@ class CodingWorkspaceController extends Controller
         }
 
         if (!$process->isSuccessful()) {
+            return null;
+        }
+
+        return $process;
+    }
+
+    /**
+     * A sibling to runGitCommand() (126-git-operations-confirmation,
+     * Grounding note 6) that returns the Process object regardless of
+     * whether it succeeded -- for the mutating git operations, which need
+     * real `stderr` text surfaced on a genuine execution-time failure.
+     * runGitCommand()'s own null-on-failure collapse (used by
+     * gitStatus()/gitDiff(), which have no need to distinguish "not a
+     * repo" from "the command itself failed") is completely unchanged.
+     * Still returns null for "not a repository" and for a Process that
+     * could not even be started -- only a genuine command failure once
+     * started is surfaced as a (non-null, !isSuccessful()) Process.
+     */
+    private function runGitCommandCapturingResult(string $rootPath, array $command): ?Process
+    {
+        if (!is_dir($rootPath.'/.git')) {
+            return null;
+        }
+
+        try {
+            $process = new Process($command, $rootPath);
+            $process->run();
+        } catch (\Throwable) {
             return null;
         }
 

@@ -1031,6 +1031,15 @@ return [
         // change to that unrelated key can never silently shorten this
         // one's retention window.
         'change_record_retention_days' => (int) env('LLM_CLIENT_CODING_AGENT_CHANGE_RECORD_RETENTION_DAYS', 365),
+
+        // 126-git-operations-confirmation, US1. gitLog's `limit` query
+        // param defaults to log_default_limit when omitted or invalid
+        // (non-numeric/<= 0), and is clamped to log_max_limit regardless
+        // of what the caller asks for.
+        'git' => [
+            'log_default_limit' => (int) env('LLM_CLIENT_CODING_AGENT_GIT_LOG_DEFAULT_LIMIT', 50),
+            'log_max_limit' => (int) env('LLM_CLIENT_CODING_AGENT_GIT_LOG_MAX_LIMIT', 200),
+        ],
     ],
 
     // Scheduler Agent — the per-action retry ceiling

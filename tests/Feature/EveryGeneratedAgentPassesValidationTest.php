@@ -117,6 +117,26 @@ class EveryGeneratedAgentPassesValidationTest extends TestCase
                     'method' => 'post',
                     'summary' => "Run a code snippet in a registered project's sandboxed workspace",
                 ],
+                'clarionApp.llmClient.codingWorkspace.gitCommit' => [
+                    'path' => '/api/coding-project/{project}/git-commit',
+                    'method' => 'post',
+                    'summary' => "Stage and commit a registered project's changes",
+                ],
+                'clarionApp.llmClient.codingWorkspace.gitPush' => [
+                    'path' => '/api/coding-project/{project}/git-push',
+                    'method' => 'post',
+                    'summary' => "Publish committed changes to a registered project's configured remote",
+                ],
+                'clarionApp.llmClient.codingWorkspace.gitBranch' => [
+                    'path' => '/api/coding-project/{project}/git-branch',
+                    'method' => 'post',
+                    'summary' => "Create a new branch in a registered project",
+                ],
+                'clarionApp.llmClient.codingWorkspace.gitRewriteHistory' => [
+                    'path' => '/api/coding-project/{project}/git-rewrite-history',
+                    'method' => 'post',
+                    'summary' => "Reset the branch pointer, optionally discarding uncommitted changes",
+                ],
                 ...$conversationsIndex,
             ]);
 
