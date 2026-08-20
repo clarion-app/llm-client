@@ -361,4 +361,90 @@ MD);
         $this->assertStringContainsString('--- END ARGUMENT TEXT ---', $text);
         $this->assertStringContainsString('You **MUST** consider the user input before proceeding', $text);
     }
+
+    // -----------------------------------------------------------------
+    // 127-command-packs, Phase 6 (US4), T028: commands stay current as
+    // template files change, with zero reinstall/restart -- write, edit,
+    // and delete a single command file across the same PHP process/same
+    // McpPromptRegistry instance, in one continuous call sequence
+    // (quickstart.md Scenario 4).
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function commands_stay_current_as_the_template_file_changes_across_the_same_process(): void
+    {
+        $projectDir = $this->makeProjectDir();
+        $project = $this->makeProject($projectDir);
+        $registry = new McpPromptRegistry();
+
+        // --- AS1 (empty workspace): no project-sourced entries yet.
+        $listBefore = $registry->getPrompts(codingProjectId: $project->id, userId: $this->userId);
+        $namesBefore = array_map(fn ($p) => $p['name'], $listBefore['prompts']);
+        $this->assertNotContains('review', $namesBefore, 'an empty workspace must not list a review command');
+
+        // --- AS1/FR-008 (write): the next getPrompts() call, same process,
+        // no restart, shows it.
+        $this->write($projectDir, '.claude/commands/review.md', <<<'MD'
+---
+description: Review the given input.
+---
+Please review the following: $ARGUMENTS
+MD);
+
+        $listAfterWrite = $registry->getPrompts(codingProjectId: $project->id, userId: $this->userId);
+        $namesAfterWrite = array_map(fn ($p) => $p['name'], $listAfterWrite['prompts']);
+        $this->assertContains('review', $namesAfterWrite, 'review.md must appear the very next getPrompts() call, same process');
+
+        // --- AS2 (edit): the next getPrompt('review', ...) call reflects
+        // the edited body.
+        $this->write($projectDir, '.claude/commands/review.md', <<<'MD'
+---
+description: Review the given input.
+---
+Please critically review the following, line by line: $ARGUMENTS
+MD);
+
+        $responseAfterEdit = $registry->getPrompt(
+            'review',
+            ['command' => 'the auth changes'],
+            codingProjectId: $project->id,
+            userId: $this->userId,
+        );
+
+        $this->assertNotNull($responseAfterEdit, 'review must still resolve after being edited');
+        $textAfterEdit = $responseAfterEdit['messages'][0]['content']['text'];
+        $this->assertStringContainsString(
+            'Please critically review the following, line by line:',
+            $textAfterEdit,
+            'getPrompt() must reflect the edited body, not a stale cached copy'
+        );
+
+        // --- AS3 (delete): the next getPrompts() call no longer lists it,
+        // and getPrompt('review', ...) returns the same not-found shape as
+        // a name that never existed.
+        @unlink($projectDir.'/.claude/commands/review.md');
+
+        $listAfterDelete = $registry->getPrompts(codingProjectId: $project->id, userId: $this->userId);
+        $namesAfterDelete = array_map(fn ($p) => $p['name'], $listAfterDelete['prompts']);
+        $this->assertNotContains('review', $namesAfterDelete, 'a deleted command must no longer be listed');
+
+        $responseAfterDelete = $registry->getPrompt(
+            'review',
+            ['command' => 'anything'],
+            codingProjectId: $project->id,
+            userId: $this->userId,
+        );
+        $responseForNeverExisted = $registry->getPrompt(
+            'this-name-never-existed',
+            ['command' => 'anything'],
+            codingProjectId: $project->id,
+            userId: $this->userId,
+        );
+
+        $this->assertSame(
+            $responseForNeverExisted,
+            $responseAfterDelete,
+            "a deleted command's getPrompt() shape must be identical to a name that never existed (contracts/mcp-prompts-get.md's unified not-found case)"
+        );
+    }
 }
