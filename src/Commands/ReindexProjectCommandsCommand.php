@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Services\CommandPackLoader;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * 128-project-command-indexing, Phase 2 (Foundational), T009.
@@ -17,10 +18,9 @@ use Illuminate\Support\Facades\DB;
  * pre-existing 'operation'/'prompt' rows ReindexOperationsJob owns are
  * never touched.
  *
- * No scheduling registration here (US3, a later phase) and no per-workspace
- * try/catch isolation yet (US4, also later) -- both are added on top of
- * this same command in their own phases. This phase's own contract only
- * requires the transactional delete-then-repopulate shape and --dry-run.
+ * Scheduling registration (US3, Phase 5) and per-workspace try/catch fault
+ * isolation (US4, Phase 6, research.md D4) are both added on top of this
+ * same command, in LlmClientServiceProvider and handle() respectively.
  */
 class ReindexProjectCommandsCommand extends Command
 {
@@ -48,31 +48,47 @@ class ReindexProjectCommandsCommand extends Command
             foreach (CodingProject::query()->cursor() as $project) {
                 $workspacesScanned++;
 
-                $result = $loader->discover($project);
+                // Defense-in-depth wrap (research.md D4): CommandPackLoader::discover()
+                // already guarantees per-file isolation by construction (a malformed
+                // template becomes a TemplateDiscoveryProblem, never a thrown exception),
+                // but an unanticipated failure -- e.g. a transient filesystem/permission
+                // error discover()'s own code doesn't itself guard against -- must not
+                // abort indexing for every other workspace in the same run (FR-008). One
+                // workspace's failure is logged and skipped; the loop continues.
+                try {
+                    $result = $loader->discover($project);
 
-                foreach ($result->commands as $command) {
-                    $commandsIndexed++;
+                    foreach ($result->commands as $command) {
+                        $commandsIndexed++;
 
-                    if ($dryRun) {
-                        continue;
+                        if ($dryRun) {
+                            continue;
+                        }
+
+                        $summary = $command->description ?? "Project-defined command from {$command->relativePath}";
+                        $searchableText = "{$command->name} {$command->description} {$command->instructions}";
+
+                        DB::table('operation_search_index')->insert([
+                            'operation_id' => "{$project->id}:{$command->name}",
+                            'package_name' => null,
+                            'type' => 'project_command',
+                            'coding_project_id' => $project->id,
+                            'summary' => $summary,
+                            'method' => null,
+                            'path' => null,
+                            'searchable_text' => $searchableText,
+                            'param_schema' => null,
+                            'prompt_content' => $command->instructions,
+                            'updated_at' => now(),
+                        ]);
                     }
-
-                    $summary = $command->description ?? "Project-defined command from {$command->relativePath}";
-                    $searchableText = "{$command->name} {$command->description} {$command->instructions}";
-
-                    DB::table('operation_search_index')->insert([
-                        'operation_id' => "{$project->id}:{$command->name}",
-                        'package_name' => null,
-                        'type' => 'project_command',
-                        'coding_project_id' => $project->id,
-                        'summary' => $summary,
-                        'method' => null,
-                        'path' => null,
-                        'searchable_text' => $searchableText,
-                        'param_schema' => null,
-                        'prompt_content' => $command->instructions,
-                        'updated_at' => now(),
+                } catch (\Throwable $e) {
+                    Log::warning('project command reindex failed for workspace', [
+                        'coding_project_id' => (string) $project->id,
+                        'error' => $e->getMessage(),
                     ]);
+
+                    continue;
                 }
             }
         });

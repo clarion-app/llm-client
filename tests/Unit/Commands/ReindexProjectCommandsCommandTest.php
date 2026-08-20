@@ -429,4 +429,159 @@ MD);
         $after = (array) DB::table('operation_search_index')->where('operation_id', 'contacts.store')->first();
         $this->assertSame($before, $after, "a pre-existing type = 'operation' row, unrelated to any workspace, must survive a reindex run byte-for-byte unchanged");
     }
+
+    // -----------------------------------------------------------------
+    // 128-project-command-indexing, Phase 6 (US4), T035.
+    //
+    // A malformed template in one workspace must never hide that same
+    // workspace's valid siblings, nor affect a second, unrelated
+    // workspace indexed in the same run (FR-007/FR-008, quickstart
+    // Scenario 4).
+    // -----------------------------------------------------------------
+
+    private static function brokenFrontmatterTemplate(): string
+    {
+        return <<<'MD'
+---
+not: [valid, yaml:
+---
+body
+MD;
+    }
+
+    #[Test]
+    public function a_malformed_template_contributes_no_row_and_never_hides_its_own_workspace_or_an_unrelated_workspace(): void
+    {
+        // Workspace A: two valid templates plus one malformed one.
+        $projectADir = $this->makeProjectDir();
+        $this->write($projectADir, '.claude/commands/review.md', self::reviewTemplate(
+            'Review the current diff for correctness bugs and report findings.'
+        ));
+        $this->write($projectADir, '.claude/commands/deploy.md', self::deployTemplate());
+        $this->write($projectADir, '.claude/commands/broken.md', self::brokenFrontmatterTemplate());
+        $projectA = $this->makeProject($projectADir);
+
+        // Workspace B: unrelated, one valid template.
+        $projectBDir = $this->makeProjectDir();
+        $this->write($projectBDir, '.claude/commands/build.md', <<<'MD'
+---
+description: Build the project.
+---
+Run the build pipeline and report the result.
+MD);
+        $projectB = $this->makeProject($projectBDir);
+
+        $exitCode = Artisan::call('llm-client:reindex-project-commands');
+
+        $this->assertSame(0, $exitCode);
+
+        $rows = DB::table('operation_search_index')->where('type', 'project_command')->get()->keyBy('operation_id');
+
+        // A's two valid commands are rows.
+        $this->assertTrue($rows->has("{$projectA->id}:review"), 'review.md must be indexed');
+        $this->assertSame($projectA->id, $rows->get("{$projectA->id}:review")->coding_project_id);
+        $this->assertTrue($rows->has("{$projectA->id}:deploy"), 'deploy.md must be indexed');
+        $this->assertSame($projectA->id, $rows->get("{$projectA->id}:deploy")->coding_project_id);
+
+        // broken.md contributes no row of any kind, for this workspace
+        // or any other -- there is no derivable name to look up under,
+        // so the only correct check is that A's row count is exactly the
+        // two valid templates, not three.
+        $aRows = $rows->filter(fn ($row) => $row->coding_project_id === $projectA->id);
+        $this->assertCount(2, $aRows, 'broken.md must not contribute a third row for workspace A');
+
+        // B's command is a row too, unaffected by A's malformed file.
+        $this->assertTrue($rows->has("{$projectB->id}:build"), 'build.md in the unrelated workspace must be indexed');
+        $this->assertSame($projectB->id, $rows->get("{$projectB->id}:build")->coding_project_id);
+
+        $this->assertCount(3, $rows, 'exactly the three valid commands across both workspaces must be indexed');
+    }
+
+    // -----------------------------------------------------------------
+    // 128-project-command-indexing, Phase 6 (US4), T035.
+    //
+    // Fault-injection proof (research.md D4): a real, uncaught failure
+    // inside CommandPackLoader::discover() for one workspace must not
+    // abort the whole command or roll back another workspace's already-
+    // staged rows in the same transaction.
+    //
+    // CommandPackLoader and CommandTemplateParser are both `final`
+    // (src/Services/CommandPackLoader.php, src/Services/
+    // CommandTemplateParser.php) with no extracted interface, so neither
+    // can be subclassed or mocked in-process -- confirmed experimentally:
+    // `new class extends CommandPackLoader {}` raises an uncatchable PHP
+    // fatal error ("cannot extend final class"), which terminates the
+    // whole PHPUnit process rather than failing a single test. Binding a
+    // literal fake into the container as tasks.md describes is therefore
+    // not achievable without first changing production code, which is
+    // T036's job, not this task's.
+    //
+    // This test instead drives the *same* uncaught-exception path
+    // through the real, unmodified CommandPackLoader: it chmod(0000)s
+    // workspace A's .claude/commands directory so that
+    // RecursiveDirectoryIterator's own constructor throws
+    // UnexpectedValueException (a RuntimeException subclass) the moment
+    // discover() tries to open it -- exactly the "transient filesystem/
+    // permission error discover()'s own code doesn't itself guard
+    // against" example research.md D4 names as this defense-in-depth
+    // wrap's target. This is a genuine fault, not a synthetic one, and
+    // requires no change to CommandPackLoader/CommandTemplateParser to
+    // exercise.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function an_unanticipated_failure_discovering_one_workspace_does_not_abort_indexing_of_another(): void
+    {
+        $projectADir = $this->makeProjectDir();
+        $commandsDir = $projectADir.'/.claude/commands';
+        mkdir($commandsDir, 0777, true);
+        // Locked empty -- nothing needs to survive teardown's recursive
+        // delete once permissions are restored below.
+        chmod($commandsDir, 0000);
+
+        try {
+            $projectA = $this->makeProject($projectADir);
+
+            $projectBDir = $this->makeProjectDir();
+            $this->write($projectBDir, '.claude/commands/build.md', <<<'MD'
+---
+description: Build the project.
+---
+Run the build pipeline and report the result.
+MD);
+            $projectB = $this->makeProject($projectBDir);
+
+            // Today (pre-T036) this call itself throws
+            // UnexpectedValueException -- uncaught anywhere in
+            // ReindexProjectCommandsCommand::handle(), it propagates
+            // straight through Artisan::call() into this test, which
+            // PHPUnit reports as a genuinely red Error for this one
+            // test (not a process crash). After T036's per-project
+            // try/catch, the exception is caught and logged for
+            // workspace A only, and the loop continues to workspace B.
+            $exitCode = Artisan::call('llm-client:reindex-project-commands');
+
+            $this->assertSame(0, $exitCode, 'one workspace\'s unexpected discovery failure must not fail the command');
+
+            $rows = DB::table('operation_search_index')->where('type', 'project_command')->get()->keyBy('operation_id');
+
+            $this->assertTrue(
+                $rows->has("{$projectB->id}:build"),
+                'workspace B must still be indexed even though workspace A raised an uncaught exception ahead of it in the same run'
+            );
+            $this->assertSame($projectB->id, $rows->get("{$projectB->id}:build")->coding_project_id);
+
+            $this->assertFalse(
+                $rows->has("{$projectA->id}:review"),
+                'the failing workspace itself contributes no row -- only its own indexing is skipped, not anyone else\'s'
+            );
+            $this->assertCount(1, $rows, 'only workspace B\'s command is indexed; workspace A\'s failure yields zero rows for A, not an aborted run');
+        } finally {
+            // Restore permissions unconditionally so tearDown's
+            // recursive delete (which does not chmod as it goes) can
+            // actually remove the directory, whether this test passed,
+            // failed, or errored.
+            @chmod($commandsDir, 0777);
+        }
+    }
 }
