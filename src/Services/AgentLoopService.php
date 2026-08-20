@@ -3776,7 +3776,13 @@ class AgentLoopService
             ]);
         }
 
-        $results = $searchService->search($query);
+        // 128-project-command-indexing (Phase 3/US1): scope the search to
+        // this conversation's own workspace so a matching project-defined
+        // command surfaces alongside built-ins (data-model.md §2). When
+        // $conversation->coding_project_id is null, search() behaves
+        // exactly as before this feature (no project-command row is ever
+        // eligible without a workspace scope).
+        $results = $searchService->search($query, $conversation->coding_project_id);
 
         if (empty($results)) {
             // Check if the table exists but is empty vs no matches
@@ -3807,13 +3813,33 @@ class AgentLoopService
         foreach ($results as $row) {
             $type = $row->type ?? 'operation';
 
-            if ($type === 'prompt') {
+            if ($type === 'project_command') {
+                // 128-project-command-indexing (Phase 3/US1, data-model.md
+                // §2, research.md D5): a project-defined command row,
+                // labeled distinctly from a built-in so its source is
+                // always independently and correctly stated (FR-002,
+                // FR-010), with its description/content resolvable without
+                // any further lookup. operationId already carries 127's own
+                // "{coding_project_id}:{name}" shape verbatim.
+                $formatted[] = [
+                    'type' => 'project_command',
+                    'source' => 'Project command',
+                    'operationId' => $row->operationId,
+                    'summary' => $row->summary,
+                    'content' => $row->promptContent,
+                ];
+            } elseif ($type === 'prompt') {
                 $formatted[] = [
                     'type' => 'prompt',
                     'id' => $row->operationId,
                     'package' => $row->package_name,
                     'summary' => $row->summary,
                     'content' => $row->promptContent,
+                    // 128-project-command-indexing (Phase 3/US1): additive
+                    // source label so a project command sharing the same
+                    // short name is never confused with a built-in
+                    // (research.md D5) -- every existing key stays.
+                    'source' => 'Built-in capability',
                 ];
             } else {
                 $formatted[] = [
@@ -3823,6 +3849,10 @@ class AgentLoopService
                     'method' => $row->method,
                     'path' => $row->path,
                     'paramSchema' => OperationsSearchService::safeDecodeParamSchema($row->paramSchema),
+                    // 128-project-command-indexing (Phase 3/US1): additive
+                    // source label, same rationale as the 'prompt' branch
+                    // above -- every existing key stays.
+                    'source' => 'Built-in capability',
                 ];
             }
         }

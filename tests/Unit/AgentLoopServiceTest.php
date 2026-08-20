@@ -803,7 +803,11 @@ class AgentLoopServiceTest extends TestCase
         $searchServiceMock = Mockery::mock(OperationsSearchService::class);
         $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
         $searchServiceMock->shouldReceive('search')
-            ->with('create a contact')
+            // 128-project-command-indexing (Phase 3/US1): handleSearchOperations()
+            // now passes $conversation->coding_project_id through as the second
+            // argument -- null here, since the default new Conversation() fixture
+            // used by invokeHandleSearchOperations() has no coding_project_id set.
+            ->with('create a contact', null)
             ->once()
             ->andReturn([$mockRow]);
 
@@ -1250,7 +1254,9 @@ class AgentLoopServiceTest extends TestCase
         ];
         $searchServiceMock->shouldReceive('tableExists')->once()->andReturn(true);
         $searchServiceMock->shouldReceive('search')
-            ->with('adjust lighting')
+            // 128-project-command-indexing (Phase 3/US1): see the matching
+            // comment above search_operations_returns_results_with_correct_wrapper_format().
+            ->with('adjust lighting', null)
             ->once()
             ->andReturn([$mockRow]);
 
