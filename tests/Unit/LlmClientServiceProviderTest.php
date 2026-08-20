@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Unit;
 
 use ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand;
+use ClarionApp\LlmClient\Commands\ReindexProjectCommandsCommand;
 use ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand;
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\LlmClientServiceProvider;
@@ -208,6 +209,82 @@ class LlmClientServiceProviderTest extends TestCase
         // Assert the event uses withoutOverlapping.
         $this->assertTrue(
             $purgeTracesEvent->withoutOverlapping,
+            'Schedule should use withoutOverlapping'
+        );
+    }
+
+    // ========================================================================
+    // 128-project-command-indexing, Phase 5 (US3), T030.
+    //
+    // Mirrors resolveAbandonedRunsCommand_is_scheduled()/
+    // purgeExpiredRunTracesCommand_is_registered() (Grounding note 10):
+    // ReindexProjectCommandsCommand must be both registered with Artisan
+    // (already true from Foundational's T009 -- expected green) and
+    // scheduled every five minutes, without overlapping (not yet true --
+    // expected red until a later task adds the schedule() entry).
+    // ========================================================================
+
+    /**
+     * T030: ReindexProjectCommandsCommand is registered in the commands
+     * array (Foundational's T009 already did this -- expected to already
+     * pass).
+     */
+    #[Test]
+    public function reindexProjectCommandsCommand_is_registered()
+    {
+        $commands = Artisan::all();
+
+        $this->assertArrayHasKey(
+            'llm-client:reindex-project-commands',
+            $commands,
+            'ReindexProjectCommandsCommand should be registered'
+        );
+
+        $command = $commands['llm-client:reindex-project-commands'];
+        $this->assertInstanceOf(
+            ReindexProjectCommandsCommand::class,
+            $command,
+            'Command should be ReindexProjectCommandsCommand instance'
+        );
+    }
+
+    /**
+     * T030: the schedule lives in the existing callAfterResolving block
+     * and runs every five minutes without overlapping (research.md D3).
+     * This is this feature's one piece of genuinely new, non-provable-by-
+     * construction production code (US3's own Goal) -- expected RED until
+     * a later task adds the $schedule->command('llm-client:reindex-
+     * project-commands')->everyFiveMinutes()->withoutOverlapping() entry.
+     */
+    #[Test]
+    public function reindexProjectCommandsCommand_is_scheduled()
+    {
+        $schedule = $this->app->make(Schedule::class);
+
+        $events = $schedule->events();
+
+        $reindexProjectCommandsEvent = null;
+        foreach ($events as $event) {
+            $command = $event->command ?? '';
+            if (str_contains($command, 'reindex-project-commands')) {
+                $reindexProjectCommandsEvent = $event;
+                break;
+            }
+        }
+
+        $this->assertNotNull(
+            $reindexProjectCommandsEvent,
+            'Schedule should contain reindex-project-commands command'
+        );
+
+        $this->assertSame(
+            '*/5 * * * *',
+            (string) $reindexProjectCommandsEvent->expression,
+            'Schedule should run every five minutes'
+        );
+
+        $this->assertTrue(
+            $reindexProjectCommandsEvent->withoutOverlapping,
             'Schedule should use withoutOverlapping'
         );
     }
