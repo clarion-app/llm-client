@@ -270,6 +270,22 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             $schedule->command('llm-client:purge-mcp-connection-tests')
                 ->hourly()
                 ->withoutOverlapping();
+
+            // Rebuild the project-command slice of the operations search
+            // index every five minutes (128-project-command-indexing,
+            // US3, research.md D3) -- the sole mechanism that makes a
+            // workspace's added/edited/removed command templates, and a
+            // workspace's own removal, show up (or disappear) in
+            // search_operations within a bounded window with zero manual
+            // reindex/reinstall/restart action, exactly mirroring
+            // llm-client:resolve-abandoned-runs above (its own cited
+            // precedent, spec.md's Assumptions section): a synchronous,
+            // self-contained sweep on the same cadence and idiom, not a
+            // dispatched queued job whose timeliness would depend on a
+            // worker being alive.
+            $schedule->command('llm-client:reindex-project-commands')
+                ->everyFiveMinutes()
+                ->withoutOverlapping();
         });
 
         // Populate provider registry with factory callables

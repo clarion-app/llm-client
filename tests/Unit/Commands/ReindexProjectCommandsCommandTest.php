@@ -121,6 +121,155 @@ Run the deployment pipeline against the current branch and report the result.
 MD;
     }
 
+    /**
+     * Fixed description, variable body -- lets a freshness-journey test
+     * change only the instructions (which feed searchable_text/
+     * prompt_content) between reindex runs without also changing the
+     * summary, so an assertion that the old body is gone is unambiguous.
+     */
+    private static function reviewTemplate(string $body): string
+    {
+        return <<<MD
+---
+description: Review a pull request for issues.
+---
+{$body}
+MD;
+    }
+
+    // -----------------------------------------------------------------
+    // 128-project-command-indexing, Phase 5 (US3), T029.
+    //
+    // Freshness journey (quickstart Scenario 3): an empty workspace, then
+    // add / edit / remove a template file -- each change is reflected
+    // only on the *next* reindex run, never before it (research.md D3's
+    // "no hot-path scan" guarantee, made observable), and never partially
+    // (the old body must be genuinely absent after an edit, not merely
+    // superseded alongside the new one).
+    //
+    // Expected red today: T029 has not been implemented against
+    // production code yet, but every assertion here is already
+    // satisfiable by Foundational's T009 implementation -- these cases
+    // extend coverage of already-working behavior with the freshness-
+    // specific assertions (the latency check in particular) that no
+    // existing test makes. If any of these are unexpectedly green before
+    // Phase 5's own production tasks run, that is Foundational already
+    // covering this ground and must be recorded as such, not silently
+    // treated as "nothing to do here."
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function freshness_journey_add_edit_remove_reflects_only_on_the_next_reindex_run(): void
+    {
+        $projectDir = $this->makeProjectDir();
+        $project = $this->makeProject($projectDir);
+
+        // An empty fixture workspace, reindexed -- zero project_command rows.
+        $exitCode = Artisan::call('llm-client:reindex-project-commands');
+        $this->assertSame(0, $exitCode);
+        $this->assertSame(0, DB::table('operation_search_index')->where('type', 'project_command')->count());
+
+        // Write review.md -- but do NOT reindex yet.
+        $this->write($projectDir, '.claude/commands/review.md', self::reviewTemplate(
+            'Review the current diff for correctness bugs and report findings.'
+        ));
+
+        // Latency check, without a second reindex run: the change must
+        // not be visible yet -- proving the change is only ever surfaced
+        // through the reindex command, never through a hot-path scan.
+        $this->assertSame(
+            0,
+            DB::table('operation_search_index')->where('operation_id', "{$project->id}:review")->count(),
+            'writing a template file must not appear in the index until the next reindex run (research.md D3)'
+        );
+
+        // Reindex -- review is now a row, findable via direct row
+        // presence (not search()'s own MATCH/AGAINST call -- SQLite has
+        // no fulltext index in this test harness, Grounding note 14).
+        Artisan::call('llm-client:reindex-project-commands');
+        $row = DB::table('operation_search_index')->where('operation_id', "{$project->id}:review")->first();
+        $this->assertNotNull($row, 'review must be indexed by the reindex run that follows its creation');
+        $this->assertSame($project->id, $row->coding_project_id);
+        $this->assertStringContainsString('Review the current diff for correctness bugs and report findings.', $row->searchable_text);
+        $this->assertStringContainsString('Review the current diff for correctness bugs and report findings.', $row->prompt_content);
+
+        // Edit review.md's body, reindex -- the row's searchable_text/
+        // prompt_content reflect the new body; the OLD text is genuinely
+        // absent, not merely present alongside the new text.
+        $this->write($projectDir, '.claude/commands/review.md', self::reviewTemplate(
+            'Check the diff for security vulnerabilities instead.'
+        ));
+        Artisan::call('llm-client:reindex-project-commands');
+        $row = DB::table('operation_search_index')->where('operation_id', "{$project->id}:review")->first();
+        $this->assertNotNull($row);
+        $this->assertStringContainsString('Check the diff for security vulnerabilities instead.', $row->searchable_text);
+        $this->assertStringNotContainsString(
+            'Review the current diff for correctness bugs and report findings.',
+            $row->searchable_text,
+            'the old body must be genuinely gone after an edit, not merely superseded alongside the new text'
+        );
+        $this->assertStringContainsString('Check the diff for security vulnerabilities instead.', $row->prompt_content);
+        $this->assertStringNotContainsString(
+            'Review the current diff for correctness bugs and report findings.',
+            $row->prompt_content,
+            'the old body must be genuinely gone from prompt_content after an edit'
+        );
+
+        // Delete review.md, reindex -- the row is gone.
+        @unlink($projectDir.'/.claude/commands/review.md');
+        Artisan::call('llm-client:reindex-project-commands');
+        $this->assertSame(
+            0,
+            DB::table('operation_search_index')->where('operation_id', "{$project->id}:review")->count(),
+            'deleting the template file must remove its row on the next reindex run'
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 128-project-command-indexing, Phase 5 (US3), T029.
+    //
+    // Workspace removal (quickstart Scenario 6, FR-009/SC-006,
+    // research.md D7): a soft-deleted workspace's indexed row disappears
+    // on the next reindex run and stays gone on a subsequent run with no
+    // further change -- not resurrected.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function workspace_removal_removes_its_row_and_a_second_reindex_does_not_resurrect_it(): void
+    {
+        $projectDir = $this->makeProjectDir();
+        $this->write($projectDir, '.claude/commands/review.md', self::reviewTemplate(
+            'Review the current diff for correctness bugs and report findings.'
+        ));
+        $project = $this->makeProject($projectDir);
+
+        Artisan::call('llm-client:reindex-project-commands');
+        $this->assertSame(
+            1,
+            DB::table('operation_search_index')->where('operation_id', "{$project->id}:review")->count(),
+            'the row must be present before the workspace is removed'
+        );
+
+        $project->delete();
+        $this->assertTrue($project->trashed(), 'delete() on a CodingProject must be a soft delete');
+
+        Artisan::call('llm-client:reindex-project-commands');
+        $this->assertSame(
+            0,
+            DB::table('operation_search_index')->where('operation_id', "{$project->id}:review")->count(),
+            'a soft-deleted workspace\'s row must be gone after the next reindex run'
+        );
+
+        // A second reindex run with no further change leaves it gone --
+        // not resurrected.
+        Artisan::call('llm-client:reindex-project-commands');
+        $this->assertSame(
+            0,
+            DB::table('operation_search_index')->where('operation_id', "{$project->id}:review")->count(),
+            'a second reindex run must not resurrect a soft-deleted workspace\'s row'
+        );
+    }
+
     // -----------------------------------------------------------------
     // Single project, single valid template -- exact row shape.
     // -----------------------------------------------------------------
