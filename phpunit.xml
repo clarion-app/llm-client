@@ -20,6 +20,9 @@
         <testsuite name="RealDocker">
             <directory>tests/RealDocker</directory>
         </testsuite>
+        <testsuite name="RealSpecKit">
+            <directory>tests/RealSpecKit</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>
