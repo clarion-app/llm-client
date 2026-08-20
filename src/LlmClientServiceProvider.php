@@ -133,6 +133,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\RefreshStaleMcpClientServersCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeMcpClientConnectionTestsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredWorkspaceChangesCommand::class,
+                \ClarionApp\LlmClient\Commands\ReindexProjectCommandsCommand::class,
             ]);
         }
 

@@ -1,0 +1,283 @@
+<?php
+
+namespace ClarionApp\LlmClient\Tests\Unit\Commands;
+
+use ClarionApp\LlmClient\Models\CodingProject;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use PHPUnit\Framework\Attributes\Test;
+use Tests\TestCase;
+
+/**
+ * 128-project-command-indexing, Phase 2 (Foundational), T006.
+ *
+ * contracts/reindex-project-commands-command.md, data-model.md §1. Uses
+ * persisted CodingProject::create() fixtures pointed at real temporary
+ * directories, mirroring tests/Unit/McpPromptRegistryCommandPacksTest.php's
+ * own fixture convention (Grounding note 8) -- not
+ * CommandPackLoaderTest.php's in-memory-only `new CodingProject([...])`,
+ * since this command genuinely queries the database via
+ * CodingProject::query()->cursor().
+ *
+ * Every case here is expected to fail against the current tree: the
+ * migration adding operation_search_index.coding_project_id does not exist,
+ * the llm-client:reindex-project-commands Artisan command does not exist,
+ * and the command's own row-writing logic does not exist. This is the
+ * correct "genuinely red" state for this phase.
+ */
+class ReindexProjectCommandsCommandTest extends TestCase
+{
+    /** @var list<string> temp directories created by this test, removed in tearDown */
+    private array $tmpDirs = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // tests/TestCase.php's operation_search_index schema is opt-in
+        // (defineOperationSearchIndexSchema()'s own doc comment explains
+        // why it is not called unconditionally from
+        // defineDatabaseMigrations()) -- this test genuinely reads and
+        // writes that table via a real Artisan::call(), so it opts in here.
+        $this->defineOperationSearchIndexSchema();
+    }
+
+    protected function tearDown(): void
+    {
+        foreach ($this->tmpDirs as $dir) {
+            if (is_dir($dir)) {
+                $this->removeDirectory($dir);
+            }
+        }
+
+        if (DB::getSchemaBuilder()->hasTable('operation_search_index')) {
+            DB::table('operation_search_index')->delete();
+        }
+        if (DB::getSchemaBuilder()->hasTable('coding_projects')) {
+            DB::table('coding_projects')->delete();
+        }
+
+        parent::tearDown();
+    }
+
+    // -----------------------------------------------------------------
+    // Fixture helpers (mirrors McpPromptRegistryCommandPacksTest.php).
+    // -----------------------------------------------------------------
+
+    private function makeProjectDir(): string
+    {
+        $dir = sys_get_temp_dir().'/reindex_project_commands_'.uniqid('', true);
+        mkdir($dir, 0777, true);
+        $this->tmpDirs[] = $dir;
+
+        return $dir;
+    }
+
+    private function write(string $projectDir, string $relativePath, string $content): void
+    {
+        $full = $projectDir.'/'.$relativePath;
+        @mkdir(dirname($full), 0777, true);
+        file_put_contents($full, $content);
+    }
+
+    private function makeProject(?string $rootPath = null, ?string $userId = null): CodingProject
+    {
+        return CodingProject::create([
+            'user_id' => $userId ?? (string) Str::uuid(),
+            'name' => 'test project',
+            'root_path' => $rootPath ?? $this->makeProjectDir(),
+            'test_command' => null,
+        ]);
+    }
+
+    private function removeDirectory(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+
+        foreach (scandir($dir) ?: [] as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $path = $dir.'/'.$item;
+            if (is_dir($path)) {
+                $this->removeDirectory($path);
+            } else {
+                @unlink($path);
+            }
+        }
+        @rmdir($dir);
+    }
+
+    private static function deployTemplate(string $description = 'Deploy the current branch'): string
+    {
+        return <<<MD
+---
+description: {$description}
+---
+Run the deployment pipeline against the current branch and report the result.
+MD;
+    }
+
+    // -----------------------------------------------------------------
+    // Single project, single valid template -- exact row shape.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_single_valid_template_is_indexed_with_the_expected_row_shape(): void
+    {
+        $projectDir = $this->makeProjectDir();
+        $this->write($projectDir, '.claude/commands/deploy.md', self::deployTemplate());
+        $project = $this->makeProject($projectDir);
+
+        $exitCode = Artisan::call('llm-client:reindex-project-commands');
+
+        $this->assertSame(0, $exitCode);
+
+        $rows = DB::table('operation_search_index')->where('type', 'project_command')->get();
+        $this->assertCount(1, $rows, 'exactly one project_command row must be written for one valid template');
+
+        $row = $rows->first();
+        $this->assertSame("{$project->id}:deploy", $row->operation_id);
+        $this->assertSame($project->id, $row->coding_project_id);
+        $this->assertNull($row->package_name, 'a project command has no owning package');
+        $this->assertSame('Deploy the current branch', $row->summary);
+        $this->assertNull($row->method);
+        $this->assertNull($row->path);
+        $this->assertNull($row->param_schema);
+
+        // searchable_text must include the name, the description, and the
+        // full instructions body -- not just the summary (data-model.md §1,
+        // "the full instructions body participates in MATCH/AGAINST
+        // ranking, not just the description").
+        $this->assertStringContainsString('deploy', $row->searchable_text);
+        $this->assertStringContainsString('Deploy the current branch', $row->searchable_text);
+        $this->assertStringContainsString('Run the deployment pipeline against the current branch and report the result.', $row->searchable_text);
+
+        $this->assertStringContainsString('Run the deployment pipeline against the current branch and report the result.', $row->prompt_content);
+    }
+
+    // -----------------------------------------------------------------
+    // Idempotency -- delete-then-repopulate, not duplicate-insert.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function running_the_command_twice_with_no_filesystem_change_leaves_exactly_one_row(): void
+    {
+        $projectDir = $this->makeProjectDir();
+        $this->write($projectDir, '.claude/commands/deploy.md', self::deployTemplate());
+        $this->makeProject($projectDir);
+
+        Artisan::call('llm-client:reindex-project-commands');
+        Artisan::call('llm-client:reindex-project-commands');
+
+        $count = DB::table('operation_search_index')->where('type', 'project_command')->count();
+        $this->assertSame(1, $count, 'a second run with no filesystem change must not duplicate the row (delete-then-repopulate, not duplicate-insert)');
+    }
+
+    // -----------------------------------------------------------------
+    // Zero recognized template files -- zero rows, not an error.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_project_with_zero_recognized_template_files_contributes_zero_rows(): void
+    {
+        $this->makeProject($this->makeProjectDir());
+
+        $exitCode = Artisan::call('llm-client:reindex-project-commands');
+
+        $this->assertSame(0, $exitCode);
+        $this->assertSame(0, DB::table('operation_search_index')->where('type', 'project_command')->count());
+    }
+
+    // -----------------------------------------------------------------
+    // Two projects, each with a differently-named command -- two rows,
+    // each correctly attributed to its own coding_project_id.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function two_projects_each_contribute_their_own_correctly_attributed_row(): void
+    {
+        $projectADir = $this->makeProjectDir();
+        $this->write($projectADir, '.claude/commands/deploy.md', self::deployTemplate());
+        $projectA = $this->makeProject($projectADir);
+
+        $projectBDir = $this->makeProjectDir();
+        $this->write($projectBDir, '.claude/commands/rollback.md', <<<'MD'
+---
+description: Roll back the last deployment.
+---
+Revert the most recent deployment and restore the prior release.
+MD);
+        $projectB = $this->makeProject($projectBDir);
+
+        $exitCode = Artisan::call('llm-client:reindex-project-commands');
+
+        $this->assertSame(0, $exitCode);
+
+        $rows = DB::table('operation_search_index')->where('type', 'project_command')->get()->keyBy('operation_id');
+        $this->assertCount(2, $rows);
+
+        $this->assertTrue($rows->has("{$projectA->id}:deploy"));
+        $this->assertSame($projectA->id, $rows->get("{$projectA->id}:deploy")->coding_project_id);
+
+        $this->assertTrue($rows->has("{$projectB->id}:rollback"));
+        $this->assertSame($projectB->id, $rows->get("{$projectB->id}:rollback")->coding_project_id);
+    }
+
+    // -----------------------------------------------------------------
+    // --dry-run: reports counts, writes nothing.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function dry_run_reports_counts_without_writing_any_row(): void
+    {
+        $projectDir = $this->makeProjectDir();
+        $this->write($projectDir, '.claude/commands/deploy.md', self::deployTemplate());
+        $this->makeProject($projectDir);
+
+        $exitCode = Artisan::call('llm-client:reindex-project-commands', ['--dry-run' => true]);
+        $output = Artisan::output();
+
+        $this->assertSame(0, $exitCode);
+        $this->assertStringContainsString('1', $output, 'the dry-run summary must report the counts (workspaces scanned, commands that would be indexed) contract §Behavior step 5 calls for');
+        $this->assertSame(0, DB::table('operation_search_index')->where('type', 'project_command')->count(), 'a dry run must never write a row');
+    }
+
+    // -----------------------------------------------------------------
+    // A pre-seeded 'operation' row is untouched -- the delete-then-
+    // repopulate step is scoped to type = 'project_command' only.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_preseeded_builtin_operation_row_survives_a_run_byte_for_byte_unchanged(): void
+    {
+        DB::table('operation_search_index')->insert([
+            'operation_id' => 'contacts.store',
+            'package_name' => '@clarion-app/contacts',
+            'type' => 'operation',
+            'summary' => 'Store a new contact',
+            'method' => 'POST',
+            'path' => '/api/contacts',
+            'searchable_text' => 'Store a new contact POST /api/contacts',
+            'param_schema' => null,
+            'prompt_content' => null,
+            'updated_at' => '2026-01-01 00:00:00',
+        ]);
+
+        $before = (array) DB::table('operation_search_index')->where('operation_id', 'contacts.store')->first();
+
+        $projectDir = $this->makeProjectDir();
+        $this->write($projectDir, '.claude/commands/deploy.md', self::deployTemplate());
+        $this->makeProject($projectDir);
+
+        $exitCode = Artisan::call('llm-client:reindex-project-commands');
+
+        $this->assertSame(0, $exitCode);
+
+        $after = (array) DB::table('operation_search_index')->where('operation_id', 'contacts.store')->first();
+        $this->assertSame($before, $after, "a pre-existing type = 'operation' row, unrelated to any workspace, must survive a reindex run byte-for-byte unchanged");
+    }
+}

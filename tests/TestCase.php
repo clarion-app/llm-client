@@ -780,6 +780,82 @@ abstract class TestCase extends BaseTestCase
     }
 
     /**
+     * The operation_search_index table (128-project-command-indexing,
+     * data-model.md §1). Deliberately NOT called from
+     * defineDatabaseMigrations() itself, unlike defineBudgetSchema()'s own
+     * sibling helpers (defineReservationSchema()/defineRateLimitSchema()) --
+     * every other hand-declared table in that method is inert until a test
+     * deliberately queries it, but this one is not: AgentLoopService::
+     * handleSearchOperations() gates on OperationsSearchService::
+     * tableExists() alone, and OperationsSearchService::search() always
+     * issues a MySQL/MariaDB-only `MATCH ... AGAINST` raw query with no
+     * SQLite fallback (unchanged by this feature, confirmed in this
+     * feature's own research.md real-db carve-out). Almost every existing
+     * Feature/Integration test that reaches search_operations through a
+     * real (unmocked) AgentLoopService relies on tableExists() being false
+     * in the fast-suite harness to short-circuit before that query ever
+     * runs -- exactly the state
+     * tests/Feature/ExternalToolSearchResultBoundJourneyTest.php's own
+     * comment documents ("this package's own test harness, tests/
+     * TestCase.php, does not create that table at all"). Calling this
+     * unconditionally from defineDatabaseMigrations() was tried first and
+     * broke that guarantee suite-wide (a genuine "table already exists"
+     * collision under RefreshDatabase tests too, per the note below) --
+     * every test class that genuinely needs a real operation_search_index
+     * table (128-project-command-indexing's own
+     * ReindexProjectCommandsCommandTest, so far) calls this directly from
+     * its own setUp(), the same opt-in shape defineBudgetSchema()'s own
+     * call sites use.
+     *
+     * package_name is nullable here — unlike the original migration's NOT
+     * NULL column — because a type = 'project_command' row's package_name
+     * is always null (data-model.md §1); the production migration relaxes
+     * the same constraint so the real schema matches this mirror.
+     *
+     * Also guarded against RefreshDatabase (and LazilyRefreshDatabase)
+     * tests: defineDatabaseMigrations() (and therefore any test class that
+     * calls this method from its own setUp()) always runs before
+     * RefreshDatabase's own migrate:fresh (Orchestra\Testbench\Concerns\
+     * HandlesDatabases::setUpDatabaseRequirements() calls
+     * defineDatabaseMigrations(), then invokes the caller-supplied
+     * $callback that triggers refreshDatabase(), in that order), and
+     * migrate:fresh's own internal `db:wipe` step is itself skipped
+     * whenever the migration repository does not yet exist -- exactly the
+     * state on a brand-new :memory: connection. So a RefreshDatabase test
+     * that called this method would leave a hand-declared
+     * operation_search_index behind for the real
+     * 2026_06_19_000000_create_operation_search_index_table migration to
+     * collide with moments later ("table already exists"), since nothing
+     * wiped it first. Skipping the hand-declared copy for any test using
+     * either trait leaves the real migration (which already includes this
+     * feature's coding_project_id column and nullable package_name) as the
+     * sole source of this table for those tests.
+     */
+    protected function defineOperationSearchIndexSchema(): void
+    {
+        if (Schema::hasTable('operation_search_index') || static::usesRefreshDatabaseTestingConcern()) {
+            return;
+        }
+
+        Schema::create('operation_search_index', function (Blueprint $table) {
+            $table->id();
+            $table->string('type', 20)->default('operation');
+            $table->string('operation_id')->unique();
+            $table->string('package_name')->nullable();
+            $table->string('coding_project_id')->nullable();
+            $table->string('summary', 500)->nullable();
+            $table->string('method', 10)->nullable();
+            $table->string('path', 1000)->nullable();
+            $table->text('searchable_text');
+            $table->json('param_schema')->nullable();
+            $table->text('prompt_content')->nullable();
+            $table->timestamps();
+
+            $table->index('coding_project_id');
+        });
+    }
+
+    /**
      * The two tables spending enforcement reads and writes.
      *
      * Extracted so the handful of test classes that hand-declare a schema

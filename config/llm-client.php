@@ -89,6 +89,11 @@ return [
     // Operations Search configuration
     'operations_search' => [
         'default_limit' => 10,    // Maximum results returned by search
+
+        // Maximum number of type = 'project_command' rows a single search
+        // may contribute to a result set (128-project-command-indexing,
+        // FR-011/SC-005, research.md D6). Inert until US5 reads it.
+        'project_command_result_cap' => 5,
     ],
 
     // Operation Cache configuration

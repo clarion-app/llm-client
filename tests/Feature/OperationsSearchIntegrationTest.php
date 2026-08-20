@@ -154,9 +154,17 @@ class OperationsSearchIntegrationTest extends TestCase
         $dbMock = Mockery::mock(\Illuminate\Database\ConnectionInterface::class);
         $dbMock->shouldReceive('table')->with('operation_search_index')->once()->andReturn($queryMock);
 
-        // Default limit is 10, but custom limit of 5 is passed
+        // Default limit is 10, but custom limit of 5 is passed.
+        // 128-project-command-indexing inserted a new $codingProjectId
+        // parameter before $limit (contracts/operations-search-service.md's
+        // Signature section: "a breaking positional-argument change for any
+        // caller passing $limit positionally as the second argument"). This
+        // call is exactly that caller, so $limit is now passed by name to
+        // keep binding to the same parameter it always has -- a genuine
+        // pre-existing test bug the signature change surfaces, not a change
+        // to this test's own intent or assertions.
         $service = new OperationsSearchService($dbMock, 10);
-        $results = $service->search('test', 5);
+        $results = $service->search('test', limit: 5);
 
         $this->assertCount(5, $results);
     }

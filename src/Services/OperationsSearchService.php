@@ -24,13 +24,23 @@ class OperationsSearchService
         $this->defaultLimit = $defaultLimit ?? (int) config('llm-client.operations_search.default_limit', 10);
     }
 
-    public function search(string $query, ?int $limit = null): array
+    /**
+     * @param string $query
+     * @param string|null $codingProjectId When non-null, scopes the result set to rows
+     *   that are either global (coding_project_id IS NULL) or belong to this workspace
+     *   (coding_project_id = $codingProjectId) -- never another workspace's rows
+     *   (128-project-command-indexing, contracts/operations-search-service.md). When
+     *   null (the default), the query is byte-for-byte identical to this method's
+     *   pre-feature behavior: no type = 'project_command' row is ever returned.
+     * @param int|null $limit
+     */
+    public function search(string $query, ?string $codingProjectId = null, ?int $limit = null): array
     {
         if ($limit === null) {
             $limit = $this->defaultLimit;
         }
 
-        $results = $this->db->table('operation_search_index')
+        $queryBuilder = $this->db->table('operation_search_index')
             ->select(
                 'operation_id as operationId',
                 'package_name',
@@ -43,7 +53,15 @@ class OperationsSearchService
             )
             ->whereRaw('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE)', [$query])
             ->orderByRaw('MATCH(type, searchable_text) AGAINST(? IN NATURAL LANGUAGE MODE) DESC', [$query])
-            ->limit($limit)
+            ->limit($limit);
+
+        if ($codingProjectId !== null) {
+            $queryBuilder->where(function ($q) use ($codingProjectId) {
+                $q->whereNull('coding_project_id')->orWhere('coding_project_id', $codingProjectId);
+            });
+        }
+
+        $results = $queryBuilder
             ->get()
             ->toArray();
 
