@@ -1018,6 +1018,120 @@ class CodingWorkspaceController extends Controller
     }
 
     /**
+     * POST coding-project/{project}/git-commit (126-git-operations-
+     * confirmation, US2, contracts/git-commit.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like every other confirmed
+     * mutation on this controller.
+     *
+     * `GitOperationInspector::previewCommit()` is called a second time
+     * here, immediately before executing (Grounding note 5's
+     * belt-and-suspenders posture -- neither layer trusts the other):
+     * called WITH whatever `paths` this request actually carries, never
+     * with `null`, so a request that resubmits the confirmation's own
+     * pinned list gets back exactly that list again (never a fresh scan
+     * that could pick up an unrelated change made while the confirmation
+     * was pending -- research.md D6). A request that omits `paths`
+     * entirely (e.g. a direct, non-agent-driven call) still gets a fresh,
+     * correct resolution the same way the confirmation preview itself
+     * would have produced.
+     */
+    public function gitCommit(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'message' => 'required|string',
+            'paths' => 'nullable|array',
+            'paths.*' => 'string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewCommit($codingProject->root_path, $validated['paths'] ?? null);
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Nothing to commit.',
+                'code' => $preview['code'] ?? 'git_nothing_to_commit',
+            ], 422);
+        }
+
+        $files = $preview['files'];
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $addProcess = $this->runGitCommandCapturingResult($codingProject->root_path, array_merge(['git', 'add', '--'], $files));
+        $commitProcess = ($addProcess !== null && $addProcess->isSuccessful())
+            ? $this->runGitCommandCapturingResult($codingProject->root_path, ['git', 'commit', '-m', $validated['message']])
+            : null;
+
+        $succeeded = $commitProcess !== null && $commitProcess->isSuccessful();
+        $failedProcess = $commitProcess ?? $addProcess;
+
+        $hash = null;
+        if ($succeeded) {
+            $hashProcess = $this->runGitCommandCapturingResult($codingProject->root_path, ['git', 'rev-parse', 'HEAD']);
+            $hash = ($hashProcess !== null && $hashProcess->isSuccessful()) ? trim($hashProcess->getOutput()) : null;
+        }
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildCommitCommandString($validated['message'], $files),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $failedProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $failedProcess?->getOutput(),
+            'stderr' => $failedProcess?->getErrorOutput(),
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'git command failed',
+                'code' => 'git_command_failed',
+                'stderr' => $failedProcess?->getErrorOutput() ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'committed' => true,
+            'hash' => $hash,
+            'message' => $validated['message'],
+            'files' => $files,
+        ], 200);
+    }
+
+    /**
+     * The human-readable, sanitized (research.md D8 -- a commit message
+     * and plain file paths never carry a credential, so no sanitization
+     * is actually needed here beyond quoting) reconstruction of a commit
+     * invocation, shared by the executed-and-recorded row above and
+     * mirrored by AgentLoopService::recordDeclinedCommandExecution()'s
+     * own gitCommit branch for a declined one (data-model.md §3,
+     * contracts/git-commit.md's Declined section).
+     *
+     * @param  string[]  $files
+     */
+    private function buildCommitCommandString(string $message, array $files): string
+    {
+        return 'git commit -m "'.addslashes($message).'" -- '.implode(' ', $files);
+    }
+
+    /**
      * Clamps the `limit` query param against the configured default/max
      * (contracts §3): a non-numeric or non-positive value floors at the
      * default, anything above the max clamps to the max.
@@ -1280,6 +1394,34 @@ class CodingWorkspaceController extends Controller
         }
 
         if (!$process->isSuccessful()) {
+            return null;
+        }
+
+        return $process;
+    }
+
+    /**
+     * A sibling to runGitCommand() (126-git-operations-confirmation,
+     * Grounding note 6) that returns the Process object regardless of
+     * whether it succeeded -- for the mutating git operations, which need
+     * real `stderr` text surfaced on a genuine execution-time failure.
+     * runGitCommand()'s own null-on-failure collapse (used by
+     * gitStatus()/gitDiff(), which have no need to distinguish "not a
+     * repo" from "the command itself failed") is completely unchanged.
+     * Still returns null for "not a repository" and for a Process that
+     * could not even be started -- only a genuine command failure once
+     * started is surfaced as a (non-null, !isSuccessful()) Process.
+     */
+    private function runGitCommandCapturingResult(string $rootPath, array $command): ?Process
+    {
+        if (!is_dir($rootPath.'/.git')) {
+            return null;
+        }
+
+        try {
+            $process = new Process($command, $rootPath);
+            $process->run();
+        } catch (\Throwable) {
             return null;
         }
 

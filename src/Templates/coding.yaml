@@ -68,6 +68,7 @@ tools:
     - clarionApp.llmClient.codingWorkspace.runTests
     - clarionApp.llmClient.codingWorkspace.runCommand
     - clarionApp.llmClient.codingWorkspace.runCode
+    - clarionApp.llmClient.codingWorkspace.gitCommit
   deny: []
 safety:
   confirmation_required:
@@ -75,4 +76,5 @@ safety:
     - clarionApp.llmClient.codingWorkspace.deleteFile
     - clarionApp.llmClient.codingWorkspace.runCommand
     - clarionApp.llmClient.codingWorkspace.runCode
+    - clarionApp.llmClient.codingWorkspace.gitCommit
   denylist: []

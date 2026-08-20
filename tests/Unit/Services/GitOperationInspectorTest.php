@@ -161,4 +161,150 @@ class GitOperationInspectorTest extends TestCase
 
         $this->assertSame($url, $this->inspector()->sanitizeRemoteUrl($url));
     }
+
+    // ---------------------------------------------------------------
+    // previewCommit() — Phase 4/US2, data-model.md §5, contracts/
+    // git-commit.md. The out-of-workspace-path rejection lives inside
+    // this method itself and returns the same plain {ok:false, code:...}
+    // refusal shape as every other precondition here — never via
+    // containmentFailureResponse()/WorkspaceRefusalRecorder, which this
+    // stateless, constructor-dependency-free service cannot call anyway
+    // (T016's resolved-contradiction note supersedes contracts/
+    // git-commit.md's contrary prose on this one point).
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function preview_commit_with_omitted_paths_resolves_every_currently_changed_or_untracked_path(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/tracked.txt', "line one\n");
+        $this->runGit(['add', 'tracked.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        // One modified, already-tracked file...
+        file_put_contents($repoPath.'/tracked.txt', "line one\nline two\n");
+        // ...and one brand-new, never-tracked file.
+        file_put_contents($repoPath.'/untracked.txt', "new file\n");
+
+        $result = $this->inspector()->previewCommit($repoPath, null);
+
+        $this->assertTrue($result['ok'] ?? null, 'omitted paths against a dirty tree must succeed');
+        $this->assertEqualsCanonicalizing(
+            ['tracked.txt', 'untracked.txt'],
+            $result['files'] ?? null,
+            'omitted paths must resolve to every currently changed-or-untracked path, tracked and untracked alike'
+        );
+    }
+
+    #[Test]
+    public function preview_commit_with_an_explicit_paths_subset_scopes_the_result_to_exactly_those(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/a.txt', "a\n");
+        file_put_contents($repoPath.'/b.txt', "b\n");
+        $this->runGit(['add', '.'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        // Both files change, but only one is named explicitly.
+        file_put_contents($repoPath.'/a.txt', "a changed\n");
+        file_put_contents($repoPath.'/b.txt', "b changed\n");
+
+        $result = $this->inspector()->previewCommit($repoPath, ['a.txt']);
+
+        $this->assertTrue($result['ok'] ?? null);
+        $this->assertSame(['a.txt'], $result['files'] ?? null, 'an explicit paths subset must scope the result to exactly those paths, never b.txt too');
+    }
+
+    #[Test]
+    public function preview_commit_rejects_a_path_outside_the_working_tree(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/inside.txt', "inside\n");
+        $this->runGit(['add', 'inside.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+        file_put_contents($repoPath.'/inside.txt', "inside changed\n");
+
+        // An absolute path well outside the repo — unambiguous regardless
+        // of whether the containment check is realpath- or string-based,
+        // and requires no file to actually exist there.
+        $outsidePath = sys_get_temp_dir().'/git_op_inspector_outside_'.uniqid('', true).'.txt';
+
+        $result = $this->inspector()->previewCommit($repoPath, [$outsidePath]);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_path_outside_workspace', $result['code'] ?? null);
+    }
+
+    #[Test]
+    public function preview_commit_on_a_clean_tree_reports_nothing_to_commit(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/only.txt', "only\n");
+        $this->runGit(['add', 'only.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        // No further edits — the tree is clean.
+        $result = $this->inspector()->previewCommit($repoPath, null);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_nothing_to_commit', $result['code'] ?? null);
+    }
+
+    #[Test]
+    public function preview_commit_against_a_non_git_directory_reports_not_a_repository(): void
+    {
+        $plainPath = $this->createPlainDirectory();
+
+        $result = $this->inspector()->previewCommit($plainPath, null);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_not_a_repository', $result['code'] ?? null);
+    }
+
+    #[Test]
+    public function preview_commit_every_refusal_code_is_mutually_distinct(): void
+    {
+        // A cheap structural pin: previewCommit()'s three refusal paths
+        // must each carry their own distinct code, never a shared/generic
+        // one a caller could not tell apart.
+        $notARepo = $this->inspector()->previewCommit($this->createPlainDirectory(), null);
+
+        $cleanRepo = $this->createGitRepo();
+        file_put_contents($cleanRepo.'/only.txt', "only\n");
+        $this->runGit(['add', 'only.txt'], $cleanRepo);
+        $this->runGit(['commit', '-m', 'Initial commit'], $cleanRepo);
+        $nothingToCommit = $this->inspector()->previewCommit($cleanRepo, null);
+
+        $dirtyRepo = $this->createGitRepo();
+        file_put_contents($dirtyRepo.'/inside.txt', "inside\n");
+        $this->runGit(['add', 'inside.txt'], $dirtyRepo);
+        $this->runGit(['commit', '-m', 'Initial commit'], $dirtyRepo);
+        file_put_contents($dirtyRepo.'/inside.txt', "changed\n");
+        $outsidePath = sys_get_temp_dir().'/git_op_inspector_outside_'.uniqid('', true).'.txt';
+        $pathOutsideWorkspace = $this->inspector()->previewCommit($dirtyRepo, [$outsidePath]);
+
+        $codes = [$notARepo['code'] ?? null, $nothingToCommit['code'] ?? null, $pathOutsideWorkspace['code'] ?? null];
+        $this->assertSame(3, count(array_unique($codes)), 'every refusal path must carry its own distinct code');
+    }
+
+    #[Test]
+    public function preview_commit_diff_stat_matches_real_git_diff_stat_output_for_a_known_fixture_change(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "line one\nline two\nline three\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        file_put_contents($repoPath.'/file.txt', "line one\nline two CHANGED\nline three\nline four\n");
+
+        // Deliberately a single, already-tracked modified file (no
+        // untracked file in this fixture) so plain `git diff --stat`
+        // itself is the unambiguous ground truth to compare against.
+        $expectedDiffStat = trim($this->runGit(['diff', '--stat'], $repoPath)->getOutput());
+
+        $result = $this->inspector()->previewCommit($repoPath, null);
+
+        $this->assertTrue($result['ok'] ?? null);
+        $this->assertSame($expectedDiffStat, $result['diff_stat'] ?? null, "diff_stat's format must match real `git diff --stat` output exactly");
+    }
 }

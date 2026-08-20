@@ -113,6 +113,11 @@ class CodingAgentProvisionerTest extends TestCase
                 'method' => 'post',
                 'summary' => 'Run a code snippet in a registered project\'s sandboxed workspace',
             ],
+            'clarionApp.llmClient.codingWorkspace.gitCommit' => [
+                'path' => '/api/coding-project/{project}/git-commit',
+                'method' => 'post',
+                'summary' => 'Stage and commit a registered project\'s changes',
+            ],
             'clarionApp.llmClient.conversations.index' => [
                 'path' => '/api/conversations',
                 'method' => 'get',
