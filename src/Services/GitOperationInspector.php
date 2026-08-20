@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Models\CodingProject;
 use Symfony\Component\Process\Process;
 
 /**
@@ -179,6 +180,200 @@ class GitOperationInspector
         $process->run();
 
         return $process->isSuccessful() ? trim($process->getOutput()) : '';
+    }
+
+    /**
+     * 126-git-operations-confirmation, US3 (data-model.md §5, contracts/
+     * git-publish.md §1). Order: not-a-repository -> `$project->
+     * network_enabled` (`git_publish_disabled`, checked before the
+     * repository's own remotes are inspected at all -- research.md D5) ->
+     * the resolved remote (defaulting to "origin" when `$remote` is
+     * omitted) must actually be configured (`git_no_remote_configured` --
+     * a distinct code from the disabled case, FR-012) -> the resolved
+     * branch (defaulting to the current branch when `$branch` is omitted)
+     * must resolve to a local commit (`git_invalid_reference`) -> a
+     * successful result carries the sanitized remote URL (D8), the
+     * resolved `remote`/`branch`/`pinned_head` (the exact local commit a
+     * caller pins into a replayed push -- D6), the commits the remote does
+     * not have yet, and whether this push would create the remote branch.
+     *
+     * `commits_ahead`/`creates_remote_branch` are derived via a read-only
+     * `git ls-remote` against the configured remote (never a `git fetch`,
+     * which would write to this repository's own remote-tracking refs --
+     * this service mutates nothing, matching every other `preview*()`
+     * method here).
+     *
+     * @return array{ok: bool, code?: string, reason?: string, remote?: string, branch?: string, remote_url_sanitized?: string, pinned_head?: string, commits_ahead?: array<int, array{hash: string, short_hash: string, subject: string}>, creates_remote_branch?: bool}
+     */
+    public function previewPush(CodingProject $project, ?string $remote, ?string $branch): array
+    {
+        $rootPath = $project->root_path;
+
+        if (!$this->isGitRepository($rootPath)) {
+            return [
+                'ok' => false,
+                'code' => 'git_not_a_repository',
+                'reason' => 'This project is not a git repository.',
+            ];
+        }
+
+        if ($project->network_enabled !== true) {
+            return [
+                'ok' => false,
+                'code' => 'git_publish_disabled',
+                'reason' => 'Publishing is not enabled for this workspace.',
+            ];
+        }
+
+        $remoteName = ($remote !== null && $remote !== '') ? $remote : 'origin';
+        $remoteUrl = $this->remoteUrlFor($rootPath, $remoteName);
+
+        if ($remoteUrl === null) {
+            return [
+                'ok' => false,
+                'code' => 'git_no_remote_configured',
+                'reason' => 'No shared location is configured for this workspace.',
+            ];
+        }
+
+        $branchName = ($branch !== null && $branch !== '') ? $branch : $this->currentBranchName($rootPath);
+        $localHash = $branchName !== null ? $this->resolveLocalRef($rootPath, $branchName) : null;
+
+        if ($branchName === null || $localHash === null) {
+            return [
+                'ok' => false,
+                'code' => 'git_invalid_reference',
+                'reason' => 'Could not resolve the branch to push.',
+            ];
+        }
+
+        $remoteBranchHash = $this->remoteBranchHash($rootPath, $remoteName, $branchName);
+        $createsRemoteBranch = $remoteBranchHash === null;
+
+        return [
+            'ok' => true,
+            'remote' => $remoteName,
+            'branch' => $branchName,
+            'remote_url_sanitized' => $this->sanitizeRemoteUrl($remoteUrl),
+            'pinned_head' => $localHash,
+            'commits_ahead' => $this->commitsAhead($rootPath, $localHash, $remoteBranchHash),
+            'creates_remote_branch' => $createsRemoteBranch,
+        ];
+    }
+
+    /**
+     * `git remote get-url <name>` -- null when the remote is not
+     * configured at all (or the command otherwise fails), never throws.
+     */
+    private function remoteUrlFor(string $rootPath, string $remoteName): ?string
+    {
+        $process = new Process(['git', 'remote', 'get-url', $remoteName], $rootPath);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return null;
+        }
+
+        $url = trim($process->getOutput());
+
+        return $url === '' ? null : $url;
+    }
+
+    /**
+     * `git rev-parse --abbrev-ref HEAD` -- null on failure (e.g. an
+     * unborn/empty repository) rather than throwing.
+     */
+    private function currentBranchName(string $rootPath): ?string
+    {
+        $process = new Process(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], $rootPath);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return null;
+        }
+
+        $branch = trim($process->getOutput());
+
+        return $branch === '' ? null : $branch;
+    }
+
+    /**
+     * Resolves $ref (a branch name, in every caller here) to the local
+     * commit hash it currently points at -- null when it does not resolve
+     * to anything.
+     */
+    private function resolveLocalRef(string $rootPath, string $ref): ?string
+    {
+        $process = new Process(['git', 'rev-parse', '--verify', $ref], $rootPath);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return null;
+        }
+
+        $hash = trim($process->getOutput());
+
+        return $hash === '' ? null : $hash;
+    }
+
+    /**
+     * A read-only `git ls-remote <remoteName> refs/heads/<branchName>` --
+     * never a `git fetch`, so this repository's own remote-tracking refs
+     * are never written to. Null when the branch does not exist on the
+     * remote yet (empty output) or the remote is unreachable.
+     */
+    private function remoteBranchHash(string $rootPath, string $remoteName, string $branchName): ?string
+    {
+        $process = new Process(['git', 'ls-remote', $remoteName, 'refs/heads/'.$branchName], $rootPath);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return null;
+        }
+
+        $output = trim($process->getOutput());
+        if ($output === '') {
+            return null;
+        }
+
+        $firstLine = strtok($output, "\r\n");
+        $parts = preg_split('/\s+/', $firstLine ?: '', 2);
+
+        return $parts[0] ?? null;
+    }
+
+    /**
+     * The commits `$localHash` has that `$remoteBranchHash` does not --
+     * every reachable commit at all when the remote branch does not exist
+     * yet (`$remoteBranchHash === null`), matching contracts/git-publish.md
+     * §1's "every commit on the local branch not already on
+     * `<remote>/<branch>` (or every commit at all, if the remote branch
+     * does not exist)".
+     *
+     * @return array<int, array{hash: string, short_hash: string, subject: string}>
+     */
+    private function commitsAhead(string $rootPath, string $localHash, ?string $remoteBranchHash): array
+    {
+        $range = $remoteBranchHash === null ? $localHash : "{$remoteBranchHash}..{$localHash}";
+
+        $process = new Process(['git', 'log', $range, '--format=%H|%h|%s'], $rootPath);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            return [];
+        }
+
+        $commits = [];
+        foreach (preg_split('/\R/', trim($process->getOutput())) as $line) {
+            if ($line === '') {
+                continue;
+            }
+
+            [$hash, $shortHash, $subject] = array_pad(explode('|', $line, 3), 3, '');
+            $commits[] = ['hash' => $hash, 'short_hash' => $shortHash, 'subject' => $subject];
+        }
+
+        return $commits;
     }
 
     /**

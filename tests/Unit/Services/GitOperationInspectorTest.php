@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Tests\Unit\Services;
 
+use ClarionApp\LlmClient\Models\CodingProject;
 use ClarionApp\LlmClient\Services\GitOperationInspector;
 use PHPUnit\Framework\Attributes\Test;
 use Symfony\Component\Process\Process;
@@ -60,6 +61,41 @@ class GitOperationInspectorTest extends TestCase
         $this->tempRepoPaths[] = $path;
 
         return $path;
+    }
+
+    /**
+     * A real, local `git init --bare` repository used as a `file://`-scheme
+     * remote stand-in (tasks.md Repository map / Grounding note 7,
+     * research.md's Testing section) -- no live network access anywhere in
+     * this file.
+     */
+    private function createBareRemote(): string
+    {
+        $path = sys_get_temp_dir().'/git_op_inspector_bare_'.uniqid('', true);
+        mkdir($path, 0777, true);
+        $this->tempRepoPaths[] = $path;
+
+        $this->runGit(['init', '--bare'], $path);
+
+        return $path;
+    }
+
+    private function currentBranch(string $repoPath): string
+    {
+        return trim($this->runGit(['rev-parse', '--abbrev-ref', 'HEAD'], $repoPath)->getOutput());
+    }
+
+    /**
+     * Pushes $repoPath's current HEAD to $barePath directly (never through
+     * the method under test, which must never itself mutate anything) and
+     * points the bare remote's own HEAD symref at that branch, so a later
+     * `git rev-parse HEAD` against the bare repo resolves deterministically
+     * regardless of git's configured default branch name.
+     */
+    private function pushToBareRemote(string $repoPath, string $barePath, string $branch): void
+    {
+        $this->runGit(['push', 'origin', "HEAD:refs/heads/{$branch}"], $repoPath);
+        $this->runGit(['symbolic-ref', 'HEAD', "refs/heads/{$branch}"], $barePath);
     }
 
     private function runGit(array $args, string $cwd): Process
@@ -306,5 +342,134 @@ class GitOperationInspectorTest extends TestCase
 
         $this->assertTrue($result['ok'] ?? null);
         $this->assertSame($expectedDiffStat, $result['diff_stat'] ?? null, "diff_stat's format must match real `git diff --stat` output exactly");
+    }
+
+    // ---------------------------------------------------------------
+    // previewPush() -- Phase 5/US3, data-model.md §5
+    // ("previewPush(CodingProject $project, ?string $remote, ?string
+    // $branch): array"), contracts/git-publish.md. Every case below uses a
+    // real local `git init --bare` repository as a `file://`-scheme remote
+    // stand-in -- never a mocked git invocation, never a live network
+    // remote of any kind.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function preview_push_with_network_disabled_is_refused_before_the_repositorys_remotes_are_even_inspected(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        // Deliberately NO remote configured at all (research.md D5): if the
+        // disabled check were accidentally ordered after remote
+        // inspection, this would instead surface as
+        // git_no_remote_configured, which the assertion below would catch.
+        $project = new CodingProject(['root_path' => $repoPath, 'network_enabled' => false]);
+
+        $result = (new GitOperationInspector())->previewPush($project, null, null);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_publish_disabled', $result['code'] ?? null);
+    }
+
+    #[Test]
+    public function preview_push_with_network_enabled_and_no_remote_configured_is_a_distinct_refusal_from_the_disabled_case(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        $project = new CodingProject(['root_path' => $repoPath, 'network_enabled' => true]);
+
+        $result = (new GitOperationInspector())->previewPush($project, null, null);
+
+        $this->assertFalse($result['ok'] ?? true);
+        $this->assertSame('git_no_remote_configured', $result['code'] ?? null);
+        $this->assertNotSame(
+            'git_publish_disabled',
+            $result['code'] ?? null,
+            'FR-012: "no remote configured" and "publishing disabled" must never be conflated into one code'
+        );
+    }
+
+    #[Test]
+    public function preview_push_happy_path_reports_a_sanitized_remote_url_and_creates_remote_branch_true_when_the_remote_branch_does_not_yet_exist(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+        $firstHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Second commit'], $repoPath);
+        $secondHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        $barePath = $this->createBareRemote();
+        $remoteUrl = 'file://'.$barePath;
+        $this->runGit(['remote', 'add', 'origin', $remoteUrl], $repoPath);
+        $branch = $this->currentBranch($repoPath);
+
+        $project = new CodingProject(['root_path' => $repoPath, 'network_enabled' => true]);
+
+        $result = (new GitOperationInspector())->previewPush($project, 'origin', $branch);
+
+        $this->assertTrue($result['ok'] ?? null);
+        $this->assertSame(
+            $remoteUrl,
+            $result['remote_url_sanitized'] ?? null,
+            'remote_url_sanitized must correctly derive from the configured remote (via sanitizeRemoteUrl())'
+        );
+        $this->assertEqualsCanonicalizing(
+            [$firstHash, $secondHash],
+            array_column($result['commits_ahead'] ?? [], 'hash'),
+            'commits_ahead must list exactly the local-only commits -- the remote has none of them yet'
+        );
+        $this->assertTrue(
+            $result['creates_remote_branch'] ?? null,
+            'no branch has ever been pushed to this empty bare remote -- this push would create it'
+        );
+    }
+
+    #[Test]
+    public function preview_push_reports_creates_remote_branch_false_once_the_remote_branch_already_exists(): void
+    {
+        $repoPath = $this->createGitRepo();
+        file_put_contents($repoPath.'/file.txt', "one\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Initial commit'], $repoPath);
+
+        $barePath = $this->createBareRemote();
+        $remoteUrl = 'file://'.$barePath;
+        $this->runGit(['remote', 'add', 'origin', $remoteUrl], $repoPath);
+        $branch = $this->currentBranch($repoPath);
+
+        // The branch is pushed directly (never through the method under
+        // test) so it already exists on the remote by the time
+        // previewPush() is called.
+        $this->pushToBareRemote($repoPath, $barePath, $branch);
+
+        file_put_contents($repoPath.'/file.txt', "one\ntwo\n");
+        $this->runGit(['add', 'file.txt'], $repoPath);
+        $this->runGit(['commit', '-m', 'Second commit'], $repoPath);
+        $secondHash = trim($this->runGit(['rev-parse', 'HEAD'], $repoPath)->getOutput());
+
+        $project = new CodingProject(['root_path' => $repoPath, 'network_enabled' => true]);
+
+        $result = (new GitOperationInspector())->previewPush($project, 'origin', $branch);
+
+        $this->assertTrue($result['ok'] ?? null);
+        $this->assertFalse(
+            $result['creates_remote_branch'] ?? null,
+            'the branch already exists on the remote -- this push updates it, it does not create it'
+        );
+        $this->assertSame(
+            [$secondHash],
+            array_column($result['commits_ahead'] ?? [], 'hash'),
+            'commits_ahead must now list only the single commit made after the remote already had the branch'
+        );
     }
 }

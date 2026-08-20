@@ -1132,6 +1132,143 @@ class CodingWorkspaceController extends Controller
     }
 
     /**
+     * POST coding-project/{project}/git-push (126-git-operations-
+     * confirmation, US3, contracts/git-publish.md §1). Reaches this
+     * controller only once already confirmed -- `coding.yaml`'s
+     * `safety.confirmation_required` and the existing pause/resume
+     * mechanism gate it upstream, exactly like gitCommit() above.
+     *
+     * `GitOperationInspector::previewPush()` is called a second time here,
+     * immediately before executing (Grounding note 5's belt-and-suspenders
+     * posture, mirrored from gitCommit()): re-derives `remote`/`branch`/
+     * `remote_url_sanitized`/`creates_remote_branch` fresh, from whatever
+     * this request actually carries. `pinned_head` (research.md D6) is
+     * taken from the request body when present -- the exact commit an
+     * already-approved confirmation named -- and only falls back to a
+     * freshly-resolved local HEAD for a direct call that never went
+     * through a confirmation at all.
+     */
+    public function gitPush(Request $request, string $project): JsonResponse
+    {
+        $codingProject = $this->findOwnedProject($project);
+        if ($codingProject === null) {
+            return $this->notFoundResponse('Coding project not found', 'coding_project_not_found');
+        }
+
+        $validated = $request->validate([
+            'remote' => 'nullable|string',
+            'branch' => 'nullable|string',
+            'pinned_head' => 'nullable|string',
+        ]);
+
+        if (!$this->gitOperationInspector->isGitRepository($codingProject->root_path)) {
+            return response()->json([
+                'error' => 'This project is not a git repository.',
+                'code' => 'git_not_a_repository',
+            ], 422);
+        }
+
+        $preview = $this->gitOperationInspector->previewPush($codingProject, $validated['remote'] ?? null, $validated['branch'] ?? null);
+        if (!($preview['ok'] ?? false)) {
+            return response()->json([
+                'error' => $preview['reason'] ?? 'Publishing refused.',
+                'code' => $preview['code'] ?? 'git_publish_disabled',
+            ], 422);
+        }
+
+        $remote = $preview['remote'];
+        $branch = $preview['branch'];
+        $requestedPinnedHead = $validated['pinned_head'] ?? null;
+        $pinnedHead = (is_string($requestedPinnedHead) && $requestedPinnedHead !== '') ? $requestedPinnedHead : $preview['pinned_head'];
+
+        $attribution = $this->resolveAttribution($request, $codingProject);
+
+        $previousRemoteHead = $this->remoteBranchHeadHash($codingProject->root_path, $remote, $branch);
+
+        $pushProcess = $this->runGitCommandCapturingResult(
+            $codingProject->root_path,
+            ['git', 'push', $remote, "{$pinnedHead}:refs/heads/{$branch}"],
+        );
+        $succeeded = $pushProcess !== null && $pushProcess->isSuccessful();
+        $sanitizedStderr = $pushProcess !== null
+            ? $this->gitOperationInspector->sanitizeRemoteUrl($pushProcess->getErrorOutput())
+            : null;
+
+        CodingCommandExecution::create([
+            'coding_project_id' => $codingProject->id,
+            'user_id' => Auth::id(),
+            'command' => $this->buildPushCommandString($remote, $pinnedHead, $branch),
+            'status' => $succeeded ? 'completed' : 'failed',
+            'exit_code' => $pushProcess?->getExitCode(),
+            'timed_out' => false,
+            'stdout' => $pushProcess?->getOutput(),
+            'stderr' => $sanitizedStderr,
+            'output_truncated' => false,
+            'network_enabled' => (bool) $codingProject->network_enabled,
+            'duration_ms' => null,
+            'agent_id' => $attribution['agent_id'],
+            'agent_name' => $attribution['agent_name'],
+            'conversation_id' => $attribution['conversation_id'],
+        ]);
+
+        if (!$succeeded) {
+            return response()->json([
+                'error' => 'push rejected',
+                'code' => 'git_push_rejected',
+                'stderr' => $sanitizedStderr ?? '',
+            ], 422);
+        }
+
+        return response()->json([
+            'pushed' => true,
+            'remote' => $remote,
+            'branch' => $branch,
+            'remote_url_sanitized' => $preview['remote_url_sanitized'],
+            'previous_remote_head' => $previousRemoteHead,
+            'new_remote_head' => $pinnedHead,
+        ], 200);
+    }
+
+    /**
+     * The human-readable, D8-sanitized reconstruction of a push invocation
+     * -- shared by the executed-and-recorded row above and mirrored by
+     * AgentLoopService::recordDeclinedCommandExecution()'s own gitPush
+     * branch for a declined one. `$remote` is sanitized defensively in
+     * case a caller passed a literal, credential-bearing URL instead of a
+     * configured remote name.
+     */
+    private function buildPushCommandString(string $remote, string $pinnedHead, string $branch): string
+    {
+        $sanitizedRemote = $this->gitOperationInspector->sanitizeRemoteUrl($remote);
+
+        return "git push {$sanitizedRemote} {$pinnedHead}:refs/heads/{$branch}";
+    }
+
+    /**
+     * A read-only `git ls-remote <remote> refs/heads/<branch>` -- the
+     * remote branch's hash immediately before this request's own push, so
+     * the response can report `previous_remote_head` honestly. Null when
+     * the branch does not exist on the remote yet (this push creates it).
+     */
+    private function remoteBranchHeadHash(string $rootPath, string $remote, string $branch): ?string
+    {
+        $process = $this->runGitCommandCapturingResult($rootPath, ['git', 'ls-remote', $remote, 'refs/heads/'.$branch]);
+        if ($process === null || !$process->isSuccessful()) {
+            return null;
+        }
+
+        $output = trim($process->getOutput());
+        if ($output === '') {
+            return null;
+        }
+
+        $firstLine = strtok($output, "\r\n");
+        $parts = preg_split('/\s+/', $firstLine ?: '', 2);
+
+        return $parts[0] ?? null;
+    }
+
+    /**
      * Clamps the `limit` query param against the configured default/max
      * (contracts §3): a non-numeric or non-positive value floors at the
      * default, anything above the max clamps to the max.

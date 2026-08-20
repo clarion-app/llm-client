@@ -1719,6 +1719,26 @@ class AgentLoopService
 
                                 $confirmationPayload['files'] = $pendingConfirmation['files'];
                                 $confirmationPayload['diff_stat'] = $pendingConfirmation['diff_stat'];
+                            } elseif ($confirmationType === 'git_publish') {
+                                // 126-git-operations-confirmation, US3: the
+                                // same "extra fields alongside the common
+                                // envelope" widening, now for git_publish's
+                                // own remote/branch/pinned_head/
+                                // remote_url_sanitized/commits_ahead/
+                                // creates_remote_branch (data-model.md §2).
+                                $pendingConfirmation['remote'] = $decoded['remote'] ?? null;
+                                $pendingConfirmation['branch'] = $decoded['branch'] ?? null;
+                                $pendingConfirmation['pinned_head'] = $decoded['pinned_head'] ?? null;
+                                $pendingConfirmation['remote_url_sanitized'] = $decoded['remote_url_sanitized'] ?? null;
+                                $pendingConfirmation['commits_ahead'] = $decoded['commits_ahead'] ?? [];
+                                $pendingConfirmation['creates_remote_branch'] = $decoded['creates_remote_branch'] ?? null;
+
+                                $confirmationPayload['remote'] = $pendingConfirmation['remote'];
+                                $confirmationPayload['branch'] = $pendingConfirmation['branch'];
+                                $confirmationPayload['pinned_head'] = $pendingConfirmation['pinned_head'];
+                                $confirmationPayload['remote_url_sanitized'] = $pendingConfirmation['remote_url_sanitized'];
+                                $confirmationPayload['commits_ahead'] = $pendingConfirmation['commits_ahead'];
+                                $confirmationPayload['creates_remote_branch'] = $pendingConfirmation['creates_remote_branch'];
                             }
                         }
 
@@ -2594,6 +2614,24 @@ class AgentLoopService
 
                             $confirmationPayload['files'] = $pendingConfirmation['files'];
                             $confirmationPayload['diff_stat'] = $pendingConfirmation['diff_stat'];
+                        } elseif ($confirmationType === 'git_publish') {
+                            // See run()'s identical branch, immediately
+                            // above the same relative point in that
+                            // sibling method (126-git-operations-
+                            // confirmation, US3).
+                            $pendingConfirmation['remote'] = $decoded['remote'] ?? null;
+                            $pendingConfirmation['branch'] = $decoded['branch'] ?? null;
+                            $pendingConfirmation['pinned_head'] = $decoded['pinned_head'] ?? null;
+                            $pendingConfirmation['remote_url_sanitized'] = $decoded['remote_url_sanitized'] ?? null;
+                            $pendingConfirmation['commits_ahead'] = $decoded['commits_ahead'] ?? [];
+                            $pendingConfirmation['creates_remote_branch'] = $decoded['creates_remote_branch'] ?? null;
+
+                            $confirmationPayload['remote'] = $pendingConfirmation['remote'];
+                            $confirmationPayload['branch'] = $pendingConfirmation['branch'];
+                            $confirmationPayload['pinned_head'] = $pendingConfirmation['pinned_head'];
+                            $confirmationPayload['remote_url_sanitized'] = $pendingConfirmation['remote_url_sanitized'];
+                            $confirmationPayload['commits_ahead'] = $pendingConfirmation['commits_ahead'];
+                            $confirmationPayload['creates_remote_branch'] = $pendingConfirmation['creates_remote_branch'];
                         }
                     }
 
@@ -4271,9 +4309,10 @@ class AgentLoopService
      */
     private function gitOperationConfirmationPreview(string $operationId, string $method, string $pathTemplate, array $params): ?string
     {
-        if ($operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID) {
-            // gitBranch/gitRewriteHistory/gitPush -- not wired until their
-            // own later stories.
+        if ($operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
+            // gitBranch/gitRewriteHistory -- not wired until their own
+            // later stories.
             return null;
         }
 
@@ -4288,6 +4327,10 @@ class AgentLoopService
             // refusal for a state enforceCodingProjectBinding() should
             // already have caught upstream.
             return null;
+        }
+
+        if ($operationId === self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
+            return $this->gitPushConfirmationPreview($project, $method, $pathTemplate, $params);
         }
 
         $requestedPaths = $params['body']['paths'] ?? null;
@@ -4315,6 +4358,60 @@ class AgentLoopService
             'parameters' => $pinnedParams,
             'files' => $preview['files'],
             'diff_stat' => $preview['diff_stat'],
+        ]);
+    }
+
+    /**
+     * 126-git-operations-confirmation, US3 (research.md D5/D6, contracts/
+     * git-publish.md §1): the gitPush arm of gitOperationConfirmationPreview()
+     * above, split out to keep that method's shared project-resolution
+     * guard in one place. `git_publish_disabled`/`git_no_remote_configured`
+     * (and any other GitOperationInspector::previewPush() refusal) are
+     * returned as a plain, unaudited {error, code} JSON string, never as a
+     * confirmation marker -- no confirmation is ever constructed for a
+     * publish that cannot possibly succeed (D5). A successful preview
+     * builds the git_publish-typed marker (data-model.md §2), with
+     * `parameters.body.pinned_head` PINNED to the resolved local HEAD --
+     * approving this exact prompt later pushes exactly that commit, even
+     * if further local commits are made while the confirmation is pending
+     * (D6).
+     */
+    private function gitPushConfirmationPreview(\ClarionApp\LlmClient\Models\CodingProject $project, string $method, string $pathTemplate, array $params): string
+    {
+        $requestedRemote = $params['body']['remote'] ?? null;
+        $requestedBranch = $params['body']['branch'] ?? null;
+
+        $preview = $this->gitOperationInspector->previewPush(
+            $project,
+            is_string($requestedRemote) ? $requestedRemote : null,
+            is_string($requestedBranch) ? $requestedBranch : null,
+        );
+
+        if (!($preview['ok'] ?? false)) {
+            return json_encode([
+                'error' => $preview['reason'] ?? 'Publishing refused.',
+                'code' => $preview['code'] ?? 'git_publish_disabled',
+            ]);
+        }
+
+        $pinnedParams = $params;
+        $pinnedParams['body']['remote'] = $preview['remote'];
+        $pinnedParams['body']['branch'] = $preview['branch'];
+        $pinnedParams['body']['pinned_head'] = $preview['pinned_head'];
+
+        return json_encode([
+            '__requires_confirmation' => true,
+            'confirmation_type' => 'git_publish',
+            'operationId' => self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID,
+            'method' => $method,
+            'path' => $pathTemplate,
+            'parameters' => $pinnedParams,
+            'remote' => $preview['remote'],
+            'branch' => $preview['branch'],
+            'pinned_head' => $preview['pinned_head'],
+            'remote_url_sanitized' => $preview['remote_url_sanitized'],
+            'commits_ahead' => $preview['commits_ahead'],
+            'creates_remote_branch' => $preview['creates_remote_branch'],
         ]);
     }
 
@@ -4409,14 +4506,21 @@ class AgentLoopService
      * `message`/`paths` (identical text to
      * CodingWorkspaceController::buildCommitCommandString(), and to
      * contracts/git-commit.md's own Declined-section example) rather than
-     * reading one verbatim.
+     * reading one verbatim. US3 widens it again for a declined gitPush --
+     * reconstructed from the pinned `remote`/`pinned_head`/`branch`
+     * (identical text to CodingWorkspaceController::buildPushCommandString(),
+     * and to contracts/git-publish.md's own Declined-section example),
+     * D8-sanitizing the reconstructed `remote` value in case a caller
+     * passed a literal, credential-bearing URL instead of a configured
+     * remote name.
      */
     private function recordDeclinedCommandExecution(array $pending, Conversation $conversation): void
     {
         $operationId = $pending['operationId'] ?? null;
 
         if ($operationId !== self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
-            && $operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID) {
+            && $operationId !== self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
+            && $operationId !== self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
             return;
         }
 
@@ -4436,6 +4540,17 @@ class AgentLoopService
             }
 
             $command = 'git commit -m "'.addslashes($message).'" -- '.implode(' ', $paths);
+        } elseif ($operationId === self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
+            $remote = $arguments['body']['remote'] ?? null;
+            $pinnedHead = $arguments['body']['pinned_head'] ?? null;
+            $branch = $arguments['body']['branch'] ?? null;
+
+            if (!is_string($remote) || !is_string($pinnedHead) || !is_string($branch)) {
+                return;
+            }
+
+            $sanitizedRemote = $this->gitOperationInspector->sanitizeRemoteUrl($remote);
+            $command = "git push {$sanitizedRemote} {$pinnedHead}:refs/heads/{$branch}";
         } else {
             $command = $arguments['body']['command'] ?? null;
 
@@ -4569,13 +4684,15 @@ class AgentLoopService
         // execution's own audit row. 126-git-operations-confirmation, US2
         // (Grounding note 10) extends it again to gitCommit, for the
         // identical reason -- its own resolveAttribution() call needs
-        // this header too.
+        // this header too. US3 extends it once more to gitPush, for the
+        // same reason.
         $extraHeaders = [];
         if ($operationId === self::CODING_WORKSPACE_WRITE_FILE_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_DELETE_FILE_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_RUN_COMMAND_OPERATION_ID
             || $operationId === self::CODING_WORKSPACE_RUN_CODE_OPERATION_ID
-            || $operationId === self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID) {
+            || $operationId === self::CODING_WORKSPACE_GIT_COMMIT_OPERATION_ID
+            || $operationId === self::CODING_WORKSPACE_GIT_PUSH_OPERATION_ID) {
             $extraHeaders['X-Llm-Client-Conversation-Id'] = (string) $conversation->id;
         }
 

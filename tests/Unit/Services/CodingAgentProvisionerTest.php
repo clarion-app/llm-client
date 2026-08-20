@@ -118,6 +118,11 @@ class CodingAgentProvisionerTest extends TestCase
                 'method' => 'post',
                 'summary' => 'Stage and commit a registered project\'s changes',
             ],
+            'clarionApp.llmClient.codingWorkspace.gitPush' => [
+                'path' => '/api/coding-project/{project}/git-push',
+                'method' => 'post',
+                'summary' => 'Publish committed changes to a registered project\'s configured remote',
+            ],
             'clarionApp.llmClient.conversations.index' => [
                 'path' => '/api/conversations',
                 'method' => 'get',

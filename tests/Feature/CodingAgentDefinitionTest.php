@@ -61,6 +61,7 @@ class CodingAgentDefinitionTest extends TestCase
             'clarionApp.llmClient.codingWorkspace.gitStatus' => ['path' => '/api/coding-project/{project}/git-status', 'method' => 'get'],
             'clarionApp.llmClient.codingWorkspace.gitDiff' => ['path' => '/api/coding-project/{project}/git-diff', 'method' => 'get'],
             'clarionApp.llmClient.codingWorkspace.gitCommit' => ['path' => '/api/coding-project/{project}/git-commit', 'method' => 'post'],
+            'clarionApp.llmClient.codingWorkspace.gitPush' => ['path' => '/api/coding-project/{project}/git-push', 'method' => 'post'],
             'clarionApp.llmClient.codingWorkspace.writeFile' => ['path' => '/api/coding-project/{project}/file', 'method' => 'post'],
             'clarionApp.llmClient.codingWorkspace.deleteFile' => ['path' => '/api/coding-project/{project}/file', 'method' => 'delete'],
             'clarionApp.llmClient.codingWorkspace.runTests' => ['path' => '/api/coding-project/{project}/run-tests', 'method' => 'post'],
@@ -254,17 +255,35 @@ class CodingAgentDefinitionTest extends TestCase
         );
     }
 
+    /**
+     * 126-git-operations-confirmation, US3 (Grounding note 3, plan.md's
+     * explicit call-out) supersedes this test's original assertion: spec
+     * 112's own FR-015 ("MUST NOT publish... on its own initiative...
+     * unless the user separately takes that action themselves") described
+     * a coding agent with no publish capability at all. Now that gitPush
+     * exists as its own, always-separately-confirmed operation, that
+     * wording is factually wrong -- the template's instructions were
+     * deliberately revised to describe the new capability instead of
+     * denying it outright, and this test's assertion is updated to match
+     * that intentional, documented behavior change rather than the
+     * now-stale "you do not publish" phrasing.
+     */
     #[Test]
-    public function instructions_require_declining_a_publish_or_push_request(): void
+    public function instructions_require_a_separately_confirmed_publish_and_no_guessed_destination(): void
     {
         $this->seedCatalog();
 
         $instructions = $this->definition()->instructions;
 
         $this->assertStringContainsString(
-            'You do not publish, push, or otherwise send changes anywhere outside this',
+            'Publishing is always held for its own separate confirmation',
             $instructions,
-            'the template must require declining a publish/push/remote-transmission request and stating a reason (FR-015)',
+            'the template must require publishing to be held for its own separate confirmation, distinct from a local recording confirmation (FR-007)',
+        );
+        $this->assertStringContainsString(
+            'say exactly that reason, rather than guessing a destination',
+            $instructions,
+            'the template must require stating the specific refusal reason rather than guessing a destination (FR-012)',
         );
     }
 
