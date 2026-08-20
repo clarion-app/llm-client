@@ -239,6 +239,64 @@ MD);
         $this->assertSame('builtin', $result['prompts'][0]['source']);
     }
 
+    // -----------------------------------------------------------------
+    // Phase 8 (Polish), T037 -- dedicated cross-project/cross-user scoping
+    // test (quickstart Scenario 6, FR-007/SC-002). The earlier
+    // "getPrompts_for_a_project_the_given_user_does_not_own_returns_builtins_only"
+    // case (Phase 3, T013) already proves a single foreign-owned project id
+    // yields no project commands, but it never constructs a *second* real
+    // project with its own distinctly-named command -- so it cannot show
+    // that project A's commands and project B's commands stay on their own
+    // sides of the fence (as opposed to, say, both being visible whenever
+    // *any* project is registered). This test constructs both A and B
+    // together and checks all three directions quickstart Scenario 6 names.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function getPrompts_scopes_project_commands_to_the_owning_project_and_user_never_leaking_across_projects(): void
+    {
+        $this->mockPackages([]);
+
+        $projectADir = $this->makeProjectDir();
+        $this->write($projectADir, '.claude/commands/a-only.md', <<<'MD'
+---
+description: Command only in project A.
+---
+This is project A's own command.
+MD);
+        $projectA = $this->makeProject($projectADir);
+
+        $projectBDir = $this->makeProjectDir();
+        $this->write($projectBDir, '.claude/commands/b-only.md', <<<'MD'
+---
+description: Command only in project B.
+---
+This is project B's own command.
+MD);
+        $projectB = $this->makeProject($projectBDir);
+
+        $registry = new McpPromptRegistry();
+
+        $resultA = $registry->getPrompts(cursor: null, codingProjectId: $projectA->id, userId: $projectA->user_id);
+        $namesA = array_column($resultA['prompts'], 'name');
+        $this->assertContains('a-only', $namesA, "project A's own command must be visible under its own project/user");
+        $this->assertNotContains('b-only', $namesA, "project B's command must never leak into project A's listing");
+
+        $resultB = $registry->getPrompts(cursor: null, codingProjectId: $projectB->id, userId: $projectB->user_id);
+        $namesB = array_column($resultB['prompts'], 'name');
+        $this->assertContains('b-only', $namesB, "project B's own command must be visible under its own project/user");
+        $this->assertNotContains('a-only', $namesB, "project A's command must never leak into project B's listing");
+
+        // Project A's id, but project B's user -- simulates a user who does
+        // not own A. Neither command may be visible: not a-only (the caller
+        // does not own A), and not b-only (the request never named B at all).
+        $resultForeign = $registry->getPrompts(cursor: null, codingProjectId: $projectA->id, userId: $projectB->user_id);
+        $namesForeign = array_column($resultForeign['prompts'], 'name');
+        $this->assertNotContains('a-only', $namesForeign, "a user who does not own A must never see A's commands");
+        $this->assertNotContains('b-only', $namesForeign, 'a request naming only project A must never surface project B\'s commands either');
+        $this->assertSame([], $namesForeign, 'must be built-ins only (empty here, since this fixture mocks zero built-in packages) -- same shape as an unrecognized project id');
+    }
+
     #[Test]
     public function existing_mcpPromptRegistryTest_assertions_still_hold_unmodified(): void
     {

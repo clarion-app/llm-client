@@ -337,9 +337,32 @@ MD,
             self::PROJECT_ID,
         );
 
+        // A third variant deliberately sets a `name:` frontmatter key to a
+        // value that differs from the path-derived name -- content, whether
+        // in the body or in frontmatter, must never be consulted for naming
+        // (D8). Without this case, a parser that started reading a `name:`
+        // frontmatter key when present would go undetected: neither of the
+        // two variants above ever sets that key, so a change limited to
+        // "prefer a `name:` frontmatter key when present" would leave both
+        // of their derived names untouched and this test green regardless.
+        $third = $this->parser()->parse(
+            <<<'MD'
+---
+name: totally-different-name
+description: Yet another different document
+---
+Version three, with a name: key that must be ignored.
+MD,
+            'foo/bar.md',
+            CommandTemplateConvention::ClaudeCommand,
+            self::PROJECT_ID,
+        );
+
         $this->assertInstanceOf(CommandTemplate::class, $first);
         $this->assertInstanceOf(CommandTemplate::class, $second);
+        $this->assertInstanceOf(CommandTemplate::class, $third);
         $this->assertSame($first->name, $second->name, 'name derivation must be a pure function of relativePath/convention alone -- content must never be consulted');
+        $this->assertSame($first->name, $third->name, 'name derivation must ignore a `name:` frontmatter key -- the relative path is the only source of truth');
         $this->assertSame('foo:bar', $first->name);
     }
 

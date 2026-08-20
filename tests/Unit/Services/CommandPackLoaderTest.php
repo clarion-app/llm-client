@@ -292,6 +292,33 @@ MD;
         $this->assertSame($before, $after, 'discover() must perform no writes of any kind to the scanned workspace');
     }
 
+    // -----------------------------------------------------------------
+    // Volume edge case (spec.md Edge Cases: "A workspace defines a very
+    // large number of command templates -- all remain individually
+    // discoverable; none are silently dropped for volume."). Added during
+    // Phase 8 (T038) reconciliation -- no prior test exercised this case.
+    // -----------------------------------------------------------------
+
+    #[Test]
+    public function a_large_number_of_valid_templates_are_all_individually_discovered_with_none_dropped(): void
+    {
+        $count = 250;
+        for ($i = 0; $i < $count; $i++) {
+            $this->write(".claude/commands/cmd-{$i}.md", self::VALID_BODY);
+        }
+
+        $result = $this->loader()->discover($this->project());
+
+        $this->assertSame([], $result->problems);
+        $this->assertCount($count, $result->commands, 'none of the many valid templates may be silently dropped for volume');
+
+        $names = array_map(static fn ($c) => $c->name, $result->commands);
+        $this->assertCount($count, array_unique($names), 'every one of the many templates must remain individually distinguishable');
+        for ($i = 0; $i < $count; $i++) {
+            $this->assertContains("cmd-{$i}", $names);
+        }
+    }
+
     /**
      * @return array<string, string>
      */
