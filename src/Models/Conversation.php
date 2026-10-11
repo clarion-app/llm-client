@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Contracts\ProviderType;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use ClarionApp\EloquentMultiChainBridge\EloquentMultiChainBridge;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Database\Factories\ConversationFactory;
@@ -59,6 +60,16 @@ class Conversation extends Model
     public function server()
     {
         return $this->belongsTo(Server::class, 'server_id');
+    }
+
+    /**
+     * The question currently waiting for this conversation's user, if any.
+     * Keyed on the pending-only latch column, so a resolved question is
+     * never returned.
+     */
+    public function pendingQuestion(): HasOne
+    {
+        return $this->hasOne(AgentQuestion::class, 'pending_conversation_id');
     }
 
     public function agent(): BelongsTo

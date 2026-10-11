@@ -278,6 +278,50 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->index(['attempt_group_id', 'target']);
             });
         }
+
+        // agent_questions table (questions agents ask users mid-task). Kept
+        // identical to the 2026_10_11_000000 migration, including the UNIQUE
+        // latch on pending_conversation_id that allows at most one pending
+        // question per conversation.
+        if (!Schema::hasTable('agent_questions')) {
+            Schema::create('agent_questions', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id');
+                $table->uuid('user_id');
+                $table->uuid('pending_conversation_id')->nullable();
+                $table->uuid('run_id')->nullable();
+                $table->uuid('step_id')->nullable();
+                $table->uuid('action_id')->nullable();
+                $table->uuid('paused_message_id');
+                $table->uuid('display_message_id')->nullable();
+                $table->string('tool_call_id', 128);
+                $table->string('channel', 50);
+                $table->string('resume_mode', 8);
+                $table->text('question');
+                $table->json('choices');
+                $table->boolean('allow_multiple')->default(false);
+                $table->string('state', 16)->default('pending');
+                $table->timestamp('asked_at', 6);
+                $table->timestamp('expires_at', 6);
+                $table->timestamp('delivered_at', 6)->nullable();
+                $table->string('delivery_failure_reason', 512)->nullable();
+                $table->timestamp('resolved_at', 6)->nullable();
+                $table->text('answer_raw')->nullable();
+                $table->json('answer_selected')->nullable();
+                $table->uuid('answered_by')->nullable();
+                $table->uuid('answer_message_id')->nullable();
+                $table->timestamp('resumed_at', 6)->nullable();
+                $table->timestamps();
+
+                $table->unique('pending_conversation_id');
+                $table->index('conversation_id');
+                $table->index(['state', 'expires_at']);
+                $table->index(['state', 'resumed_at', 'resolved_at']);
+                $table->index(['conversation_id', 'asked_at']);
+                $table->index('run_id');
+                $table->index(['user_id', 'channel', 'state']);
+            });
+        }
     }
 
     protected function fixture(): ConversationFixture

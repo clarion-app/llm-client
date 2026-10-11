@@ -391,6 +391,40 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $this->checkForUnprocessedMessages($conversation);
     }
 
+    /**
+     * Record a confirmation pause on this turn's assistant message. Results of
+     * the calls that already ran earlier in the batch are kept, and every
+     * call after the paused one is answered as not executed, so resuming only
+     * adds the paused call's result.
+     *
+     * The top-level action_id stays unset on the streamed path, exactly as
+     * before; the execute_operation branch carries it inside the pending
+     * confirmation instead.
+     *
+     * @param  list<array<string, mixed>>  $toolResults
+     */
+    private function storePausedTurn(array $pendingConfirmation, string $pausedToolCallId, array $toolResults, int $iteration): void
+    {
+        $this->message->update([
+            'content' => $this->reply ?: '',
+            'tool_data' => ['tool_calls' => $this->toolCalls],
+        ]);
+
+        app(\ClarionApp\LlmClient\Services\PausedTurnWriter::class)->pause(
+            $this->message,
+            \ClarionApp\LlmClient\ValueObjects\PauseKind::Confirmation,
+            $pendingConfirmation,
+            new \ClarionApp\LlmClient\ValueObjects\PausedTurnContext(
+                pausedToolCallId: $pausedToolCallId,
+                pendingToolResults: $toolResults,
+                iteration: $iteration,
+                runId: $this->runId,
+                stepId: $this->stepId,
+                actionId: null,
+            ),
+        );
+    }
+
     private function handleToolCalls(Conversation $conversation, int $iteration): void
     {
         $conversationId = $conversation->id;
@@ -501,20 +535,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                             'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
                         ];
 
-                        $toolData = [
-                            'tool_calls' => $this->toolCalls,
-                            'tool_results' => null,
-                            'iteration' => $iteration,
-                            'pending_confirmation' => $pendingConfirmation,
-                            'run_id' => $this->runId,
-                            'step_id' => $this->stepId,
-                            'paused_at' => now()->toIso8601String(),
-                        ];
-
-                        $this->message->update([
-                            'content' => $this->reply ?: '',
-                            'tool_data' => $toolData,
-                        ]);
+                        $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
 
                         event(new ApiCallConfirmationRequiredEvent(
                             $conversationId,
@@ -594,20 +615,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
                     }
 
-                    $toolData = [
-                        'tool_calls' => $this->toolCalls,
-                        'tool_results' => null,
-                        'iteration' => $iteration,
-                        'pending_confirmation' => $pendingConfirmation,
-                        'run_id' => $this->runId,
-                        'step_id' => $this->stepId,
-                        'paused_at' => now()->toIso8601String(),
-                    ];
-
-                    $this->message->update([
-                        'content' => $this->reply ?: '',
-                        'tool_data' => $toolData,
-                    ]);
+                    $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
 
                     event(new ApiCallConfirmationRequiredEvent(
                         $conversationId,

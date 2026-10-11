@@ -323,6 +323,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new ProviderRegistry();
         });
 
+        // Bound here rather than in boot() so another package's boot() can
+        // register its own channel adapter regardless of provider order.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ConversationChannelRegistry::class, function ($app) {
+            $registry = new \ClarionApp\LlmClient\Services\ConversationChannelRegistry();
+            $registry->register($app->make(\ClarionApp\LlmClient\Services\WebChannelDelivery::class));
+
+            return $registry;
+        });
+
         $this->app->singleton(ToolFormatter::class, function ($app) {
             return new ToolFormatter();
         });
