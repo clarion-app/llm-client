@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
 use ClarionApp\LlmClient\ValueObjects\QuestionRefusal;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -227,15 +228,58 @@ class AgentQuestionService
     }
 
     /**
-     * Resolve a pending question whose answerable period has passed.
+     * Resolve a pending question whose answerable period has passed,
+     * following the policy it was asked with.
      *
-     * Only the winner (true) writes the expiry notice into the conversation
-     * and delivers it; resuming the run is the caller's job. A question
-     * already resolved by anything else loses (false) and nothing changes.
+     * A question asked before unanswered policies existed expires as it
+     * always did. A `stop` question stops instead: it keeps its
+     * conversation's question slot so a late reply still reaches it, stays
+     * unresolved, leaves the conversation not processing, and its run waits
+     * for a late answer or a discard.
+     *
+     * Only the winner writes the notice into the conversation and delivers
+     * it; resuming the run (for a state that continues it) is the caller's
+     * job. Returns the state won, or null when anything else resolved the
+     * question first — nothing changes then.
+     */
+    public function expireWithPolicy(AgentQuestion $question): ?QuestionState
+    {
+        $policy = $question->unanswered_policy instanceof UnansweredPolicy
+            ? $question->unanswered_policy
+            : UnansweredPolicy::tryFrom((string) $question->unanswered_policy);
+
+        if ($policy === null) {
+            return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::Expired, [], true)
+                ? QuestionState::Expired
+                : null;
+        }
+
+        if ($policy === UnansweredPolicy::ProceedOnAssumption) {
+            throw new \LogicException('Expiry of a question that proceeds on an assumption is not supported yet.');
+        }
+
+        // Written with its fraction of a second, which a bound date loses
+        // on MySQL.
+        $stoppedAt = now()->format('Y-m-d H:i:s.u');
+
+        return $this->resolveWithNotice(
+            $question,
+            [QuestionState::Pending],
+            QuestionState::Stopped,
+            ['stopped_at' => $stoppedAt],
+            setProcessing: false,
+            releaseSlot: false,
+            resolves: false,
+        ) ? QuestionState::Stopped : null;
+    }
+
+    /**
+     * Expire a pending question by its policy (see expireWithPolicy()):
+     * true when this call won.
      */
     public function expire(AgentQuestion $question): bool
     {
-        return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::Expired, [], true);
+        return $this->expireWithPolicy($question) !== null;
     }
 
     /**
@@ -302,26 +346,42 @@ class AgentQuestionService
     }
 
     /**
-     * Resolve a pending question without an answer and tell the user.
+     * Move a question out of a waiting state without an answer and tell the
+     * user.
      *
      * The notice message is written in the winning transition's transaction,
-     * so a notice exists exactly when the resolution happened. No notice is
+     * so a notice exists exactly when the transition happened. No notice is
      * written or delivered when the conversation no longer exists.
      *
-     * $from lists the states the question may be resolved from;
-     * $setProcessing is true for every resolution that continues the run.
+     * $from lists the states the question may leave; $setProcessing is true
+     * for every resolution that continues the run. A transition that keeps
+     * the question waiting ($resolves false — the stop) also records its new
+     * state on the message showing the question, in the same commit; a
+     * resolution's is recorded when its run resumes.
      *
      * @param  list<QuestionState>  $from
      * @param  array<string, mixed>  $fields
      */
-    private function resolveWithNotice(AgentQuestion $question, array $from, QuestionState $to, array $fields, bool $setProcessing): bool
-    {
-        $result = DB::transaction(function () use ($question, $from, $to, $fields, $setProcessing) {
-            if (!$this->transition($question->id, $from, $to, $fields, $setProcessing)) {
+    private function resolveWithNotice(
+        AgentQuestion $question,
+        array $from,
+        QuestionState $to,
+        array $fields,
+        bool $setProcessing,
+        bool $releaseSlot = true,
+        bool $resolves = true,
+    ): bool {
+        $result = DB::transaction(function () use ($question, $from, $to, $fields, $setProcessing, $releaseSlot, $resolves) {
+            if (!$this->transition($question->id, $from, $to, $fields, $setProcessing, $releaseSlot, $resolves)) {
                 return null;
             }
 
             $resolved = AgentQuestion::findOrFail($question->id);
+
+            if (!$resolves) {
+                $this->markDisplayMessage($resolved);
+            }
+
             $conversation = Conversation::find($resolved->conversation_id);
 
             if ($conversation === null) {
@@ -365,6 +425,21 @@ class AgentQuestionService
         }
 
         return true;
+    }
+
+    /** Record the question's current state on the message showing it. */
+    private function markDisplayMessage(AgentQuestion $question): void
+    {
+        $display = $question->display_message_id === null ? null : Message::find($question->display_message_id);
+
+        if ($display === null) {
+            return;
+        }
+
+        $toolData = is_array($display->tool_data) ? $display->tool_data : [];
+        $toolData['state'] = $question->state->value;
+        $display->tool_data = $toolData;
+        $display->save();
     }
 
     /**

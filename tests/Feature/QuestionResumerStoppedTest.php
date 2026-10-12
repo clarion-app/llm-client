@@ -52,6 +52,17 @@ use Tests\TestCase;
  */
 class QuestionResumerStoppedTest extends TestCase
 {
+    /** The stored result of a call the paused turn made before asking. */
+    private const EARLIER_RESULT = '{"files":["composer.json","src"]}';
+
+    private const LATE_ANSWER_MESSAGE = 'The question expired without an answer after %d minutes and work stopped. '
+        .'The user answered later; continue with this answer. Nothing was done while the work was stopped.';
+
+    private const DISCARD_NOTICE = 'The stopped task waiting on "Which test framework should I use?" was discarded '
+        .'because the conversation was ended or deleted. It no longer needs a reply.';
+
+    private const WITHDRAWN_RESULT_MESSAGE = 'The user stopped this task while the question was pending.';
+
     private User $user;
 
     private Server $server;
@@ -173,8 +184,12 @@ class QuestionResumerStoppedTest extends TestCase
      * `stopped` exactly as the stop transition leaves it: slot kept,
      * unresolved, `stopped_at` set.
      */
-    private function stoppedQuestion(?Conversation $conversation = null, bool $stop = true): AgentQuestion
-    {
+    private function stoppedQuestion(
+        ?Conversation $conversation = null,
+        bool $stop = true,
+        bool $withEarlierCall = false,
+        ?int $waitMinutes = null,
+    ): AgentQuestion {
         $conversation ??= $this->conversation;
         $conversation->update(['is_processing' => true]);
 
@@ -196,19 +211,23 @@ class QuestionResumerStoppedTest extends TestCase
             'user' => 'Clarion',
             'content' => '',
             'responseTime' => 0,
-            'tool_data' => ['tool_calls' => [[
+            'tool_data' => ['tool_calls' => array_merge($withEarlierCall ? [[
+                'id' => 'call_list',
+                'type' => 'function',
+                'function' => ['name' => 'list_files', 'arguments' => json_encode(['path' => '.'])],
+            ]] : [], [[
                 'id' => 'call_ask',
                 'type' => 'function',
                 'function' => ['name' => 'ask_user', 'arguments' => json_encode([
                     'question' => 'Which test framework should I use?',
                     'choices' => ['PHPUnit', 'Pest', 'Codeception'],
                 ])],
-            ]]],
+            ]])],
         ]);
 
         $opened = app(AgentQuestionService::class)->open(new OpenQuestionRequest(
             conversation: $conversation->fresh(),
-            request: new AskUserRequest('Which test framework should I use?', ['PHPUnit', 'Pest', 'Codeception'], false),
+            request: new AskUserRequest('Which test framework should I use?', ['PHPUnit', 'Pest', 'Codeception'], false, requestedWaitMinutes: $waitMinutes),
             runId: $runId,
             stepId: $stepId,
             actionId: $actionId,
@@ -216,7 +235,7 @@ class QuestionResumerStoppedTest extends TestCase
             toolCallId: 'call_ask',
             resumeMode: OpenQuestionRequest::RESUME_STREAM,
             preamble: null,
-            pendingToolResults: [],
+            pendingToolResults: $withEarlierCall ? [['tool_call_id' => 'call_list', 'content' => self::EARLIER_RESULT]] : [],
             iteration: 1,
         ));
 
@@ -413,5 +432,203 @@ class QuestionResumerStoppedTest extends TestCase
         $output = Artisan::output();
         $this->assertStringContainsString('Questions that would be expired: 0', $output);
         $this->assertStringContainsString('Resolved questions that would be re-driven: 0', $output, 'nothing is counted for a stopped question');
+    }
+
+    // ---------------------------------------------------------------
+    // A late answer
+    // ---------------------------------------------------------------
+
+    /** @return list<array<string, mixed>>|null the paused turn's answered calls */
+    private function toolResults(AgentQuestion $question): ?array
+    {
+        return Message::findOrFail($question->paused_message_id)->tool_data['tool_results'] ?? null;
+    }
+
+    private static function utc(\DateTimeInterface $at): string
+    {
+        return \Illuminate\Support\Carbon::instance($at)->utc()->format('Y-m-d\TH:i:s\Z');
+    }
+
+    #[Test]
+    public function a_late_answer_resumes_the_paused_turn_once_with_an_answered_late_result(): void
+    {
+        $question = $this->stoppedQuestion(withEarlierCall: true);
+        $this->assertSame(
+            [['tool_call_id' => 'call_list', 'content' => self::EARLIER_RESULT]],
+            Message::findOrFail($question->paused_message_id)->tool_data['pending_tool_results'],
+            'precondition: the earlier call\'s result is stored with the paused turn',
+        );
+        $this->assertIsInt($question->effective_wait_minutes, 'precondition: the question records its waiting period');
+
+        $this->travel(3)->hours();
+        $this->assertNotNull(app(AgentQuestionService::class)->answer(
+            $question,
+            (new AnswerParser())->parse('2', $question),
+            (string) $this->user->id,
+            '2',
+        ), 'precondition: the late answer is accepted');
+        $question->refresh();
+        $this->assertSame(QuestionState::Answered, $question->state, 'precondition: answered');
+        $this->assertNotNull($question->stopped_at, 'precondition: the answered question remembers it had stopped');
+        $this->assertNotNull($question->resolved_at);
+
+        $resumer = app(QuestionResumer::class);
+        $this->assertNull($resumer->resume($question->id, ResumeCaller::HttpRequest), 'a streamed continuation returns nothing');
+
+        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        $this->assertNotNull($question->fresh()->resumed_at, 'the resume claim is taken');
+
+        $expected = json_encode([
+            'outcome' => 'answered_late',
+            'question_id' => $question->id,
+            'waiting_period_minutes' => $question->effective_wait_minutes,
+            'stopped_at' => self::utc($question->stopped_at),
+            'answered_at' => self::utc($question->resolved_at),
+            'answer' => [
+                'raw_reply' => '2',
+                'is_selection' => true,
+                'selected' => [['number' => 2, 'text' => 'Pest']],
+            ],
+            'message' => sprintf(self::LATE_ANSWER_MESSAGE, $question->effective_wait_minutes),
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        $results = $this->toolResults($question);
+        $this->assertSame([
+            // Replayed from storage: the earlier call is not run again.
+            ['tool_call_id' => 'call_list', 'content' => self::EARLIER_RESULT],
+            ['tool_call_id' => 'call_ask', 'content' => $expected],
+        ], $results, 'the paused turn is answered with the late answer, beside the earlier call\'s stored result');
+
+        $paused = Message::findOrFail($question->paused_message_id)->tool_data;
+        $this->assertNull($paused['pending_tool_results'], 'the stored results were consumed');
+        $this->assertSame(
+            ['ask_user'],
+            DB::table('agent_run_actions')->where('step_id', $question->step_id)->where('action_type', 'tool_invocation')->pluck('target')->all(),
+            'no tool call of the paused turn was executed again',
+        );
+
+        $action = DB::table('agent_run_actions')->where('id', $question->action_id)->first();
+        $this->assertSame('success', $action->outcome, 'a late answer is an answer');
+        $this->assertNull($action->failure_reason);
+        $this->assertSame('answered', Message::findOrFail($question->display_message_id)->tool_data['state'] ?? null);
+
+        // Exactly once.
+        $this->travel(5)->seconds();
+        $this->assertNull($resumer->resume($question->id, ResumeCaller::Background), 'a second resume finds nothing to do');
+        $this->runJob(new ResumeAfterQuestionJob($question->id));
+
+        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        $this->assertSame($results, $this->toolResults($question), 'the paused turn is answered exactly once');
+    }
+
+    #[Test]
+    public function the_step_wait_covers_the_whole_wait_including_the_stopped_period(): void
+    {
+        $question = $this->stoppedQuestion(stop: false, waitMinutes: 60);
+
+        // The question stops the way the expiry sweep stops it.
+        $this->travel(61)->minutes();
+        $this->assertSame(0, Artisan::call('llm-client:resolve-expired-questions'), 'the sweep succeeds');
+        $question->refresh();
+        $this->assertSame(QuestionState::Stopped, $question->state, 'precondition: the sweep stopped the question');
+        Queue::assertNotPushed(ResumeAfterQuestionJob::class);
+
+        $this->travel(2)->days();
+        $this->assertNotNull(app(AgentQuestionService::class)->answer(
+            $question,
+            (new AnswerParser())->parse('1', $question),
+            (string) $this->user->id,
+            '1',
+        ), 'precondition: the late answer is accepted');
+
+        app(QuestionResumer::class)->resume($question->id, ResumeCaller::HttpRequest);
+        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+
+        $step = DB::table('agent_run_steps')->where('id', $question->step_id)->first();
+        $this->assertNotNull($step->ended_at, 'the step that spanned the wait is closed');
+        $whole = (61 * 60 + 2 * 86400) * 1000;
+        $this->assertGreaterThanOrEqual($whole, (int) $step->wait_ms, 'the wait runs from the pause to the late answer, stopped period included');
+        $this->assertLessThan($whole + 60000, (int) $step->wait_ms);
+    }
+
+    // ---------------------------------------------------------------
+    // A discard
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function discarding_a_stopped_question_ends_its_run_as_a_discard(): void
+    {
+        $question = $this->stoppedQuestion();
+
+        $this->travel(3)->days();
+        $this->assertTrue(app(AgentQuestionService::class)->withdrawForConversation($this->conversation), 'precondition: the discard wins');
+
+        $question->refresh();
+        $this->assertSame(QuestionState::Withdrawn, $question->state, 'precondition: withdrawn');
+        $this->assertNotNull($question->stopped_at, 'precondition: it remembers it had stopped');
+
+        $run = DB::table('agent_runs')->where('id', $question->run_id)->first();
+        $this->assertSame('stopped_early', $run->end_state);
+        $this->assertSame('stopped question discarded', $run->end_reason);
+
+        $step = DB::table('agent_run_steps')->where('id', $question->step_id)->first();
+        $this->assertSame('stopped_early', $step->end_state);
+        $this->assertSame('stopped question discarded', $step->end_reason);
+        $this->assertGreaterThanOrEqual(3 * 86400 * 1000, (int) $step->wait_ms, 'the wait covers the stopped period');
+
+        $this->assertSame([[
+            'tool_call_id' => 'call_ask',
+            'content' => json_encode([
+                'outcome' => 'withdrawn',
+                'question_id' => $question->id,
+                'message' => self::WITHDRAWN_RESULT_MESSAGE,
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        ]], $this->toolResults($question), 'the paused call is answered with the withdrawn outcome');
+
+        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        $this->assertFalse((bool) Conversation::findOrFail($question->conversation_id)->is_processing, 'nothing continues');
+    }
+
+    #[Test]
+    public function withdrawing_a_merely_pending_question_keeps_the_withdrawn_reason(): void
+    {
+        $question = $this->stoppedQuestion(stop: false);
+
+        $this->assertTrue(app(AgentQuestionService::class)->withdrawForConversation($this->conversation), 'precondition: the withdrawal wins');
+
+        $question->refresh();
+        $this->assertSame(QuestionState::Withdrawn, $question->state);
+        $this->assertNull($question->stopped_at, 'precondition: it never stopped');
+
+        $this->assertSame('question withdrawn', DB::table('agent_runs')->where('id', $question->run_id)->value('end_reason'));
+        $this->assertSame('question withdrawn', DB::table('agent_run_steps')->where('id', $question->step_id)->value('end_reason'));
+    }
+
+    #[Test]
+    public function discarding_a_stopped_question_tells_the_user_once(): void
+    {
+        $question = $this->stoppedQuestion();
+        $service = app(AgentQuestionService::class);
+
+        $this->assertTrue($service->withdrawForConversation($this->conversation), 'precondition: the discard wins');
+        $this->assertFalse($service->withdrawForConversation($this->conversation->fresh()), 'a second discard finds nothing waiting');
+
+        $notices = Message::all()
+            ->filter(fn (Message $m) => is_array($m->tool_data)
+                && ($m->tool_data['kind'] ?? null) === AgentQuestionService::KIND_NOTICE
+                && ($m->tool_data['question_id'] ?? null) === $question->id)
+            ->values();
+        $this->assertCount(1, $notices, 'the discard notice is written once');
+        $this->assertSame('assistant', $notices[0]->role);
+        $this->assertSame(self::DISCARD_NOTICE, $notices[0]->content);
+        $this->assertEquals(
+            ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'withdrawn'],
+            $notices[0]->tool_data,
+        );
+        $this->assertSame(
+            [['conversation_id' => $question->conversation_id, 'text' => self::DISCARD_NOTICE]],
+            $this->web->deliveries,
+            'and delivered once on the conversation\'s channel',
+        );
     }
 }

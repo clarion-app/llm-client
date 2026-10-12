@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Commands;
 
+use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -140,10 +141,14 @@ class PurgeExpiredRunTracesCommand extends Command
     /**
      * Runs past the cutoff: closed runs by `ended_at`, still-open ones by their
      * own `started_at` so an abandoned run the sweep never reached still ages out.
+     *
+     * A run paused on a question that can still be answered — pending, or
+     * stopped until a late answer or a discard — is kept however old it is:
+     * the paused turn resumes into it.
      */
     private function expiredRunsQuery($cutoffDate)
     {
-        return DB::table('agent_runs')
+        $query = DB::table('agent_runs')
             ->select('id')
             ->where(function ($query) use ($cutoffDate) {
                 $query->where(function ($q) use ($cutoffDate) {
@@ -151,5 +156,16 @@ class PurgeExpiredRunTracesCommand extends Command
                         ->where('started_at', '<', $cutoffDate);
                 })->orWhere('ended_at', '<', $cutoffDate);
             });
+
+        if (DB::getSchemaBuilder()->hasTable('agent_questions')) {
+            $query->whereNotExists(function ($waiting) {
+                $waiting->select(DB::raw(1))
+                    ->from('agent_questions')
+                    ->whereColumn('agent_questions.run_id', 'agent_runs.id')
+                    ->whereIn('agent_questions.state', [QuestionState::Pending->value, QuestionState::Stopped->value]);
+            });
+        }
+
+        return $query;
     }
 }

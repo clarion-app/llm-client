@@ -19,6 +19,7 @@ use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -90,6 +91,9 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
     private ?\Closure $interloper = null;
 
     private bool $hookFired = false;
+
+    /** When the current trial's question was asked; the clock is frozen there. */
+    private ?Carbon $trialAskedAt = null;
 
     protected function setUp(): void
     {
@@ -225,6 +229,27 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
         return json_decode(json_encode($payload->messages), true);
     }
 
+    /**
+     * Freeze the clock at the start of $trial: ten minutes apart, so time
+     * never runs backwards across trials, and the deadline each trial's
+     * question states is known exactly.
+     */
+    private function startTrial(int $trial): void
+    {
+        $this->trialAskedAt = Carbon::parse(AgentQuestionWebJourneyTest::ASKED_AT, 'UTC')->addMinutes(10 * $trial);
+        $this->travelTo($this->trialAskedAt);
+    }
+
+    /** The three-choice question exactly as shown when asked at the current trial's start, with its one-minute period. */
+    private function askedQuestionText(): string
+    {
+        $deadline = $this->trialAskedAt->copy()->addMinute();
+
+        return AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES."\n\n"
+            .'If there is no answer by '.$deadline->format('H:i').' UTC on 12 Oct 2026 (1 minute after this was asked), '
+            .'work on this task will pause until you reply.';
+    }
+
     /** The user asks for work and the model's first streamed turn asks a question. */
     private function ask(Conversation $conversation): AgentQuestion
     {
@@ -358,12 +383,12 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
             ->values();
         if ($state === 'answered') {
             $this->assertCount(0, $notices, "{$label}: an answered question shows no notice");
-            $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES], $this->web->textsFor($conversation->id), "{$label}: only the question was delivered");
+            $this->assertSame([$this->askedQuestionText()], $this->web->textsFor($conversation->id), "{$label}: only the question was delivered");
         } else {
             $this->assertCount(1, $notices, "{$label}: exactly one notice is shown");
             $this->assertSame($state, $notices[0]->tool_data['state'] ?? null, "{$label}: the notice tells the outcome the agent received");
             $this->assertSame(
-                [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, $notices[0]->content],
+                [$this->askedQuestionText(), $notices[0]->content],
                 $this->web->textsFor($conversation->id),
                 "{$label}: the question, then the one notice, were delivered",
             );
@@ -439,6 +464,7 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
             [$first, $second] = $trial % 2 === 0 ? [$a, $b] : [$b, $a];
             $label = "trial {$trial}: {$second} arriving {$boundary} of {$first}";
 
+            $this->startTrial($trial);
             $conversation = $this->newConversation();
             $question = $this->ask($conversation);
             if (in_array('expire', [$a, $b], true)) {
@@ -557,6 +583,7 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
     public function two_asks_landing_at_once_in_one_conversation_leave_exactly_one_pending_question(): void
     {
         for ($trial = 0; $trial < self::TRIALS; $trial++) {
+            $this->startTrial($trial);
             $conversation = $this->newConversation();
 
             $this->actingAs($this->fixture()->user, 'api')->postJson(self::MESSAGE_ENDPOINT, [
@@ -623,7 +650,7 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
                 "trial {$trial}: the second ask is refused because one is pending",
             );
             $this->assertSame(
-                [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES],
+                [$this->askedQuestionText()],
                 $this->web->textsFor($conversation->id),
                 "trial {$trial}: the user sees one question",
             );

@@ -28,6 +28,7 @@ use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use Dedoc\Scramble\Generator;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schema;
@@ -447,6 +448,9 @@ class AgentControllerQuestionIntakeTest extends TestCase
     #[Test]
     public function an_answer_whose_continuation_asks_again_returns_202_awaiting_user(): void
     {
+        // Frozen, so the deadline the follow-up question states is known exactly.
+        $this->travelTo(Carbon::parse('2026-10-12 09:00:00', 'UTC'));
+
         $conversation = $this->conversation();
         $first = $this->pendingQuestion($conversation);
         // Opening the fixture's question delivered it; only what the reply
@@ -473,7 +477,8 @@ class AgentControllerQuestionIntakeTest extends TestCase
             'question_id' => $followUp->id,
         ]);
         $this->assertSame(
-            ["Should I also update the docs?\n\n1. Yes\n2. No\n\nReply with the number of your choice, or answer in your own words."],
+            ["Should I also update the docs?\n\n1. Yes\n2. No\n\nReply with the number of your choice, or answer in your own words.\n\n"
+                .'If there is no answer by 09:00 UTC on 13 Oct 2026 (1 day after this was asked), work on this task will pause until you reply.'],
             $this->telegram->textsFor($conversation->id),
             'the follow-up question was pushed to the chat',
         );

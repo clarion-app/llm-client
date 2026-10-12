@@ -26,6 +26,13 @@ use Illuminate\Support\Facades\Log;
  */
 class ResolveAbandonedRunsCommand extends Command
 {
+    /**
+     * How long after its deadline a still-pending question keeps its run
+     * exempt, covering the expiry sweep that runs after this one in the
+     * same scheduler tick.
+     */
+    private const PENDING_QUESTION_GRACE_MINUTES = 10;
+
     protected $signature = 'llm-client:resolve-abandoned-runs
                             {--minutes= : Abandonment threshold in minutes (default: from config)}
                             {--dry-run : Show what would be resolved without actually resolving}';
@@ -254,12 +261,19 @@ class ResolveAbandonedRunsCommand extends Command
     }
 
     /**
-     * Get run ids paused on a pending question that can still be answered.
+     * Get run ids paused on a question that can still be answered.
      *
      * The paused step stays open for as long as the user takes to answer,
-     * which is exactly what this sweep looks for. The exemption ends at the
-     * question's `expires_at` even when the expiry sweep has not run yet, so
-     * a stalled expiry sweep can never pin a run open forever.
+     * which is exactly what this sweep looks for. A stopped question waits
+     * for a late answer or a discard with no time bound, so its run is
+     * always exempt.
+     *
+     * A pending question's exemption lasts until a short grace after its
+     * `expires_at`: this sweep runs before the expiry sweep when both are
+     * due in the same scheduler tick, so a question whose deadline has just
+     * passed may not have been stopped yet. The bound still ends the
+     * exemption when the expiry sweep has stalled, so a stalled sweep can
+     * never pin a run open forever.
      *
      * @return array<string>
      */
@@ -270,8 +284,12 @@ class ResolveAbandonedRunsCommand extends Command
         }
 
         return DB::table('agent_questions')
-            ->where('state', QuestionState::Pending->value)
-            ->where('expires_at', '>', now())
+            ->where(function ($query) {
+                $query->where(function ($pending) {
+                    $pending->where('state', QuestionState::Pending->value)
+                        ->where('expires_at', '>', now()->subMinutes(self::PENDING_QUESTION_GRACE_MINUTES));
+                })->orWhere('state', QuestionState::Stopped->value);
+            })
             ->whereNotNull('run_id')
             ->distinct()
             ->pluck('run_id')

@@ -225,14 +225,15 @@ class AgentController extends Controller
 
     /**
      * The user's conversation on $channel holding the most recently asked
-     * pending question, if any.
+     * question still waiting for an answer — pending, or stopped at its
+     * deadline and waiting for a late one — if any.
      */
     private function conversationAwaitingAnswer(string $userId, string $channel): ?Conversation
     {
         $conversationId = AgentQuestion::query()
             ->join('conversations', 'conversations.id', '=', 'agent_questions.pending_conversation_id')
             ->where('agent_questions.user_id', $userId)
-            ->where('agent_questions.state', QuestionState::Pending->value)
+            ->whereIn('agent_questions.state', [QuestionState::Pending->value, QuestionState::Stopped->value])
             ->where('conversations.user_id', $userId)
             ->where('conversations.channel', $channel)
             ->whereNull('conversations.deleted_at')

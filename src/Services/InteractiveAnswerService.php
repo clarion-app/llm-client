@@ -20,8 +20,9 @@ use Illuminate\Support\Facades\Log;
  *
  * The answer names its question by id. Checked in order, the first that
  * applies deciding: the question exists and belongs to the user (else
- * NotFound, identical for both); it is still pending (else NotPending,
- * nothing written); the answer is not empty (AnswerRequired); a selection
+ * NotFound, identical for both); it still takes an answer — pending, or
+ * stopped at its deadline (else NotPending, nothing written); the answer
+ * is not empty (AnswerRequired); a selection
  * fits the question's choices (InvalidAnswer). Only then is the answer
  * turned into the reply the user could have typed for the same meaning and
  * recorded through the same parser and compare-and-set as a typed reply,
@@ -50,7 +51,8 @@ class InteractiveAnswerService implements InteractiveQuestionAnswers
 
         $state = $this->stateOf($question);
 
-        if ($state !== QuestionState::Pending) {
+        // A stopped question still takes an answer: it resumes the work.
+        if (!$state->acceptsAnswers()) {
             return InteractiveAnswerOutcome::notPending($state, $question);
         }
 

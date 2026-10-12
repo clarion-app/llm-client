@@ -33,6 +33,9 @@ class QuestionResumer
 
     public const WITHDRAWN_REASON = 'question withdrawn';
 
+    /** A question whose work had stopped at its deadline, withdrawn when its conversation ended. */
+    public const DISCARDED_REASON = 'stopped question discarded';
+
     /**
      * @return array<string, mixed>|null  the synchronous continuation's
      *   result; null when there is none (a streamed continuation, a run
@@ -65,8 +68,9 @@ class QuestionResumer
 
         // A withdrawn question ends its run without another model call.
         if (!$question->state->continuesRun()) {
-            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON, $this->waitMs($question, $paused));
-            $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON);
+            $reason = $question->stopped_at !== null ? self::DISCARDED_REASON : self::WITHDRAWN_REASON;
+            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, $reason, $this->waitMs($question, $paused));
+            $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, $reason);
 
             return null;
         }

@@ -35,7 +35,9 @@ class MessageIndexQuestionViewTest extends TestCase
 {
     use QuestionEndpointHarness;
 
-    private const VIEW_KEYS = ['allow_multiple', 'answer', 'choices', 'expires_at', 'id', 'preamble', 'question', 'state'];
+    private const VIEW_KEYS = ['allow_multiple', 'answer', 'answerable', 'answered_late', 'assumed_answer', 'choices',
+        'consequential', 'expires_at', 'expiry_statement', 'id', 'if_unanswered', 'outcome_text', 'preamble', 'question',
+        'state', 'stopped_at'];
 
     private const INTERNAL_KEYS = ['run_id', 'step_id', 'action_id', 'tool_call_id', 'paused_message_id', 'display_message_id',
         'delivered_at', 'delivery_failure_reason', 'presentation', 'presentation_fallback_reason', 'pending_conversation_id',

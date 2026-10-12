@@ -16,6 +16,7 @@ use ClarionApp\LlmClient\ValueObjects\InteractiveAnswerStatus;
 use ClarionApp\LlmClient\ValueObjects\PresentationFallbackReason;
 use ClarionApp\LlmClient\ValueObjects\PresentationMode;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
@@ -57,6 +58,9 @@ class QuestionDegradationJourneyTest extends AssembledSystemTestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse(AgentQuestionWebJourneyTest::ASKED_AT, 'UTC'));
 
         $this->entryPath = 'sync';
         config(['llm-client.run_trace.enabled' => true]);
@@ -219,7 +223,7 @@ class QuestionDegradationJourneyTest extends AssembledSystemTestCase
     private function assertStoredAsPlainText(AgentQuestion $question): void
     {
         $this->assertSame(
-            AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES,
+            AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED,
             Message::findOrFail($question->display_message_id)->content,
         );
     }
@@ -253,7 +257,7 @@ class QuestionDegradationJourneyTest extends AssembledSystemTestCase
 
         $question = $this->ask($conversation);
 
-        $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES], $plain->textsFor($conversation->id), 'exactly the plain-text question, sent once');
+        $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED], $plain->textsFor($conversation->id), 'exactly the plain-text question, sent once');
         $this->assertPresentedAs($question, PresentationMode::PlainText, PresentationFallbackReason::ChannelLacksOptions);
         $this->assertStoredAsPlainText($question);
 
@@ -277,7 +281,7 @@ class QuestionDegradationJourneyTest extends AssembledSystemTestCase
 
         $this->assertSame([], $limited->presentationsFor($conversation->id), 'no buttons at all — not the first two choices as buttons');
         $texts = $limited->textsFor($conversation->id);
-        $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES], $texts);
+        $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED], $texts);
         foreach (self::CHOICES as $index => $choice) {
             $this->assertStringContainsString(($index + 1).'. '.$choice, $texts[0], 'every choice is numbered and reachable');
         }
@@ -303,7 +307,7 @@ class QuestionDegradationJourneyTest extends AssembledSystemTestCase
         $question = $this->ask($conversation);
 
         $this->assertSame([], $unsupported->presentationsFor($conversation->id), 'never asked to show buttons');
-        $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES], $unsupported->textsFor($conversation->id));
+        $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED], $unsupported->textsFor($conversation->id));
         $this->assertPresentedAs($question, PresentationMode::PlainText, PresentationFallbackReason::ChannelLacksOptions);
 
         $typed = $this->typeTwo($conversation, $question, 'Frontend first.');
@@ -328,7 +332,7 @@ class QuestionDegradationJourneyTest extends AssembledSystemTestCase
 
         $this->assertCount(1, $rejecting->presentationsFor($conversation->id), 'the rich send was attempted once');
         $this->assertSame(
-            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES],
+            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED],
             $rejecting->textsFor($conversation->id),
             'then the same question went out once as plain text',
         );
@@ -369,7 +373,7 @@ class QuestionDegradationJourneyTest extends AssembledSystemTestCase
 
         $question = AgentQuestion::where('conversation_id', $conversation->id)->firstOrFail();
         $this->assertCount(1, $failing->presentationsFor($conversation->id), 'the rich send was attempted');
-        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, $failing->textsFor($conversation->id)[0] ?? null, 'then the plain text was attempted');
+        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED, $failing->textsFor($conversation->id)[0] ?? null, 'then the plain text was attempted');
         $this->assertSame(QuestionState::Undeliverable, $question->state);
         $this->assertSame(
             'telegram send failed: Forbidden: bot was blocked by the user',

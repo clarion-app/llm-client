@@ -6,12 +6,17 @@ use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Support\Collection;
 
 /**
  * The question view the conversation screen renders a question from: what
  * was asked, its numbered choices, whether several may be chosen, its
- * current state and, once answered, the answer and how it was given.
+ * current state and, once answered, the answer and how it was given; and
+ * what happens if it goes unanswered — whether it can still be answered,
+ * the policy and assumption it was asked with, the advance statement
+ * exactly as its text carries it, a one-line outcome once it is no longer
+ * pending, when work stopped, and whether its answer came after that.
  *
  * Built from the stored question on every request, so a screen that loads
  * the conversation always shows the question's current state. It carries
@@ -19,8 +24,12 @@ use Illuminate\Support\Collection;
  */
 class QuestionViewBuilder
 {
+    public function __construct(private readonly QuestionRenderer $renderer)
+    {
+    }
+
     /**
-     * @return array{id: string, question: string, preamble: ?string, choices: list<array{number: int, text: string}>, allow_multiple: bool, state: string, expires_at: ?string, answer: ?array{is_selection: bool, selected: list<array{number: int, text: string}>, raw_reply: string, method: ?string}}
+     * @return array{id: string, question: string, preamble: ?string, choices: list<array{number: int, text: string}>, allow_multiple: bool, state: string, expires_at: ?string, answer: ?array{is_selection: bool, selected: list<array{number: int, text: string}>, raw_reply: string, method: ?string}, answerable: bool, if_unanswered: ?string, consequential: bool, assumed_answer: ?array{is_selection: bool, selected: list<array{number: int, text: string}>, raw_reply: string}, expiry_statement: ?string, outcome_text: ?string, stopped_at: ?string, answered_late: bool}
      */
     public function forQuestion(AgentQuestion $question): array
     {
@@ -30,6 +39,10 @@ class QuestionViewBuilder
         }
 
         $state = $question->state instanceof QuestionState ? $question->state : QuestionState::from((string) $question->state);
+        $policy = $question->unanswered_policy instanceof UnansweredPolicy
+            ? $question->unanswered_policy
+            : UnansweredPolicy::tryFrom((string) $question->unanswered_policy);
+        $assumed = $policy === UnansweredPolicy::ProceedOnAssumption ? $question->assumedAnswer() : null;
 
         return [
             'id' => (string) $question->id,
@@ -40,6 +53,19 @@ class QuestionViewBuilder
             'state' => $state->value,
             'expires_at' => $question->expires_at?->copy()->utc()->format('Y-m-d\\TH:i:s\\Z'),
             'answer' => $state === QuestionState::Answered ? $this->answer($question) : null,
+            'answerable' => $state->acceptsAnswers(),
+            'if_unanswered' => $policy?->value,
+            'consequential' => (bool) $question->consequential,
+            'assumed_answer' => $assumed === null ? null : [
+                'is_selection' => $assumed->isSelection,
+                'selected' => $assumed->selected,
+                'raw_reply' => $assumed->rawReply,
+            ],
+            // The renderer is the one producer of every line the user reads.
+            'expiry_statement' => $this->renderer->expiryStatement($question),
+            'outcome_text' => $state === QuestionState::Pending ? null : $this->renderer->renderOutcome($question),
+            'stopped_at' => $question->stopped_at?->copy()->utc()->format('Y-m-d\\TH:i:s\\Z'),
+            'answered_late' => $state === QuestionState::Answered && $question->stopped_at !== null,
         ];
     }
 
