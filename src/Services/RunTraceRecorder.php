@@ -1226,6 +1226,39 @@ class RunTraceRecorder
     }
 
     /**
+     * Replace the content of an action that is still waiting on a person
+     * (outcome awaiting_confirmation), e.g. once a question has been
+     * delivered and how it was presented is known. Only `content` changes;
+     * it is sanitized and capped exactly as closeAction()'s suspend path
+     * stores it. An action that is not waiting, a null or unknown id, or
+     * disabled tracing writes nothing and announces nothing. Never throws.
+     */
+    public function updateSuspendedActionContent(?string $actionId, string $content): void
+    {
+        if ($actionId === null || !$this->enabled()) {
+            return;
+        }
+
+        try {
+            $affected = DB::table('agent_run_actions')
+                ->where('id', $actionId)
+                ->where('outcome', ActionOutcome::AwaitingConfirmation->value)
+                ->update(['content' => $this->sanitizer->prepare($content)]);
+
+            if ($affected !== 1) {
+                return;
+            }
+
+            $this->broadcast(fn () => event(new RunActionUpdated($actionId)));
+        } catch (\Throwable $e) {
+            Log::warning('RunTraceRecorder: failed to update a suspended action\'s content', [
+                'action_id' => $actionId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
      * Write an already-finished action in a single INSERT, with explicit timestamps.
      *
      * @return string|null The action id, or null on no-op/failure.

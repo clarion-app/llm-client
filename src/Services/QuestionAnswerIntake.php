@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\IntakeResult;
 
 /**
@@ -40,7 +41,13 @@ class QuestionAnswerIntake
             return IntakeResult::answerRequired($question);
         }
 
-        $message = $this->questions->answer($question, $this->parser->parse($rawContent, $question), $userId, $rawContent);
+        $message = $this->questions->answer(
+            $question,
+            $this->parser->parse($rawContent, $question),
+            $userId,
+            $rawContent,
+            AnswerMethod::TypedReply,
+        );
 
         if ($message === null) {
             return IntakeResult::notAnAnswer();

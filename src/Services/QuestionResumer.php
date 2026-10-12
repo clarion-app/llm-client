@@ -118,6 +118,25 @@ class QuestionResumer
     }
 
     /**
+     * Continue the run a question answered from the conversation screen
+     * paused. A question paused on the streaming path continues over the
+     * conversation's broadcasts; one paused on the synchronous path (a
+     * conversation that lives on another channel, answered from the screen)
+     * has nobody waiting on its reply, so the reply is pushed to the
+     * conversation's own channel.
+     *
+     * @return array<string, mixed>|null  as resume()
+     */
+    public function resumeAfterAnswer(AgentQuestion $question): ?array
+    {
+        $caller = $question->resume_mode === OpenQuestionRequest::RESUME_SYNC
+            ? ResumeCaller::Background
+            : ResumeCaller::HttpRequest;
+
+        return $this->resume($question->id, $caller);
+    }
+
+    /**
      * The human wait of the step a run that ends here (withdrawn, or its
      * context gone) spent paused on its question, so the run's recorded
      * human wait covers it exactly as it does for a run that continues.

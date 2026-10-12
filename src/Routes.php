@@ -49,6 +49,7 @@ use ClarionApp\LlmClient\Controllers\CodingWorkspaceController;
 use ClarionApp\LlmClient\Controllers\SchedulerTriggerController;
 use ClarionApp\LlmClient\Controllers\AgentStartingPointController;
 use ClarionApp\LlmClient\Controllers\McpClientServerController;
+use ClarionApp\LlmClient\Controllers\QuestionController;
 
 Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function () {
     Route::resource('conversation', ConversationController::class);
@@ -61,6 +62,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::resource('server', ServerController::class);
     Route::resource('message', MessageController::class);
     Route::get('conversation/{conversation_id}/message', [MessageController::class, "index"]);
+    Route::post('question/{id}/answer', [QuestionController::class, "answer"]);
     Route::get('server/{server_id}/model', [LanguageModelController::class, "index"]);
     Route::post('models/{server_id}/refresh', [LanguageModelController::class, "refresh"]);
     Route::get('model', [LanguageModelController::class, "index"]);
