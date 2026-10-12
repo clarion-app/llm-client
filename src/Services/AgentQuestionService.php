@@ -53,6 +53,9 @@ class AgentQuestionService
     /** Every message kind that exists only for the user, never for the model. */
     public const CONVERSATION_ONLY_KINDS = [self::KIND_QUESTION, self::KIND_NOTICE, self::KIND_ANSWER, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT];
 
+    /** Assistant-role messages the system writes, which are never the agent replying to anyone. */
+    public const SYSTEM_NOTICE_KINDS = [self::KIND_NOTICE, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT];
+
     /** Length of the `agent_questions.delivery_failure_reason` column. */
     private const MAX_FAILURE_REASON_CHARS = 512;
 

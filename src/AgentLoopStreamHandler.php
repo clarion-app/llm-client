@@ -1006,7 +1006,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             ->latest('created_at')
             ->cursor()
             ->first(fn (Message $message) => !(is_array($message->tool_data)
-                && ($message->tool_data['kind'] ?? null) === \ClarionApp\LlmClient\Services\AgentQuestionService::KIND_NOTICE));
+                && in_array($message->tool_data['kind'] ?? null, \ClarionApp\LlmClient\Services\AgentQuestionService::SYSTEM_NOTICE_KINDS, true)));
 
         if ($latestUserMessage && $latestAssistantMessage &&
             $latestUserMessage->created_at > $latestAssistantMessage->created_at) {

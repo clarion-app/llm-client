@@ -270,8 +270,24 @@ trait TaskBudgetJourneys
             $this->assertSame($display->content, $presentations[0]->plainText);
             $this->assertCount(3, $presentations[0]->options, 'three choices, as buttons');
         } else {
-            $this->assertSame([$display->content], $this->web->textsFor($conversation->id), 'delivered once on the web');
+            $this->assertSame([$display->content], $this->withoutApproachNotices($this->web->textsFor($conversation->id)), 'delivered once on the web');
         }
+    }
+
+    /** The approach notice's opening, which no other text shares. */
+    protected const APPROACH_NOTICE_OPENING = "Heads up — this task's budget is ";
+
+    /**
+     * $texts without any approach notice: a task that runs long enough is
+     * told it is nearing its ceiling before it reaches it, and a journey
+     * about something else checks the rest of what was delivered.
+     *
+     * @param  list<string>  $texts
+     * @return list<string>
+     */
+    protected function withoutApproachNotices(array $texts): array
+    {
+        return array_values(array_filter($texts, fn (string $text) => !str_starts_with($text, self::APPROACH_NOTICE_OPENING)));
     }
 
     /** Work every queued resume the way a queue worker does. */

@@ -17,6 +17,13 @@ class RecordingChannelDelivery implements ConversationChannelDelivery
     /** @var list<array{conversation_id: string, text: string}> */
     public array $deliveries = [];
 
+    /**
+     * Called with (conversation, text) on every plain delivery, as it is
+     * attempted — for a test that needs to know what else had happened by
+     * then.
+     */
+    public ?\Closure $onDeliver = null;
+
     private ?string $failureReason = null;
 
     private ?string $throwMessage = null;
@@ -33,6 +40,10 @@ class RecordingChannelDelivery implements ConversationChannelDelivery
     public function deliver(Conversation $conversation, string $text): DeliveryResult
     {
         $this->deliveries[] = ['conversation_id' => $conversation->id, 'text' => $text];
+
+        if ($this->onDeliver !== null) {
+            ($this->onDeliver)($conversation, $text);
+        }
 
         if ($this->throwMessage !== null) {
             // Deliberately breaks the contract's "MUST NOT throw", to prove

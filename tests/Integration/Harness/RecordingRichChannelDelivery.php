@@ -34,6 +34,13 @@ class RecordingRichChannelDelivery implements ConversationChannelDelivery, Prese
     /** @var list<array{conversation_id: string, text: string}> */
     public array $deliveries = [];
 
+    /**
+     * Called with (conversation, text) on every plain delivery, as it is
+     * attempted — for a test that needs to know what else had happened by
+     * then.
+     */
+    public ?\Closure $onDeliver = null;
+
     /** @var list<array{conversation_id: string, presentation: QuestionPresentation}> */
     public array $presentations = [];
 
@@ -76,6 +83,10 @@ class RecordingRichChannelDelivery implements ConversationChannelDelivery, Prese
     public function deliver(Conversation $conversation, string $text): DeliveryResult
     {
         $this->deliveries[] = ['conversation_id' => $conversation->id, 'text' => $text];
+
+        if ($this->onDeliver !== null) {
+            ($this->onDeliver)($conversation, $text);
+        }
 
         return $this->plainFailure === null ? DeliveryResult::ok() : DeliveryResult::failed($this->plainFailure);
     }

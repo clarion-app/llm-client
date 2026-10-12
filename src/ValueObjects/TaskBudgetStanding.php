@@ -36,6 +36,12 @@ final readonly class TaskBudgetStanding
     ) {
     }
 
+    /** The same standing with a different step count. */
+    public function withStepsUsed(int $stepsUsed): self
+    {
+        return new self(...array_merge(get_object_vars($this), ['stepsUsed' => $stepsUsed]));
+    }
+
     public function subState(): ?string
     {
         if ($this->state !== TaskBudgetState::Paused) {

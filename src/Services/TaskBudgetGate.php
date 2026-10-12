@@ -3,7 +3,9 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\TaskBudget;
+use ClarionApp\LlmClient\ValueObjects\DeliveryResult;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetDecision;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
 use Illuminate\Support\Facades\DB;
@@ -93,6 +95,8 @@ class TaskBudgetGate
                 ]);
 
             if ($claimed === 1) {
+                $this->noticeApproach($task, $spend);
+
                 return TaskBudgetDecision::allow();
             }
 
@@ -106,6 +110,88 @@ class TaskBudgetGate
             Log::error('Task budget could not be checked for conversation '.$conversation->id, ['conversation_id' => $conversation->id, 'error' => $e->getMessage()]);
 
             return TaskBudgetDecision::unavailable();
+        }
+    }
+
+    /**
+     * Tells the user, once per ceiling, that the task has used most of it.
+     * Runs only after an allowed claim. Whether a ceiling is a candidate is
+     * decided from the row read before the claim (its steps_used is the
+     * number of completed steps), so the common path adds no query; the
+     * notice itself goes out only for ceilings whose latch this call wins
+     * with a conditional UPDATE, so concurrent workers post it once. Any
+     * failure here is logged and swallowed: a notice never stops a step.
+     */
+    private function noticeApproach(TaskBudget $before, string $spend): void
+    {
+        try {
+            $threshold = (string) $before->approach_threshold;
+            $candidates = [];
+            if ($before->steps_approach_noticed_at === null
+                && bccomp((string) (int) $before->steps_used, bcmul($threshold, (string) (int) $before->max_steps, 10), 10) >= 0) {
+                $candidates[] = 'steps';
+            }
+            if ($before->spend_approach_noticed_at === null
+                && bccomp($spend, bcmul($threshold, (string) $before->max_spend, 10), 10) >= 0) {
+                $candidates[] = 'spend';
+            }
+            if ($candidates === []) {
+                return;
+            }
+
+            $won = [];
+            foreach ($candidates as $ceiling) {
+                $column = $ceiling.'_approach_noticed_at';
+                $updated = DB::table('task_budgets')
+                    ->where('id', $before->id)
+                    ->whereNull($column)
+                    ->update([$column => now()->format('Y-m-d H:i:s.u')]);
+                if ($updated === 1) {
+                    $won[] = $ceiling;
+                }
+            }
+            if ($won === []) {
+                return;
+            }
+
+            $task = TaskBudget::find($before->id);
+            $root = $task === null ? null : Conversation::find($task->root_conversation_id);
+            if ($task === null || $root === null) {
+                return;
+            }
+            $asOf = $this->tasks->standing($task)->withStepsUsed((int) $task->steps_used - 1);
+            $text = app(TaskBudgetText::class)->approachNotice($asOf, $won);
+            $message = Message::create([
+                'conversation_id' => $root->id,
+                'role' => 'assistant',
+                'user' => $root->character,
+                'content' => $text,
+                'responseTime' => 0,
+                'tool_data' => ['kind' => AgentQuestionService::KIND_TASK_BUDGET_NOTICE, 'task_budget_id' => $task->id, 'notice' => 'approach'],
+            ]);
+
+            // An unreachable root (unattended, no user, a channel nobody
+            // listens on) keeps the notice in its history without trying to
+            // deliver it; only a delivery that was attempted and failed is
+            // worth a warning.
+            $refusal = app(UserReachability::class)->refusal($root, (bool) $task->unattended);
+            if ($refusal === null) {
+                $delivery = app(AgentQuestionService::class)->deliver($root, $text);
+                if (!$delivery->delivered) {
+                    Log::warning('Task budget approach notice could not be delivered for task '.$task->id, ['task_budget_id' => $task->id, 'reason' => $delivery->failureReason]);
+                }
+            } else {
+                $delivery = DeliveryResult::failed($refusal->reason);
+            }
+
+            $this->tasks->appendEvent($task, 'approach_notice', [
+                'ceilings' => $won,
+                'message_id' => $message->id,
+                'delivered' => $delivery->delivered,
+                'delivery_failure_reason' => $delivery->delivered ? null : $delivery->failureReason,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Task budget approach notice failed for task '.$before->id, ['task_budget_id' => $before->id, 'error' => $e->getMessage()]);
         }
     }
 }
