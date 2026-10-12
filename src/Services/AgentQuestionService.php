@@ -130,13 +130,20 @@ class AgentQuestionService
                 Conversation::find($conversation->id)?->update(['is_processing' => false]);
                 $conversation->setAttribute('is_processing', false);
 
-                app(RunTraceRecorder::class)->closeAction($request->actionId, ActionOutcome::AwaitingConfirmation);
+                app(RunTraceRecorder::class)->closeAction(
+                    $request->actionId,
+                    ActionOutcome::AwaitingConfirmation,
+                    content: $question->runRecordSnapshot(),
+                );
 
                 return [$question, $display];
             });
         } catch (UniqueConstraintViolationException) {
             return QuestionRefusal::alreadyPending();
         }
+
+        // The run is now waiting on its user.
+        app(RunTraceRecorder::class)->announceRunChanged($question->run_id);
 
         $delivery = $this->deliver($conversation, (string) $display->content);
 

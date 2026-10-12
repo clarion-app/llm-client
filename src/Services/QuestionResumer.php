@@ -51,6 +51,9 @@ class QuestionResumer
 
         $recorder = app(RunTraceRecorder::class);
 
+        // The run is no longer waiting on its user.
+        $recorder->announceRunChanged($question->run_id);
+
         // The conversation or the paused turn is gone: nothing can continue.
         if ($conversation === null || $paused === null) {
             $conversation?->update(['is_processing' => false]);
@@ -157,13 +160,17 @@ class QuestionResumer
         $resolution = $this->resolutionFor($question);
         $recorder = app(RunTraceRecorder::class);
 
+        // The action's content becomes the question's final record: how it
+        // was resolved, when, after how long, and the answer if any.
+        $snapshot = $question->runRecordSnapshot();
+
         $this->markDisplayMessage($question);
 
         $conversation = Conversation::find($question->conversation_id);
         $paused = Message::where('id', $question->paused_message_id)->lockForUpdate()->first();
 
         if ($conversation === null || $paused === null) {
-            $recorder->closeAction($question->action_id, ActionOutcome::Failure, self::CONTEXT_DELETED_REASON);
+            $recorder->closeAction($question->action_id, ActionOutcome::Failure, self::CONTEXT_DELETED_REASON, $snapshot);
 
             return [$question, $resolution, $conversation, $paused];
         }
@@ -171,9 +178,9 @@ class QuestionResumer
         app(PausedTurnWriter::class)->consume($paused, $resolution->toToolResult($question));
 
         if ($question->state === QuestionState::Answered) {
-            $recorder->closeAction($question->action_id, ActionOutcome::Success);
+            $recorder->closeAction($question->action_id, ActionOutcome::Success, null, $snapshot);
         } else {
-            $recorder->closeAction($question->action_id, ActionOutcome::Failure, 'question '.$question->state->value);
+            $recorder->closeAction($question->action_id, ActionOutcome::Failure, 'question '.$question->state->value, $snapshot);
         }
 
         return [$question, $resolution, $conversation, $paused];

@@ -202,9 +202,15 @@ class DelegationQuery
             ->groupBy('run_id')
             ->pluck('cnt', 'run_id');
 
+        $awaitingUser = $this->runTraceQuery->runIdsAwaitingUser($referencedRunIds);
+
         $runsMap = [];
         foreach ($runs as $id => $runRow) {
-            $runsMap[$id] = $this->runTraceQuery->runSummaryRow($runRow, (int) ($actionCounts[$id] ?? 0));
+            $runsMap[$id] = $this->runTraceQuery->runSummaryRow(
+                $runRow,
+                (int) ($actionCounts[$id] ?? 0),
+                isset($awaitingUser[$id]),
+            );
         }
 
         return [
