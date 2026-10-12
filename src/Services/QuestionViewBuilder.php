@@ -46,7 +46,8 @@ class QuestionViewBuilder
     /**
      * The view for each question display message among $messages, keyed by
      * message id, read with one query however many questions there are (and
-     * none when there are none).
+     * none when there are none). A message naming a question asked in
+     * another conversation gets no view.
      *
      * @param  Collection<int, Message>  $messages
      * @return array<string, array<string, mixed>>
@@ -54,6 +55,7 @@ class QuestionViewBuilder
     public function forMessages(Collection $messages): array
     {
         $questionIdByMessage = [];
+        $conversationByMessage = [];
         foreach ($messages as $message) {
             $toolData = $message->tool_data;
             if (is_string($toolData)) {
@@ -65,6 +67,7 @@ class QuestionViewBuilder
             $questionId = $toolData['question_id'] ?? null;
             if (is_string($questionId) && $questionId !== '') {
                 $questionIdByMessage[(string) $message->id] = $questionId;
+                $conversationByMessage[(string) $message->id] = (string) $message->conversation_id;
             }
         }
 
@@ -77,7 +80,10 @@ class QuestionViewBuilder
         $views = [];
         foreach ($questionIdByMessage as $messageId => $questionId) {
             $question = $questions->get($questionId);
-            if ($question !== null) {
+            // Only a question asked in the message's own conversation: a
+            // message can never show the state or answer of one asked
+            // elsewhere.
+            if ($question !== null && (string) $question->conversation_id === $conversationByMessage[$messageId]) {
                 $views[$messageId] = $this->forQuestion($question);
             }
         }

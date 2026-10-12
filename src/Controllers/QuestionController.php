@@ -30,6 +30,12 @@ class QuestionController extends Controller
 {
     public const ANSWER_REQUIRED_MESSAGE = 'Choose an option or type an answer.';
 
+    /**
+     * The longest free-text answer, in bytes: the answer is stored verbatim
+     * in a TEXT column, which holds 65,535 bytes on MySQL.
+     */
+    public const MAX_TEXT_BYTES = 65535;
+
     public function answer(Request $request, string $id): JsonResponse
     {
         $answer = $this->answerFrom($request);
@@ -109,9 +115,13 @@ class QuestionController extends Controller
         }
 
         if ($hasText) {
-            return is_string($body['text'])
-                ? InteractiveAnswer::freeText($body['text'])
-                : 'Your own words must be text.';
+            if (!is_string($body['text'])) {
+                return 'Your own words must be text.';
+            }
+
+            return strlen($body['text']) > self::MAX_TEXT_BYTES
+                ? 'Your answer is too long.'
+                : InteractiveAnswer::freeText($body['text']);
         }
 
         $selected = $body['selected'];

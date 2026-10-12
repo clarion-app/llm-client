@@ -122,6 +122,29 @@ class MessageIndexQuestionViewTest extends TestCase
     // ---------------------------------------------------------------
 
     #[Test]
+    public function a_display_message_naming_a_question_of_another_conversation_carries_no_view(): void
+    {
+        // Another user's question, answered; its display message then ends
+        // up in the owner's conversation (however it got there). The view
+        // is built only for a question asked in the conversation being
+        // listed, so nothing of the other user's question — its state, its
+        // answer — is shown.
+        $theirs = $this->questionConversation($this->admin, 'web');
+        $question = AgentQuestion::findOrFail($this->openQuestion($theirs)->question->id);
+        $answered = app(AgentQuestionService::class)->answer($question, app(AnswerParser::class)->parse('my private reply', $question), (string) $this->admin->id, 'my private reply');
+        $this->assertNotNull($answered, 'precondition: their question is answered');
+
+        $mine = $this->questionConversation($this->owner, 'web');
+        DB::table('messages')->where('id', $question->display_message_id)->update(['conversation_id' => $mine->id]);
+
+        $response = $this->index($mine);
+        $listed = $this->listed($response, $question->display_message_id);
+
+        $this->assertArrayNotHasKey('question', $listed, 'no view for a question asked elsewhere');
+        $this->assertStringNotContainsString('my private reply', $response->getContent());
+    }
+
+    #[Test]
     public function a_pending_question_carries_its_view_on_the_display_message(): void
     {
         $conversation = $this->questionConversation($this->owner, 'web');

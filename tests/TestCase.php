@@ -811,7 +811,7 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('answer_message_id')->nullable();
                 $table->timestamp('resumed_at', 6)->nullable();
                 $table->timestamps();
-                $table->text('preamble')->nullable();
+                $table->longText('preamble')->nullable();
                 $table->string('presentation', 16)->nullable();
                 $table->string('presentation_fallback_reason', 32)->nullable();
                 $table->string('answer_method', 24)->nullable();

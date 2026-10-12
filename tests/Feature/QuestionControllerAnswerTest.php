@@ -276,6 +276,10 @@ class QuestionControllerAnswerTest extends TestCase
             'fractional entry' => [['selected' => [1.5]]],
             'null entry' => [['selected' => [null]]],
             'text is not a string' => [['text' => 5]],
+            // The answer is stored verbatim in a TEXT column (65,535 bytes on
+            // MySQL); a longer one is refused here rather than failing the
+            // write. 32,768 two-byte characters are 65,536 bytes.
+            'text longer than an answer can hold' => [['text' => str_repeat('é', 32768)]],
         ];
     }
 
@@ -387,6 +391,34 @@ class QuestionControllerAnswerTest extends TestCase
         };
         $this->assertSame($headers($absent), $headers($foreign), 'identical headers');
 
+        $this->assertStillPendingAndUntouched($question, $rowBefore, $footprintBefore);
+    }
+
+    #[Test]
+    public function a_foreign_question_is_not_found_even_for_a_requester_who_would_be_refused_admission(): void
+    {
+        // The owner check comes before admission: were it after, someone
+        // out of allowance would be told 429 for an existing question but
+        // 404 for an absent one, revealing which ids exist.
+        $question = $this->pending();
+
+        app(RateLimitService::class)->upsert(
+            RateLimitScope::UserDefault,
+            RateLimit::INSTALLATION_SCOPE_ID,
+            ['max_requests' => 1, 'window_seconds' => 60],
+        );
+        app(RateLimitGate::class)->admit((string) $this->stranger->id, BudgetWorkKind::Interactive, (string) Str::uuid());
+        $this->app->forgetScopedInstances();
+
+        $rowBefore = $this->row($question->id);
+        $footprintBefore = $this->footprint();
+
+        $absent = $this->submit((string) Str::uuid(), ['selected' => [2]], $this->stranger);
+        $foreign = $this->submit($question->id, ['selected' => [2]], $this->stranger);
+
+        $absent->assertStatus(404);
+        $foreign->assertStatus(404);
+        $this->assertSame($absent->getContent(), $foreign->getContent(), 'byte-identical bodies');
         $this->assertStillPendingAndUntouched($question, $rowBefore, $footprintBefore);
     }
 

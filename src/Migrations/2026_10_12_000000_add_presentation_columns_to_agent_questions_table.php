@@ -9,7 +9,9 @@ use Illuminate\Support\Facades\Schema;
  *
  * - `preamble`: the assistant text shown above the question (synchronous
  *   path only), so a form rebuilt from the row shows what the display
- *   message shows.
+ *   message shows. LONGTEXT like that message's content: the model's text
+ *   is not length-limited, and a TEXT column would make opening a question
+ *   with a long preamble fail on MySQL.
  * - `presentation`: `rich` | `plain_text`, written once delivery finished.
  * - `presentation_fallback_reason`: why plain text was used
  *   (`channel_lacks_options` | `too_many_options` | `rich_send_rejected`).
@@ -29,7 +31,7 @@ return new class extends Migration
 
         Schema::table('agent_questions', function (Blueprint $table) {
             if (!Schema::hasColumn('agent_questions', 'preamble')) {
-                $table->text('preamble')->nullable();
+                $table->longText('preamble')->nullable();
             }
             if (!Schema::hasColumn('agent_questions', 'presentation')) {
                 $table->string('presentation', 16)->nullable();
