@@ -19,9 +19,8 @@ use ClarionApp\LlmClient\Services\RateLimitGate;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
 use ClarionApp\LlmClient\Services\QuestionResumer;
+use ClarionApp\LlmClient\Services\QuestionViewBuilder;
 use ClarionApp\LlmClient\ValueObjects\IntakeResult;
-use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
-use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 
 class MessageController extends Controller
@@ -32,13 +31,27 @@ class MessageController extends Controller
         $conversation = Conversation::ownedByRealUser()->find($conversation_id);
         if(!$conversation) return response()->json([], 404);
         
-        if($conversation->user_id != Auth::id())
+        $isOwner = $conversation->user_id == Auth::id();
+        if(!$isOwner)
         {
             if(!Auth::user()->can('list users')) return response()->json([], 403);
         }
 
         $messages = Message::where('conversation_id', $conversation_id)->orderBy('created_at')->get();
         foreach($messages as &$message) $message->streaming = false;
+        unset($message);
+
+        // The owner's screen renders each question from its current stored
+        // state; someone else reading the conversation sees only the text.
+        if ($isOwner) {
+            $views = app(QuestionViewBuilder::class)->forMessages($messages);
+            foreach ($messages as $message) {
+                if (isset($views[$message->id])) {
+                    $message->question = $views[$message->id];
+                }
+            }
+        }
+
         return response()->json($messages, 200);
     }
 
@@ -117,10 +130,7 @@ class MessageController extends Controller
             // conversation answered from this screen) returns its reply
             // here, so the resumer pushes it to the conversation's own
             // channel, as it does when no request is waiting at all.
-            $caller = $intake->question->resume_mode === OpenQuestionRequest::RESUME_SYNC
-                ? ResumeCaller::Background
-                : ResumeCaller::HttpRequest;
-            app(QuestionResumer::class)->resume($intake->question->id, $caller);
+            app(QuestionResumer::class)->resumeAfterAnswer($intake->question);
 
             return response()->json($intake->message, 201);
         }

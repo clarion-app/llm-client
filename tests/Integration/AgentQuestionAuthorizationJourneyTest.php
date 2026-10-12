@@ -29,9 +29,11 @@ use Tests\Integration\Harness\RecordingChannelDelivery;
  * answer it through both reply endpoints and to read it through the run
  * endpoints. Every attempt is refused with the shape those endpoints already
  * use for a stranger, and A's question stays pending, unanswered and
- * undelivered-to-anyone-else. No endpoint takes a question id at all, so the
- * question id alone grants nothing. B's own messages, blank or ordinary,
- * never touch A's question.
+ * undelivered-to-anyone-else. The one endpoint that takes a question id —
+ * answering it from the conversation screen's form — checks the owner and
+ * answers B exactly as it answers an id that does not exist, so the question
+ * id alone grants nothing. B's own messages, blank or ordinary, never touch
+ * A's question.
  *
  * Real wiring throughout, with the model scripted at the HTTP boundary.
  */
@@ -200,9 +202,11 @@ class AgentQuestionAuthorizationJourneyTest extends AssembledSystemTestCase
     }
 
     #[Test]
-    public function no_endpoint_takes_a_question_id(): void
+    public function the_only_endpoint_taking_a_question_id_is_the_owner_checked_answer_route(): void
     {
         $this->scenario = 'question_authorization_routes';
+        $this->script()
+            ->toolRequest('ask_user', ['question' => AgentQuestionWebJourneyTest::QUESTION, 'choices' => AgentQuestionWebJourneyTest::CHOICES]);
 
         $llmClientRoutes = collect(Route::getRoutes()->getRoutes())
             ->filter(fn (RoutingRoute $route) => str_starts_with($route->uri(), 'api/clarion-app/llm-client/'));
@@ -222,7 +226,26 @@ class AgentQuestionAuthorizationJourneyTest extends AssembledSystemTestCase
             ->values()
             ->all();
 
-        $this->assertSame([], $offending, 'a question is only ever reached through its conversation or run, both owner-checked');
+        $this->assertSame(
+            ['POST api/clarion-app/llm-client/question/{id}/answer'],
+            $offending,
+            'apart from the form\'s answer route, a question is only ever reached through its conversation or run, both owner-checked',
+        );
+
+        // That route refuses B exactly as it refuses an id that does not
+        // exist, and A's question is untouched.
+        $question = $this->userAIsAsked();
+        $asB = $this->actingAs($this->userB, 'api');
+
+        $foreign = $asB->postJson(self::API."/question/{$question->id}/answer", ['selected' => [2]]);
+        $absent = $asB->postJson(self::API.'/question/'.Str::uuid().'/answer', ['selected' => [2]]);
+
+        $foreign->assertStatus(404);
+        $absent->assertStatus(404);
+        $this->assertSame('{}', $foreign->getContent());
+        $this->assertSame($absent->getContent(), $foreign->getContent());
+
+        $this->assertStillPending($question, 'B answered through the form route');
     }
 
     #[Test]

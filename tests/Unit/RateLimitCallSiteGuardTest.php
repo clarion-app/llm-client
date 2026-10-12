@@ -14,17 +14,17 @@ use RegexIterator;
  *
  * Unlike the enforcement guard the spending ceiling feature needed, there
  * is no open set of "must eventually be gated" call sites to keep covered
- * here — the rate limiter has exactly two entry funnels by design, and
+ * here — the rate limiter has a closed set of interactive entry funnels by design, and
  * nothing else in this package ever reaches a rate-limited user's request
  * count. This guard exists in the other direction: to catch a *future*
- * addition that wires RateLimitGate into a third call site by analogy with
+ * addition that wires RateLimitGate into a further call site by analogy with
  * how spending is enforced (a background job, a deferred retry, or a
  * system-initiated path) — precisely the kind of well-intentioned "fix"
  * that would let system-initiated work quietly consume a human user's own
  * allowance.
  *
  * Equality, not containment: a subset check would notice a new,
- * unauthorized call site but say nothing when one of the two intended call
+ * unauthorized call site but say nothing when one of the intended call
  * sites disappears — silently un-gating a whole entry path while this test
  * keeps passing.
  *
@@ -39,6 +39,11 @@ class RateLimitCallSiteGuardTest extends TestCase
     private const ALLOWLIST = [
         'Services/AgentLoopService.php',
         'Controllers/MessageController.php',
+        // Answering a question from the conversation screen's form is a
+        // user's own request that resumes model work, the same as a typed
+        // reply through MessageController; it is admitted before the
+        // answer is recorded so a refusal leaves the question waiting.
+        'Controllers/QuestionController.php',
     ];
 
     private string $srcDir;
