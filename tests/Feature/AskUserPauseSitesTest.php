@@ -30,6 +30,7 @@ use ClarionApp\LlmClient\Services\RoleAssignmentService;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\ValueObjects\PauseKind;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Dedoc\Scramble\Generator;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -37,6 +38,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Mockery;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Integration\Harness\RecordingChannelDelivery;
 use Tests\TestCase;
@@ -241,7 +243,7 @@ class AskUserPauseSitesTest extends TestCase
             'type' => 'function',
             'function' => [
                 'name' => 'ask_user',
-                'description' => 'Pause this task and ask the user a question. The task resumes when the user answers, or when the question expires or is withdrawn; the outcome is returned as this tool\'s result. Offer up to 10 choices when the answer is one of a known set; the user may always answer in their own words. Only one question can be pending in a conversation at a time.',
+                'description' => 'Pause this task and ask the user a question. The task resumes when the user answers, or when the question expires or is withdrawn; the outcome is returned as this tool\'s result. Offer up to 10 choices when the answer is one of a known set; the user may always answer in their own words. Only one question can be pending in a conversation at a time. Decide per question what happens if the user does not answer in time: by default work stops until they answer; set if_unanswered to proceed_on_assumption and state the answer you will assume (assumed_choices or assumed_text) only when the question has a safe default. Mark questions that gate spending, deleting, sending or other real-world consequences as consequential — those can never proceed on an assumption.',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
@@ -253,6 +255,28 @@ class AskUserPauseSitesTest extends TestCase
                             'description' => 'Optional choices, shown numbered from 1.',
                         ],
                         'allow_multiple' => ['type' => 'boolean', 'description' => 'Whether several choices may be selected. Requires choices.'],
+                        'if_unanswered' => [
+                            'type' => 'string',
+                            'enum' => ['proceed_on_assumption', 'stop'],
+                            'description' => 'What happens if no answer arrives in time. Default: stop (or proceed_on_assumption when an assumed answer is given).',
+                        ],
+                        'assumed_choices' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'integer'],
+                            'description' => 'The choice number(s) to assume if unanswered. Exactly one unless allow_multiple.',
+                        ],
+                        'assumed_text' => [
+                            'type' => 'string',
+                            'description' => 'The free-text answer to assume if unanswered, read exactly as if the user had typed it. Use instead of assumed_choices.',
+                        ],
+                        'consequential' => [
+                            'type' => 'boolean',
+                            'description' => 'True when the answer gates an action with real-world consequences. A consequential question always stops if unanswered.',
+                        ],
+                        'wait_minutes' => [
+                            'type' => 'integer',
+                            'description' => 'How long to wait for an answer. Brought within the installation\'s minimum and maximum.',
+                        ],
                     ],
                     'required' => ['question'],
                 ],
@@ -269,7 +293,11 @@ class AskUserPauseSitesTest extends TestCase
         $parameters = array_keys((array) $askUser['function']['parameters']['properties']);
         sort($parameters);
 
-        $this->assertSame(['allow_multiple', 'choices', 'question'], $parameters, 'the asking side never names a channel, chat or conversation');
+        $this->assertSame(
+            ['allow_multiple', 'assumed_choices', 'assumed_text', 'choices', 'consequential', 'if_unanswered', 'question', 'wait_minutes'],
+            $parameters,
+            'the asking side never names a channel, chat or conversation',
+        );
     }
 
     #[Test]
@@ -648,6 +676,108 @@ class AskUserPauseSitesTest extends TestCase
         $this->assertSame(PauseKind::Question->notExecutedResult(), $pending[1]['content'] ?? null);
         $this->assertSame([self::GOLDEN_THREE_CHOICES], $this->telegram->textsFor($conversation->id));
         $this->assertFalse((bool) $conversation->fresh()->is_processing);
+    }
+
+    // ---------------------------------------------------------------
+    // What happens if nobody answers: carried from the ask to the row
+    // ---------------------------------------------------------------
+
+    /** @return array<string, array{string}> */
+    public static function pauseSites(): array
+    {
+        return [
+            'synchronous run()' => ['run'],
+            'synchronous resumeSync()' => ['resumeSync'],
+            'streaming handler' => ['stream'],
+        ];
+    }
+
+    /** Ask with $arguments at $site and return the question it opened. */
+    private function askAt(string $site, array $arguments): AgentQuestion
+    {
+        if ($site === 'stream') {
+            $conversation = $this->conversation();
+            $this->streamTurn($conversation, [$this->askCall('call_ask', $arguments)]);
+
+            $question = AgentQuestion::where('conversation_id', $conversation->id)->first();
+            $this->assertNotNull($question, 'a valid streamed ask opens a question');
+            $this->assertSame('stream', $question->resume_mode);
+
+            return $question;
+        }
+
+        if ($site === 'run') {
+            $conversation = $this->telegramConversation();
+            $service = $this->syncService([$this->toolCallReply([$this->askCall('call_ask', $arguments)])]);
+
+            return $this->assertAwaitingUser($service->run($conversation->fresh(), 'Help me tidy up the project.'), $conversation);
+        }
+
+        // resumeSync(): the first turn pauses for a confirmation; once it is
+        // approved, the continuation turn asks.
+        $this->actingAs($this->user, 'api');
+        $mcpServer = McpClientServer::create([
+            'name' => 'Filesystem Server',
+            'transport' => 'streamable_http',
+            'url' => 'https://example.test/mcp',
+            'user_id' => $this->user->id,
+        ]);
+        $tool = McpClientTool::create([
+            'server_id' => $mcpServer->id,
+            'synthetic_operation_id' => "mcp:{$mcpServer->id}:delete_file",
+            'name' => 'delete_file',
+            'description' => 'Deletes a file.',
+            'input_schema' => ['type' => 'object', 'properties' => []],
+            'last_seen_at' => now(),
+        ]);
+        $executor = Mockery::mock(McpClientToolExecutor::class);
+        $executor->shouldReceive('execute')->andReturn(['content' => [['type' => 'text', 'text' => 'file deleted']], 'isError' => false]);
+        $this->app->instance(McpClientToolExecutor::class, $executor);
+        config(['llm-client.confirm_methods' => []]);
+        config(['llm-client.api_denylist' => []]);
+
+        $conversation = $this->telegramConversation();
+        $service = $this->syncService([
+            $this->toolCallReply([$this->toolCall('call_confirm', 'execute_operation', ['operationId' => $tool->synthetic_operation_id, 'parameters' => []])]),
+            $this->toolCallReply([$this->askCall('call_ask', $arguments)]),
+        ]);
+
+        $first = $service->run($conversation->fresh(), 'Tidy up my files.');
+        $this->assertSame('confirmation_required', $first['status'] ?? null, 'precondition; got: '.json_encode($first));
+
+        return $this->assertAwaitingUser(
+            $service->resumeSync($conversation->fresh(), Message::findOrFail($first['message_id']), true),
+            $conversation,
+        );
+    }
+
+    #[Test]
+    #[DataProvider('pauseSites')]
+    public function an_assumed_answer_and_a_requested_wait_reach_the_question_at_every_pause_site(string $site): void
+    {
+        $question = $this->askAt($site, ['assumed_choices' => [1], 'wait_minutes' => 120])->fresh();
+
+        $this->assertSame(UnansweredPolicy::ProceedOnAssumption, $question->unanswered_policy, 'an assumed answer with no policy proceeds on it');
+        $this->assertSame('1', $question->assumed_answer_raw);
+        $this->assertSame([['number' => 1, 'text' => 'Backend']], $question->assumed_answer_selected);
+        $this->assertFalse($question->consequential);
+        $this->assertSame(120, $question->requested_wait_minutes);
+        $this->assertSame(120, $question->effective_wait_minutes);
+        $this->assertSame(120 * 60, $question->expires_at->getTimestamp() - $question->asked_at->getTimestamp(), 'the deadline is the requested period');
+    }
+
+    #[Test]
+    #[DataProvider('pauseSites')]
+    public function a_consequential_ask_stops_at_every_pause_site(string $site): void
+    {
+        $question = $this->askAt($site, ['consequential' => true])->fresh();
+
+        $this->assertSame(UnansweredPolicy::Stop, $question->unanswered_policy);
+        $this->assertTrue($question->consequential);
+        $this->assertNull($question->assumed_answer_raw);
+        $this->assertNull($question->assumed_answer_selected);
+        $this->assertNull($question->requested_wait_minutes);
+        $this->assertSame(1440, $question->effective_wait_minutes, 'no requested period: the installation default');
     }
 }
 

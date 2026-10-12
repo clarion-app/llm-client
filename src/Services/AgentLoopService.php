@@ -3579,7 +3579,7 @@ class AgentLoopService
                 'type' => 'function',
                 'function' => [
                     'name' => 'ask_user',
-                    'description' => 'Pause this task and ask the user a question. The task resumes when the user answers, or when the question expires or is withdrawn; the outcome is returned as this tool\'s result. Offer up to 10 choices when the answer is one of a known set; the user may always answer in their own words. Only one question can be pending in a conversation at a time.',
+                    'description' => 'Pause this task and ask the user a question. The task resumes when the user answers, or when the question expires or is withdrawn; the outcome is returned as this tool\'s result. Offer up to 10 choices when the answer is one of a known set; the user may always answer in their own words. Only one question can be pending in a conversation at a time. Decide per question what happens if the user does not answer in time: by default work stops until they answer; set if_unanswered to proceed_on_assumption and state the answer you will assume (assumed_choices or assumed_text) only when the question has a safe default. Mark questions that gate spending, deleting, sending or other real-world consequences as consequential — those can never proceed on an assumption.',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
@@ -3596,6 +3596,28 @@ class AgentLoopService
                             'allow_multiple' => [
                                 'type' => 'boolean',
                                 'description' => 'Whether several choices may be selected. Requires choices.',
+                            ],
+                            'if_unanswered' => [
+                                'type' => 'string',
+                                'enum' => ['proceed_on_assumption', 'stop'],
+                                'description' => 'What happens if no answer arrives in time. Default: stop (or proceed_on_assumption when an assumed answer is given).',
+                            ],
+                            'assumed_choices' => [
+                                'type' => 'array',
+                                'items' => ['type' => 'integer'],
+                                'description' => 'The choice number(s) to assume if unanswered. Exactly one unless allow_multiple.',
+                            ],
+                            'assumed_text' => [
+                                'type' => 'string',
+                                'description' => 'The free-text answer to assume if unanswered, read exactly as if the user had typed it. Use instead of assumed_choices.',
+                            ],
+                            'consequential' => [
+                                'type' => 'boolean',
+                                'description' => 'True when the answer gates an action with real-world consequences. A consequential question always stops if unanswered.',
+                            ],
+                            'wait_minutes' => [
+                                'type' => 'integer',
+                                'description' => 'How long to wait for an answer. Brought within the installation\'s minimum and maximum.',
                             ],
                         ],
                         'required' => ['question'],

@@ -78,7 +78,13 @@ class AgentQuestionService
         try {
             [$question, $display] = DB::transaction(function () use ($request, $conversation, $preamble) {
                 $now = now();
-                $expiryMinutes = max(1, (int) config('llm-client.agent_questions.expiry_minutes', 1440));
+                $ask = $request->request;
+                $assumed = $ask->assumedAnswer;
+
+                // The waiting period the agent asked for, brought within the
+                // installation's bounds. It and the policy are fixed here, at
+                // ask time, and nothing changes them afterwards.
+                $effectiveMinutes = app(QuestionWaitingPeriod::class)->effectiveMinutes($ask->requestedWaitMinutes);
 
                 // Inserted first: the UNIQUE slot latch refuses a second
                 // pending question before anything else is written.
@@ -99,7 +105,15 @@ class AgentQuestionService
                     'preamble' => $preamble,
                     'state' => QuestionState::Pending,
                     'asked_at' => $now,
-                    'expires_at' => $now->copy()->addMinutes($expiryMinutes),
+                    'expires_at' => $now->copy()->addMinutes($effectiveMinutes),
+                    // Written in this insert, so the display message rendered
+                    // below from this in-memory model already carries them.
+                    'unanswered_policy' => $ask->policy,
+                    'consequential' => $ask->consequential,
+                    'assumed_answer_raw' => $assumed?->rawReply,
+                    'assumed_answer_selected' => $assumed?->selected,
+                    'requested_wait_minutes' => $ask->requestedWaitMinutes,
+                    'effective_wait_minutes' => $effectiveMinutes,
                 ]);
 
                 $display = Message::create([
