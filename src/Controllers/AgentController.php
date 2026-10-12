@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\AgentLoopService;
+use ClarionApp\LlmClient\Services\LateReplyNotifier;
 use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
 use ClarionApp\LlmClient\Services\QuestionResumer;
 use ClarionApp\LlmClient\Services\RoleResolver;
@@ -102,6 +103,14 @@ class AgentController extends Controller
                 return $refusal;
             }
 
+            // A reply after the conversation's latest question expired on its
+            // assumption is told so before anything else can refuse it, so a
+            // conversation still busy with the run continuing on that
+            // assumption still explains why the reply was not an answer.
+            if (!$answered) {
+                app(LateReplyNotifier::class)->noticeFor($conversation, (string) $user->id);
+            }
+
             // Read fresh: a question resolved a moment ago (e.g. by expiry)
             // has already marked the conversation processing for its resumed
             // run, and this message must not start a second, concurrent one.
@@ -112,9 +121,26 @@ class AgentController extends Controller
                 ], 409);
             }
         } else {
+            // A reply after a question on this channel expired on its
+            // assumption belongs with that question's conversation, however
+            // long ago it was last active: the user is told there, once, that
+            // the reply came too late. While the run continuing on the
+            // assumption still has that conversation the reply goes where an
+            // ordinary reply would, so no second run starts beside it.
+            $conversation = null;
+            $assumedIn = $this->conversationOwedLateReplyNotice((string) $user->id, $channel);
+
+            if ($assumedIn !== null) {
+                app(LateReplyNotifier::class)->noticeFor($assumedIn, (string) $user->id);
+
+                if (!Conversation::whereKey($assumedIn->id)->value('is_processing')) {
+                    $conversation = $assumedIn;
+                }
+            }
+
             // Lookup recent conversation by user + channel + inactivity threshold
             $thresholdHours = config('llm-client.conversation.inactivity_threshold_hours', 4);
-            $conversation = Conversation::where('user_id', $user->id)
+            $conversation ??= Conversation::where('user_id', $user->id)
                 ->where('channel', $channel)
                 ->where('updated_at', '>', now()->subHours($thresholdHours))
                 ->where('is_processing', false)
@@ -239,6 +265,34 @@ class AgentController extends Controller
             ->whereNull('conversations.deleted_at')
             ->orderByDesc('agent_questions.asked_at')
             ->value('agent_questions.pending_conversation_id');
+
+        return $conversationId === null ? null : Conversation::find($conversationId);
+    }
+
+    /**
+     * The user's open conversation on $channel whose most recently asked
+     * question expired on its assumption and has not yet had its late-reply
+     * notice, if any — the most recently asked such question wins.
+     */
+    private function conversationOwedLateReplyNotice(string $userId, string $channel): ?Conversation
+    {
+        $conversationId = AgentQuestion::query()
+            ->join('conversations', 'conversations.id', '=', 'agent_questions.conversation_id')
+            ->where('agent_questions.user_id', $userId)
+            ->where('agent_questions.state', QuestionState::ExpiredAssumed->value)
+            ->whereNull('agent_questions.late_reply_noticed_at')
+            ->where('conversations.user_id', $userId)
+            ->where('conversations.channel', $channel)
+            ->whereNull('conversations.ended_at')
+            ->whereNull('conversations.deleted_at')
+            ->whereNotExists(function ($newer) {
+                $newer->selectRaw('1')
+                    ->from('agent_questions as newer')
+                    ->whereColumn('newer.conversation_id', 'agent_questions.conversation_id')
+                    ->whereColumn('newer.asked_at', '>', 'agent_questions.asked_at');
+            })
+            ->orderByDesc('agent_questions.asked_at')
+            ->value('agent_questions.conversation_id');
 
         return $conversationId === null ? null : Conversation::find($conversationId);
     }

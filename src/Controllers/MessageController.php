@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\Services\BudgetGate;
 use ClarionApp\LlmClient\Services\RateLimitGate;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
+use ClarionApp\LlmClient\Services\LateReplyNotifier;
 use ClarionApp\LlmClient\Services\QuestionResumer;
 use ClarionApp\LlmClient\Services\QuestionViewBuilder;
 use ClarionApp\LlmClient\ValueObjects\IntakeResult;
@@ -140,6 +141,11 @@ class MessageController extends Controller
         $validatedData['user'] = Auth::user()->name;
 
         $message = Message::create($validatedData);
+
+        // A reply that came after the conversation's latest question had
+        // already expired on its assumption is told so, once, right after
+        // the reply in the history. It is still handled as a new message.
+        app(LateReplyNotifier::class)->noticeFor($conversation, (string) Auth::id());
 
         // Read fresh: a question resolved a moment ago (e.g. by expiry) has
         // already marked the conversation processing for its resumed run, and

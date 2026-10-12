@@ -24,8 +24,10 @@ use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\ValueObjects\OpenedQuestion;
 use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
+use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Dedoc\Scramble\Generator;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -47,6 +49,16 @@ use Tests\TestCase;
  * recorded as a late answer and the stopped run continues synchronously in
  * the request. A blank reply is refused with `answer_required` and the
  * question stays stopped; another user's reply never reaches it.
+ *
+ * A reply after a question expired on the assumption it stated is never an
+ * answer: the user is told once, in that conversation, that it arrived
+ * after the deadline and what was assumed — even when the run continuing on
+ * the assumption still has the conversation and the reply is refused as
+ * `processing`. Without a conversation id, such a reply is routed to the
+ * conversation that proceeded (however long ago it was last active), unless
+ * that conversation's continuing run still has it: then the notice is still
+ * posted there, but the reply goes where an ordinary reply would, so a
+ * second run never starts beside the first.
  */
 class AgentControllerStoppedQuestionTest extends TestCase
 {
@@ -55,6 +67,9 @@ class AgentControllerStoppedQuestionTest extends TestCase
     private const QUESTION = 'Which part should I change first?';
 
     private const CHOICES = ['Backend', 'Frontend', 'Docs'];
+
+    private const LATE_REPLY_NOTICE = 'Your reply arrived after the question "Which part should I change first?" had expired. '
+        .'The agent had already continued assuming: 1. Backend. Your reply is being handled as a new message.';
 
     private User $user;
 
@@ -228,7 +243,7 @@ class AgentControllerStoppedQuestionTest extends TestCase
      * A pending question in $conversation, opened the way the synchronous
      * pause site opens it (resume mode `sync`).
      */
-    private function pendingQuestion(Conversation $conversation, string $question = self::QUESTION, array $choices = self::CHOICES): AgentQuestion
+    private function pendingQuestion(Conversation $conversation, string $question = self::QUESTION, array $choices = self::CHOICES, ?AskUserRequest $request = null): AgentQuestion
     {
         $conversation->update(['is_processing' => true]);
 
@@ -259,7 +274,7 @@ class AgentControllerStoppedQuestionTest extends TestCase
 
         $opened = app(AgentQuestionService::class)->open(new OpenQuestionRequest(
             conversation: $conversation->fresh(),
-            request: new AskUserRequest($question, $choices, false),
+            request: $request ?? new AskUserRequest($question, $choices, false),
             runId: $runId,
             stepId: $stepId,
             actionId: $actionId,
@@ -300,6 +315,65 @@ class AgentControllerStoppedQuestionTest extends TestCase
         $this->assertFalse((bool) $conversation->fresh()->is_processing, 'precondition: nothing is processing');
 
         return $stopped;
+    }
+
+    /**
+     * A question asked an hour ago that proceeds assuming choice 1, expired
+     * by its policy as the sweep does. Unless $stillProcessing, the run that
+     * continued on the assumption has finished and the conversation is free.
+     */
+    private function assumedQuestion(Conversation $conversation, bool $stillProcessing = false): AgentQuestion
+    {
+        $this->travel(-61)->minutes();
+        $pending = $this->pendingQuestion($conversation, request: new AskUserRequest(
+            self::QUESTION,
+            self::CHOICES,
+            false,
+            policy: UnansweredPolicy::ProceedOnAssumption,
+            assumedAnswer: new ParsedAnswer('1', true, [['number' => 1, 'text' => 'Backend']]),
+            requestedWaitMinutes: 60,
+        ));
+        $this->travelBack();
+
+        $this->assertSame(QuestionState::ExpiredAssumed, app(AgentQuestionService::class)->expireWithPolicy($pending), 'precondition: proceeded on its assumption');
+        if (!$stillProcessing) {
+            $conversation->update(['is_processing' => false]);
+        }
+        $this->telegram->deliveries = [];
+
+        $assumed = AgentQuestion::findOrFail($pending->id);
+        $this->assertNull($assumed->pending_conversation_id, 'precondition: the slot is free');
+        $this->assertNull($assumed->late_reply_noticed_at, 'precondition: no late reply noticed yet');
+        $this->assertSame($stillProcessing, (bool) $conversation->fresh()->is_processing, 'precondition');
+
+        return $assumed;
+    }
+
+    /** @return array<string, mixed> what a late reply must never change about the question */
+    private function decision(AgentQuestion $question): array
+    {
+        return (array) DB::table('agent_questions')->where('id', $question->id)->first([
+            'state', 'assumed_answer_raw', 'assumed_answer_selected', 'answer_raw', 'answer_selected', 'answer_method',
+            'answer_message_id', 'pending_conversation_id', 'resolved_at', 'resumed_at',
+        ]);
+    }
+
+    /** @return list<Message> */
+    private function lateReplyNotices(Conversation $conversation): array
+    {
+        return Message::where('conversation_id', $conversation->id)->get()
+            ->filter(fn (Message $m) => ($m->tool_data['notice'] ?? null) === 'late_reply')
+            ->values()
+            ->all();
+    }
+
+    private function assertNoticedOnce(Conversation $conversation, AgentQuestion $question): void
+    {
+        $notices = $this->lateReplyNotices($conversation);
+        $this->assertCount(1, $notices, 'the late reply is noticed once, in the conversation that proceeded');
+        $this->assertSame(self::LATE_REPLY_NOTICE, $notices[0]->content);
+        $this->assertSame($question->id, $notices[0]->tool_data['question_id'] ?? null);
+        $this->assertSame([self::LATE_REPLY_NOTICE], $this->telegram->textsFor($conversation->id), 'delivered on the conversation\'s channel');
     }
 
     /** Make $conversation look idle for $hours. */
@@ -498,5 +572,182 @@ class AgentControllerStoppedQuestionTest extends TestCase
         $this->assertSame($before, (array) DB::table('agent_questions')->where('id', $question->id)->first());
         $this->assertSame(1, $this->userMessageCount($conversation));
         $this->assertSame(0, $this->chatCalls);
+    }
+
+    // ---------------------------------------------------------------
+    // A reply after the question proceeded on its assumption
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function with_the_conversation_id_the_late_reply_is_noticed_before_the_busy_conversation_refuses_it(): void
+    {
+        $conversation = $this->conversation();
+        $question = $this->assumedQuestion($conversation, stillProcessing: true);
+        $decision = $this->decision($question);
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'conversation_id' => $conversation->id,
+            'channel' => 'telegram',
+        ]);
+
+        $response->assertStatus(409);
+        $response->assertJson(['code' => 'processing']);
+        $this->assertNoticedOnce($conversation, $question);
+        $this->assertSame($decision, $this->decision($question), 'the reply is not applied to the question');
+        $this->assertSame(0, $this->chatCalls, 'no run is started beside the one continuing');
+    }
+
+    #[Test]
+    public function with_the_conversation_id_a_late_reply_is_noticed_and_handled_as_a_new_message(): void
+    {
+        $conversation = $this->conversation();
+        $question = $this->assumedQuestion($conversation);
+        $decision = $this->decision($question);
+        $this->replies = [$this->textReply('Noted, switching to the frontend.')];
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'conversation_id' => $conversation->id,
+            'channel' => 'telegram',
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson(['conversation_id' => $conversation->id, 'status' => 'completed', 'content' => 'Noted, switching to the frontend.']);
+        $this->assertNoticedOnce($conversation, $question);
+        $this->assertSame($decision, $this->decision($question));
+        $this->assertSame(1, $this->chatCalls, 'the reply starts a new run');
+        $reply = Message::where('conversation_id', $conversation->id)->where('role', 'user')->where('content', '2')->first();
+        $this->assertNotNull($reply, 'the reply is in the conversation');
+        $this->assertNull($reply->tool_data, 'as an ordinary message');
+    }
+
+    #[Test]
+    public function without_a_conversation_id_a_late_reply_goes_to_the_conversation_that_proceeded_and_is_noticed_there(): void
+    {
+        $assumedIn = $this->conversation();
+        $question = $this->assumedQuestion($assumedIn);
+        $decision = $this->decision($question);
+        $this->lastActive($assumedIn, 30);
+
+        // A more recently active conversation on the same channel, which the
+        // ordinary lookup would otherwise pick.
+        $recent = $this->conversation();
+        $this->lastActive($recent, 1);
+        $this->replies = [$this->textReply('Noted, switching to the frontend.')];
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'channel' => 'telegram',
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson(['conversation_id' => $assumedIn->id, 'status' => 'completed']);
+        $this->assertNoticedOnce($assumedIn, $question);
+        $this->assertSame($decision, $this->decision($question), 'the reply is not applied to the question');
+        $this->assertSame(1, $this->chatCalls, 'handled as a new message in that conversation');
+        $this->assertSame(0, Message::where('conversation_id', $recent->id)->count(), 'the other conversation is untouched');
+        $this->assertSame(2, Conversation::where('user_id', $this->user->id)->count(), 'no new conversation is created');
+    }
+
+    #[Test]
+    public function once_noticed_a_reply_without_a_conversation_id_is_routed_as_before(): void
+    {
+        $assumedIn = $this->conversation();
+        $question = $this->assumedQuestion($assumedIn);
+        $this->lastActive($assumedIn, 30);
+        $recent = $this->conversation();
+        $this->lastActive($recent, 2);
+
+        $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, ['message' => '2', 'channel' => 'telegram'])
+            ->assertStatus(200)
+            ->assertJson(['conversation_id' => $assumedIn->id]);
+        $this->lastActive($assumedIn, 30);
+
+        $second = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, ['message' => 'And the docs too.', 'channel' => 'telegram']);
+
+        $second->assertStatus(200);
+        $second->assertJson(['conversation_id' => $recent->id], 'the ordinary lookup picks the recently active conversation');
+        $this->assertNoticedOnce($assumedIn, $question);
+        $this->assertSame([], $this->lateReplyNotices($recent));
+        $this->assertSame(2, $this->chatCalls);
+    }
+
+    #[Test]
+    public function without_a_conversation_id_a_busy_conversation_that_proceeded_gets_the_notice_but_not_the_reply(): void
+    {
+        $assumedIn = $this->conversation();
+        $question = $this->assumedQuestion($assumedIn, stillProcessing: true);
+        $decision = $this->decision($question);
+        $runsBefore = DB::table('agent_runs')->where('conversation_id', $assumedIn->id)->count();
+        $userMessagesBefore = $this->userMessageCount($assumedIn);
+
+        $recent = $this->conversation();
+        $this->lastActive($recent, 1);
+        $this->replies = [$this->textReply('Hello again.')];
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'channel' => 'telegram',
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson(['conversation_id' => $recent->id], 'the reply goes where an ordinary reply would');
+        $this->assertNoticedOnce($assumedIn, $question);
+        $this->assertSame($decision, $this->decision($question));
+        $this->assertSame($userMessagesBefore, $this->userMessageCount($assumedIn), 'the reply is not put into the busy conversation');
+        $this->assertSame($runsBefore, DB::table('agent_runs')->where('conversation_id', $assumedIn->id)->count(), 'no second run starts beside the continuing one');
+        $this->assertTrue((bool) $assumedIn->fresh()->is_processing, 'the continuing run still has its conversation');
+        $this->assertSame(1, $this->chatCalls, 'one run, in the other conversation');
+    }
+
+    public static function closedConversations(): array
+    {
+        return [
+            'ended' => ['ended'],
+            'deleted' => ['deleted'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('closedConversations')]
+    public function without_a_conversation_id_an_ended_or_deleted_conversation_that_proceeded_is_left_alone(string $how): void
+    {
+        $assumedIn = $this->conversation();
+        $question = $this->assumedQuestion($assumedIn);
+        $this->lastActive($assumedIn, 30);
+        DB::table('conversations')->where('id', $assumedIn->id)->update($how === 'ended' ? ['ended_at' => now()->subHours(29)] : ['deleted_at' => now()->subHours(29)]);
+
+        $recent = $this->conversation();
+        $this->lastActive($recent, 1);
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'channel' => 'telegram',
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson(['conversation_id' => $recent->id]);
+        $this->assertSame([], $this->lateReplyNotices($assumedIn), "an {$how} conversation is not told");
+        $this->assertSame([], $this->telegram->deliveries, 'nothing is delivered');
+        $this->assertNull(DB::table('agent_questions')->where('id', $question->id)->value('late_reply_noticed_at'));
+    }
+
+    #[Test]
+    public function another_users_reply_without_a_conversation_id_never_reaches_a_conversation_that_proceeded(): void
+    {
+        $assumedIn = $this->conversation();
+        $question = $this->assumedQuestion($assumedIn);
+        $this->lastActive($assumedIn, 30);
+
+        $response = $this->actingAs($this->stranger, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'channel' => 'telegram',
+        ]);
+
+        $response->assertStatus(200);
+        $this->assertNotSame($assumedIn->id, $response->json('conversation_id'));
+        $this->assertSame([], $this->lateReplyNotices($assumedIn));
+        $this->assertNull(DB::table('agent_questions')->where('id', $question->id)->value('late_reply_noticed_at'));
     }
 }

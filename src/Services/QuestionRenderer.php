@@ -245,6 +245,18 @@ class QuestionRenderer
         return implode("\n\n", $blocks);
     }
 
+    /**
+     * The one-time notice for a reply typed after a question already
+     * expired on the assumption it stated: the reply is not applied to the
+     * question, and is handled as a new message instead.
+     */
+    public function renderLateReplyNotice(AgentQuestion $question): string
+    {
+        return 'Your reply arrived after the question "'.$question->question.'" had expired. '
+            .'The agent had already continued assuming: '.$this->assumptionText($question).'. '
+            .'Your reply is being handled as a new message.';
+    }
+
     /** The notice shown when a question is resolved without an answer. */
     public function renderNotice(AgentQuestion $question): string
     {

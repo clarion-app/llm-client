@@ -6,17 +6,26 @@ use ClarionApp\Backend\Models\User;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
+use ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers;
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Services\AgentQuestionService;
+use ClarionApp\LlmClient\Services\AnswerParser;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\Services\InteractiveAnswerService;
+use ClarionApp\LlmClient\Services\QuestionRenderer;
 use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
+use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
 use ClarionApp\LlmClient\ValueObjects\InteractiveAnswer;
 use ClarionApp\LlmClient\ValueObjects\InteractiveAnswerStatus;
+use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Fixtures\QuestionChannels\QuestionEndpointHarness;
 use Tests\Integration\Harness\RecordingChannelDelivery;
@@ -28,6 +37,12 @@ use Tests\TestCase;
  * tapped option, exactly as a pending question does. The late answer is
  * recorded through the same checks, parser and compare-and-set; refused
  * answers leave it stopped; ownership is checked the same way.
+ *
+ * describeState() is what a channel tells the user when a control is used on
+ * a question that no longer takes an answer: the question's outcome line,
+ * naming what was assumed when it proceeded on an assumption. It says
+ * nothing — identically — for a question that does not exist or is someone
+ * else's, and nothing for one that still takes an answer.
  */
 class InteractiveAnswerStoppedTest extends TestCase
 {
@@ -225,5 +240,109 @@ class InteractiveAnswerStoppedTest extends TestCase
 
         $this->assertSame(QuestionState::Stopped, $this->service()->stateFor($question->id, (string) $this->user->id));
         $this->assertNull($this->service()->stateFor($question->id, (string) $this->stranger->id), 'another user\'s question');
+    }
+
+    // ---------------------------------------------------------------
+    // describeState(): what a stale control is told
+    // ---------------------------------------------------------------
+
+    /** A question in each state, reached the way that state is reached. */
+    private function questionIn(string $how): AgentQuestion
+    {
+        $service = app(AgentQuestionService::class);
+
+        if ($how === 'expired_assumed') {
+            $conversation = $this->questionConversation($this->user, 'web');
+            $question = AgentQuestion::findOrFail($this->openQuestion($conversation, request: new AskUserRequest(
+                'Which part should I change first?',
+                ['Backend', 'Frontend', 'Docs'],
+                false,
+                policy: UnansweredPolicy::ProceedOnAssumption,
+                assumedAnswer: new ParsedAnswer('1', true, [['number' => 1, 'text' => 'Backend']]),
+                requestedWaitMinutes: 60,
+            ))->question->id);
+            $this->assertSame(QuestionState::ExpiredAssumed, $service->expireWithPolicy($question), 'precondition: proceeded on its assumption');
+
+            return $question->fresh();
+        }
+
+        if (in_array($how, ['stopped', 'answered_late', 'discarded'], true)) {
+            $question = $this->stopped();
+        } else {
+            $question = $this->pendingQuestionIn($this->questionConversation($this->user, 'web'));
+        }
+
+        $won = match ($how) {
+            'pending', 'stopped' => true,
+            'answered', 'answered_late' => $service->answer($question, app(AnswerParser::class)->parse('2', $question), (string) $this->user->id, '2') !== null,
+            'expired' => (function () use ($question, $service) {
+                // A question asked before unanswered policies existed: it expires as it always did.
+                DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+
+                return $service->expire($question->fresh());
+            })(),
+            'withdrawn', 'discarded' => $service->withdrawForConversation(Conversation::findOrFail($question->conversation_id)),
+            'undeliverable' => $service->markUndeliverable($question, 'chat not found'),
+        };
+        $this->assertTrue($won, "precondition: the question became {$how}");
+
+        return $question->fresh();
+    }
+
+    public static function statesThatNoLongerTakeAnAnswer(): array
+    {
+        return [
+            'answered' => ['answered', 'answered', 'Answered: 2. Frontend'],
+            'answered after work stopped' => ['answered_late', 'answered', 'Answered after work stopped: 2. Frontend'],
+            'expired before unanswered policies existed' => ['expired', 'expired', 'This question expired and is no longer awaiting a reply.'],
+            'proceeded on its assumption' => ['expired_assumed', 'expired_assumed', 'Expired — no answer arrived in time; the agent continued assuming: 1. Backend'],
+            'withdrawn while waiting' => ['withdrawn', 'withdrawn', 'This question was withdrawn and is no longer awaiting a reply.'],
+            'discarded while stopped' => ['discarded', 'withdrawn', 'Discarded — the conversation was ended or deleted while work was stopped.'],
+            'undeliverable' => ['undeliverable', 'undeliverable', 'This question could not be delivered.'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('statesThatNoLongerTakeAnAnswer')]
+    public function describe_state_tells_the_owner_how_a_question_that_no_longer_takes_an_answer_ended(string $how, string $state, string $expected): void
+    {
+        $question = $this->questionIn($how);
+        $this->assertSame($state, $question->state->value, 'precondition');
+
+        $described = app(InteractiveQuestionAnswers::class)->describeState($question->id, (string) $this->user->id);
+
+        $this->assertSame($expected, $described);
+        $this->assertSame(app(QuestionRenderer::class)->renderOutcome($question), $described, 'the question\'s own outcome line');
+    }
+
+    #[Test]
+    public function describe_state_says_nothing_about_a_question_that_still_takes_an_answer(): void
+    {
+        foreach (['pending', 'stopped'] as $how) {
+            $question = $this->questionIn($how);
+            $this->assertSame($how, $question->state->value, 'precondition');
+            $rowBefore = $this->row($question->id);
+
+            $described = $this->service()->describeState($question->id, (string) $this->user->id);
+
+            $this->assertNull($described, "{$how}: the question still takes an answer");
+            $this->assertSame($rowBefore, $this->row($question->id), "{$how}: nothing changes");
+        }
+    }
+
+    #[Test]
+    public function describe_state_reveals_nothing_about_an_absent_or_foreign_question(): void
+    {
+        $answered = $this->questionIn('answered');
+        $assumed = $this->questionIn('expired_assumed');
+
+        $absent = $this->service()->describeState((string) Str::uuid(), (string) $this->stranger->id);
+        $foreignAnswered = $this->service()->describeState($answered->id, (string) $this->stranger->id);
+        $foreignAssumed = $this->service()->describeState($assumed->id, (string) $this->stranger->id);
+
+        $this->assertNull($absent, 'an unknown question');
+        $this->assertNull($foreignAnswered, 'another user\'s answered question');
+        $this->assertNull($foreignAssumed, 'another user\'s question, whatever it assumed');
+        $this->assertNotNull($this->service()->describeState($assumed->id, (string) $this->user->id), 'precondition: its owner is told');
     }
 }

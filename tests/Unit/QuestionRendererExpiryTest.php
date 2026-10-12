@@ -554,6 +554,43 @@ class QuestionRendererExpiryTest extends TestCase
     }
 
     #[Test]
+    public function a_late_typed_reply_is_told_what_was_assumed_and_that_it_is_a_new_message(): void
+    {
+        $choice = $this->proceedQuestion(['state' => 'expired_assumed']);
+        $ownWords = $this->proceedQuestion([
+            'state' => 'expired_assumed',
+            'assumed_answer_raw' => 'whichever is already installed',
+            'assumed_answer_selected' => [],
+        ]);
+        $several = $this->proceedQuestion([
+            'state' => 'expired_assumed',
+            'question' => 'Which parts should I change?',
+            'choices' => ['Backend', 'Frontend', 'Docs'],
+            'allow_multiple' => true,
+            'assumed_answer_raw' => '1, 3',
+            'assumed_answer_selected' => [['number' => 1, 'text' => 'Backend'], ['number' => 3, 'text' => 'Docs']],
+        ]);
+
+        $this->assertSame(
+            'Your reply arrived after the question "'.self::FRAMEWORK_QUESTION.'" had expired. '
+            .'The agent had already continued assuming: 1. PHPUnit. Your reply is being handled as a new message.',
+            $this->renderer()->renderLateReplyNotice($choice),
+        );
+        $this->assertSame(
+            'Your reply arrived after the question "'.self::FRAMEWORK_QUESTION.'" had expired. '
+            .'The agent had already continued assuming: "whichever is already installed". Your reply is being handled as a new message.',
+            $this->renderer()->renderLateReplyNotice($ownWords),
+            'an assumption in the agent\'s own words is quoted in full',
+        );
+        $this->assertSame(
+            'Your reply arrived after the question "Which parts should I change?" had expired. '
+            .'The agent had already continued assuming: 1. Backend, 3. Docs. Your reply is being handled as a new message.',
+            $this->renderer()->renderLateReplyNotice($several),
+            'every assumed choice by its full label',
+        );
+    }
+
+    #[Test]
     public function the_legacy_expiry_notice_and_outcome_are_unchanged(): void
     {
         $legacy = $this->question(policy: null, extra: ['state' => 'expired']);

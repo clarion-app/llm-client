@@ -501,6 +501,69 @@ class AgentQuestionService
     }
 
     /**
+     * Claim the one late-reply notice a question that expired on its
+     * assumption is owed. A compare-and-set: of any number of concurrent
+     * callers exactly one gets true, and every later call gets false.
+     */
+    public function claimLateReplyNotice(string $id): bool
+    {
+        $now = now()->format('Y-m-d H:i:s.u');
+
+        return DB::table('agent_questions')
+            ->where('id', $id)
+            ->where('state', QuestionState::ExpiredAssumed->value)
+            ->whereNull('late_reply_noticed_at')
+            ->update(['late_reply_noticed_at' => $now, 'updated_at' => $now]) === 1;
+    }
+
+    /**
+     * Post the late-reply notice for $question in $conversation, if it is
+     * still owed: the claim and the notice message are written in one
+     * transaction, and the notice is delivered on the conversation's channel
+     * once that commits. Returns the notice, or null when another reply
+     * already claimed it. A failed delivery is logged; the notice stands.
+     */
+    public function postLateReplyNotice(AgentQuestion $question, Conversation $conversation): ?Message
+    {
+        $notice = DB::transaction(function () use ($question, $conversation) {
+            if (!$this->claimLateReplyNotice($question->id)) {
+                return null;
+            }
+
+            return Message::create([
+                'conversation_id' => $conversation->id,
+                'role' => 'assistant',
+                'user' => $conversation->character,
+                'content' => app(QuestionRenderer::class)->renderLateReplyNotice($question),
+                'responseTime' => 0,
+                'tool_data' => [
+                    'kind' => self::KIND_NOTICE,
+                    'question_id' => $question->id,
+                    'state' => QuestionState::ExpiredAssumed->value,
+                    'notice' => 'late_reply',
+                ],
+            ]);
+        });
+
+        if ($notice === null) {
+            return null;
+        }
+
+        $delivery = $this->deliver($conversation, (string) $notice->content);
+
+        if (!$delivery->delivered) {
+            Log::warning('AgentQuestionService: late-reply notice could not be delivered', [
+                'question_id' => $question->id,
+                'conversation_id' => $conversation->id,
+                'channel' => $conversation->channel,
+                'reason' => $delivery->failureReason,
+            ]);
+        }
+
+        return $notice;
+    }
+
+    /**
      * Hand text to the conversation's channel adapter. An adapter that
      * throws, or a channel with no adapter, is a failed delivery; this
      * never throws.

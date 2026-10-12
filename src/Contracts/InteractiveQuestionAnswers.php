@@ -26,4 +26,12 @@ interface InteractiveQuestionAnswers
         InteractiveAnswer $answer,
         AnswerMethod $method,
     ): InteractiveAnswerOutcome;
+
+    /**
+     * Plain-text description of a question that no longer accepts answers
+     * (QuestionRenderer::renderOutcome()), or null when it does not exist,
+     * is not $userId's, or still accepts answers. Absent and foreign are
+     * identical, so the result reveals nothing about another user's question.
+     */
+    public function describeState(string $questionId, string $userId): ?string;
 }

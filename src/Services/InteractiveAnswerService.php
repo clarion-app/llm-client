@@ -109,6 +109,21 @@ class InteractiveAnswerService implements InteractiveQuestionAnswers
         return QuestionState::from((string) $row->state);
     }
 
+    public function describeState(string $questionId, string $userId): ?string
+    {
+        $question = AgentQuestion::find($questionId);
+
+        if ($question === null || (string) $question->user_id !== $userId) {
+            return null;
+        }
+
+        if ($this->stateOf($question)->acceptsAnswers()) {
+            return null;
+        }
+
+        return $this->renderer->renderOutcome($question);
+    }
+
     /**
      * Whether a selection can be an answer to this question: it has
      * choices, every number names one, no number repeats, and a
