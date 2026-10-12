@@ -47,6 +47,8 @@ use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use ClarionApp\LlmClient\ValueObjects\PauseKind;
 use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
+use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
+use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
 use ClarionApp\LlmClient\ValueObjects\QuestionRefusal;
 use ClarionApp\LlmClient\ValueObjects\QuestionResolution;
 use ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision;
@@ -1775,6 +1777,31 @@ class AgentLoopService
                         $decoded = json_decode($result, true);
                     }
 
+                    // A valid ask_user call: pause until the user answers. A
+                    // refused one gives its refusal as this call's result and
+                    // the batch continues.
+                    if (is_array($decoded) && !empty($decoded[self::REQUIRES_USER_INPUT])) {
+                        $asked = $this->pauseSyncForQuestion(
+                            $conversation,
+                            $content ?: '',
+                            $toolCalls,
+                            $decoded,
+                            $toolCallId,
+                            $activeActionId,
+                            array_merge($toolResults, $this->laterBatchDelegationResults($toolCalls, $tcIndex, $batchDelegationResults)),
+                            $iteration,
+                            $runId,
+                            $currentStepId,
+                        );
+
+                        if (is_array($asked)) {
+                            return $asked;
+                        }
+
+                        $result = $asked;
+                        $decoded = json_decode($result, true);
+                    }
+
                     if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
                         $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
 
@@ -2281,42 +2308,7 @@ class AgentLoopService
         // Recover run_id and step_id from tool_data.
         // If step_id is present, close it with wait_ms (T059) — the step spans
         // the confirmation pause. If run_id is null (pre-feature), mint a fresh run.
-        $currentStepId = null;
-        $waitMs = $this->confirmationWaitMs($toolData, $message);
-        if ($this->runTraceRecorder !== null) {
-            if ($runId !== null) {
-                // Close the step that spanned the confirmation pause (T059).
-                if ($pendingStepId !== null) {
-                    $this->runTraceRecorder->closeStep(
-                        $pendingStepId,
-                        RunEndState::Completed,
-                        null,
-                        $waitMs, // wait_ms for the human wait portion
-                    );
-                }
-                // Open a new step for the resumed work.
-                $currentStepId = $this->runTraceRecorder->openStep(
-                    $runId,
-                    null, // position auto-assigned
-                    $attemptGroupId,
-                );
-            } else {
-                // Pre-feature tool_data — mint a fresh run for the resumed portion.
-                $runId = $this->runTraceRecorder->openRun(
-                    \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
-                    (string) $conversation->user_id,
-                    $conversation->id,
-                    streamed: false,
-                    model: $conversation->model,
-                    agentId: $conversation->character ?? $conversation->id,
-                );
-                $currentStepId = $this->runTraceRecorder->openStep(
-                    $runId,
-                    null, // position auto-assigned
-                    $attemptGroupId,
-                );
-            }
-        }
+        [$runId, $currentStepId] = $this->openResumedSyncStep($conversation, $message, $toolData, $runId, $attemptGroupId);
 
         // 112-coding-agent (US1, data-model.md §6): tracks whether
         // executeApiCall() genuinely ran, so a chain-check rejection below
@@ -2464,6 +2456,167 @@ class AgentLoopService
             $attemptGroupId,
             ($toolData['iteration'] ?? 1) + 1,
         );
+    }
+
+    /**
+     * Close the step that spanned a synchronous pause, recording the human
+     * wait portion, and open the step the resumed work runs in. A paused
+     * message from before run tracing has no run, so one is minted for the
+     * resumed portion.
+     *
+     * @return array{0: ?string, 1: ?string}  the run id and the new step id
+     */
+    private function openResumedSyncStep(Conversation $conversation, Message $message, array $toolData, ?string $runId, string $attemptGroupId): array
+    {
+        if ($this->runTraceRecorder === null) {
+            return [$runId, null];
+        }
+
+        $pendingStepId = $toolData['step_id'] ?? null;
+
+        if ($runId !== null) {
+            if ($pendingStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $pendingStepId,
+                    RunEndState::Completed,
+                    null,
+                    $this->confirmationWaitMs($toolData, $message),
+                );
+            }
+
+            return [$runId, $this->runTraceRecorder->openStep($runId, null, $attemptGroupId)];
+        }
+
+        $runId = $this->runTraceRecorder->openRun(
+            \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+            (string) $conversation->user_id,
+            $conversation->id,
+            streamed: false,
+            model: $conversation->model,
+            agentId: $conversation->character ?? $conversation->id,
+        );
+
+        return [$runId, $this->runTraceRecorder->openStep($runId, null, $attemptGroupId)];
+    }
+
+    /**
+     * Continue a synchronous run whose question was resolved, returning the
+     * continuation's result exactly as run() would (including another
+     * `awaiting_user` when the agent asks again).
+     *
+     * QuestionResumer has already answered the paused `ask_user` call with
+     * $resolution's outcome, so this runs the shared resume prologue, closes
+     * the step that spanned the wait, and continues the synchronous loop.
+     */
+    public function resumeQuestionSync(Conversation $conversation, Message $message, QuestionResolution $resolution): array
+    {
+        if (!$resolution->state->continuesRun()) {
+            throw new \LogicException("A question resolved as {$resolution->state->value} does not continue its run.");
+        }
+
+        $toolData = is_array($message->tool_data) ? $message->tool_data : [];
+        $runId = $toolData['run_id'] ?? null;
+
+        if (($revokedStop = $this->resumePrologue($conversation, $runId, $toolData['step_id'] ?? null)) !== null) {
+            return $revokedStop;
+        }
+
+        $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+        [$runId, $currentStepId] = $this->openResumedSyncStep($conversation, $message, $toolData, $runId, $attemptGroupId);
+
+        return $this->continueSyncAfterPause(
+            $conversation,
+            $runId,
+            $currentStepId,
+            $attemptGroupId,
+            ($toolData['iteration'] ?? 1) + 1,
+        );
+    }
+
+    /**
+     * Pause a synchronous turn on a valid `ask_user` call: store the turn as
+     * its paused assistant message and open the question, which records the
+     * pause, shows the question (with the turn's assistant text above it,
+     * since a synchronous caller receives no reply content) and delivers it
+     * through the conversation's channel before this returns.
+     *
+     * Returns the `awaiting_user` result when the run is suspended, or the
+     * tool result to give the call instead when the question was refused.
+     *
+     * @param  array<string, mixed>  $marker  the normalized question
+     * @param  list<array<string, mixed>>  $pendingToolResults  results of the
+     *   calls already executed in this batch
+     * @return array<string, mixed>|string
+     */
+    private function pauseSyncForQuestion(
+        Conversation $conversation,
+        string $content,
+        array $toolCalls,
+        array $marker,
+        string $toolCallId,
+        ?string $actionId,
+        array $pendingToolResults,
+        int $iteration,
+        ?string $runId,
+        ?string $stepId,
+    ): array|string {
+        $paused = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $content,
+            'role' => 'assistant',
+            'user' => $conversation->character,
+            'responseTime' => 0,
+            'tool_data' => ['tool_calls' => $toolCalls],
+        ]);
+
+        try {
+            $opened = app(AgentQuestionService::class)->open(new OpenQuestionRequest(
+                conversation: $conversation,
+                request: new AskUserRequest(
+                    (string) ($marker['question'] ?? ''),
+                    array_values($marker['choices'] ?? []),
+                    (bool) ($marker['allow_multiple'] ?? false),
+                ),
+                runId: $runId,
+                stepId: $stepId,
+                actionId: $actionId,
+                pausedMessage: $paused,
+                toolCallId: $toolCallId,
+                resumeMode: OpenQuestionRequest::RESUME_SYNC,
+                preamble: $content,
+                pendingToolResults: $pendingToolResults,
+                iteration: $iteration,
+            ));
+        } catch (\Throwable $e) {
+            $paused->delete();
+            Log::error('AgentLoopService: could not open the question', [
+                'conversation_id' => $conversation->id,
+                'tool_call_id' => $toolCallId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return json_encode(['error' => 'The question could not be asked: '.$e->getMessage()]);
+        }
+
+        if ($opened instanceof QuestionRefusal) {
+            // The turn is stored once, with every result, when the batch
+            // completes; this paused copy was never used.
+            $paused->delete();
+
+            return $opened->toToolResult();
+        }
+
+        if ($opened->resumeResult !== null) {
+            return $opened->resumeResult;
+        }
+
+        return [
+            'status' => 'awaiting_user',
+            'conversation_id' => $conversation->id,
+            'message_id' => $opened->displayMessage->id,
+            'question_id' => $opened->question->id,
+            'content' => '',
+        ];
     }
 
     /**
@@ -2699,6 +2852,29 @@ class AgentLoopService
                     $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId);
                 }
                 $decoded = json_decode($result, true);
+
+                // See the identical ask_user pause in run()'s tool-call loop.
+                if (is_array($decoded) && !empty($decoded[self::REQUIRES_USER_INPUT])) {
+                    $asked = $this->pauseSyncForQuestion(
+                        $conversation,
+                        $content ?: '',
+                        $toolCalls,
+                        $decoded,
+                        $toolCall['id'] ?? '',
+                        $toolActionId,
+                        array_merge($toolResults, $this->laterBatchDelegationResults($toolCalls, $tcIndex, $batchDelegationResults)),
+                        $iteration,
+                        $runId,
+                        $currentStepId,
+                    );
+
+                    if (is_array($asked)) {
+                        return $asked;
+                    }
+
+                    $result = $asked;
+                    $decoded = json_decode($result, true);
+                }
 
                 if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
                     $confirmationType = $decoded['confirmation_type'] ?? 'api_call';

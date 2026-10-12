@@ -32,20 +32,30 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
 {
     private const MESSAGE_ENDPOINT = '/api/clarion-app/llm-client/message';
 
-    private const QUESTION = 'Which part should I change first?';
+    public const QUESTION = 'Which part should I change first?';
 
-    private const CHOICES = ['Backend', 'Frontend', 'Docs'];
+    public const CHOICES = ['Backend', 'Frontend', 'Docs'];
 
     /** @var list<array<string, mixed>> every request the host API received to store a note */
     private array $noteWrites = [];
 
-    private const GOLDEN_THREE_CHOICES = "Which part should I change first?\n"
+    public const GOLDEN_THREE_CHOICES = "Which part should I change first?\n"
         ."\n"
         ."1. Backend\n"
         ."2. Frontend\n"
         ."3. Docs\n"
         ."\n"
         .'Reply with the number of your choice, or answer in your own words.';
+
+    /**
+     * The exact `ask_user` arguments the model sends in the three-choice
+     * scenario. The messaging journey asserts its model sent these same
+     * bytes: the asking side never differs by channel.
+     */
+    public static function threeChoiceAskArguments(): string
+    {
+        return json_encode(['question' => self::QUESTION, 'choices' => self::CHOICES]);
+    }
 
     protected function setUp(): void
     {
@@ -257,6 +267,11 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
 
         // The user sees the numbered question in the conversation.
         $question = $this->pendingQuestion();
+        $this->assertSame(
+            self::threeChoiceAskArguments(),
+            Message::findOrFail($question->paused_message_id)->tool_data['tool_calls'][0]['function']['arguments'] ?? null,
+            'the ask_user arguments the model sent are stored verbatim',
+        );
         $display = Message::findOrFail($question->display_message_id);
         $this->assertSame(self::GOLDEN_THREE_CHOICES, $display->content);
 

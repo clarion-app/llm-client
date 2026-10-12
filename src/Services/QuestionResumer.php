@@ -75,6 +75,19 @@ class QuestionResumer
                 return null;
             }
 
+            if ($question->resume_mode === OpenQuestionRequest::RESUME_SYNC) {
+                $result = app(AgentLoopService::class)->resumeQuestionSync($conversation, $paused, $resolution);
+
+                // Nobody is waiting on an HTTP response for a background
+                // resume, so the reply goes to the user through their
+                // channel. A follow-up question was already delivered.
+                if ($caller === ResumeCaller::Background && ($result['status'] ?? null) !== 'awaiting_user') {
+                    $this->deliverReply($conversation, $question, (string) ($result['content'] ?? ''));
+                }
+
+                return $result;
+            }
+
             throw new \LogicException("Resuming a question paused on the '{$question->resume_mode}' path is not supported.");
         } catch (BudgetExceededException|RateLimitExceededException $e) {
             // Re-admission refused the continuation; the gate has already
@@ -98,6 +111,25 @@ class QuestionResumer
             ]);
 
             throw $e;
+        }
+    }
+
+    /** Push a resumed synchronous run's reply to the conversation's channel. */
+    private function deliverReply(Conversation $conversation, AgentQuestion $question, string $content): void
+    {
+        if (trim($content) === '') {
+            return;
+        }
+
+        $delivery = app(AgentQuestionService::class)->deliver($conversation, $content);
+
+        if (!$delivery->delivered) {
+            Log::warning('QuestionResumer: the resumed run\'s reply could not be delivered', [
+                'question_id' => $question->id,
+                'conversation_id' => $conversation->id,
+                'channel' => $conversation->channel,
+                'reason' => $delivery->failureReason,
+            ]);
         }
     }
 

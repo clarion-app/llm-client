@@ -195,9 +195,10 @@ class AgentQuestionService
 
     /**
      * Hand text to the conversation's channel adapter. An adapter that
-     * throws, or a channel with no adapter, is a failed delivery.
+     * throws, or a channel with no adapter, is a failed delivery; this
+     * never throws.
      */
-    private function deliver(Conversation $conversation, string $text): DeliveryResult
+    public function deliver(Conversation $conversation, string $text): DeliveryResult
     {
         $channel = (string) ($conversation->channel ?? 'web');
         $adapter = app(ConversationChannelRegistry::class)->for($channel);

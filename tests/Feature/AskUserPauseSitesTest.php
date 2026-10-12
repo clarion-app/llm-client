@@ -6,6 +6,7 @@ use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
+use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
@@ -13,14 +14,18 @@ use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\McpClientServer;
+use ClarionApp\LlmClient\Models\McpClientTool;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\Server;
 use ClarionApp\LlmClient\Providers\ProviderRegistry;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
+use ClarionApp\LlmClient\Services\McpClientToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\OperationCache;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use ClarionApp\LlmClient\Services\RoleAssignmentService;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\ValueObjects\PauseKind;
@@ -47,6 +52,11 @@ use Tests\TestCase;
  * their results, calls after it are not executed and are answered as such.
  * An invalid ask never pauses: its refusal is the call's result in the same
  * iteration and nothing is written or shown to the user.
+ *
+ * The synchronous pause sites (AgentLoopService::run() and resumeSync()'s
+ * continuation loop, which serve `/agent` and so Telegram) pause the same
+ * way, push the question through the conversation's channel adapter before
+ * returning, and report `awaiting_user` instead of a reply.
  */
 class AskUserPauseSitesTest extends TestCase
 {
@@ -63,6 +73,8 @@ class AskUserPauseSitesTest extends TestCase
     private Server $server;
 
     private RecordingChannelDelivery $web;
+
+    private RecordingChannelDelivery $telegram;
 
     private AskRecordingAgentLoopService $service;
 
@@ -97,6 +109,8 @@ class AskUserPauseSitesTest extends TestCase
 
         $this->web = new RecordingChannelDelivery('web');
         app(ConversationChannelRegistry::class)->register($this->web);
+        $this->telegram = new RecordingChannelDelivery('telegram');
+        app(ConversationChannelRegistry::class)->register($this->telegram);
 
         $this->service = new AskRecordingAgentLoopService(
             app(McpToolRegistry::class),
@@ -122,6 +136,8 @@ class AskUserPauseSitesTest extends TestCase
         }
         DB::table('messages')->delete();
         DB::table('conversations')->delete();
+        DB::table('mcp_client_tools')->delete();
+        DB::table('mcp_client_servers')->delete();
         DB::table('llm_role_assignments')->delete();
         DB::table('llm_servers')->delete();
         DB::table('users')->delete();
@@ -377,6 +393,261 @@ class AskUserPauseSitesTest extends TestCase
         );
 
         Queue::assertPushed(SendHttpStreamRequest::class, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Synchronous pause sites: run() and resumeSync()
+    // ---------------------------------------------------------------
+
+    /** Number of model requests the synchronous service made. */
+    private int $chatCalls = 0;
+
+    private function telegramConversation(): Conversation
+    {
+        return Conversation::factory()->create([
+            'user_id' => $this->user->id,
+            'server_id' => $this->server->id,
+            'model' => 'test-model',
+            'title' => 'Ask user over Telegram',
+            'channel' => 'telegram',
+            'is_processing' => false,
+        ]);
+    }
+
+    private function toolCallReply(array $calls, string $content = ''): array
+    {
+        return ['choices' => [['message' => ['role' => 'assistant', 'content' => $content, 'tool_calls' => $calls]]]];
+    }
+
+    private function textReply(string $content): array
+    {
+        return [
+            'choices' => [['message' => ['role' => 'assistant', 'content' => $content, 'tool_calls' => []]]],
+            'usage' => ['prompt_tokens' => 10, 'completion_tokens' => 10, 'total_tokens' => 20],
+        ];
+    }
+
+    /**
+     * A synchronous service whose model replies are scripted (counted in
+     * $chatCalls) and whose `record_note_a` / `record_note_b` tools record
+     * their executions.
+     */
+    private function syncService(array $responses): AskRecordingAgentLoopService
+    {
+        $provider = Mockery::mock(LlmProvider::class);
+        $provider->shouldReceive('chat')->andReturnUsing(function () use (&$responses) {
+            $this->chatCalls++;
+
+            return array_shift($responses) ?? ['choices' => [['message' => ['content' => 'Done.', 'tool_calls' => []]]]];
+        });
+        $provider->shouldReceive('countTokens')->andReturnUsing(fn ($t) => (int) ceil(strlen((string) $t) / 4));
+
+        $registry = Mockery::mock(ProviderRegistry::class);
+        $registry->shouldReceive('resolve')->andReturn($provider);
+        $registry->shouldReceive('resolveByType')->andReturn($provider);
+
+        $service = new AskRecordingAgentLoopService(
+            app(McpToolRegistry::class),
+            new McpToolExecutor(app(McpToolRegistry::class), null, fn ($user) => 'test-token'),
+            app(OperationCache::class),
+            $registry,
+            runTraceRecorder: app(RunTraceRecorder::class),
+        );
+        $this->app->instance(AgentLoopService::class, $service);
+
+        return $service;
+    }
+
+    /**
+     * The synchronous `awaiting_user` result: the question was asked and
+     * already delivered; there is no reply content.
+     */
+    private function assertAwaitingUser(array $result, Conversation $conversation): AgentQuestion
+    {
+        $this->assertSame('awaiting_user', $result['status'] ?? null, 'got: '.json_encode($result));
+        $this->assertSame($conversation->id, $result['conversation_id'] ?? null);
+        $this->assertSame('', $result['content'] ?? null, 'the question is pushed through the channel, not returned as content');
+
+        $question = AgentQuestion::find($result['question_id'] ?? null);
+        $this->assertNotNull($question, 'the result names the opened question');
+        $this->assertSame($conversation->id, $question->conversation_id);
+        $this->assertSame($question->display_message_id, $result['message_id'] ?? null, 'message_id is the question\'s display message');
+        $this->assertSame(QuestionState::Pending, $question->state);
+        $this->assertSame('sync', $question->resume_mode);
+        $this->assertSame('telegram', $question->channel);
+
+        return $question;
+    }
+
+    #[Test]
+    public function run_pauses_on_ask_user_and_reports_awaiting_user(): void
+    {
+        $conversation = $this->telegramConversation();
+        $service = $this->syncService([$this->toolCallReply([$this->askCall()])]);
+
+        $result = $service->run($conversation->fresh(), 'Help me tidy up the project.');
+
+        $question = $this->assertAwaitingUser($result, $conversation);
+        $this->assertSame(1, $this->chatCalls, 'the run waits for the user: no further model request');
+        $this->assertSame('call_ask', $question->tool_call_id);
+
+        $paused = Message::findOrFail($question->paused_message_id);
+        $this->assertSame(PauseKind::Question->value, $paused->tool_data['pause_kind'] ?? null);
+        $this->assertSame('call_ask', $paused->tool_data['paused_tool_call_id'] ?? null);
+        $this->assertSame(['question_id' => $question->id], $paused->tool_data['pending_question'] ?? null);
+        $this->assertArrayHasKey('tool_results', $paused->tool_data);
+        $this->assertNull($paused->tool_data['tool_results'], 'the paused call is not answered yet');
+
+        $this->assertSame(self::GOLDEN_THREE_CHOICES, Message::findOrFail($question->display_message_id)->content);
+        $this->assertSame([self::GOLDEN_THREE_CHOICES], $this->telegram->textsFor($conversation->id), 'the question was delivered before run() returned');
+        $this->assertSame([], $this->web->deliveries, 'only the conversation\'s own channel receives it');
+        $this->assertNotNull($question->delivered_at);
+
+        $this->assertFalse((bool) $conversation->fresh()->is_processing, 'a waiting conversation is not processing');
+
+        $this->assertNotNull($question->run_id);
+        $this->assertSame('awaiting_confirmation', DB::table('agent_run_actions')->where('id', $question->action_id)->value('outcome'));
+        $this->assertSame('in_progress', DB::table('agent_runs')->where('id', $question->run_id)->value('end_state'));
+    }
+
+    #[Test]
+    public function run_puts_the_turns_assistant_text_before_the_question(): void
+    {
+        $conversation = $this->telegramConversation();
+        $preamble = 'I found three areas that need work.';
+        $service = $this->syncService([$this->toolCallReply([$this->askCall()], $preamble)]);
+
+        $result = $service->run($conversation->fresh(), 'Help me tidy up the project.');
+
+        $question = $this->assertAwaitingUser($result, $conversation);
+        $expected = $preamble."\n\n".self::GOLDEN_THREE_CHOICES;
+        $this->assertSame($expected, Message::findOrFail($question->display_message_id)->content, 'on the synchronous path the assistant text is shown with the question, since the reply content is empty');
+        $this->assertSame([$expected], $this->telegram->textsFor($conversation->id));
+    }
+
+    #[Test]
+    public function run_batch_keeps_earlier_results_and_does_not_execute_later_calls(): void
+    {
+        $conversation = $this->telegramConversation();
+        $service = $this->syncService([$this->toolCallReply([
+            $this->toolCall('call_a', 'record_note_a', []),
+            $this->askCall(),
+            $this->toolCall('call_b', 'record_note_b', []),
+        ])]);
+
+        $result = $service->run($conversation->fresh(), 'Help me tidy up the project.');
+
+        $question = $this->assertAwaitingUser($result, $conversation);
+        $this->assertSame(1, $this->chatCalls);
+        $this->assertSame(['record_note_a'], $service->executedTools, 'the call before the ask runs; the call after it never does');
+
+        $pending = Message::findOrFail($question->paused_message_id)->tool_data['pending_tool_results'] ?? null;
+        $this->assertIsArray($pending);
+        $this->assertSame(['call_a', 'call_b'], array_map(fn ($r) => $r['tool_call_id'] ?? null, $pending));
+        $this->assertStringContainsString('record_note_a', (string) $pending[0]['content'], 'the earlier call keeps its real result');
+        $this->assertSame(PauseKind::Question->notExecutedResult(), $pending[1]['content']);
+    }
+
+    #[Test]
+    public function run_second_ask_in_the_same_turn_is_not_executed(): void
+    {
+        $conversation = $this->telegramConversation();
+        $service = $this->syncService([$this->toolCallReply([
+            $this->askCall('call_first'),
+            $this->askCall('call_second', ['question' => 'Should I also update the docs?', 'choices' => ['Yes', 'No']]),
+        ])]);
+
+        $result = $service->run($conversation->fresh(), 'Help me tidy up the project.');
+
+        $question = $this->assertAwaitingUser($result, $conversation);
+        $this->assertSame('call_first', $question->tool_call_id);
+        $this->assertSame(1, AgentQuestion::where('conversation_id', $conversation->id)->count(), 'only the first ask opens a question');
+        $this->assertSame(
+            [['tool_call_id' => 'call_second', 'content' => PauseKind::Question->notExecutedResult()]],
+            Message::findOrFail($question->paused_message_id)->tool_data['pending_tool_results'] ?? null,
+        );
+        $this->assertCount(1, $this->telegram->textsFor($conversation->id), 'only one question is shown');
+    }
+
+    #[Test]
+    public function run_refuses_an_invalid_ask_in_the_same_iteration(): void
+    {
+        $conversation = $this->telegramConversation();
+        $tooMany = array_map(fn (int $n) => "Option {$n}", range(1, 11));
+        $service = $this->syncService([
+            $this->toolCallReply([$this->askCall('call_ask', ['choices' => $tooMany])]),
+            $this->textReply('I will pick one myself.'),
+        ]);
+
+        $result = $service->run($conversation->fresh(), 'Help me tidy up the project.');
+
+        $this->assertSame('completed', $result['status'] ?? null, 'a refused ask does not pause; got: '.json_encode($result));
+        $this->assertSame(2, $this->chatCalls, 'the refusal goes back to the model in the next request');
+        $this->assertSame(0, AgentQuestion::count());
+        $this->assertSame([], $this->telegram->deliveries, 'nothing is shown to the user for a refused ask');
+
+        $turn = Message::where('conversation_id', $conversation->id)
+            ->where('role', 'assistant')
+            ->get()
+            ->first(fn (Message $m) => !empty($m->tool_data['tool_calls'] ?? null));
+        $this->assertNotNull($turn);
+        $this->assertSame(
+            ['outcome' => 'refused', 'code' => 'invalid_question', 'reason' => 'more than 10 choices'],
+            json_decode((string) ($turn->tool_data['tool_results'][0]['content'] ?? ''), true),
+            'the refusal is the call\'s result',
+        );
+    }
+
+    #[Test]
+    public function resume_sync_pauses_on_ask_user_in_its_continuation(): void
+    {
+        $this->actingAs($this->user, 'api');
+
+        // The first turn pauses for a confirmation; once approved, the
+        // continuation turn asks the user — the pause inside resumeSync().
+        $mcpServer = McpClientServer::create([
+            'name' => 'Filesystem Server',
+            'transport' => 'streamable_http',
+            'url' => 'https://example.test/mcp',
+            'user_id' => $this->user->id,
+        ]);
+        $tool = McpClientTool::create([
+            'server_id' => $mcpServer->id,
+            'synthetic_operation_id' => "mcp:{$mcpServer->id}:delete_file",
+            'name' => 'delete_file',
+            'description' => 'Deletes a file.',
+            'input_schema' => ['type' => 'object', 'properties' => []],
+            'last_seen_at' => now(),
+        ]);
+        $executor = Mockery::mock(McpClientToolExecutor::class);
+        $executor->shouldReceive('execute')->andReturn(['content' => [['type' => 'text', 'text' => 'file deleted']], 'isError' => false]);
+        $this->app->instance(McpClientToolExecutor::class, $executor);
+        config(['llm-client.confirm_methods' => []]);
+        config(['llm-client.api_denylist' => []]);
+
+        $conversation = $this->telegramConversation();
+        $service = $this->syncService([
+            $this->toolCallReply([$this->toolCall('call_confirm', 'execute_operation', ['operationId' => $tool->synthetic_operation_id, 'parameters' => []])]),
+            $this->toolCallReply([
+                $this->toolCall('call_a', 'record_note_a', []),
+                $this->askCall(),
+                $this->toolCall('call_b', 'record_note_b', []),
+            ]),
+        ]);
+
+        $first = $service->run($conversation->fresh(), 'Tidy up my files.');
+        $this->assertSame('confirmation_required', $first['status'] ?? null, 'precondition; got: '.json_encode($first));
+
+        $result = $service->resumeSync($conversation->fresh(), Message::findOrFail($first['message_id']), true);
+
+        $question = $this->assertAwaitingUser($result, $conversation);
+        $this->assertSame(2, $this->chatCalls, 'no model request after the ask');
+        $this->assertSame(['record_note_a'], $service->executedTools);
+        $pending = Message::findOrFail($question->paused_message_id)->tool_data['pending_tool_results'] ?? null;
+        $this->assertSame(['call_a', 'call_b'], array_map(fn ($r) => $r['tool_call_id'] ?? null, (array) $pending));
+        $this->assertSame(PauseKind::Question->notExecutedResult(), $pending[1]['content'] ?? null);
+        $this->assertSame([self::GOLDEN_THREE_CHOICES], $this->telegram->textsFor($conversation->id));
+        $this->assertFalse((bool) $conversation->fresh()->is_processing);
     }
 }
 
