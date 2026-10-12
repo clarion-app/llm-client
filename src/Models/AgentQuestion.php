@@ -114,8 +114,10 @@ class AgentQuestion extends Model
 
     /**
      * The JSON content of this question's `ask_user` run action: what was
-     * asked, when, and how (and whether yet) it was resolved. Written at the
-     * pause with resolution "pending" and rewritten when the run resumes.
+     * asked, when, how it was presented to the user, and how (and whether
+     * yet) it was resolved and answered. Written at the pause with resolution
+     * "pending" and no presentation, rewritten once the question has been
+     * delivered, and rewritten again when the run resumes.
      */
     public function runRecordSnapshot(): string
     {
@@ -128,6 +130,7 @@ class AgentQuestion extends Model
             $answer = [
                 'raw_reply' => (string) $this->answer_raw,
                 'selected' => array_values($this->answer_selected ?? []),
+                'method' => self::enumValue($this->answer_method),
             ];
         }
 
@@ -147,6 +150,20 @@ class AgentQuestion extends Model
             'resolved_at' => $resolvedAt?->copy()->utc()->format('Y-m-d\\TH:i:s\\Z'),
             'waited_ms' => $waitedMs,
             'answer' => $answer,
+            'presentation' => [
+                'mode' => self::enumValue($this->presentation),
+                'fallback_reason' => self::enumValue($this->presentation_fallback_reason),
+            ],
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR);
+    }
+
+    /** The stored string of an enum-cast column, or null when the row has none. */
+    private static function enumValue(mixed $value): ?string
+    {
+        if ($value instanceof \BackedEnum) {
+            return (string) $value->value;
+        }
+
+        return $value === null || $value === '' ? null : (string) $value;
     }
 }

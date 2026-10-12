@@ -19,13 +19,15 @@ use Illuminate\Support\Facades\Log;
  * plain-text question. A rich send that fails (or throws) is followed at
  * once by the plain text, so a question is undeliverable only when the
  * plain-text attempt itself failed. How the question was presented, and
- * why plain text was used, is recorded on its row.
+ * why plain text was used, is recorded on its row and in the waiting
+ * `ask_user` run action.
  */
 class QuestionPresenter
 {
     public function __construct(
         private readonly ConversationChannelRegistry $registry,
         private readonly QuestionPresentationPlanner $planner,
+        private readonly RunTraceRecorder $recorder,
     ) {
     }
 
@@ -101,5 +103,24 @@ class QuestionPresenter
         $question->presentation = $mode;
         $question->presentation_fallback_reason = $reason;
         $question->syncOriginalAttributes(['presentation', 'presentation_fallback_reason']);
+
+        $this->rewriteWaitingAction($question);
+    }
+
+    /**
+     * Shows how the question was presented in its `ask_user` run action
+     * while the run waits. The recorder only rewrites an action that is
+     * still waiting, so an already resolved record is left alone.
+     */
+    private function rewriteWaitingAction(AgentQuestion $question): void
+    {
+        try {
+            $this->recorder->updateSuspendedActionContent($question->action_id, $question->fresh()?->runRecordSnapshot() ?? $question->runRecordSnapshot());
+        } catch (\Throwable $e) {
+            Log::warning('QuestionPresenter: could not show the question\'s presentation in its run record', [
+                'question_id' => $question->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 }

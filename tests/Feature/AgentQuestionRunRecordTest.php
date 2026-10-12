@@ -57,8 +57,9 @@ use Tests\TestCase;
  * `confirm_wait_ms`.
  *
  * Snapshot shape: `{question_id, question, choices, allow_multiple,
- * asked_at, expires_at, resolution, resolved_at, waited_ms, answer}`, where
- * `answer` is `{raw_reply, selected}` for an answered question and null
+ * asked_at, expires_at, resolution, resolved_at, waited_ms, answer,
+ * presentation}`, where `answer` is `{raw_reply, selected, method}` (this
+ * file answers by typed reply) for an answered question and null
  * otherwise, `waited_ms` is `resolved_at - asked_at` in milliseconds (null
  * while pending), and the timestamps denote the same instants as the
  * question row's.
@@ -70,6 +71,13 @@ class AgentQuestionRunRecordTest extends TestCase
     private const CHOICES = ['Backend', 'Frontend', 'Docs'];
 
     private const SNAPSHOT_KEYS = [
+        'question_id', 'question', 'choices', 'allow_multiple', 'asked_at',
+        'expires_at', 'resolution', 'resolved_at', 'waited_ms', 'answer',
+        'presentation',
+    ];
+
+    /** A refused ask presented nothing to anyone, so it has no `presentation`. */
+    private const REFUSED_SNAPSHOT_KEYS = [
         'question_id', 'question', 'choices', 'allow_multiple', 'asked_at',
         'expires_at', 'resolution', 'resolved_at', 'waited_ms', 'answer',
     ];
@@ -320,13 +328,16 @@ class AgentQuestionRunRecordTest extends TestCase
         return $response->json();
     }
 
-    /** @return array<string, mixed> the decoded snapshot */
-    private function snapshotOf(array $detail): array
+    /**
+     * @param  list<string>  $keys  the snapshot's exact field set
+     * @return array<string, mixed> the decoded snapshot
+     */
+    private function snapshotOf(array $detail, array $keys = self::SNAPSHOT_KEYS): array
     {
         $this->assertIsString($detail['content'] ?? null, 'the ask_user action carries the question snapshot as its content');
         $snapshot = json_decode($detail['content'], true);
         $this->assertIsArray($snapshot, 'the content is the JSON snapshot; got: '.$detail['content']);
-        $this->assertEqualsCanonicalizing(self::SNAPSHOT_KEYS, array_keys($snapshot), 'the snapshot has exactly the documented fields');
+        $this->assertEqualsCanonicalizing($keys, array_keys($snapshot), 'the snapshot has exactly the documented fields');
 
         return $snapshot;
     }
@@ -436,6 +447,7 @@ class AgentQuestionRunRecordTest extends TestCase
         $this->assertSnapshotOf($question, $snapshot, 'answered', [
             'raw_reply' => '2',
             'selected' => [['number' => 2, 'text' => 'Frontend']],
+            'method' => 'typed_reply',
         ]);
         $this->assertGreaterThanOrEqual(90000, $snapshot['waited_ms'], 'the snapshot shows the 90 s the task waited');
     }
@@ -635,7 +647,7 @@ class AgentQuestionRunRecordTest extends TestCase
         $this->assertSame('failure', $detail['outcome']);
         $this->assertSame('ask refused: invalid_question', $detail['failure_reason']);
 
-        $snapshot = $this->snapshotOf($detail);
+        $snapshot = $this->snapshotOf($detail, self::REFUSED_SNAPSHOT_KEYS);
         $this->assertNull($snapshot['question_id'], 'no question row exists for a refused ask');
         $this->assertSame(self::QUESTION, $snapshot['question']);
         $this->assertSame(['Backend', 'backend'], $snapshot['choices'], 'the choices are recorded as the agent submitted them');

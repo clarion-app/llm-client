@@ -3,13 +3,20 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
+use ClarionApp\LlmClient\Events\RunActionUpdated;
+use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\Services\QuestionPresenter;
 use ClarionApp\LlmClient\Services\QuestionRenderer;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
+use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\ChannelQuestionCapabilities;
 use ClarionApp\LlmClient\ValueObjects\DeliveryResult;
+use ClarionApp\LlmClient\ValueObjects\InteractiveAnswer;
+use ClarionApp\LlmClient\ValueObjects\InteractiveAnswerStatus;
 use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
 use ClarionApp\LlmClient\ValueObjects\QuestionPresentation;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
@@ -17,6 +24,7 @@ use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Fixtures\QuestionChannels\QuestionEndpointHarness;
 use Tests\Fixtures\QuestionChannels\RecordingPresentingDelivery;
@@ -29,7 +37,9 @@ use Tests\TestCase;
  * as the exact plain text a channel received before options existed. How
  * the question was presented, and why plain text was used, is recorded on
  * the row. A question becomes undeliverable only when the plain-text
- * attempt itself failed.
+ * attempt itself failed. Once delivery is known, the question's run record
+ * (its still-waiting `ask_user` action) is rewritten once to show how the
+ * question was presented.
  */
 class QuestionPresenterTest extends TestCase
 {
@@ -333,5 +343,150 @@ class QuestionPresenterTest extends TestCase
             ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'channel_lacks_options'],
             $this->recorded($question->id),
         );
+    }
+
+    // ---------------------------------------------------------------
+    // The run record shows how the question was presented
+    // ---------------------------------------------------------------
+
+    /**
+     * Have the run trace record every request to rewrite a waiting
+     * action's content, still carrying each one out.
+     */
+    private function recordContentRewrites(): RunTraceRecorder
+    {
+        $recorder = new class extends RunTraceRecorder
+        {
+            /** @var list<array{action_id: ?string, content: string}> */
+            public array $contentRewrites = [];
+
+            public function updateSuspendedActionContent(?string $actionId, string $content): void
+            {
+                $this->contentRewrites[] = ['action_id' => $actionId, 'content' => $content];
+
+                parent::updateSuspendedActionContent($actionId, $content);
+            }
+        };
+        $this->app->instance(RunTraceRecorder::class, $recorder);
+
+        return $recorder;
+    }
+
+    private function storedActionContent(?string $actionId): ?string
+    {
+        return DB::table('agent_run_actions')->where('id', $actionId)->value('content');
+    }
+
+    /** @return array<string, array{string, string, ?string, string}> */
+    public static function deliveryOutcomes(): array
+    {
+        return [
+            'presented with options' => ['presents options', 'rich', null, 'pending'],
+            'rich send rejected, then plain text' => ['rejects the rich send', 'plain_text', 'rich_send_rejected', 'pending'],
+            'an adapter that declares nothing' => ['declares nothing', 'plain_text', 'channel_lacks_options', 'pending'],
+            'more choices than the channel shows' => ['shows at most two options', 'plain_text', 'too_many_options', 'pending'],
+            'both attempts failed' => ['rejects everything', 'plain_text', 'rich_send_rejected', 'undeliverable'],
+            'no adapter for the channel' => ['no adapter', 'plain_text', 'channel_lacks_options', 'undeliverable'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('deliveryOutcomes')]
+    public function the_waiting_action_is_rewritten_once_with_how_the_question_was_presented(
+        string $served,
+        string $mode,
+        ?string $reason,
+        string $finalState,
+    ): void {
+        $recorder = $this->recordContentRewrites();
+        $channel = $served === 'no adapter' ? 'carrier-pigeon' : 'telegram';
+        match ($served) {
+            'presents options' => $this->register(new RecordingPresentingDelivery('telegram')),
+            'rejects the rich send' => $this->register((new RecordingPresentingDelivery('telegram'))->rejectRich('rich no')),
+            'declares nothing' => $this->register(new RecordingChannelDelivery('telegram')),
+            'shows at most two options' => $this->register(new RecordingPresentingDelivery('telegram', new ChannelQuestionCapabilities(
+                supportsOptions: true,
+                maxOptions: 2,
+                maxOptionLabelChars: null,
+            ))),
+            'rejects everything' => $this->register((new RecordingPresentingDelivery('telegram'))->rejectRich('rich no')->failPlain('plain no')),
+            'no adapter' => null,
+        };
+
+        // Streamed: an undeliverable question's continuation is queued, so
+        // its action is still waiting when open() returns.
+        $opened = $this->openQuestion($this->questionConversation($this->user, $channel), OpenQuestionRequest::RESUME_STREAM);
+        $question = AgentQuestion::findOrFail($opened->question->id);
+        $this->assertSame($finalState, $question->state->value, 'precondition: the delivery outcome');
+        $this->assertSame(['presentation' => $mode, 'presentation_fallback_reason' => $reason], $this->recorded($question->id), 'precondition: the row records the presentation');
+        $this->assertNotNull($question->action_id, 'precondition: the ask is a recorded action');
+        $this->assertSame(
+            'awaiting_confirmation',
+            DB::table('agent_run_actions')->where('id', $question->action_id)->value('outcome'),
+            'precondition: the ask still waits for its continuation',
+        );
+
+        $this->assertCount(1, $recorder->contentRewrites, 'the waiting action is rewritten exactly once per delivery');
+        $this->assertSame($question->action_id, $recorder->contentRewrites[0]['action_id'], 'it is the question\'s own ask_user action that is rewritten');
+
+        $rewritten = json_decode($recorder->contentRewrites[0]['content'], true);
+        $this->assertIsArray($rewritten, 'the rewrite is the question\'s JSON snapshot');
+        $this->assertSame($question->id, $rewritten['question_id'] ?? null);
+        $this->assertSame('pending', $rewritten['resolution'] ?? null, 'written once delivery is known, before any resolution');
+        $this->assertSame(['mode' => $mode, 'fallback_reason' => $reason], $rewritten['presentation'] ?? null, 'the snapshot carries the recorded presentation');
+
+        if ($finalState === 'pending') {
+            $this->assertSame(
+                $question->runRecordSnapshot(),
+                $recorder->contentRewrites[0]['content'],
+                'the rewrite is the question\'s own snapshot, nothing else',
+            );
+        }
+
+        $this->assertSame(
+            $rewritten,
+            json_decode((string) $this->storedActionContent($question->action_id), true),
+            'the waiting action now shows how the question was presented',
+        );
+    }
+
+    #[Test]
+    public function an_action_that_is_no_longer_waiting_is_not_rewritten(): void
+    {
+        $this->register(new RecordingPresentingDelivery('telegram'));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+        $question = AgentQuestion::findOrFail($this->openQuestion($conversation, OpenQuestionRequest::RESUME_SYNC)->question->id);
+
+        $outcome = app(InteractiveQuestionAnswers::class)->submit($question->id, (string) $this->user->id, InteractiveAnswer::selection([2]), AnswerMethod::MessagingOption);
+        $this->assertSame(InteractiveAnswerStatus::Answered, $outcome->status, 'precondition: answered');
+        $this->app->call([new ResumeAfterQuestionJob($question->id), 'handle']);
+
+        $action = DB::table('agent_run_actions')->where('id', $question->action_id)->first();
+        $this->assertSame('success', $action->outcome, 'precondition: the ask is resolved in the run record');
+        $final = $action->content;
+        $this->assertNotNull($final);
+
+        /** @var list<string> $announced */
+        $announced = [];
+        Event::listen(RunActionUpdated::class, function (RunActionUpdated $event) use (&$announced) {
+            $announced[] = $event->actionId;
+        });
+        $this->recordContentRewrites();
+
+        // Delivered again, this time falling back to plain text, so the
+        // row's presentation changes and any rewrite would show.
+        $this->register((new RecordingPresentingDelivery('telegram'))->rejectRich('rich no'));
+        $delivery = app(QuestionPresenter::class)->deliverQuestion($conversation->fresh(), $question->fresh(), self::GOLDEN, null);
+        $this->assertTrue($delivery->delivered, 'precondition: the plain text was delivered');
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'rich_send_rejected'],
+            $this->recorded($question->id),
+            'precondition: the row now records a different presentation',
+        );
+
+        $after = DB::table('agent_run_actions')->where('id', $question->action_id)->first();
+        $this->assertSame('success', $after->outcome);
+        $this->assertSame($final, $after->content, 'a resolved action keeps its final record');
+        $this->assertNotContains($question->action_id, $announced, 'nothing changed, so nothing is announced');
     }
 }
