@@ -47,6 +47,8 @@ use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use ClarionApp\LlmClient\ValueObjects\PauseKind;
 use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
+use ClarionApp\LlmClient\ValueObjects\QuestionRefusal;
+use ClarionApp\LlmClient\ValueObjects\QuestionResolution;
 use ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision;
 use ClarionApp\LlmClient\ValueObjects\DegradationDecision;
 use ClarionApp\LlmClient\ValueObjects\RateLimitDecision;
@@ -69,6 +71,13 @@ class AgentLoopService
      * Public because AgentLoopStreamHandler records the same envelope on the
      * streaming path and must recognise the same operation.
      */
+    /**
+     * Marker key in an `ask_user` result meaning "pause this turn and ask
+     * the user": the pause site opens the question instead of returning
+     * the result to the model.
+     */
+    public const REQUIRES_USER_INPUT = '__requires_user_input';
+
     public const PAGE_TEXT_OPERATION_ID = 'clarionApp.llmClient.fetchPage.getTextFromUrl';
 
     /**
@@ -805,6 +814,42 @@ class AgentLoopService
             array_diff_key($pausedResult, ['tool_call_id' => true, 'content' => true]),
         );
 
+        $this->dispatchResumedStream($conversation, $runId, $iteration);
+    }
+
+    /**
+     * Continue a streamed run whose question was resolved.
+     *
+     * QuestionResumer has already answered the paused `ask_user` call with
+     * $resolution's outcome (in the same transaction that claimed the
+     * resume), so this runs the shared resume prologue, closes the step that
+     * spanned the wait, and dispatches the next streamed request from the
+     * stored conversation.
+     */
+    public function resumeQuestion(Conversation $conversation, Message $message, QuestionResolution $resolution): void
+    {
+        if (!$resolution->state->continuesRun()) {
+            throw new \LogicException("A question resolved as {$resolution->state->value} does not continue its run.");
+        }
+
+        $toolData = is_array($message->tool_data) ? $message->tool_data : [];
+        $runId = $toolData['run_id'] ?? null;
+
+        if ($this->resumePrologue($conversation, $runId, $toolData['step_id'] ?? null) !== null) {
+            return;
+        }
+
+        $this->closePausedStreamStep($toolData, $message);
+
+        $this->dispatchResumedStream($conversation, $runId, ($toolData['iteration'] ?? 1) + 1);
+    }
+
+    /**
+     * Rebuild the payload from the stored conversation and dispatch the
+     * next streamed request of a resumed run.
+     */
+    private function dispatchResumedStream(Conversation $conversation, ?string $runId, int $iteration): void
+    {
         // Resolved once, before buildToolsPayload()/applyContextWindowTrim()
         // — resuming never
         // mints a run of its own, so this reads back whatever the original
@@ -3328,6 +3373,33 @@ class AgentLoopService
                     ],
                 ],
             ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'ask_user',
+                    'description' => 'Pause this task and ask the user a question. The task resumes when the user answers, or when the question expires or is withdrawn; the outcome is returned as this tool\'s result. Offer up to 10 choices when the answer is one of a known set; the user may always answer in their own words. Only one question can be pending in a conversation at a time.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'question' => [
+                                'type' => 'string',
+                                'description' => 'The question to ask, in plain text.',
+                            ],
+                            'choices' => [
+                                'type' => 'array',
+                                'items' => ['type' => 'string'],
+                                'maxItems' => 10,
+                                'description' => 'Optional choices, shown numbered from 1.',
+                            ],
+                            'allow_multiple' => [
+                                'type' => 'boolean',
+                                'description' => 'Whether several choices may be selected. Requires choices.',
+                            ],
+                        ],
+                        'required' => ['question'],
+                    ],
+                ],
+            ],
         ];
 
         // 103-manager-agent (US1, contracts/manager-agent-meta-tools.md
@@ -3657,8 +3729,29 @@ class AgentLoopService
             'report_shortfall' => $this->handleReportShortfall($arguments, $conversation),
             'finalize_task' => $this->handleFinalizeTask($arguments, $conversation),
             'record_task_note' => $this->handleRecordTaskNote($arguments, $conversation),
+            'ask_user' => $this->handleAskUser($arguments),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
+    }
+
+    /**
+     * The checks an `ask_user` call gets before any pause. An invalid
+     * question is refused here, and the refusal is the call's result. A
+     * valid one comes back as a marker carrying the normalized question; the
+     * pause site that receives it opens the question and suspends the run.
+     */
+    private function handleAskUser(array $arguments): string
+    {
+        $validated = (new AgentQuestionValidator())->validate($arguments);
+
+        if ($validated instanceof QuestionRefusal) {
+            return $validated->toToolResult();
+        }
+
+        return json_encode(
+            [self::REQUIRES_USER_INPUT => true] + $validated->toArray(),
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
+        );
     }
 
     private function handleMemoryCreate(array $arguments, Conversation $conversation): string
@@ -5653,6 +5746,15 @@ class AgentLoopService
         $payload = [];
 
         foreach ($dbMessages as $msg) {
+            // A question shown to the user, a notice about it, and the
+            // user's answer exist only in the conversation: the model gets
+            // the outcome once, as the ask_user call's result.
+            if (is_array($msg->tool_data)
+                && in_array($msg->tool_data['kind'] ?? null, AgentQuestionService::CONVERSATION_ONLY_KINDS, true)
+            ) {
+                continue;
+            }
+
             if ($msg->tool_data && !empty($msg->tool_data['tool_calls'])) {
                 // Assistant message with tool calls
                 $assistantMsg = [

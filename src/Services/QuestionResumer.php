@@ -1,0 +1,181 @@
+<?php
+
+namespace ClarionApp\LlmClient\Services;
+
+use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
+use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
+use ClarionApp\LlmClient\Models\AgentQuestion;
+use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
+use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
+use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
+use ClarionApp\LlmClient\ValueObjects\QuestionResolution;
+use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
+use ClarionApp\LlmClient\ValueObjects\RunEndState;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Continues the run a resolved question paused, exactly once.
+ *
+ * The claim (`resumed_at`), answering the paused `ask_user` call with the
+ * resolution's outcome, marking the display message with the final state,
+ * and resolving the `ask_user` action commit together. Whoever makes that
+ * claim is the only caller that continues the run; every later call is a
+ * no-op. The continuation itself happens after the commit, on the loop path
+ * the run paused on.
+ */
+class QuestionResumer
+{
+    public const CONTEXT_DELETED_REASON = 'question context deleted';
+
+    public const WITHDRAWN_REASON = 'question withdrawn';
+
+    /**
+     * @return array<string, mixed>|null  the synchronous continuation's
+     *   result; null when there is none (a streamed continuation, a run
+     *   that ends instead of continuing, or nothing left to resume)
+     */
+    public function resume(string $questionId, ResumeCaller $caller): ?array
+    {
+        $claim = DB::transaction(fn () => $this->claim($questionId));
+
+        if ($claim === null) {
+            return null;
+        }
+
+        /** @var AgentQuestion $question */
+        [$question, $resolution, $conversation, $paused] = $claim;
+
+        $recorder = app(RunTraceRecorder::class);
+
+        // The conversation or the paused turn is gone: nothing can continue.
+        if ($conversation === null || $paused === null) {
+            $conversation?->update(['is_processing' => false]);
+            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::CONTEXT_DELETED_REASON);
+            $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, self::CONTEXT_DELETED_REASON);
+
+            return null;
+        }
+
+        // A withdrawn question ends its run without another model call.
+        if (!$question->state->continuesRun()) {
+            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON);
+            $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON);
+
+            return null;
+        }
+
+        try {
+            if ($question->resume_mode === OpenQuestionRequest::RESUME_STREAM) {
+                app(AgentLoopService::class)->resumeQuestion($conversation, $paused, $resolution);
+
+                return null;
+            }
+
+            throw new \LogicException("Resuming a question paused on the '{$question->resume_mode}' path is not supported.");
+        } catch (BudgetExceededException|RateLimitExceededException $e) {
+            // Re-admission refused the continuation; the gate has already
+            // left the conversation usable and recorded the refusal.
+            throw $e;
+        } catch (\Throwable $e) {
+            // The winning resolution marked the conversation processing and
+            // no sweep ever clears that flag, so a failed continuation must,
+            // or the conversation would refuse every later message.
+            Conversation::find($conversation->id)?->update(['is_processing' => false]);
+
+            $reason = 'question resume failed: '.get_class($e);
+            $recorder->closeStep($question->step_id, RunEndState::Failed, $reason);
+            $recorder->closeRun($question->run_id, RunEndState::Failed, $reason);
+
+            Log::error('QuestionResumer: the resumed run failed to continue', [
+                'question_id' => $question->id,
+                'conversation_id' => $conversation->id,
+                'caller' => $caller->value,
+                'error' => $e->getMessage(),
+            ]);
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Take the one-time resume claim and, when the context still exists,
+     * consume the paused turn. Runs inside the caller's transaction.
+     *
+     * @return array{0: AgentQuestion, 1: QuestionResolution, 2: ?Conversation, 3: ?Message}|null
+     */
+    private function claim(string $questionId): ?array
+    {
+        $now = now();
+
+        $claimed = DB::table('agent_questions')
+            ->where('id', $questionId)
+            ->where('state', '<>', QuestionState::Pending->value)
+            ->whereNull('resumed_at')
+            ->update(['resumed_at' => $now, 'updated_at' => $now]);
+
+        if ($claimed !== 1) {
+            return null;
+        }
+
+        $question = AgentQuestion::findOrFail($questionId);
+        $resolution = $this->resolutionFor($question);
+        $recorder = app(RunTraceRecorder::class);
+
+        $this->markDisplayMessage($question);
+
+        $conversation = Conversation::find($question->conversation_id);
+        $paused = Message::where('id', $question->paused_message_id)->lockForUpdate()->first();
+
+        if ($conversation === null || $paused === null) {
+            $recorder->closeAction($question->action_id, ActionOutcome::Failure, self::CONTEXT_DELETED_REASON);
+
+            return [$question, $resolution, $conversation, $paused];
+        }
+
+        app(PausedTurnWriter::class)->consume($paused, $resolution->toToolResult($question));
+
+        if ($question->state === QuestionState::Answered) {
+            $recorder->closeAction($question->action_id, ActionOutcome::Success);
+        } else {
+            $recorder->closeAction($question->action_id, ActionOutcome::Failure, 'question '.$question->state->value);
+        }
+
+        return [$question, $resolution, $conversation, $paused];
+    }
+
+    private function resolutionFor(AgentQuestion $question): QuestionResolution
+    {
+        if ($question->state === QuestionState::Answered) {
+            $selected = array_values($question->answer_selected ?? []);
+
+            return new QuestionResolution(
+                QuestionState::Answered,
+                new ParsedAnswer((string) $question->answer_raw, $selected !== [], $selected),
+            );
+        }
+
+        return new QuestionResolution($question->state, null, $question->delivery_failure_reason);
+    }
+
+    /** Record the question's final state on the message showing it. */
+    private function markDisplayMessage(AgentQuestion $question): void
+    {
+        if ($question->display_message_id === null) {
+            return;
+        }
+
+        $display = Message::find($question->display_message_id);
+        if ($display === null) {
+            return;
+        }
+
+        $toolData = is_array($display->tool_data) ? $display->tool_data : [];
+        $toolData['state'] = $question->state->value;
+        $display->tool_data = $toolData;
+        $display->save();
+    }
+}

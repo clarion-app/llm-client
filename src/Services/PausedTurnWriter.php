@@ -48,7 +48,9 @@ class PausedTurnWriter
         }
         $toolData['run_id'] = $context->runId;
         $toolData['step_id'] = $context->stepId;
-        $toolData['paused_at'] = now()->toIso8601String();
+        // Millisecond precision: the step's recorded human wait is measured
+        // from this stamp, and a whole-second stamp overstates it.
+        $toolData['paused_at'] = now()->format('Y-m-d\TH:i:s.vP');
         $toolData['action_id'] = $context->actionId;
 
         $message->tool_data = $toolData;
