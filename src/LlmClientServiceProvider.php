@@ -118,6 +118,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\EndIdleConversationsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredContextManagementMetricsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand::class,
+                \ClarionApp\LlmClient\Commands\ResolveExpiredQuestionsCommand::class,
                 \ClarionApp\LlmClient\Commands\ReleaseAbandonedReservationsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand::class,
                 \ClarionApp\LlmClient\Commands\ForwardRunTracesCommand::class,
@@ -171,6 +172,13 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // Resolve abandoned (stale in_progress) agent runs every five minutes.
             $schedule->command('llm-client:resolve-abandoned-runs')
                 ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Re-drive agent questions that were resolved but whose run never
+            // resumed (the resolving process died first) every minute, so a
+            // paused task waits at most a minute past the grace window.
+            $schedule->command('llm-client:resolve-expired-questions')
+                ->everyMinute()
                 ->withoutOverlapping();
 
             // Release cost reservations left held by a process that never
