@@ -3,19 +3,29 @@
 namespace Tests\Integration;
 
 use ClarionApp\Backend\Models\User;
+use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers;
+use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
+use ClarionApp\LlmClient\Services\InteractiveAnswerService;
 use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
 use ClarionApp\LlmClient\Services\RoleAssignmentService;
+use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\IntakeResult;
+use ClarionApp\LlmClient\ValueObjects\InteractiveAnswer;
+use ClarionApp\LlmClient\ValueObjects\InteractiveAnswerStatus;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Routing\Route as RoutingRoute;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Str;
+use Illuminate\Testing\TestResponse;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Integration\Harness\RecordingChannelDelivery;
 
@@ -32,7 +42,11 @@ use Tests\Integration\Harness\RecordingChannelDelivery;
  * undelivered-to-anyone-else. The one endpoint that takes a question id —
  * answering it from the conversation screen's form — checks the owner and
  * answers B exactly as it answers an id that does not exist, so the question
- * id alone grants nothing. B's own messages, blank or ordinary, never touch
+ * id alone grants nothing — nor does any other id B holds put in its place.
+ * The interactive-answer contract the messaging channel calls tells B
+ * nothing either: no state, and a refusal identical to an absent question's.
+ * An administrator allowed to read A's conversation reads its messages but
+ * is never shown the form. B's own messages, blank or ordinary, never touch
  * A's question.
  *
  * Real wiring throughout, with the model scripted at the HTTP boundary.
@@ -291,5 +305,117 @@ class AgentQuestionAuthorizationJourneyTest extends AssembledSystemTestCase
             $this->telegram->deliveries,
             fn (array $d) => $d['conversation_id'] === $ordinary->json('conversation_id'),
         )), 'no question is pushed to B');
+    }
+
+    /** Everything about a response a caller could tell apart, except the time it was sent. */
+    private function observable(TestResponse $response): array
+    {
+        $headers = $response->headers->all();
+        unset($headers['date']);
+
+        return ['status' => $response->getStatusCode(), 'body' => $response->getContent(), 'headers' => $headers];
+    }
+
+    #[Test]
+    public function another_user_holding_every_identifier_can_neither_see_nor_answer_through_any_interactive_route(): void
+    {
+        $this->scenario = 'question_authorization_interactive';
+        $this->script()
+            ->toolRequest('ask_user', ['question' => AgentQuestionWebJourneyTest::QUESTION, 'choices' => AgentQuestionWebJourneyTest::CHOICES]);
+        // Anything that did resume A's run would be queued here, not run unseen.
+        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+
+        $question = $this->userAIsAsked();
+        $userA = $this->fixture()->user;
+        $messagesBefore = Message::where('conversation_id', $question->conversation_id)->count();
+        $modelRequestsBefore = count($this->transport()->capturedChatPayloads());
+        $this->assertNotNull($question->display_message_id, 'precondition: the question has a display message');
+
+        $asA = $this->actingAs($userA, 'api');
+        $ownerList = $asA->getJson(self::API."/conversation/{$question->conversation_id}/message")->assertStatus(200)->json();
+        $ownerView = collect($ownerList)->firstWhere('id', $question->display_message_id)['question'] ?? null;
+        $this->assertSame('pending', $ownerView['state'] ?? null, 'precondition: the owner is shown the form');
+
+        // --- The web form's answer route ---------------------------------
+        $asB = $this->actingAs($this->userB, 'api');
+        $absentId = (string) Str::uuid();
+        $answers = [['selected' => [2]], ['selected' => [1]], ['text' => 'Frontend, please']];
+
+        foreach ($answers as $body) {
+            $label = json_encode($body);
+            $absent = $asB->postJson(self::API."/question/{$absentId}/answer", $body);
+            $absent->assertStatus(404);
+            $this->assertSame('{}', $absent->getContent(), "{$label}: an absent id is answered with an empty 404");
+
+            // B holds the question id, and tries every other id involved as one too.
+            $held = [
+                'question id' => $question->id,
+                'conversation id' => $question->conversation_id,
+                'display message id' => $question->display_message_id,
+                'run id' => $question->run_id,
+                'ask action id' => $question->action_id,
+            ];
+            foreach ($held as $what => $id) {
+                $this->assertSame(
+                    $this->observable($absent),
+                    $this->observable($asB->postJson(self::API."/question/{$id}/answer", $body)),
+                    "{$label} with A's {$what}: indistinguishable from an id that does not exist",
+                );
+            }
+            $this->assertStillPending($question, "B submitted {$label} to the form route");
+        }
+
+        // --- Viewing the conversation -------------------------------------
+        // An ordinary user is refused A's conversation, as before.
+        $asB->getJson(self::API."/conversation/{$question->conversation_id}/message")->assertStatus(403);
+
+        // An administrator allowed to read other users' conversations reads
+        // the same messages A does, but never the form: the question view is
+        // the owner's alone.
+        $adminId = (string) $this->userB->id;
+        Gate::define('list users', fn ($user) => (string) $user->id === $adminId);
+        $adminList = $this->actingAs($this->userB, 'api')
+            ->getJson(self::API."/conversation/{$question->conversation_id}/message")
+            ->assertStatus(200)
+            ->json();
+        $this->assertSame(array_column($ownerList, 'id'), array_column($adminList, 'id'), 'precondition: the administrator reads the same messages');
+        foreach ($adminList as $message) {
+            $this->assertArrayNotHasKey('question', $message, 'no message carries a question view for anyone but the owner');
+        }
+        $this->assertStillPending($question, 'B read A\'s conversation');
+
+        // --- The interactive-answer contract the messaging channel calls ---
+        $contract = $this->app->make(InteractiveQuestionAnswers::class);
+        $userB = (string) $this->userB->id;
+
+        $this->assertSame(QuestionState::Pending, $contract->stateFor($question->id, (string) $userA->id), 'precondition: the owner is told the state');
+        $this->assertNull($contract->stateFor($question->id, $userB), 'B is not told the question\'s state');
+        $this->assertNull($contract->stateFor($absentId, $userB));
+
+        $absentOutcome = $contract->submit($absentId, $userB, InteractiveAnswer::selection([2]), AnswerMethod::MessagingOption);
+        $this->assertSame(InteractiveAnswerStatus::NotFound, $absentOutcome->status);
+
+        foreach ([InteractiveAnswer::selection([2]), InteractiveAnswer::selection([3]), InteractiveAnswer::freeText('Frontend, please')] as $answer) {
+            $label = $answer->toReplyText();
+
+            $tapped = $contract->submit($question->id, $userB, $answer, AnswerMethod::MessagingOption);
+            $this->assertSame(InteractiveAnswerStatus::NotFound, $tapped->status, "B's tap {$label}: not found");
+            $this->assertEquals($absentOutcome, $tapped, "B's tap {$label}: indistinguishable from an absent question");
+
+            $recorded = $this->app->make(InteractiveAnswerService::class)->record($question->id, $userB, $answer, AnswerMethod::WebForm);
+            $this->assertEquals($absentOutcome, $recorded, "B's recorded answer {$label}: indistinguishable from an absent question");
+
+            $this->assertStillPending($question, "B answered {$label} through the contract");
+        }
+
+        // --- Nothing anywhere moved ----------------------------------------
+        Queue::assertNotPushed(ResumeAfterQuestionJob::class);
+        $this->assertNothingStoredFor($question, $messagesBefore);
+        $this->assertSame($modelRequestsBefore, count($this->transport()->capturedChatPayloads()), 'A\'s agent was never resumed');
+        $this->assertCount(1, $this->telegram->deliveries, 'only A\'s question was ever delivered');
+
+        // A's form is exactly as it was.
+        $ownerListAfter = $this->actingAs($userA, 'api')->getJson(self::API."/conversation/{$question->conversation_id}/message")->assertStatus(200)->json();
+        $this->assertSame($ownerView, collect($ownerListAfter)->firstWhere('id', $question->display_message_id)['question'] ?? null, 'A is still shown the same pending form');
     }
 }
