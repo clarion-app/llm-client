@@ -89,6 +89,8 @@ class QuestionRenderer
         return match ($state) {
             QuestionState::Answered => $this->renderAnswered($question, $stopped),
             QuestionState::Expired => 'This question expired and is no longer awaiting a reply.',
+            QuestionState::ExpiredAssumed => 'Expired — no answer arrived in time; the agent continued assuming: '
+                .$this->assumptionText($question),
             QuestionState::Stopped => 'Expired — work stopped. Answer to resume.',
             QuestionState::Withdrawn => $stopped
                 ? 'Discarded — the conversation was ended or deleted while work was stopped.'
@@ -125,11 +127,15 @@ class QuestionRenderer
             ? $question->unanswered_policy
             : UnansweredPolicy::tryFrom((string) $question->unanswered_policy);
 
-        if ($policy !== UnansweredPolicy::Stop) {
+        if ($policy === null) {
             return null;
         }
 
         $deadline = $this->deadlineText($question);
+
+        if ($policy === UnansweredPolicy::ProceedOnAssumption) {
+            return "If there is no answer by {$deadline}, the agent will continue assuming: ".$this->assumptionText($question);
+        }
 
         if ($question->consequential) {
             return 'Work on this task will not continue without your answer. '
@@ -137,6 +143,29 @@ class QuestionRenderer
         }
 
         return "If there is no answer by {$deadline}, work on this task will pause until you reply.";
+    }
+
+    /**
+     * The answer the question said it would assume if nobody answered it,
+     * in full: the chosen choices by number and text ("1. Backend, 3. Docs"),
+     * or the assumed free text in quotes. Null when it assumes nothing.
+     */
+    public function assumptionText(AgentQuestion $question): ?string
+    {
+        if ($question->assumed_answer_raw === null) {
+            return null;
+        }
+
+        $selected = array_values($question->assumed_answer_selected ?? []);
+
+        if ($selected === []) {
+            return '"'.$question->assumed_answer_raw.'"';
+        }
+
+        return implode(', ', array_map(
+            fn (array $choice) => $this->optionLabel((int) $choice['number'], (string) $choice['text'], null),
+            $selected,
+        ));
     }
 
     /**
@@ -224,6 +253,9 @@ class QuestionRenderer
         return match ($question->state) {
             QuestionState::Expired => "The question {$quoted} expired without an answer. "
                 .'The agent will continue without it; replies sent now are treated as new messages.',
+            QuestionState::ExpiredAssumed => "No answer to {$quoted} was received by the deadline ({$this->deadlineText($question)}). "
+                .'The agent is continuing on the assumption it stated: '.$this->assumptionText($question).'. '
+                .'Replies sent now are treated as new messages and will not change that assumption.',
             QuestionState::Stopped => "No answer to {$quoted} was received by the deadline ({$this->deadlineText($question)}). "
                 .'Work on this task has stopped. It will continue when you answer the question above.',
             QuestionState::Withdrawn => $question->stopped_at !== null

@@ -3,6 +3,8 @@
 namespace ClarionApp\LlmClient\Tests\Unit;
 
 use ClarionApp\LlmClient\Models\AgentQuestion;
+use ClarionApp\LlmClient\Services\AgentQuestionValidator;
+use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
 use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
 use ClarionApp\LlmClient\ValueObjects\QuestionResolution;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
@@ -148,6 +150,122 @@ class QuestionResolutionPolicyTest extends TestCase
 
         $this->assertSame('2026-10-13T14:00:03Z', $decoded['stopped_at']);
         $this->assertSame('2026-10-15T09:12:44Z', $decoded['answered_at']);
+    }
+
+    // ---------------------------------------------------------------
+    // Proceeded on the stated assumption
+    // ---------------------------------------------------------------
+
+    private const ASSUMED_MESSAGE_1440 = 'No answer arrived within 1440 minutes. Continue using the answer you said you would assume. '
+        .'This is your own assumption, not the user\'s answer: never treat it as the user\'s confirmation, approval or '
+        .'authorization of any action. The user has been told what was assumed.';
+
+    /** A proceed question that expired on its one-day deadline, assuming $raw / $selected. */
+    private function expiredAssumed(string $raw = '1', array $selected = [['number' => 1, 'text' => 'Record A']], array $extra = []): AgentQuestion
+    {
+        $askedAt = Carbon::parse('2026-10-13 13:00:00', 'UTC');
+
+        return $this->question($extra + [
+            'state' => 'expired_assumed',
+            'unanswered_policy' => 'proceed_on_assumption',
+            'assumed_answer_raw' => $raw,
+            'assumed_answer_selected' => $selected,
+            'requested_wait_minutes' => null,
+            'effective_wait_minutes' => 1440,
+            'expires_at' => $askedAt->copy()->addMinutes(1440),
+            'resolved_at' => $askedAt->copy()->addMinutes(1441),
+        ]);
+    }
+
+    private function resultFor(AgentQuestion $question): string
+    {
+        // The resolution a resumed run is handed for an assumed expiry.
+        return (new QuestionResolution(QuestionState::ExpiredAssumed, $question->assumedAnswer()))->toToolResult($question);
+    }
+
+    #[Test]
+    public function an_expiry_on_an_assumed_choice_hands_the_agent_its_assumption_flagged_as_assumed(): void
+    {
+        $this->assertSame(
+            '{"outcome":"expired_assumed","question_id":"'.self::ID.'","waiting_period_minutes":1440,'
+            .'"answer_source":"assumed",'
+            .'"assumed_answer":{"raw_reply":"1","is_selection":true,"selected":[{"number":1,"text":"Record A"}]},'
+            .'"message":"'.self::ASSUMED_MESSAGE_1440.'"}',
+            $this->resultFor($this->expiredAssumed()),
+        );
+    }
+
+    #[Test]
+    public function the_assumption_is_carried_under_its_own_key_never_as_an_answer(): void
+    {
+        $decoded = json_decode($this->resultFor($this->expiredAssumed()), true);
+
+        $this->assertSame(
+            ['outcome', 'question_id', 'waiting_period_minutes', 'answer_source', 'assumed_answer', 'message'],
+            array_keys($decoded),
+        );
+        $this->assertArrayNotHasKey('answer', $decoded, 'an assumption is never reported as the user\'s answer');
+        $this->assertSame('assumed', $decoded['answer_source']);
+    }
+
+    #[Test]
+    public function an_assumption_in_the_agents_own_words_is_carried_as_free_text(): void
+    {
+        $decoded = json_decode($this->resultFor($this->expiredAssumed('keep both records', [])), true);
+
+        $this->assertSame('expired_assumed', $decoded['outcome']);
+        $this->assertSame(['raw_reply' => 'keep both records', 'is_selection' => false, 'selected' => []], $decoded['assumed_answer']);
+        $this->assertSame(self::ASSUMED_MESSAGE_1440, $decoded['message']);
+    }
+
+    #[Test]
+    public function an_assumed_multi_selection_carries_every_choice(): void
+    {
+        $question = $this->expiredAssumed('1, 2', [['number' => 1, 'text' => 'Record A'], ['number' => 2, 'text' => 'Record B']], ['allow_multiple' => true]);
+
+        $decoded = json_decode($this->resultFor($question), true);
+
+        $this->assertSame(
+            ['raw_reply' => '1, 2', 'is_selection' => true, 'selected' => [['number' => 1, 'text' => 'Record A'], ['number' => 2, 'text' => 'Record B']]],
+            $decoded['assumed_answer'],
+        );
+    }
+
+    #[Test]
+    public function an_assumed_number_typed_as_text_is_delivered_as_that_choice(): void
+    {
+        // The agent wrote the number as its own words; the assumption is
+        // read exactly as the same typed reply would be, so the agent gets
+        // back the selection of choice 2.
+        $request = (new AgentQuestionValidator())->validate([
+            'question' => 'Which record should I keep?',
+            'choices' => ['Record A', 'Record B'],
+            'assumed_text' => '2',
+        ]);
+        $this->assertInstanceOf(AskUserRequest::class, $request, 'precondition: the ask is accepted');
+
+        $question = $this->expiredAssumed($request->assumedAnswer->rawReply, $request->assumedAnswer->selected);
+        $decoded = json_decode($this->resultFor($question), true);
+
+        $this->assertSame(
+            ['raw_reply' => '2', 'is_selection' => true, 'selected' => [['number' => 2, 'text' => 'Record B']]],
+            $decoded['assumed_answer'],
+        );
+    }
+
+    #[Test]
+    public function the_assumed_result_states_the_period_fixed_when_the_question_was_asked(): void
+    {
+        config(['llm-client.agent_questions.expiry_minutes' => 5]);
+        $question = $this->expiredAssumed(extra: [
+            'effective_wait_minutes' => 600,
+            'expires_at' => Carbon::parse('2026-10-13 23:00:00', 'UTC'),
+        ]);
+
+        $decoded = json_decode($this->resultFor($question), true);
+
+        $this->assertSame(600, $decoded['waiting_period_minutes']);
+        $this->assertStringStartsWith('No answer arrived within 600 minutes. ', $decoded['message']);
     }
 
     // ---------------------------------------------------------------

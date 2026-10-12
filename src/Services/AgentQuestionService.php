@@ -232,7 +232,9 @@ class AgentQuestionService
      * following the policy it was asked with.
      *
      * A question asked before unanswered policies existed expires as it
-     * always did. A `stop` question stops instead: it keeps its
+     * always did. A `proceed_on_assumption` question resolves the same way
+     * but its run continues on the answer it said it would assume. A `stop`
+     * question stops instead: it keeps its
      * conversation's question slot so a late reply still reaches it, stays
      * unresolved, leaves the conversation not processing, and its run waits
      * for a late answer or a discard.
@@ -255,7 +257,12 @@ class AgentQuestionService
         }
 
         if ($policy === UnansweredPolicy::ProceedOnAssumption) {
-            throw new \LogicException('Expiry of a question that proceeds on an assumption is not supported yet.');
+            // Resolved like any expiry: the slot is released and the
+            // conversation marked processing, since the run continues on
+            // the assumption the question stated.
+            return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::ExpiredAssumed, [], true)
+                ? QuestionState::ExpiredAssumed
+                : null;
         }
 
         // Written with its fraction of a second, which a bound date loses

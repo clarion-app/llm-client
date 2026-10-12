@@ -8,7 +8,10 @@ use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\AgentQuestionService;
 use ClarionApp\LlmClient\Services\AnswerParser;
+use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
+use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -282,6 +285,107 @@ class QuestionViewPolicyTest extends TestCase
         $this->assertFalse($view['answered_late']);
         $this->assertSame('Discarded — the conversation was ended or deleted while work was stopped.', $view['outcome_text']);
         $this->assertSame('2026-10-13T09:00:05Z', $view['stopped_at']);
+    }
+
+    // ---------------------------------------------------------------
+    // Proceeding on an assumption
+    // ---------------------------------------------------------------
+
+    private const PROCEED_STATEMENT = 'If there is no answer by 10:00 UTC on 12 Oct 2026 (1 hour after this was asked), '
+        .'the agent will continue assuming: 1. Backend';
+
+    private const ASSUMED_OUTCOME = 'Expired — no answer arrived in time; the agent continued assuming: 1. Backend';
+
+    /** @return array{0: Conversation, 1: AgentQuestion} a pending question asked now that proceeds assuming choice 1 within an hour */
+    private function askedToProceed(): array
+    {
+        $conversation = $this->questionConversation($this->owner, 'web');
+        $opened = $this->openQuestion($conversation, request: new AskUserRequest(
+            'Which part should I change first?',
+            ['Backend', 'Frontend', 'Docs'],
+            false,
+            policy: UnansweredPolicy::ProceedOnAssumption,
+            assumedAnswer: new ParsedAnswer('1', true, [['number' => 1, 'text' => 'Backend']]),
+            requestedWaitMinutes: 60,
+        ));
+        $question = AgentQuestion::findOrFail($opened->question->id);
+        $this->assertSame('proceed_on_assumption', DB::table('agent_questions')->where('id', $question->id)->value('unanswered_policy'), 'precondition: asked to proceed');
+
+        return [$conversation, $question];
+    }
+
+    #[Test]
+    public function a_pending_proceed_question_shows_its_assumption_and_the_exact_advance_statement(): void
+    {
+        [$conversation, $question] = $this->askedToProceed();
+
+        $view = $this->viewOn($this->index($conversation), $question->display_message_id);
+
+        $this->assertSame('pending', $view['state'], 'precondition');
+        $this->assertSame(self::VIEW_KEYS, $this->sortedKeys($view));
+        $this->assertTrue($view['answerable']);
+        $this->assertSame('proceed_on_assumption', $view['if_unanswered']);
+        $this->assertFalse($view['consequential']);
+        $this->assertSame(
+            ['is_selection' => true, 'selected' => [['number' => 1, 'text' => 'Backend']], 'raw_reply' => '1'],
+            $view['assumed_answer'],
+        );
+        $this->assertSame(self::PROCEED_STATEMENT, $view['expiry_statement']);
+        $this->assertNull($view['outcome_text']);
+        $this->assertNull($view['stopped_at']);
+        $this->assertFalse($view['answered_late']);
+
+        $displayed = (string) DB::table('messages')->where('id', $question->display_message_id)->value('content');
+        $this->assertStringEndsWith("\n\n".self::PROCEED_STATEMENT, $displayed, 'one producer: the question text ends with the same statement');
+    }
+
+    #[Test]
+    public function a_proceed_question_assuming_its_own_words_shows_them(): void
+    {
+        $conversation = $this->questionConversation($this->owner, 'web');
+        $opened = $this->openQuestion($conversation, request: new AskUserRequest(
+            'Which part should I change first?',
+            ['Backend', 'Frontend', 'Docs'],
+            false,
+            policy: UnansweredPolicy::ProceedOnAssumption,
+            assumedAnswer: new ParsedAnswer('whichever is smallest', false, []),
+            requestedWaitMinutes: 60,
+        ));
+
+        $view = $this->viewOn($this->index($conversation), $opened->question->display_message_id);
+
+        $this->assertSame(['is_selection' => false, 'selected' => [], 'raw_reply' => 'whichever is smallest'], $view['assumed_answer']);
+        $this->assertSame(
+            'If there is no answer by 10:00 UTC on 12 Oct 2026 (1 hour after this was asked), the agent will continue assuming: "whichever is smallest"',
+            $view['expiry_statement'],
+        );
+    }
+
+    #[Test]
+    public function a_question_that_proceeded_on_its_assumption_is_no_longer_answerable_and_says_what_was_assumed(): void
+    {
+        [$conversation, $question] = $this->askedToProceed();
+        // Exactly as the expiry leaves it: resolved, slot released.
+        DB::table('agent_questions')->where('id', $question->id)->update([
+            'state' => 'expired_assumed',
+            'resolved_at' => '2026-10-12 10:00:30',
+            'pending_conversation_id' => null,
+        ]);
+
+        $view = $this->viewOn($this->index($conversation), $question->display_message_id);
+
+        $this->assertSame('expired_assumed', $view['state']);
+        $this->assertSame(self::VIEW_KEYS, $this->sortedKeys($view));
+        $this->assertFalse($view['answerable'], 'the decision is made; a late answer cannot change it');
+        $this->assertSame(self::ASSUMED_OUTCOME, $view['outcome_text']);
+        $this->assertSame('proceed_on_assumption', $view['if_unanswered']);
+        $this->assertSame(
+            ['is_selection' => true, 'selected' => [['number' => 1, 'text' => 'Backend']], 'raw_reply' => '1'],
+            $view['assumed_answer'],
+        );
+        $this->assertNull($view['answer'], 'the assumption is not shown as the user\'s answer');
+        $this->assertNull($view['stopped_at']);
+        $this->assertFalse($view['answered_late']);
     }
 
     // ---------------------------------------------------------------

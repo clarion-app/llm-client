@@ -667,22 +667,6 @@ class AgentQuestionServiceTransitionTest extends TestCase
 
         $this->travel(2)->hours();
 
-        if ($how === 'expire') {
-            // Expiry of a question that proceeds on its assumption does not
-            // exist yet: it refuses before writing anything, so the question
-            // is still pending with everything decided at ask time intact.
-            try {
-                $this->resolve($how, $conversation, $id);
-                $this->fail('expiring a question that proceeds on an assumption is refused for now');
-            } catch (\LogicException $e) {
-                $this->assertSame('Expiry of a question that proceeds on an assumption is not supported yet.', $e->getMessage());
-            }
-            $this->assertSame('pending', $this->row($id)->state);
-            $this->assertSame($before, $this->policyColumns($id));
-
-            return;
-        }
-
         $this->resolve($how, $conversation, $id);
 
         $this->assertSame($before, $this->policyColumns($id));

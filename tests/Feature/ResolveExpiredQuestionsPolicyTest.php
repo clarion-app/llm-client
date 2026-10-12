@@ -15,9 +15,11 @@ use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
 use ClarionApp\LlmClient\ValueObjects\OpenedQuestion;
+use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
 use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -103,7 +105,7 @@ class ResolveExpiredQuestionsPolicyTest extends TestCase
      * policy by default; $legacy marks the row as asked before unanswered
      * policies existed. Deliveries made while opening it are cleared.
      */
-    private function openQuestion(bool $legacy = false, string $resumeMode = OpenQuestionRequest::RESUME_STREAM): AgentQuestion
+    private function openQuestion(bool $legacy = false, string $resumeMode = OpenQuestionRequest::RESUME_STREAM, bool $proceed = false): AgentQuestion
     {
         $conversation = Conversation::factory()->create([
             'user_id' => $this->user->id,
@@ -135,7 +137,16 @@ class ResolveExpiredQuestionsPolicyTest extends TestCase
 
         $opened = app(AgentQuestionService::class)->open(new OpenQuestionRequest(
             conversation: $conversation->fresh(),
-            request: new AskUserRequest(self::QUESTION, ['Backend', 'Frontend', 'Docs'], false, requestedWaitMinutes: 60),
+            request: $proceed
+                ? new AskUserRequest(
+                    self::QUESTION,
+                    ['Backend', 'Frontend', 'Docs'],
+                    false,
+                    policy: UnansweredPolicy::ProceedOnAssumption,
+                    assumedAnswer: new ParsedAnswer('1', true, [['number' => 1, 'text' => 'Backend']]),
+                    requestedWaitMinutes: 60,
+                )
+                : new AskUserRequest(self::QUESTION, ['Backend', 'Frontend', 'Docs'], false, requestedWaitMinutes: 60),
             runId: $runId,
             stepId: $stepId,
             actionId: $actionId,
@@ -156,7 +167,7 @@ class ResolveExpiredQuestionsPolicyTest extends TestCase
         }
 
         $question = AgentQuestion::findOrFail($opened->question->id);
-        $this->assertSame($legacy ? null : 'stop', $question->unanswered_policy?->value, 'precondition: the policy the question was asked with');
+        $this->assertSame($legacy ? null : ($proceed ? 'proceed_on_assumption' : 'stop'), $question->unanswered_policy?->value, 'precondition: the policy the question was asked with');
         $this->assertSame(60 * 60, $question->expires_at->getTimestamp() - $question->asked_at->getTimestamp(), 'precondition: a one-hour period');
         $this->assertFalse((bool) Conversation::findOrFail($question->conversation_id)->is_processing, 'precondition: a waiting conversation is not processing');
 
@@ -259,6 +270,124 @@ class ResolveExpiredQuestionsPolicyTest extends TestCase
 
         $this->assertSame([$legacy->id], $this->queuedResumes(), 'only the legacy expiry queues a resume; a stopped run waits');
         $this->assertCount(1, Queue::pushed(ResumeAfterQuestionJob::class), 'exactly one job for the three questions');
+    }
+
+    /** Asked at 09:15 UTC on 12 Oct 2026 with a one-hour period, assuming choice 1. */
+    private const ASSUMED_NOTICE = 'No answer to "Which part should I change first?" was received by the deadline '
+        .'(10:15 UTC on 12 Oct 2026 (1 hour after this was asked)). The agent is continuing on the assumption it stated: 1. Backend. '
+        .'Replies sent now are treated as new messages and will not change that assumption.';
+
+    #[Test]
+    public function the_sweep_proceeds_on_the_assumption_and_queues_the_run_to_continue(): void
+    {
+        $legacy = $this->openQuestion(legacy: true);
+        $proceed = $this->openQuestion(proceed: true);
+        $stop = $this->openQuestion();
+
+        $this->travel(61)->minutes();
+        $this->sweep();
+
+        $proceed->refresh();
+        $this->assertSame(QuestionState::ExpiredAssumed, $proceed->state, 'a proceed question expires on its assumption');
+        $this->assertNotNull($proceed->resolved_at, 'proceeding resolves the question');
+        $this->assertSame('2026-10-12 10:16:00', $proceed->resolved_at->copy()->utc()->format('Y-m-d H:i:s'));
+        $this->assertNull($proceed->stopped_at, 'nothing stopped');
+        $this->assertNull($proceed->resumed_at, 'resuming is the queued job\'s work');
+        $this->assertNull($proceed->pending_conversation_id, 'the slot is freed: the decision is made');
+        $this->assertTrue((bool) Conversation::findOrFail($proceed->conversation_id)->is_processing, 'the conversation is processing until its run continues');
+        $this->assertSame('1', $proceed->assumed_answer_raw, 'the assumption is unchanged');
+        $this->assertSame([['number' => 1, 'text' => 'Backend']], $proceed->assumed_answer_selected);
+        $this->assertNull($proceed->answer_raw, 'an assumption is never recorded as an answer');
+
+        $notices = $this->noticesFor($proceed);
+        $this->assertCount(1, $notices, 'the user is told once');
+        $this->assertSame('assistant', $notices[0]->role);
+        $this->assertSame(self::ASSUMED_NOTICE, $notices[0]->content);
+        $this->assertEquals(
+            ['kind' => 'agent_question_notice', 'question_id' => $proceed->id, 'state' => 'expired_assumed'],
+            $notices[0]->tool_data,
+        );
+        $this->assertSame([self::ASSUMED_NOTICE], $this->deliveredTo($proceed), 'the notice is delivered once on the conversation\'s channel');
+
+        // The other two follow their own policies in the same sweep.
+        $this->assertSame(QuestionState::Expired, $legacy->fresh()->state);
+        $this->assertSame(QuestionState::Stopped, $stop->fresh()->state);
+
+        $queued = $this->queuedResumes();
+        sort($queued);
+        $expected = [$legacy->id, $proceed->id];
+        sort($expected);
+        $this->assertSame($expected, $queued, 'the legacy and proceed runs continue; the stopped one waits');
+        $this->assertCount(2, Queue::pushed(ResumeAfterQuestionJob::class), 'exactly two jobs for the three questions');
+    }
+
+    #[Test]
+    public function a_proceed_question_not_yet_due_is_left_alone_and_a_second_sweep_changes_nothing(): void
+    {
+        $overdue = $this->openQuestion(proceed: true);
+
+        $this->travel(30)->minutes();
+        $notDue = $this->openQuestion(proceed: true);
+
+        $this->travel(31)->minutes();
+        $this->sweep();
+
+        $this->assertSame(QuestionState::ExpiredAssumed, $overdue->fresh()->state, 'precondition: the overdue question proceeded');
+        $this->assertSame(QuestionState::Pending, $notDue->fresh()->state, 'a question inside its period is untouched');
+        $this->assertSame([], $this->noticesFor($notDue));
+
+        $deliveries = $this->web->deliveries;
+        $messages = Message::count();
+
+        $this->travel(10)->seconds();
+        $output = $this->sweep();
+
+        $this->assertSame(QuestionState::ExpiredAssumed, $overdue->fresh()->state);
+        $this->assertCount(1, $this->noticesFor($overdue), 'never told twice');
+        $this->assertSame($deliveries, $this->web->deliveries);
+        $this->assertSame($messages, Message::count());
+        $this->assertSame([$overdue->id], $this->queuedResumes(), 'one job, queued once');
+        $this->assertStringContainsString('Questions expired: 0', $output);
+    }
+
+    #[Test]
+    public function expire_with_policy_returns_expired_assumed_for_a_proceed_question(): void
+    {
+        $proceed = $this->openQuestion(proceed: true);
+        $service = app(AgentQuestionService::class);
+
+        $this->travel(61)->minutes();
+
+        $this->assertSame(QuestionState::ExpiredAssumed, $service->expireWithPolicy($proceed));
+        $this->assertSame(QuestionState::ExpiredAssumed, $proceed->fresh()->state);
+        $this->assertNull($service->expireWithPolicy($proceed->fresh()), 'it cannot expire again');
+        $this->assertFalse($service->expire($proceed->fresh()));
+        $this->assertCount(1, $this->noticesFor($proceed));
+        $this->assertSame([], $this->queuedResumes(), 'the service queues nothing; resuming is the sweep\'s job');
+
+        // expire() answers whether it won for a proceed question too.
+        $another = $this->openQuestion(proceed: true);
+        $this->travel(61)->minutes();
+        $this->assertTrue($service->expire($another));
+        $this->assertSame(QuestionState::ExpiredAssumed, $another->fresh()->state);
+    }
+
+    #[Test]
+    public function a_proceed_question_answered_in_time_is_not_expired(): void
+    {
+        $proceed = $this->openQuestion(proceed: true);
+        $service = app(AgentQuestionService::class);
+
+        $this->travel(61)->minutes();
+        $this->assertNotNull($service->answer($proceed, (new AnswerParser())->parse('2', $proceed), (string) $this->user->id, '2'), 'precondition: the answer won');
+
+        $this->assertNull($service->expireWithPolicy($proceed));
+        $this->sweep();
+
+        $fresh = $proceed->fresh();
+        $this->assertSame(QuestionState::Answered, $fresh->state, 'the answer stands');
+        $this->assertSame([], $this->noticesFor($proceed), 'the loser writes no notice');
+        $this->assertSame([], $this->web->deliveries);
     }
 
     #[Test]

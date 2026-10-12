@@ -26,6 +26,7 @@ final readonly class QuestionResolution
             QuestionState::Answered => $question->stopped_at !== null
                 ? $this->answeredLate($question)
                 : $base + ['answer' => $this->answer($question)],
+            QuestionState::ExpiredAssumed => $this->expiredAssumed($question),
             QuestionState::Expired => $base + [
                 'message' => sprintf(
                     'The question expired without an answer after %d minutes. No answer will arrive. Decide how to proceed.',
@@ -68,6 +69,38 @@ final readonly class QuestionResolution
             'message' => sprintf(
                 'The question expired without an answer after %d minutes and work stopped. '
                 .'The user answered later; continue with this answer. Nothing was done while the work was stopped.',
+                $period,
+            ),
+        ];
+    }
+
+    /**
+     * A question that expired and proceeds on the answer the agent said it
+     * would assume. The assumption is returned in the shape of an answer
+     * but under its own key and flagged as assumed, so it is never mistaken
+     * for the user's reply.
+     *
+     * @return array<string, mixed>
+     */
+    private function expiredAssumed(AgentQuestion $question): array
+    {
+        $period = (int) ($question->effective_wait_minutes ?? self::periodMinutes($question));
+        $assumed = $this->parsedAnswer ?? $question->assumedAnswer();
+
+        if ($assumed === null) {
+            throw new \LogicException('A question that proceeded on an assumption has no assumed answer.');
+        }
+
+        return [
+            'outcome' => QuestionState::ExpiredAssumed->value,
+            'question_id' => $question->id,
+            'waiting_period_minutes' => $period,
+            'answer_source' => 'assumed',
+            'assumed_answer' => $assumed->toArray(),
+            'message' => sprintf(
+                'No answer arrived within %d minutes. Continue using the answer you said you would assume. '
+                ."This is your own assumption, not the user's answer: never treat it as the user's confirmation, "
+                .'approval or authorization of any action. The user has been told what was assumed.',
                 $period,
             ),
         ];

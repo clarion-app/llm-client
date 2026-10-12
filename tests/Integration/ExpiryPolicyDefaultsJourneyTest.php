@@ -2,18 +2,23 @@
 
 namespace Tests\Integration;
 
+use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
+use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\Integration\Harness\CapturedPayload;
@@ -31,6 +36,12 @@ use Tests\Integration\Harness\RecordingChannelDelivery;
  * delivered. The same ask made on the web and on a messaging channel is
  * stored identically: the asking side carries nothing about where the user
  * is.
+ *
+ * And when nobody answers, each question does what it said it would: in
+ * one conversation, the question that named an assumption proceeds on it
+ * at its deadline, while the question that named stop and the one that
+ * named nothing each stop the work — no model call, no tool call — until
+ * the user answers them late.
  *
  * Real wiring throughout — controllers, agent loop, validator, question
  * service, intake, resumer — with the model scripted at the streaming and
@@ -289,6 +300,121 @@ class ExpiryPolicyDefaultsJourneyTest extends AssembledSystemTestCase
         // Every question was shown on the chat; nothing on the web.
         $this->assertCount(3, $this->telegram->textsFor($conversation->id));
         $this->assertSame([], $this->web->deliveries);
+    }
+
+    // ---------------------------------------------------------------
+    // Nobody answers: each question does what it was asked to do
+    // ---------------------------------------------------------------
+
+    /** @var array<int, true> resume jobs already worked, by object id */
+    private array $worked = [];
+
+    private function sweepAfterTheDeadline(): void
+    {
+        // Every question here waits the installation default, one day.
+        $this->travel(1441)->minutes();
+        $this->assertSame(0, Artisan::call('llm-client:resolve-expired-questions'), 'the sweep succeeds');
+    }
+
+    private function workQueuedResumes(): int
+    {
+        $worked = 0;
+        foreach (Queue::pushed(ResumeAfterQuestionJob::class)->all() as $job) {
+            if (isset($this->worked[spl_object_id($job)])) {
+                continue;
+            }
+            $this->worked[spl_object_id($job)] = true;
+            $this->app->call([$job, 'handle']);
+            $worked++;
+        }
+
+        return $worked;
+    }
+
+    /** The result of call $toolCallId in model request #$index. */
+    private function toolResultIn(int $index, string $toolCallId): ?array
+    {
+        foreach ($this->chatPayloadMessages($index) as $message) {
+            if (($message['role'] ?? null) === 'tool' && ($message['tool_call_id'] ?? null) === $toolCallId) {
+                $content = $message['content'] ?? null;
+
+                return json_decode(is_string($content) ? $content : json_encode($content), true);
+            }
+        }
+
+        return null;
+    }
+
+    public function test_unanswered_the_proceed_question_proceeds_and_the_stop_and_default_questions_stop(): void
+    {
+        $this->scenario = 'expiry_policy_three_expiries_in_turn';
+        $this->entryPath = 'sync';
+        $this->travelTo(Carbon::parse('2026-10-12 09:00:00', 'UTC'));
+        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        $conversation = $this->telegramConversation();
+
+        $this->script()
+            ->toolRequest('ask_user', $this->ask(['if_unanswered' => 'proceed_on_assumption', 'assumed_choices' => [1]]))
+            ->toolRequest('ask_user', $this->ask(['if_unanswered' => 'stop'], 'Should the tests run on every push?'))
+            ->toolRequest('ask_user', $this->ask([], 'Which directory should the tests live in?'))
+            ->finalAnswer('PHPUnit, on every push, in the tests directory.');
+
+        // The proceed question: nobody answers, and the agent goes on with
+        // its assumption — straight into the second question.
+        $this->send($conversation, 'Set up the tests.')->assertStatus(202)->assertJson(['status' => 'awaiting_user']);
+        $proceed = $this->latestQuestionIn($conversation);
+        $this->assertSame(UnansweredPolicy::ProceedOnAssumption, $proceed->unanswered_policy, 'precondition');
+
+        $this->sweepAfterTheDeadline();
+        $this->assertSame(QuestionState::ExpiredAssumed, $proceed->fresh()->state, 'the proceed question proceeds on its assumption');
+        $this->assertCount(1, Queue::pushed(ResumeAfterQuestionJob::class), 'its run is queued to continue');
+        $this->assertSame(1, $this->workQueuedResumes());
+        $this->assertCount(2, $this->transport()->capturedChatPayloads(), 'the run continued with one model request');
+        $proceedResult = $this->toolResultIn(1, (string) $proceed->tool_call_id);
+        $this->assertSame('expired_assumed', $proceedResult['outcome'] ?? null);
+        $this->assertSame('assumed', $proceedResult['answer_source'] ?? null);
+        $this->assertSame([['number' => 1, 'text' => 'PHPUnit']], $proceedResult['assumed_answer']['selected'] ?? null);
+
+        // The stop question: nobody answers, and the work stops.
+        $stop = $this->latestQuestionIn($conversation);
+        $this->assertNotSame($proceed->id, $stop->id, 'the continuation asked the second question');
+        $this->assertSame(UnansweredPolicy::Stop, $stop->unanswered_policy, 'precondition');
+
+        $this->sweepAfterTheDeadline();
+        $this->assertSame(QuestionState::Stopped, $stop->fresh()->state, 'the stop question stops');
+        $this->assertCount(2, $this->transport()->capturedChatPayloads(), 'no model call after the stop');
+        $this->assertCount(1, Queue::pushed(ResumeAfterQuestionJob::class), 'nothing is queued for a stopped question');
+        $this->assertSame(0, $this->workQueuedResumes());
+
+        // Answered late, it resumes — straight into the third question.
+        $this->send($conversation, 'Yes, every push')->assertStatus(202)->assertJson(['status' => 'awaiting_user']);
+        $this->assertSame('answered_late', $this->toolResultIn(2, (string) $stop->tool_call_id)['outcome'] ?? null);
+
+        // The question naming neither: it stops too.
+        $neither = $this->latestQuestionIn($conversation);
+        $this->assertNotSame($stop->id, $neither->id, 'the continuation asked the third question');
+        $this->assertSame(UnansweredPolicy::Stop, $neither->unanswered_policy, 'precondition');
+
+        $this->sweepAfterTheDeadline();
+        $this->assertSame(QuestionState::Stopped, $neither->fresh()->state, 'naming nothing stops: proceeding never happens by omission');
+        $this->assertCount(3, $this->transport()->capturedChatPayloads(), 'no model call after the stop');
+        $this->assertCount(1, Queue::pushed(ResumeAfterQuestionJob::class), 'nothing is queued for a stopped question');
+
+        $this->send($conversation, 'tests')
+            ->assertStatus(200)
+            ->assertJson(['status' => 'completed', 'content' => 'PHPUnit, on every push, in the tests directory.']);
+        $this->assertSame('answered_late', $this->toolResultIn(3, (string) $neither->tool_call_id)['outcome'] ?? null);
+
+        // The user was told what happened to each, in the chat.
+        $notices = Message::where('conversation_id', $conversation->id)->get()
+            ->filter(fn (Message $m) => ($m->tool_data['kind'] ?? null) === 'agent_question_notice')
+            ->map(fn (Message $m) => [$m->tool_data['question_id'] ?? null, $m->tool_data['state'] ?? null])
+            ->values()
+            ->all();
+        $this->assertSame(
+            [[$proceed->id, 'expired_assumed'], [$stop->id, 'stopped'], [$neither->id, 'stopped']],
+            $notices,
+        );
     }
 
     // ---------------------------------------------------------------

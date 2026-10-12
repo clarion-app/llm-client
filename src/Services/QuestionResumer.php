@@ -250,6 +250,10 @@ class QuestionResumer
             );
         }
 
+        if ($question->state === QuestionState::ExpiredAssumed) {
+            return new QuestionResolution(QuestionState::ExpiredAssumed, $question->assumedAnswer());
+        }
+
         return new QuestionResolution($question->state, null, $question->delivery_failure_reason);
     }
 

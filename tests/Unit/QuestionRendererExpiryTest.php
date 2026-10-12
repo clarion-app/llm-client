@@ -374,6 +374,198 @@ class QuestionRendererExpiryTest extends TestCase
         );
     }
 
+    // ---------------------------------------------------------------
+    // Proceeding on an assumption
+    // ---------------------------------------------------------------
+
+    private const FRAMEWORK_QUESTION = 'Which test framework should I set up?';
+
+    /** The plain-text framework question exactly as it renders without a statement. */
+    private const FRAMEWORK_PLAIN = "Which test framework should I set up?\n"
+        ."\n"
+        ."1. PHPUnit\n"
+        ."2. Pest\n"
+        ."\n"
+        .'Reply with the number of your choice, or answer in your own words.';
+
+    private const FRAMEWORK_WITH_OPTIONS = "Which test framework should I set up?\n"
+        ."\n"
+        ."1. PHPUnit\n"
+        ."2. Pest\n"
+        ."\n"
+        .'Choose an option below, or reply in your own words.';
+
+    private const PROCEED_STATEMENT_60 = 'If there is no answer by 13:00 UTC on 12 Oct 2026 (1 hour after this was asked), '
+        .'the agent will continue assuming: 1. PHPUnit';
+
+    /**
+     * A question that proceeds on an assumption, asked at 12:00 UTC on
+     * 12 Oct 2026 with a one-hour period. By default it assumes choice 1.
+     */
+    private function proceedQuestion(array $extra = []): AgentQuestion
+    {
+        return $this->question('proceed_on_assumption', 60, $extra + [
+            'question' => self::FRAMEWORK_QUESTION,
+            'choices' => ['PHPUnit', 'Pest'],
+            'assumed_answer_raw' => '1',
+            'assumed_answer_selected' => [['number' => 1, 'text' => 'PHPUnit']],
+        ]);
+    }
+
+    #[Test]
+    public function the_assumption_of_a_single_choice_is_its_full_label(): void
+    {
+        $this->assertSame('1. PHPUnit', $this->renderer()->assumptionText($this->proceedQuestion()));
+    }
+
+    #[Test]
+    public function the_assumption_of_several_choices_lists_each_full_label_separated_by_commas(): void
+    {
+        $question = $this->proceedQuestion([
+            'question' => 'Which parts should I change?',
+            'choices' => ['Backend', 'Frontend', 'Docs'],
+            'allow_multiple' => true,
+            'assumed_answer_raw' => '1, 3',
+            'assumed_answer_selected' => [['number' => 1, 'text' => 'Backend'], ['number' => 3, 'text' => 'Docs']],
+        ]);
+
+        $this->assertSame('1. Backend, 3. Docs', $this->renderer()->assumptionText($question));
+    }
+
+    #[Test]
+    public function an_assumption_in_the_agents_own_words_is_quoted_in_full(): void
+    {
+        $long = 'use Pest, with the Laravel plugin, parallel runs on, coverage reported per file and the slowest ten tests listed';
+        $question = $this->proceedQuestion(['assumed_answer_raw' => $long, 'assumed_answer_selected' => []]);
+
+        $this->assertSame('"'.$long.'"', $this->renderer()->assumptionText($question), 'quoted, never shortened');
+
+        $short = $this->proceedQuestion(['assumed_answer_raw' => 'use Pest', 'assumed_answer_selected' => []]);
+        $this->assertSame('"use Pest"', $this->renderer()->assumptionText($short));
+    }
+
+    #[Test]
+    public function a_question_that_assumes_nothing_has_no_assumption_text(): void
+    {
+        $this->assertNull($this->renderer()->assumptionText($this->question()), 'a stop question assumes nothing');
+        $this->assertNull($this->renderer()->assumptionText($this->question(policy: null)), 'nor does a legacy question');
+    }
+
+    #[Test]
+    public function a_question_that_proceeds_says_what_the_agent_will_assume_and_by_when(): void
+    {
+        $this->assertSame(self::PROCEED_STATEMENT_60, $this->renderer()->expiryStatement($this->proceedQuestion()));
+    }
+
+    #[Test]
+    public function the_proceed_statement_quotes_an_assumption_in_the_agents_own_words(): void
+    {
+        $question = $this->proceedQuestion(['assumed_answer_raw' => 'use Pest', 'assumed_answer_selected' => []]);
+
+        $this->assertSame(
+            'If there is no answer by 13:00 UTC on 12 Oct 2026 (1 hour after this was asked), the agent will continue assuming: "use Pest"',
+            $this->renderer()->expiryStatement($question),
+        );
+    }
+
+    #[Test]
+    public function the_proceed_statement_is_the_last_block_of_both_renderings(): void
+    {
+        $question = $this->proceedQuestion();
+
+        $this->assertSame(self::FRAMEWORK_PLAIN."\n\n".self::PROCEED_STATEMENT_60, $this->renderer()->render($question));
+        $this->assertSame(self::FRAMEWORK_WITH_OPTIONS."\n\n".self::PROCEED_STATEMENT_60, $this->renderer()->renderWithOptions($question));
+        $this->assertSame(
+            "Before I start:\n\n".self::FRAMEWORK_PLAIN."\n\n".self::PROCEED_STATEMENT_60,
+            $this->renderer()->render($question, 'Before I start:'),
+        );
+    }
+
+    #[Test]
+    public function the_rich_body_and_every_plain_text_presentation_carry_the_proceed_statement(): void
+    {
+        $question = $this->proceedQuestion();
+        $planner = app(QuestionPresentationPlanner::class);
+
+        // Rich: the body shown with the buttons, and its plain fallback (sent
+        // when the channel rejects the rich message).
+        $rich = $planner->plan($question, new RecordingPresentingDelivery('telegram', ChannelQuestionCapabilities::unlimited()), null);
+        $this->assertSame(PresentationMode::Rich, $rich->mode);
+        $this->assertSame(self::FRAMEWORK_WITH_OPTIONS."\n\n".self::PROCEED_STATEMENT_60, $rich->presentation->bodyText);
+        $this->assertSame(self::FRAMEWORK_PLAIN."\n\n".self::PROCEED_STATEMENT_60, $rich->presentation->plainText);
+
+        // A channel that cannot show options, and one that cannot show this
+        // many, receive the plain-text question, which is render()'s.
+        foreach ([ChannelQuestionCapabilities::none(), new ChannelQuestionCapabilities(true, 1)] as $capabilities) {
+            $plain = $planner->plan($question, new RecordingPresentingDelivery('telegram', $capabilities), null);
+            $this->assertSame(PresentationMode::PlainText, $plain->mode, 'precondition: this channel degrades to plain text');
+        }
+        $this->assertStringEndsWith("\n\n".self::PROCEED_STATEMENT_60, $this->renderer()->render($question));
+    }
+
+    #[Test]
+    public function an_assumed_label_longer_than_a_buttons_limit_is_still_stated_in_full(): void
+    {
+        $long = 'PHPUnit with the strict configuration, random order and every deprecation reported';
+        $question = $this->proceedQuestion([
+            'choices' => [$long, 'Pest'],
+            'assumed_answer_selected' => [['number' => 1, 'text' => $long]],
+        ]);
+
+        $plan = app(QuestionPresentationPlanner::class)->plan(
+            $question,
+            new RecordingPresentingDelivery('telegram', new ChannelQuestionCapabilities(true, null, 30)),
+            null,
+        );
+
+        $this->assertSame(PresentationMode::Rich, $plan->mode);
+        $this->assertSame(30, mb_strlen($plan->presentation->options[0]->label), 'precondition: the button label is shortened');
+        $this->assertStringEndsWith('the agent will continue assuming: 1. '.$long, $plan->presentation->bodyText, 'the statement names the whole assumption');
+        $this->assertStringEndsWith('the agent will continue assuming: 1. '.$long, $plan->presentation->plainText);
+    }
+
+    #[Test]
+    public function the_assumed_notice_names_the_question_its_deadline_and_the_assumption(): void
+    {
+        $expired = $this->proceedQuestion(['state' => 'expired_assumed']);
+
+        $this->assertSame(
+            'No answer to "Which test framework should I set up?" was received by the deadline '
+            .'(13:00 UTC on 12 Oct 2026 (1 hour after this was asked)). '
+            .'The agent is continuing on the assumption it stated: 1. PHPUnit. '
+            .'Replies sent now are treated as new messages and will not change that assumption.',
+            $this->renderer()->renderNotice($expired),
+        );
+    }
+
+    #[Test]
+    public function the_assumed_outcome_line_names_the_assumption(): void
+    {
+        $this->assertSame(
+            'Expired — no answer arrived in time; the agent continued assuming: 1. PHPUnit',
+            $this->renderer()->renderOutcome($this->proceedQuestion(['state' => 'expired_assumed'])),
+        );
+
+        $freeText = $this->proceedQuestion(['state' => 'expired_assumed', 'assumed_answer_raw' => 'use Pest', 'assumed_answer_selected' => []]);
+        $this->assertSame(
+            'Expired — no answer arrived in time; the agent continued assuming: "use Pest"',
+            $this->renderer()->renderOutcome($freeText),
+        );
+    }
+
+    #[Test]
+    public function the_legacy_expiry_notice_and_outcome_are_unchanged(): void
+    {
+        $legacy = $this->question(policy: null, extra: ['state' => 'expired']);
+
+        $this->assertSame(
+            'The question "Which record should I keep?" expired without an answer. '
+            .'The agent will continue without it; replies sent now are treated as new messages.',
+            $this->renderer()->renderNotice($legacy),
+        );
+        $this->assertSame('This question expired and is no longer awaiting a reply.', $this->renderer()->renderOutcome($legacy));
+    }
+
     #[Test]
     public function questions_answered_or_withdrawn_without_stopping_keep_their_outcome_lines(): void
     {
