@@ -127,9 +127,13 @@ class AgentQuestionAuthorizationJourneyTest extends AssembledSystemTestCase
             ->assertStatus(403);
         $this->assertStillPending($question, 'B replied through POST message');
 
-        // A blank reply is refused the same way, never answer_required.
+        // A blank reply is never answer_required: it is the ordinary blank-
+        // message validation error, exactly what a conversation with no
+        // pending question returns, so it reveals nothing about A's question.
         $asB->postJson(self::API.'/message', ['conversation_id' => $question->conversation_id, 'content' => ''])
-            ->assertStatus(403);
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('content')
+            ->assertJsonMissing(['code' => 'answer_required']);
         $this->assertStillPending($question, 'B sent a blank reply through POST message');
 
         // The agent endpoint, A's conversation id: the existing 403 shape.
@@ -139,8 +143,9 @@ class AgentQuestionAuthorizationJourneyTest extends AssembledSystemTestCase
         $this->assertStillPending($question, 'B replied through POST agent');
 
         $asB->postJson(self::API.'/agent', ['message' => '', 'channel' => 'telegram', 'conversation_id' => $question->conversation_id])
-            ->assertStatus(403)
-            ->assertExactJson(['error' => 'Forbidden', 'code' => 'forbidden']);
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('message')
+            ->assertJsonMissing(['code' => 'answer_required']);
         $this->assertStillPending($question, 'B sent a blank reply through POST agent');
 
         // The question id in place of a conversation id is not a conversation.

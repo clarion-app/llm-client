@@ -57,7 +57,7 @@ class QuestionResumer
         // The conversation or the paused turn is gone: nothing can continue.
         if ($conversation === null || $paused === null) {
             $conversation?->update(['is_processing' => false]);
-            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::CONTEXT_DELETED_REASON);
+            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::CONTEXT_DELETED_REASON, $this->waitMs($question, $paused));
             $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, self::CONTEXT_DELETED_REASON);
 
             return null;
@@ -65,7 +65,7 @@ class QuestionResumer
 
         // A withdrawn question ends its run without another model call.
         if (!$question->state->continuesRun()) {
-            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON);
+            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON, $this->waitMs($question, $paused));
             $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON);
 
             return null;
@@ -115,6 +115,34 @@ class QuestionResumer
 
             throw $e;
         }
+    }
+
+    /**
+     * The human wait of the step a run that ends here (withdrawn, or its
+     * context gone) spent paused on its question, so the run's recorded
+     * human wait covers it exactly as it does for a run that continues.
+     * Measured from the paused turn's millisecond `paused_at` stamp (the
+     * question row's own timestamps are whole seconds, which would overstate
+     * it); unknown when the paused turn is gone.
+     */
+    private function waitMs(AgentQuestion $question, ?Message $paused): ?int
+    {
+        $pausedAt = is_array($paused?->tool_data) ? ($paused->tool_data['paused_at'] ?? null) : null;
+
+        if ($question->step_id === null || !is_string($pausedAt)) {
+            return null;
+        }
+
+        // Never earlier than the step itself began: `paused_at` is stored to
+        // the millisecond and the step's start to the microsecond, so the
+        // wait can otherwise exceed the step it is part of by a rounding.
+        $from = \Illuminate\Support\Carbon::parse($pausedAt);
+        $stepStartedAt = DB::table('agent_run_steps')->where('id', $question->step_id)->value('started_at');
+        if ($stepStartedAt !== null && \Illuminate\Support\Carbon::parse($stepStartedAt)->greaterThan($from)) {
+            $from = \Illuminate\Support\Carbon::parse($stepStartedAt);
+        }
+
+        return max(0, (int) floor($from->diffInMilliseconds(now(), false)));
     }
 
     /** Push a resumed synchronous run's reply to the conversation's channel. */

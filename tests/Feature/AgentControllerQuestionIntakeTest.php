@@ -583,4 +583,128 @@ class AgentControllerQuestionIntakeTest extends TestCase
         $this->assertSame(1, $this->chatCalls);
         $this->assertSame(0, AgentQuestion::count());
     }
+
+    // ---------------------------------------------------------------
+    // Post-implementation reconciliation
+    // ---------------------------------------------------------------
+
+    /**
+     * Between intake reading the conversation's pending question and the
+     * answer's compare-and-set, the question expires the way the expiry
+     * sweep expires it (which also marks the conversation processing for
+     * the run it is about to resume). Returns a flag set once that happened.
+     */
+    private function expireWhenIntakeReads(AgentQuestion $question): \ArrayObject
+    {
+        $state = new \ArrayObject(['expired' => false]);
+        Event::listen('eloquent.retrieved: '.AgentQuestion::class, function (AgentQuestion $retrieved) use ($state, $question) {
+            if ($state['expired'] || $retrieved->id !== $question->id) {
+                return;
+            }
+            $state['expired'] = true;
+            $this->assertTrue(app(AgentQuestionService::class)->expire($retrieved), 'precondition: the expiry won');
+        });
+
+        return $state;
+    }
+
+    #[Test]
+    public function a_reply_without_a_conversation_id_that_loses_to_an_expiry_is_an_ordinary_message_elsewhere(): void
+    {
+        $waiting = $this->conversation();
+        $question = $this->pendingQuestion($waiting);
+        $expired = $this->expireWhenIntakeReads($question);
+        $this->replies = [$this->textReply('A fresh start.')];
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'channel' => 'telegram',
+        ]);
+
+        $this->assertTrue($expired['expired'], 'precondition: intake read the pending question');
+        $response->assertStatus(200);
+        $this->assertNotSame(
+            $waiting->id,
+            $response->json('conversation_id'),
+            'the expired question\'s conversation is resuming its own run; the reply must not start a second one there',
+        );
+        $this->assertSame(1, $this->userMessageCount($waiting), 'nothing was added to the conversation that is resuming');
+        $this->assertSame(QuestionState::Expired, $question->fresh()->state, 'the expiry stands');
+        $this->assertNull($question->fresh()->answer_raw);
+    }
+
+    #[Test]
+    public function an_explicit_reply_that_loses_to_an_expiry_conflicts_instead_of_starting_a_second_run(): void
+    {
+        $conversation = $this->conversation();
+        $question = $this->pendingQuestion($conversation);
+        $expired = $this->expireWhenIntakeReads($question);
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'conversation_id' => $conversation->id,
+            'channel' => 'telegram',
+        ]);
+
+        $this->assertTrue($expired['expired'], 'precondition: intake read the pending question');
+        $response->assertStatus(409);
+        $response->assertJson(['code' => 'processing']);
+        $this->assertSame(0, $this->chatCalls, 'no model call: the expired question\'s own resume owns the conversation');
+        $this->assertSame(QuestionState::Expired, $question->fresh()->state);
+    }
+
+    /**
+     * A blank message is let through validation only for the requester's
+     * own pending question; otherwise whether someone else's conversation is
+     * waiting on its user would show in the status code.
+     */
+    #[Test]
+    #[DataProvider('blankReplies')]
+    public function a_blank_message_reveals_nothing_about_another_users_pending_question(?string $message): void
+    {
+        $conversation = $this->conversation();
+        $question = $this->pendingQuestion($conversation);
+
+        foreach (['/api/clarion-app/llm-client/agent' => 'message', '/api/clarion-app/llm-client/message' => 'content'] as $endpoint => $field) {
+            $response = $this->actingAs($this->stranger, 'api')->postJson($endpoint, [
+                $field => $message,
+                'conversation_id' => $conversation->id,
+                'channel' => 'telegram',
+            ]);
+
+            $response->assertStatus(422);
+            $response->assertJsonValidationErrors($field);
+        }
+
+        $this->assertSame(QuestionState::Pending, $question->fresh()->state);
+        $this->assertSame(0, $this->chatCalls);
+    }
+
+    /**
+     * A Telegram conversation is listed on the web screen too, and the
+     * owner's reply there answers its question. The question paused a
+     * synchronous run, whose reply `POST message` does not carry, so it is
+     * pushed to the conversation's own channel.
+     */
+    #[Test]
+    public function a_synchronous_question_answered_from_the_web_screen_delivers_the_reply_to_its_channel(): void
+    {
+        $conversation = $this->conversation('telegram');
+        $question = $this->pendingQuestion($conversation);
+        $this->telegram->deliveries = [];
+        $this->replies = [$this->textReply('Backend first, then.')];
+
+        $this->actingAs($this->user, 'api')->postJson('/api/clarion-app/llm-client/message', [
+            'conversation_id' => $conversation->id,
+            'content' => '1',
+        ])->assertStatus(201);
+
+        $this->assertSame(QuestionState::Answered, $question->fresh()->state);
+        $this->assertSame(1, $this->chatCalls, 'the paused run continued');
+        $this->assertContains(
+            'Backend first, then.',
+            $this->telegram->textsFor($conversation->id),
+            'the continuation\'s reply reaches the Telegram chat the conversation lives on',
+        );
+    }
 }

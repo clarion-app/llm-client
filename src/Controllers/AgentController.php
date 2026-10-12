@@ -43,10 +43,31 @@ class AgentController extends Controller
             ? $this->conversationAwaitingAnswer((string) $user->id, $channel)
             : null;
 
-        if (trim($message) === '') {
-            $hasPendingQuestion = empty($validated['conversation_id'])
-                ? $questionConversation !== null
-                : AgentQuestion::where('pending_conversation_id', $validated['conversation_id'])->exists();
+        $answered = null;
+
+        if ($questionConversation !== null) {
+            [$answered, $refusal] = $this->acceptAnswer($questionConversation, (string) $user->id, $message);
+            if ($refusal !== null) {
+                return $refusal;
+            }
+
+            // Resolved by something else (expiry, withdrawal) a moment
+            // earlier: the reply is an ordinary message, handled by the
+            // ordinary lookup below rather than run in the conversation
+            // whose resolution may already be resuming.
+            if ($answered === null) {
+                $questionConversation = null;
+            }
+        }
+
+        // Only the requester's own pending question lets a blank message
+        // through, so a blank message can never reveal whether someone
+        // else's conversation is waiting on its user.
+        if ($answered === null && trim($message) === '') {
+            $hasPendingQuestion = !empty($validated['conversation_id'])
+                && AgentQuestion::where('pending_conversation_id', $validated['conversation_id'])
+                    ->where('user_id', $user->id)
+                    ->exists();
 
             if (!$hasPendingQuestion) {
                 $request->validate(['message' => 'required|string']);
@@ -81,7 +102,10 @@ class AgentController extends Controller
                 return $refusal;
             }
 
-            if (!$answered && $conversation->is_processing) {
+            // Read fresh: a question resolved a moment ago (e.g. by expiry)
+            // has already marked the conversation processing for its resumed
+            // run, and this message must not start a second, concurrent one.
+            if (!$answered && Conversation::whereKey($conversation->id)->value('is_processing')) {
                 return response()->json([
                     'error' => 'Conversation is already processing',
                     'code' => 'processing',
@@ -125,15 +149,8 @@ class AgentController extends Controller
             }
         }
 
-        if ($questionConversation !== null) {
-            [$answered, $refusal] = $this->acceptAnswer($conversation, (string) $user->id, $message);
-            if ($refusal !== null) {
-                return $refusal;
-            }
-        }
-
         try {
-            if ($answered ?? false) {
+            if ($answered !== null) {
                 // Intake recorded the answer; the run it paused continues
                 // synchronously and its result is this request's response.
                 $result = app(QuestionResumer::class)->resume($answered->id, ResumeCaller::HttpRequest)

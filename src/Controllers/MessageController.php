@@ -21,6 +21,7 @@ use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
 use ClarionApp\LlmClient\Services\QuestionResumer;
 use ClarionApp\LlmClient\ValueObjects\IntakeResult;
 use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
+use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 
 class MessageController extends Controller
@@ -52,8 +53,13 @@ class MessageController extends Controller
         ]);
         $content = (string) ($validatedData['content'] ?? '');
 
+        // Only the requester's own pending question lets a blank message
+        // through, so a blank message can never reveal whether someone
+        // else's conversation is waiting on its user.
         if (trim($content) === ''
-            && !AgentQuestion::where('pending_conversation_id', $validatedData['conversation_id'])->exists()
+            && !AgentQuestion::where('pending_conversation_id', $validatedData['conversation_id'])
+                ->where('user_id', Auth::id())
+                ->exists()
         ) {
             $request->validate(['content' => 'required|string']);
         }
@@ -105,7 +111,16 @@ class MessageController extends Controller
         }
 
         if ($intake->kind === IntakeResult::ANSWERED) {
-            app(QuestionResumer::class)->resume($intake->question->id, ResumeCaller::HttpRequest);
+            // This response carries only the answer message. A question
+            // paused on the streaming path continues over the conversation's
+            // broadcasts; one paused on the synchronous path (a Telegram
+            // conversation answered from this screen) returns its reply
+            // here, so the resumer pushes it to the conversation's own
+            // channel, as it does when no request is waiting at all.
+            $caller = $intake->question->resume_mode === OpenQuestionRequest::RESUME_SYNC
+                ? ResumeCaller::Background
+                : ResumeCaller::HttpRequest;
+            app(QuestionResumer::class)->resume($intake->question->id, $caller);
 
             return response()->json($intake->message, 201);
         }

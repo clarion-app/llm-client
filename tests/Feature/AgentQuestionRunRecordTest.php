@@ -501,6 +501,35 @@ class AgentQuestionRunRecordTest extends TestCase
         $this->assertGreaterThanOrEqual($stepWait, $run['confirm_wait_ms'], 'the run\'s human wait includes the question wait');
     }
 
+    /**
+     * A withdrawn question ends its run instead of continuing it, but the
+     * user's wait was just as real: the paused step records it and the run's
+     * human wait includes it.
+     */
+    #[Test]
+    #[DataProvider('channels')]
+    public function a_withdrawn_questions_wait_is_the_paused_steps_human_wait(string $channel): void
+    {
+        $conversation = $this->conversation($channel);
+        $question = $this->askIn($conversation);
+
+        $this->travel(90)->seconds();
+        $this->actingAs($this->user, 'api')
+            ->postJson("/api/clarion-app/llm-client/conversation/{$conversation->id}/end")
+            ->assertStatus(200);
+        $this->assertSame(QuestionState::Withdrawn, $question->fresh()->state, 'precondition: ending the conversation withdrew the question');
+        $this->assertSame('stopped_early', DB::table('agent_runs')->where('id', $question->run_id)->value('end_state'), 'precondition: the run ended');
+
+        $stepWait = DB::table('agent_run_steps')->where('id', $question->step_id)->value('wait_ms');
+        $this->assertNotNull($stepWait, 'the paused step records its human wait');
+        $this->assertGreaterThanOrEqual(90000, (int) $stepWait, 'the question wait is the paused step\'s wait');
+        $this->assertGreaterThanOrEqual(
+            (int) $stepWait,
+            (int) DB::table('agent_runs')->where('id', $question->run_id)->value('confirm_wait_ms'),
+            'the run\'s human wait includes the question wait',
+        );
+    }
+
     #[Test]
     public function an_expired_question_is_shown_as_expired(): void
     {
