@@ -277,6 +277,10 @@ class QuestionRenderer
     /** The notice shown when a question is resolved without an answer. */
     public function renderNotice(AgentQuestion $question): string
     {
+        if ($question->isCeilingPrompt() && $question->state === QuestionState::Stopped) {
+            return app(TaskBudgetText::class)->expiredStopped();
+        }
+
         $quoted = '"'.$question->question.'"';
 
         return match ($question->state) {

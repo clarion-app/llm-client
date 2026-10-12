@@ -54,6 +54,11 @@ use Tests\Integration\Harness\TaskBudgetJourneys;
  * its run. Any other failure closes the run as failed and frees the
  * conversation. A second resume, or one for a task
  * that is no longer paused on the prompt, does nothing.
+ *
+ * A prompt withdrawn because its conversation was ended or deleted
+ * discards the task: it ends, and its run closes with the reason any
+ * withdrawn question's run closes with. So does a decision whose
+ * conversation is gone by the time it is resumed.
  */
 class TaskBudgetResumerTest extends AssembledSystemTestCase
 {
@@ -437,6 +442,97 @@ class TaskBudgetResumerTest extends AssembledSystemTestCase
         $this->assertSame('ended', $task->state, 'the run\'s close ends its task');
         $this->assertSame('failed', $task->end_reason);
         $this->assertSame(2, $this->modelRequests('sync'));
+    }
+
+    // ---------------------------------------------------------------
+    // Withdrawn, or the conversation gone
+    // ---------------------------------------------------------------
+
+    /** @return array<string, array{0: string, 1: string}> */
+    public static function withdrawals(): array
+    {
+        return [
+            'pending, synchronous' => ['sync', 'pending'],
+            'pending, streamed' => ['stream', 'pending'],
+            'stopped, synchronous' => ['sync', 'stopped'],
+            'stopped, streamed' => ['stream', 'stopped'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('withdrawals')]
+    public function a_withdrawn_prompt_discards_the_task_and_closes_its_run(string $path, string $waiting): void
+    {
+        $this->scenario = 'task_budget_resumer_withdrawn_'.$waiting.'_'.$path;
+        $this->entryPath = $path;
+        [$conversation, $prompt, $runId] = $this->pausedAtTheCeiling($path);
+        $taskId = $this->taskRowOf($conversation)->id;
+        if ($waiting === 'stopped') {
+            $stop = app(QuestionAnswerIntake::class)->accept($conversation->fresh(), (string) $this->fixture()->user->id, 'stop');
+            $this->assertSame(IntakeResult::DECISION_RECORDED, $stop->kind, 'precondition: the user stopped the task');
+        }
+
+        // What ending or deleting the conversation does first.
+        $this->app->forgetScopedInstances();
+        $this->assertTrue(app(AgentQuestionService::class)->withdrawForConversation($conversation->fresh()));
+
+        $this->assertSame(QuestionState::Withdrawn, $prompt->fresh()->state);
+        $task = DB::table('task_budgets')->where('id', $taskId)->first();
+        $this->assertSame('ended', $task->state, 'the task is discarded');
+        $this->assertSame('discarded', $task->end_reason);
+        $this->assertNotNull($task->ended_at);
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertSame('stopped_early', $run->end_state);
+        $this->assertSame(
+            $waiting === 'stopped' ? QuestionResumer::DISCARDED_REASON : QuestionResumer::WITHDRAWN_REASON,
+            $run->end_reason,
+            'the run closes with the reason any withdrawn question\'s run closes with',
+        );
+        $withdrawn = $this->events($taskId, 'prompt_withdrawn');
+        $this->assertCount(1, $withdrawn);
+        $this->assertSame($prompt->id, $withdrawn[0]['question_id'] ?? null);
+        $ended = $this->events($taskId, 'ended');
+        $this->assertCount(1, $ended);
+        $this->assertSame('discarded', $ended[0]['reason'] ?? null);
+        $this->assertCount(0, $this->events($taskId, 'allowance_granted'));
+        $this->assertSame(2, $this->modelRequests($path), 'nothing runs');
+        $this->assertFalse((bool) $conversation->fresh()->is_processing);
+
+        // Resuming it again changes nothing.
+        $events = DB::table('task_budget_events')->where('task_budget_id', $taskId)->count();
+        $this->assertNull($this->resume($prompt));
+        $this->assertSame($events, DB::table('task_budget_events')->where('task_budget_id', $taskId)->count());
+        $this->assertSame('ended', DB::table('task_budgets')->where('id', $taskId)->value('state'));
+    }
+
+    #[Test]
+    #[DataProvider('paths')]
+    public function a_decision_whose_conversation_is_gone_discards_the_task_and_closes_its_run_as_context_deleted(string $path): void
+    {
+        $this->scenario = 'task_budget_resumer_conversation_gone_'.$path;
+        $this->entryPath = $path;
+        [$conversation, $prompt, $runId] = $this->pausedAtTheCeiling($path);
+        $taskId = $this->taskRowOf($conversation)->id;
+        $this->decide($conversation, 'continue');
+
+        // Deleted after the decision was recorded and before it was resumed.
+        Conversation::findOrFail($conversation->id)->delete();
+
+        $this->assertNull($this->resume($prompt));
+
+        $task = DB::table('task_budgets')->where('id', $taskId)->first();
+        $this->assertSame('ended', $task->state, 'the task is discarded');
+        $this->assertSame('discarded', $task->end_reason);
+        $this->assertNotNull($task->ended_at);
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertSame('stopped_early', $run->end_state);
+        $this->assertSame(QuestionResumer::CONTEXT_DELETED_REASON, $run->end_reason);
+        $ended = $this->events($taskId, 'ended');
+        $this->assertCount(1, $ended);
+        $this->assertSame('discarded', $ended[0]['reason'] ?? null);
+        $this->assertCount(0, $this->events($taskId, 'allowance_granted'), 'the decision is never applied');
+        $this->assertCount(0, $this->events($taskId, 'prompt_withdrawn'), 'the prompt was decided, not withdrawn');
+        $this->assertSame(2, $this->modelRequests($path), 'nothing runs');
     }
 
     // ---------------------------------------------------------------

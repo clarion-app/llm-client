@@ -300,8 +300,10 @@ class AgentQuestionService
                 'question_id' => $question->id,
                 'conversation_id' => $conversation->id,
                 'channel' => $question->channel,
-                'reason' => $delivery->failureReason,
+                'reason' => self::recordableReason((string) $delivery->failureReason),
             ]);
+            $this->stopCeilingPrompt($question, null, null, (string) ($delivery->failureReason ?? 'delivery failed'));
+            $question->refresh();
         }
 
         return new OpenedQuestion($question, $display, $delivery);
@@ -320,7 +322,10 @@ class AgentQuestionService
     /**
      * Park a pending ceiling prompt at the user's request (or because it
      * could not be delivered): stopped, keeping the question slot. The
-     * user's reply is kept in the conversation and a notice says so.
+     * user's reply is kept in the conversation and a notice says so. A
+     * prompt stopped because its channel failed records the failure and
+     * posts no notice (the channel has just failed, and the user chose
+     * nothing); it stays answerable from the web form.
      * Returns the stored reply, or null when the prompt was not pending.
      */
     public function stopCeilingPrompt(AgentQuestion $question, ?string $userId = null, ?string $rawContent = null, ?string $deliveryFailureReason = null): ?Message
@@ -331,7 +336,7 @@ class AgentQuestionService
             $fields['delivery_failure_reason'] = self::recordableReason($deliveryFailureReason);
         }
 
-        $result = DB::transaction(function () use ($question, $fields, $userId, $rawContent) {
+        $result = DB::transaction(function () use ($question, $fields, $userId, $rawContent, $deliveryFailureReason) {
             if (!$this->transition($question->id, [QuestionState::Pending], QuestionState::Stopped, $fields, false, false, false)) {
                 return null;
             }
@@ -348,7 +353,7 @@ class AgentQuestionService
                     'tool_data' => $this->answerToolData($stopped),
                 ]);
             }
-            $notice = $conversation === null ? null : Message::create([
+            $notice = ($conversation === null || $deliveryFailureReason !== null) ? null : Message::create([
                 'conversation_id' => $conversation->id,
                 'role' => 'assistant',
                 'user' => $conversation->character,
@@ -366,7 +371,11 @@ class AgentQuestionService
         [$stopped, $conversation, $reply, $notice] = $result;
 
         if ($stopped->task_budget_id !== null && ($task = TaskBudget::find($stopped->task_budget_id)) !== null) {
-            app(TaskBudgetService::class)->appendEvent($task, 'decision', ['decision' => 'stop', 'question_id' => $stopped->id], $userId);
+            if ($deliveryFailureReason !== null) {
+                app(TaskBudgetService::class)->appendEvent($task, 'prompt_stopped', ['question_id' => $stopped->id, 'reason' => 'undeliverable']);
+            } else {
+                app(TaskBudgetService::class)->appendEvent($task, 'decision', ['decision' => 'stop', 'question_id' => $stopped->id], $userId);
+            }
         }
         if ($conversation !== null && $notice !== null) {
             $this->deliverNotice($conversation, $notice, 'AgentQuestionService: the stop notice could not be delivered', ['question_id' => $stopped->id, 'conversation_id' => $conversation->id]);
@@ -467,6 +476,16 @@ class AgentQuestionService
         }
 
         $this->recordStop($question);
+
+        if ($question->isCeilingPrompt()) {
+            try {
+                if ($question->task_budget_id !== null && ($task = TaskBudget::find($question->task_budget_id)) !== null) {
+                    app(TaskBudgetService::class)->appendEvent($task, 'prompt_stopped', ['question_id' => $question->id, 'reason' => 'expired']);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('AgentQuestionService: the expired task budget prompt could not be recorded on its task', ['question_id' => $question->id, 'error' => $e->getMessage()]);
+            }
+        }
 
         return QuestionState::Stopped;
     }

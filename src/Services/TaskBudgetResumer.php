@@ -21,7 +21,9 @@ use Illuminate\Support\Facades\Log;
  * Applies a decided ceiling prompt to its task, exactly once: continue
  * raises the reached ceilings and continues the same run from the iteration
  * it paused at (streamed or synchronous, as it paused); accept concludes the
- * task with a report and closes its run as completed.
+ * task with a report and closes its run as completed. A prompt withdrawn
+ * because its conversation was ended or deleted, or a decision whose
+ * conversation is gone, discards the task and closes its run as stopped.
  */
 class TaskBudgetResumer
 {
@@ -39,14 +41,20 @@ class TaskBudgetResumer
         $task = $question->task_budget_id === null ? null : TaskBudget::find($question->task_budget_id);
 
         if ($conversation === null || $task === null) {
+            if ($task !== null) {
+                $this->discard($task, $question, false);
+            }
             $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, QuestionResumer::CONTEXT_DELETED_REASON);
 
             return null;
         }
 
+        if ($question->state === QuestionState::Withdrawn) {
+            return $this->withdrawn($question, $task);
+        }
+
         if ($question->state !== QuestionState::Answered) {
-            $reason = $question->stopped_at !== null ? QuestionResumer::DISCARDED_REASON : QuestionResumer::WITHDRAWN_REASON;
-            $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, $reason);
+            Log::warning("TaskBudgetResumer: ceiling prompt {$question->id} was resumed in state {$question->state->value}");
 
             return null;
         }
@@ -176,6 +184,36 @@ class TaskBudgetResumer
         }
 
         return ['status' => 'completed', 'content' => $content];
+    }
+
+    /**
+     * The conversation was ended or deleted while the task waited on its
+     * prompt: the task is discarded and its run closed.
+     */
+    public function withdrawn(AgentQuestion $question, TaskBudget $task): ?array
+    {
+        $this->discard($task, $question, true);
+        $reason = $question->stopped_at !== null ? QuestionResumer::DISCARDED_REASON : QuestionResumer::WITHDRAWN_REASON;
+        app(RunTraceRecorder::class)->closeRun($question->run_id, RunEndState::StoppedEarly, $reason);
+
+        return null;
+    }
+
+    private function discard(TaskBudget $task, AgentQuestion $question, bool $withdrawn): void
+    {
+        $now = now()->format('Y-m-d H:i:s.u');
+        $won = DB::table('task_budgets')->where('id', $task->id)
+            ->where('state', TaskBudgetState::Paused->value)
+            ->where('prompt_question_id', $question->id)
+            ->update(['state' => TaskBudgetState::Ended->value, 'end_reason' => 'discarded', 'ended_at' => $now, 'updated_at' => $now]);
+        if ($won !== 1) {
+            return;
+        }
+        $task->refresh();
+        if ($withdrawn) {
+            $this->tasks->appendEvent($task, 'prompt_withdrawn', ['question_id' => $question->id]);
+        }
+        $this->tasks->appendEvent($task, 'ended', ['reason' => 'discarded']);
     }
 
     private function deliver(Conversation $conversation, string $content): void
