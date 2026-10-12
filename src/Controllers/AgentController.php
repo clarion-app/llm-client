@@ -124,16 +124,22 @@ class AgentController extends Controller
             // A reply after a question on this channel expired on its
             // assumption belongs with that question's conversation, however
             // long ago it was last active: the user is told there, once, that
-            // the reply came too late. While the run continuing on the
-            // assumption still has that conversation the reply goes where an
-            // ordinary reply would, so no second run starts beside it.
+            // the reply came too late — even when the conversation has since
+            // ended (the idle timeout ends it soon after the run that
+            // continued on the assumption finished, long before a user who
+            // missed the deadline usually replies). The reply itself goes
+            // into that conversation only while it is open and free; while
+            // the continuing run still has it, or once it has ended, the
+            // reply goes where an ordinary reply would, so no second run
+            // starts beside the continuing one.
             $conversation = null;
             $assumedIn = $this->conversationOwedLateReplyNotice((string) $user->id, $channel);
 
             if ($assumedIn !== null) {
                 app(LateReplyNotifier::class)->noticeFor($assumedIn, (string) $user->id);
 
-                if (!Conversation::whereKey($assumedIn->id)->value('is_processing')) {
+                $current = Conversation::whereKey($assumedIn->id)->first(['is_processing', 'ended_at']);
+                if ($current !== null && !$current->is_processing && $current->ended_at === null) {
                     $conversation = $assumedIn;
                 }
             }
@@ -270,9 +276,10 @@ class AgentController extends Controller
     }
 
     /**
-     * The user's open conversation on $channel whose most recently asked
-     * question expired on its assumption and has not yet had its late-reply
-     * notice, if any — the most recently asked such question wins.
+     * The user's conversation on $channel (not deleted; possibly ended)
+     * whose most recently asked question expired on its assumption and has
+     * not yet had its late-reply notice, if any — the most recently asked
+     * such question wins.
      */
     private function conversationOwedLateReplyNotice(string $userId, string $channel): ?Conversation
     {
@@ -283,7 +290,6 @@ class AgentController extends Controller
             ->whereNull('agent_questions.late_reply_noticed_at')
             ->where('conversations.user_id', $userId)
             ->where('conversations.channel', $channel)
-            ->whereNull('conversations.ended_at')
             ->whereNull('conversations.deleted_at')
             ->whereNotExists(function ($newer) {
                 $newer->selectRaw('1')

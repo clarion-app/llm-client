@@ -701,22 +701,13 @@ class AgentControllerStoppedQuestionTest extends TestCase
         $this->assertSame(1, $this->chatCalls, 'one run, in the other conversation');
     }
 
-    public static function closedConversations(): array
-    {
-        return [
-            'ended' => ['ended'],
-            'deleted' => ['deleted'],
-        ];
-    }
-
     #[Test]
-    #[DataProvider('closedConversations')]
-    public function without_a_conversation_id_an_ended_or_deleted_conversation_that_proceeded_is_left_alone(string $how): void
+    public function without_a_conversation_id_a_deleted_conversation_that_proceeded_is_left_alone(): void
     {
         $assumedIn = $this->conversation();
         $question = $this->assumedQuestion($assumedIn);
         $this->lastActive($assumedIn, 30);
-        DB::table('conversations')->where('id', $assumedIn->id)->update($how === 'ended' ? ['ended_at' => now()->subHours(29)] : ['deleted_at' => now()->subHours(29)]);
+        DB::table('conversations')->where('id', $assumedIn->id)->update(['deleted_at' => now()->subHours(29)]);
 
         $recent = $this->conversation();
         $this->lastActive($recent, 1);
@@ -728,9 +719,44 @@ class AgentControllerStoppedQuestionTest extends TestCase
 
         $response->assertStatus(200);
         $response->assertJson(['conversation_id' => $recent->id]);
-        $this->assertSame([], $this->lateReplyNotices($assumedIn), "an {$how} conversation is not told");
+        $this->assertSame([], $this->lateReplyNotices($assumedIn), 'a deleted conversation is not told');
         $this->assertSame([], $this->telegram->deliveries, 'nothing is delivered');
         $this->assertNull(DB::table('agent_questions')->where('id', $question->id)->value('late_reply_noticed_at'));
+    }
+
+    /**
+     * The idle timeout ends a conversation soon after the run that continued
+     * on the assumption finished — long before a user who missed a day-long
+     * deadline usually replies. The user must still be told their reply came
+     * too late; the reply itself goes where an ordinary reply would.
+     */
+    #[Test]
+    public function without_a_conversation_id_an_ended_conversation_that_proceeded_is_still_told_but_does_not_take_the_reply(): void
+    {
+        $assumedIn = $this->conversation();
+        $question = $this->assumedQuestion($assumedIn);
+        $decision = $this->decision($question);
+        $this->lastActive($assumedIn, 30);
+        // Ended as the idle timeout ends it.
+        DB::table('conversations')->where('id', $assumedIn->id)->update(['ended_at' => now()->subHours(29)]);
+        $userMessagesBefore = $this->userMessageCount($assumedIn);
+
+        $recent = $this->conversation();
+        $this->lastActive($recent, 1);
+        $this->replies = [$this->textReply('Noted.')];
+
+        $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
+            'message' => '2',
+            'channel' => 'telegram',
+        ]);
+
+        $response->assertStatus(200);
+        $response->assertJson(['conversation_id' => $recent->id], 'the reply goes where an ordinary reply would');
+        $this->assertNoticedOnce($assumedIn, $question);
+        $this->assertSame($decision, $this->decision($question), 'the reply is not applied to the question');
+        $this->assertSame($userMessagesBefore, $this->userMessageCount($assumedIn), 'the reply is not put into the ended conversation');
+        $this->assertNotNull($assumedIn->fresh()->ended_at, 'the ended conversation stays ended');
+        $this->assertSame(1, $this->chatCalls, 'handled once, as a new message');
     }
 
     #[Test]

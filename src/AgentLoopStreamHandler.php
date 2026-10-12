@@ -1018,10 +1018,18 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             ->latest('created_at')
             ->first();
 
+        // A question notice (an expiry notice, or the one telling a user their
+        // reply came after a question expired on its assumption) is written
+        // by the system, not by the agent answering anyone: it never counts
+        // as a reply. Otherwise a reply typed while a run continued on an
+        // assumed answer would be hidden by the notice posted right after it
+        // and never handled.
         $latestAssistantMessage = Message::where('conversation_id', $conversation->id)
             ->where('role', 'assistant')
             ->latest('created_at')
-            ->first();
+            ->cursor()
+            ->first(fn (Message $message) => !(is_array($message->tool_data)
+                && ($message->tool_data['kind'] ?? null) === \ClarionApp\LlmClient\Services\AgentQuestionService::KIND_NOTICE));
 
         if ($latestUserMessage && $latestAssistantMessage &&
             $latestUserMessage->created_at > $latestAssistantMessage->created_at) {

@@ -244,13 +244,23 @@ class AgentQuestionExpiryPolicyQueriesTest extends RealDatabaseTestCase
         $superseded = $this->conversation('telegram');
         $this->question($superseded, 'expired_assumed', ['channel' => 'telegram', 'unanswered_policy' => 'proceed_on_assumption', 'asked_at' => now()->subHours(3)]);
         $this->question($superseded, 'answered', ['channel' => 'telegram', 'asked_at' => now()->subHours(2)]);
-        $ended = $this->conversation('telegram', ['ended_at' => now()->subHour()]);
-        $this->question($ended, 'expired_assumed', ['channel' => 'telegram', 'unanswered_policy' => 'proceed_on_assumption', 'asked_at' => now()->subHour()]);
+        $deleted = $this->conversation('telegram', ['deleted_at' => now()->subHour()]);
+        $this->question($deleted, 'expired_assumed', ['channel' => 'telegram', 'unanswered_policy' => 'proceed_on_assumption', 'asked_at' => now()->subHour()]);
+        $ended = $this->conversation('telegram', ['ended_at' => now()->subHours(5)]);
+        $endedQuestion = $this->question($ended, 'expired_assumed', ['channel' => 'telegram', 'unanswered_policy' => 'proceed_on_assumption', 'asked_at' => now()->subHours(6)]);
 
         $owed = $this->callPrivate($controller, 'conversationOwedLateReplyNotice', [$this->userId, 'telegram']);
         $this->assertInstanceOf(Conversation::class, $owed);
-        $this->assertSame($assumedIn, $owed->id, 'the newest un-noticed, unsuperseded question in an open conversation');
+        $this->assertSame($assumedIn, $owed->id, 'the newest un-noticed, unsuperseded question in a conversation not deleted');
         $this->assertNull($this->callPrivate($controller, 'conversationOwedLateReplyNotice', [(string) Str::uuid(), 'telegram']));
+
+        // An ended conversation is still owed its notice (the idle timeout
+        // ends it long before a late reply usually comes).
+        DB::table('agent_questions')->where('conversation_id', $assumedIn)->update(['late_reply_noticed_at' => now()->format('Y-m-d H:i:s.u')]);
+        $owed = $this->callPrivate($controller, 'conversationOwedLateReplyNotice', [$this->userId, 'telegram']);
+        $this->assertInstanceOf(Conversation::class, $owed);
+        $this->assertSame($ended, $owed->id, 'an ended conversation is still told');
+        $this->assertNotNull($endedQuestion);
     }
 
     #[Test]
