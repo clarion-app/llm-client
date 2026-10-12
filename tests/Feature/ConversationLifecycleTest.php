@@ -81,6 +81,7 @@ class ConversationLifecycleTest extends TestCase
         });
 
         Schema::create('conversations', function (Blueprint $table) {
+            $table->uuid('active_task_budget_id')->nullable();
             $table->uuid('id')->primary();
             $table->uuid('user_id')->nullable();
             $table->uuid('server_id')->nullable();

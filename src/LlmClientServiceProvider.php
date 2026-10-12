@@ -556,6 +556,20 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new \ClarionApp\LlmClient\Services\SpendingCeilingService();
         });
 
+        // Task budgets. The gate is scoped() for the same reason as
+        // BudgetLedger: a queue worker must never carry one job's view of a
+        // task into the next. It holds no memo today — every decision reads
+        // the task row and its spend afresh, and the step claim is a single
+        // conditional UPDATE — so scoping is a guard against one being
+        // added, not a cache lifetime. The rest are stateless and resolved
+        // fresh on every use, so a rebound CostRollupQuery or a config
+        // change is seen immediately.
+        $this->app->scoped(\ClarionApp\LlmClient\Services\TaskBudgetGate::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\TaskBudgetService::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\TaskBudgetLimits::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\TaskBudgetText::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\UserReachability::class);
+
         // scoped(), for the same reason BudgetLedger is — and for one more of
         // its own. The gate keeps two pieces of per-unit-of-work state: the
         // ledger memo it reads through, and its own record of which scopes it

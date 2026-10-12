@@ -326,8 +326,11 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->unsignedInteger('effective_wait_minutes')->nullable();
                 $table->timestamp('stopped_at', 6)->nullable();
                 $table->timestamp('late_reply_noticed_at', 6)->nullable();
+                $table->string('origin', 16)->nullable();
+                $table->uuid('task_budget_id')->nullable();
 
                 $table->unique('pending_conversation_id');
+                $table->index('task_budget_id');
                 $table->index('conversation_id');
                 $table->index(['state', 'expires_at']);
                 $table->index(['state', 'resumed_at', 'resolved_at']);

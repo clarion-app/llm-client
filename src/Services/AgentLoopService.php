@@ -3992,33 +3992,7 @@ class AgentLoopService
      */
     private function askReachabilityRefusal(Conversation $conversation, bool $unattended): ?QuestionRefusal
     {
-        if ($conversation->user_id === null || $conversation->user_id === '') {
-            return QuestionRefusal::noReachableUser(QuestionRefusal::NO_USER_REASON);
-        }
-
-        if ($unattended) {
-            return QuestionRefusal::noReachableUser(QuestionRefusal::UNATTENDED_REASON);
-        }
-
-        $channel = (string) ($conversation->channel ?? 'web');
-
-        if ($channel === self::DELEGATION_CHANNEL) {
-            $rootId = DelegationService::chainRootConversationId((string) $conversation->id);
-
-            if ($rootId !== (string) $conversation->id
-                && AgentQuestion::where('pending_conversation_id', $rootId)->exists()
-            ) {
-                return QuestionRefusal::alreadyPending();
-            }
-
-            return QuestionRefusal::noReachableUser(QuestionRefusal::HELPER_REASON);
-        }
-
-        if (!app(ConversationChannelRegistry::class)->has($channel)) {
-            return QuestionRefusal::noReachableUser("Questions cannot be delivered on the '{$channel}' channel.");
-        }
-
-        return null;
+        return app(\ClarionApp\LlmClient\Services\UserReachability::class)->refusal($conversation, $unattended);
     }
 
     private function handleMemoryCreate(array $arguments, Conversation $conversation): string

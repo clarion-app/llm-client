@@ -45,6 +45,7 @@ class ConversationObserverTest extends TestCase
         });
 
         Schema::create('conversations', function (Blueprint $table) {
+            $table->uuid('active_task_budget_id')->nullable();
             $table->uuid('id')->primary();
             $table->uuid('server_id')->nullable();
             $table->foreign('server_id')->references('id')->on('llm_servers')->onDelete('set null');

@@ -185,6 +185,28 @@ class CostRollupQuery
         return $rows->map(fn ($row) => array_merge([$idKey => $row->entity_id], $this->shapeRow($row)))->all();
     }
 
+    /**
+     * Total usage of one task budget, read straight from usage_records (not
+     * the daily cost_summaries rollup, which lags) in the common shape.
+     * Never memoized: enforcement must see spend recorded a moment ago by
+     * another worker.
+     */
+    public function taskTotal(string $taskBudgetId): array
+    {
+        $row = DB::table('usage_records')
+            ->where('task_budget_id', $taskBudgetId)
+            ->selectRaw(
+                'COUNT(*) as request_count, '.
+                'COALESCE(SUM(CASE WHEN cost_unpriced = 0 THEN total_cost ELSE 0 END), 0) as priced_cost_total, '.
+                'COALESCE(SUM(CASE WHEN cost_unpriced = 0 AND total_cost = 0 THEN 1 ELSE 0 END), 0) as zero_priced_request_count, '.
+                'COALESCE(SUM(CASE WHEN cost_unpriced = 1 THEN 1 ELSE 0 END), 0) as unpriced_request_count, '.
+                'COALESCE(SUM(CASE WHEN cost_unpriced = 1 THEN total_tokens ELSE 0 END), 0) as unpriced_total_tokens, '.
+                'COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN 1 ELSE 0 END), 0) as estimated_request_count'
+            )->first();
+
+        return $this->shapeRow($row);
+    }
+
     private function shapeRow(?object $row): array
     {
         return [

@@ -171,7 +171,9 @@ abstract class TestCase extends BaseTestCase
                 $table->timestamp('routing_disclosed_at')->nullable();
                 $table->uuid('coding_project_id')->nullable();
                 $table->uuid('scheduler_trigger_id')->nullable();
+                $table->uuid('active_task_budget_id')->nullable();
                 $table->index('user_id');
+                $table->index('active_task_budget_id');
                 $table->index('agent_id');
                 $table->index('agent_version_id');
                 $table->index('coding_project_id');
@@ -402,6 +404,7 @@ abstract class TestCase extends BaseTestCase
                 $table->boolean('cost_unpriced')->default(false);
                 $table->boolean('cost_estimated')->default(false);
                 $table->timestamp('created_at')->useCurrent();
+                $table->uuid('task_budget_id')->nullable();
 
                 $table->index('conversation_id');
                 $table->index('user_id');
@@ -409,6 +412,63 @@ abstract class TestCase extends BaseTestCase
                 $table->index(['user_id', 'created_at']);
                 $table->index('run_id');
                 $table->index('agent_id');
+                $table->index('task_budget_id');
+            });
+        }
+
+        // task_budgets / task_budget_events, and the task_budget_id /
+        // active_task_budget_id / origin columns above and below — mirror
+        // 2026_10_14_000000_create_task_budgets_tables.php column for column.
+        if (!Schema::hasTable('task_budgets')) {
+            Schema::create('task_budgets', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id')->nullable();
+                $table->uuid('root_conversation_id');
+                $table->uuid('root_run_id')->nullable();
+                $table->uuid('managed_task_id')->nullable();
+                $table->string('scope', 16);
+                $table->boolean('unattended')->default(false);
+                $table->string('state', 16)->default('running');
+                $table->string('end_reason', 256)->nullable();
+                $table->unsignedInteger('max_steps');
+                $table->string('max_steps_origin', 32);
+                $table->unsignedInteger('original_max_steps');
+                $table->decimal('max_spend', 20, 10);
+                $table->string('max_spend_origin', 32);
+                $table->decimal('original_max_spend', 20, 10);
+                $table->unsignedInteger('steps_used')->default(0);
+                $table->decimal('approach_threshold', 5, 4);
+                $table->timestamp('steps_approach_noticed_at', 6)->nullable();
+                $table->timestamp('spend_approach_noticed_at', 6)->nullable();
+                $table->timestamp('paused_at', 6)->nullable();
+                $table->string('pause_reason', 16)->nullable();
+                $table->uuid('paused_run_id')->nullable();
+                $table->unsignedInteger('paused_iteration')->nullable();
+                $table->string('resume_mode', 8)->nullable();
+                $table->unsignedInteger('paused_steps_used')->nullable();
+                $table->decimal('paused_spend', 20, 10)->nullable();
+                $table->uuid('prompt_question_id')->nullable();
+                $table->timestamp('ended_at', 6)->nullable();
+                $table->timestamp('created_at', 6)->nullable();
+                $table->timestamp('updated_at', 6)->nullable();
+
+                $table->index('root_conversation_id');
+                $table->index(['user_id', 'updated_at']);
+                $table->index(['state', 'updated_at']);
+                $table->index('managed_task_id');
+                $table->index('prompt_question_id');
+            });
+        }
+
+        if (!Schema::hasTable('task_budget_events')) {
+            Schema::create('task_budget_events', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('task_budget_id');
+                $table->string('kind', 32);
+                $table->json('payload');
+                $table->uuid('actor_user_id')->nullable();
+                $table->timestamp('created_at', 6)->useCurrent();
+                $table->index(['task_budget_id', 'created_at']);
             });
         }
 
@@ -824,8 +884,11 @@ abstract class TestCase extends BaseTestCase
                 $table->unsignedInteger('effective_wait_minutes')->nullable();
                 $table->timestamp('stopped_at', 6)->nullable();
                 $table->timestamp('late_reply_noticed_at', 6)->nullable();
+                $table->string('origin', 16)->nullable();
+                $table->uuid('task_budget_id')->nullable();
 
                 $table->unique('pending_conversation_id');
+                $table->index('task_budget_id');
                 $table->index('conversation_id');
                 $table->index(['state', 'expires_at']);
                 $table->index(['state', 'resumed_at', 'resolved_at']);
