@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
+use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\DeliveryResult;
 use ClarionApp\LlmClient\ValueObjects\OpenedQuestion;
 use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
@@ -57,7 +58,9 @@ class AgentQuestionService
      * already taken nothing is written and the ask is refused.
      *
      * Delivery to the user's channel is an external side effect, so it
-     * happens only after the commit. A failed delivery never throws: it is
+     * happens only after the commit, through QuestionPresenter: with the
+     * choices as controls where the channel can show them, else as plain
+     * text. A failed delivery never throws: it is
      * reported on the returned OpenedQuestion, the question is resolved as
      * undeliverable, and the run is resumed with that outcome (inline on the
      * synchronous path, whose result is returned as `resumeResult`; a
@@ -93,6 +96,7 @@ class AgentQuestionService
                     'question' => $request->request->question,
                     'choices' => $request->request->choices,
                     'allow_multiple' => $request->request->allowMultiple,
+                    'preamble' => $preamble,
                     'state' => QuestionState::Pending,
                     'asked_at' => $now,
                     'expires_at' => $now->copy()->addMinutes($expiryMinutes),
@@ -148,7 +152,7 @@ class AgentQuestionService
         // The run is now waiting on its user.
         app(RunTraceRecorder::class)->announceRunChanged($question->run_id);
 
-        $delivery = $this->deliver($conversation, (string) $display->content);
+        $delivery = app(QuestionPresenter::class)->deliverQuestion($conversation, $question, (string) $display->content, $preamble);
 
         if ($delivery->delivered) {
             $deliveredAt = now();
@@ -354,17 +358,26 @@ class AgentQuestionService
      * winning transition's transaction, so `answer_message_id` never names
      * a message that does not exist. Returns null when the question was
      * already resolved by something else; nothing is written then.
+     *
+     * $method records how the user answered (typed, web form, tapped
+     * option); it is written in the same update as the answer.
      */
-    public function answer(AgentQuestion $question, ParsedAnswer $answer, string $userId, string $rawContent): ?Message
-    {
+    public function answer(
+        AgentQuestion $question,
+        ParsedAnswer $answer,
+        string $userId,
+        string $rawContent,
+        AnswerMethod $method = AnswerMethod::TypedReply,
+    ): ?Message {
         if ((string) $question->user_id !== $userId) {
             throw new \LogicException('Only the user who was asked may answer a question.');
         }
 
-        return DB::transaction(function () use ($question, $answer, $userId, $rawContent) {
+        return DB::transaction(function () use ($question, $answer, $userId, $rawContent, $method) {
             $won = $this->transition($question->id, QuestionState::Answered, [
                 'answer_raw' => $rawContent,
                 'answer_selected' => json_encode($answer->selected),
+                'answer_method' => $method->value,
                 'answered_by' => $userId,
             ], true);
 
@@ -420,6 +433,10 @@ class AgentQuestionService
      * between this resolution and the resume can never start a concurrent
      * run. A losing caller (returns false) changes nothing.
      *
+     * The winner also schedules QuestionPresentationUpdater to run once the
+     * outermost transaction commits, so every place the question is shown
+     * learns of the resolution — and never of one that rolled back.
+     *
      * @param  array<string, mixed>  $fields
      */
     private function transition(string $id, QuestionState $to, array $fields, bool $setProcessing): bool
@@ -449,6 +466,8 @@ class AgentQuestionService
                 $conversationId = DB::table('agent_questions')->where('id', $id)->value('conversation_id');
                 Conversation::find($conversationId)?->update(['is_processing' => true]);
             }
+
+            DB::afterCommit(fn () => app(QuestionPresentationUpdater::class)->resolved($id));
 
             return true;
         });

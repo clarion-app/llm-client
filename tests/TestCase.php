@@ -778,9 +778,10 @@ abstract class TestCase extends BaseTestCase
         }
 
         // agent_questions table (questions agents ask users mid-task). Kept
-        // identical to the 2026_10_11_000000 migration, including the UNIQUE
-        // latch on pending_conversation_id that allows at most one pending
-        // question per conversation.
+        // identical to the 2026_10_11_000000 migration plus the four columns
+        // added by 2026_10_12_000000, including the UNIQUE latch on
+        // pending_conversation_id that allows at most one pending question
+        // per conversation.
         if (!Schema::hasTable('agent_questions')) {
             Schema::create('agent_questions', function (Blueprint $table) {
                 $table->uuid('id')->primary();
@@ -810,6 +811,10 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('answer_message_id')->nullable();
                 $table->timestamp('resumed_at', 6)->nullable();
                 $table->timestamps();
+                $table->text('preamble')->nullable();
+                $table->string('presentation', 16)->nullable();
+                $table->string('presentation_fallback_reason', 32)->nullable();
+                $table->string('answer_method', 24)->nullable();
 
                 $table->unique('pending_conversation_id');
                 $table->index('conversation_id');

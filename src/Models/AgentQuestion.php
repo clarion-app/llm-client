@@ -2,6 +2,9 @@
 
 namespace ClarionApp\LlmClient\Models;
 
+use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
+use ClarionApp\LlmClient\ValueObjects\PresentationFallbackReason;
+use ClarionApp\LlmClient\ValueObjects\PresentationMode;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -53,6 +56,10 @@ class AgentQuestion extends Model
         'answered_by',
         'answer_message_id',
         'resumed_at',
+        'preamble',
+        'presentation',
+        'presentation_fallback_reason',
+        'answer_method',
     ];
 
     protected $casts = [
@@ -65,6 +72,9 @@ class AgentQuestion extends Model
         'delivered_at' => 'datetime',
         'resolved_at' => 'datetime',
         'resumed_at' => 'datetime',
+        'presentation' => PresentationMode::class,
+        'presentation_fallback_reason' => PresentationFallbackReason::class,
+        'answer_method' => AnswerMethod::class,
     ];
 
     protected $attributes = [

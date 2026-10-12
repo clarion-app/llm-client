@@ -1,0 +1,337 @@
+<?php
+
+namespace ClarionApp\LlmClient\Tests\Feature;
+
+use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
+use ClarionApp\LlmClient\Models\AgentQuestion;
+use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
+use ClarionApp\LlmClient\Services\QuestionPresenter;
+use ClarionApp\LlmClient\Services\QuestionRenderer;
+use ClarionApp\LlmClient\ValueObjects\ChannelQuestionCapabilities;
+use ClarionApp\LlmClient\ValueObjects\DeliveryResult;
+use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
+use ClarionApp\LlmClient\ValueObjects\QuestionPresentation;
+use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use Illuminate\Log\Events\MessageLogged;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Queue;
+use PHPUnit\Framework\Attributes\Test;
+use Tests\Fixtures\QuestionChannels\QuestionEndpointHarness;
+use Tests\Fixtures\QuestionChannels\RecordingPresentingDelivery;
+use Tests\Integration\Harness\RecordingChannelDelivery;
+use Tests\TestCase;
+
+/**
+ * QuestionPresenter delivers a newly opened question: richly when its
+ * channel can show the options, otherwise — or when the rich send fails —
+ * as the exact plain text a channel received before options existed. How
+ * the question was presented, and why plain text was used, is recorded on
+ * the row. A question becomes undeliverable only when the plain-text
+ * attempt itself failed.
+ */
+class QuestionPresenterTest extends TestCase
+{
+    use QuestionEndpointHarness;
+
+    private const GOLDEN = "Which part should I change first?\n"
+        ."\n"
+        ."1. Backend\n"
+        ."2. Frontend\n"
+        ."3. Docs\n"
+        ."\n"
+        .'Reply with the number of your choice, or answer in your own words.';
+
+    private const PREAMBLE = 'I found three areas that need work.';
+
+    private User $user;
+
+    /** @var list<MessageLogged> */
+    private array $logged = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->user = User::factory()->create();
+        $this->setUpQuestionEndpoints([$this->user]);
+
+        Queue::fake();
+        Event::fake([NewConversationMessageEvent::class]);
+        Event::listen(MessageLogged::class, function (MessageLogged $entry) {
+            $this->logged[] = $entry;
+        });
+    }
+
+    protected function tearDown(): void
+    {
+        $this->tearDownQuestionEndpoints();
+
+        parent::tearDown();
+    }
+
+    private function register(object $adapter): object
+    {
+        app(ConversationChannelRegistry::class)->register($adapter);
+
+        return $adapter;
+    }
+
+    /** @return array{presentation: ?string, presentation_fallback_reason: ?string} */
+    private function recorded(string $questionId): array
+    {
+        $row = DB::table('agent_questions')
+            ->where('id', $questionId)
+            ->select(['presentation', 'presentation_fallback_reason'])
+            ->first();
+
+        return ['presentation' => $row->presentation, 'presentation_fallback_reason' => $row->presentation_fallback_reason];
+    }
+
+    private function assertWarnedAbout(string $questionId): void
+    {
+        foreach ($this->logged as $entry) {
+            if (in_array($entry->level, ['warning', 'error'], true) && ($entry->context['question_id'] ?? null) === $questionId) {
+                return;
+            }
+        }
+
+        $this->fail("expected a warning or error logged with question_id {$questionId}");
+    }
+
+    // ---------------------------------------------------------------
+    // Rich presentation
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_channel_that_presents_options_receives_the_question_richly_and_nothing_plain(): void
+    {
+        $telegram = $this->register(new RecordingPresentingDelivery('telegram'));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+
+        $opened = $this->openQuestion($conversation, OpenQuestionRequest::RESUME_SYNC, preamble: self::PREAMBLE);
+        $question = AgentQuestion::findOrFail($opened->question->id);
+
+        $this->assertCount(1, $telegram->presentations);
+        $this->assertSame([], $telegram->deliveries, 'a successful rich presentation is not followed by plain text');
+        $this->assertSame(0, $telegram->presentations[0]['transaction_level'], 'presented only after the question was committed');
+
+        /** @var QuestionPresentation $presentation */
+        $presentation = $telegram->presentations[0]['presentation'];
+        $renderer = app(QuestionRenderer::class);
+        $this->assertSame($question->id, $presentation->questionId);
+        $this->assertSame(self::PREAMBLE, $presentation->preamble);
+        $this->assertCount(3, $presentation->options);
+        $this->assertSame($renderer->renderWithOptions($question, self::PREAMBLE), $presentation->bodyText);
+        $this->assertSame((string) $opened->displayMessage->content, $presentation->plainText, 'the plain text is exactly the display message');
+
+        $this->assertSame(['presentation' => 'rich', 'presentation_fallback_reason' => null], $this->recorded($question->id));
+        $this->assertSame(QuestionState::Pending, $question->state);
+        $this->assertNotNull($question->delivered_at);
+        $this->assertTrue($opened->delivery->delivered);
+    }
+
+    #[Test]
+    public function the_synchronous_preamble_is_kept_on_the_row_and_the_streamed_one_is_not(): void
+    {
+        $this->register(new RecordingPresentingDelivery('telegram'));
+        $this->register(new RecordingPresentingDelivery('web'));
+
+        $sync = $this->openQuestion($this->questionConversation($this->user, 'telegram'), OpenQuestionRequest::RESUME_SYNC, preamble: self::PREAMBLE);
+        $stream = $this->openQuestion($this->questionConversation($this->user, 'web'), OpenQuestionRequest::RESUME_STREAM, preamble: self::PREAMBLE);
+
+        $this->assertSame(self::PREAMBLE, DB::table('agent_questions')->where('id', $sync->question->id)->value('preamble'));
+        $this->assertNull(
+            DB::table('agent_questions')->where('id', $stream->question->id)->value('preamble'),
+            'on the streamed path the accompanying text was already streamed as the paused message',
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Falling back to plain text
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_rejected_rich_send_is_followed_immediately_by_the_plain_text(): void
+    {
+        $telegram = $this->register((new RecordingPresentingDelivery('telegram'))->rejectRich('telegram send failed: Bad Request'));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+
+        $opened = $this->openQuestion($conversation);
+        $question = AgentQuestion::findOrFail($opened->question->id);
+
+        $this->assertCount(1, $telegram->presentations);
+        $this->assertCount(1, $telegram->deliveries);
+        $this->assertSame(self::GOLDEN, $telegram->deliveries[0]['text'], 'the fallback is exactly the plain-text question');
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'rich_send_rejected'],
+            $this->recorded($question->id),
+        );
+        $this->assertSame(QuestionState::Pending, $question->state, 'the plain text reached the user, so the question waits');
+        $this->assertNotNull($question->delivered_at);
+        $this->assertTrue($opened->delivery->delivered);
+        $this->assertWarnedAbout($question->id);
+    }
+
+    #[Test]
+    public function a_rich_send_that_throws_is_treated_as_rejected(): void
+    {
+        $telegram = $this->register((new RecordingPresentingDelivery('telegram'))->throwOnRich('connection reset'));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+
+        $opened = $this->openQuestion($conversation);
+        $question = AgentQuestion::findOrFail($opened->question->id);
+
+        $this->assertCount(1, $telegram->deliveries);
+        $this->assertSame(self::GOLDEN, $telegram->deliveries[0]['text']);
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'rich_send_rejected'],
+            $this->recorded($question->id),
+        );
+        $this->assertSame(QuestionState::Pending, $question->state);
+        $this->assertTrue($opened->delivery->delivered);
+    }
+
+    #[Test]
+    public function when_both_attempts_fail_the_question_is_undeliverable_for_the_plain_attempts_reason(): void
+    {
+        $telegram = $this->register(
+            (new RecordingPresentingDelivery('telegram'))
+                ->rejectRich('rich: keyboard rejected')
+                ->failPlain('plain: chat not found'),
+        );
+        $conversation = $this->questionConversation($this->user, 'telegram');
+
+        $opened = $this->openQuestion($conversation);
+        $question = AgentQuestion::findOrFail($opened->question->id);
+
+        $this->assertCount(1, $telegram->presentations);
+        $this->assertSame(self::GOLDEN, $telegram->deliveries[0]['text'] ?? null, 'plain text was attempted after the rich failure');
+        $this->assertSame(QuestionState::Undeliverable, $question->state);
+        $this->assertSame('plain: chat not found', $question->delivery_failure_reason);
+        $this->assertFalse($opened->delivery->delivered);
+        $this->assertSame('plain: chat not found', $opened->delivery->failureReason);
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'rich_send_rejected'],
+            $this->recorded($question->id),
+        );
+    }
+
+    #[Test]
+    public function an_adapter_that_declares_nothing_gets_exactly_the_plain_text_it_always_got(): void
+    {
+        $plain = $this->register(new RecordingChannelDelivery('telegram'));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+
+        $opened = $this->openQuestion($conversation);
+        $question = AgentQuestion::findOrFail($opened->question->id);
+
+        $this->assertSame([self::GOLDEN], $plain->textsFor($conversation->id));
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'channel_lacks_options'],
+            $this->recorded($question->id),
+        );
+        $this->assertSame(QuestionState::Pending, $question->state);
+    }
+
+    #[Test]
+    public function a_channel_that_cannot_show_options_gets_plain_text(): void
+    {
+        $telegram = $this->register(new RecordingPresentingDelivery('telegram', ChannelQuestionCapabilities::none()));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+
+        $opened = $this->openQuestion($conversation);
+
+        $this->assertSame([], $telegram->presentations);
+        $this->assertSame(self::GOLDEN, $telegram->deliveries[0]['text'] ?? null);
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'channel_lacks_options'],
+            $this->recorded($opened->question->id),
+        );
+    }
+
+    #[Test]
+    public function too_many_choices_for_the_channel_gets_the_whole_question_as_plain_text(): void
+    {
+        $telegram = $this->register(new RecordingPresentingDelivery('telegram', new ChannelQuestionCapabilities(
+            supportsOptions: true,
+            maxOptions: 2,
+            maxOptionLabelChars: null,
+        )));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+
+        $opened = $this->openQuestion($conversation);
+
+        $this->assertSame([], $telegram->presentations, 'never a subset of the options');
+        $this->assertSame([self::GOLDEN], array_column($telegram->deliveries, 'text'));
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'too_many_options'],
+            $this->recorded($opened->question->id),
+        );
+        $this->assertSame(QuestionState::Pending, $opened->question->fresh()->state);
+    }
+
+    #[Test]
+    public function a_channel_with_no_adapter_is_recorded_as_plain_text_and_the_question_is_undeliverable(): void
+    {
+        $conversation = $this->questionConversation($this->user, 'carrier-pigeon');
+
+        $opened = $this->openQuestion($conversation);
+        $question = AgentQuestion::findOrFail($opened->question->id);
+
+        $this->assertSame(QuestionState::Undeliverable, $question->state);
+        $this->assertSame("no delivery is registered for the 'carrier-pigeon' channel", $question->delivery_failure_reason);
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'channel_lacks_options'],
+            $this->recorded($question->id),
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // deliverQuestion() itself
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function deliver_question_returns_the_result_of_the_last_attempt(): void
+    {
+        // Opened on a plain adapter; each case below swaps the channel's
+        // adapter and delivers the same question again.
+        $this->register(new RecordingChannelDelivery('telegram'));
+        $conversation = $this->questionConversation($this->user, 'telegram');
+        $question = AgentQuestion::findOrFail($this->openQuestion($conversation)->question->id);
+        $presenter = app(QuestionPresenter::class);
+
+        $this->register(new RecordingPresentingDelivery('telegram'));
+        $rich = $presenter->deliverQuestion($conversation, $question, self::GOLDEN, null);
+        $this->assertInstanceOf(DeliveryResult::class, $rich);
+        $this->assertTrue($rich->delivered);
+        $this->assertSame('rich', $this->recorded($question->id)['presentation']);
+
+        $this->register((new RecordingPresentingDelivery('telegram'))->rejectRich('rich no')->failPlain('plain no'));
+        $both = $presenter->deliverQuestion($conversation, $question, self::GOLDEN, null);
+        $this->assertFalse($both->delivered);
+        $this->assertSame('plain no', $both->failureReason);
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'rich_send_rejected'],
+            $this->recorded($question->id),
+        );
+
+        $fallback = (new RecordingPresentingDelivery('telegram'))->rejectRich('rich no');
+        $this->register($fallback);
+        $plain = $presenter->deliverQuestion($conversation, $question, 'the plain text as given', null);
+        $this->assertTrue($plain->delivered);
+        $this->assertSame(['the plain text as given'], array_column($fallback->deliveries, 'text'), 'the plain attempt sends the text it was given');
+
+        // The conversation and its question both name a channel nothing serves.
+        $conversation->channel = 'nowhere';
+        $question->channel = 'nowhere';
+        $none = $presenter->deliverQuestion($conversation, $question, self::GOLDEN, null);
+        $this->assertFalse($none->delivered);
+        $this->assertSame("no delivery is registered for the 'nowhere' channel", $none->failureReason);
+        $this->assertSame(
+            ['presentation' => 'plain_text', 'presentation_fallback_reason' => 'channel_lacks_options'],
+            $this->recorded($question->id),
+        );
+    }
+}

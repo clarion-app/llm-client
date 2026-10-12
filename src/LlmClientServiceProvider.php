@@ -340,6 +340,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return $registry;
         });
 
+        // How another package (e.g. a messaging channel) applies an answer
+        // given through its own controls; bound in register() so it can be
+        // resolved from any provider's boot().
+        $this->app->bind(
+            \ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers::class,
+            \ClarionApp\LlmClient\Services\InteractiveAnswerService::class,
+        );
+
         $this->app->singleton(ToolFormatter::class, function ($app) {
             return new ToolFormatter();
         });
