@@ -3,9 +3,11 @@
 namespace ClarionApp\LlmClient\Models;
 
 use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
+use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
 use ClarionApp\LlmClient\ValueObjects\PresentationFallbackReason;
 use ClarionApp\LlmClient\ValueObjects\PresentationMode;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Str;
@@ -60,6 +62,14 @@ class AgentQuestion extends Model
         'presentation',
         'presentation_fallback_reason',
         'answer_method',
+        'unanswered_policy',
+        'consequential',
+        'assumed_answer_raw',
+        'assumed_answer_selected',
+        'requested_wait_minutes',
+        'effective_wait_minutes',
+        'stopped_at',
+        'late_reply_noticed_at',
     ];
 
     protected $casts = [
@@ -75,11 +85,19 @@ class AgentQuestion extends Model
         'presentation' => PresentationMode::class,
         'presentation_fallback_reason' => PresentationFallbackReason::class,
         'answer_method' => AnswerMethod::class,
+        'unanswered_policy' => UnansweredPolicy::class,
+        'consequential' => 'boolean',
+        'assumed_answer_selected' => 'array',
+        'requested_wait_minutes' => 'integer',
+        'effective_wait_minutes' => 'integer',
+        'stopped_at' => 'datetime',
+        'late_reply_noticed_at' => 'datetime',
     ];
 
     protected $attributes = [
         'allow_multiple' => false,
         'state' => 'pending',
+        'consequential' => false,
     ];
 
     protected static function booted(): void
@@ -110,6 +128,31 @@ class AgentQuestion extends Model
     public function choiceList(): array
     {
         return array_values(array_map('strval', $this->choices ?? []));
+    }
+
+    /**
+     * The answer the agent said it would assume if nobody answered, in the
+     * shape a user's answer has; null unless the question proceeds on an
+     * assumption.
+     */
+    public function assumedAnswer(): ?ParsedAnswer
+    {
+        if ($this->assumed_answer_raw === null) {
+            return null;
+        }
+
+        $selected = array_values($this->assumed_answer_selected ?? []);
+
+        return new ParsedAnswer((string) $this->assumed_answer_raw, $selected !== [], $selected);
+    }
+
+    /**
+     * Whether the question's period passed under the stop policy. Stays
+     * true after a late answer or a discard, which it then marks.
+     */
+    public function wasStopped(): bool
+    {
+        return $this->stopped_at !== null;
     }
 
     /**

@@ -41,6 +41,7 @@ final readonly class QuestionResolution
                 'message' => 'The user stopped this task while the question was pending.',
             ],
             QuestionState::Pending => throw new \LogicException('A pending question has no resolution.'),
+            QuestionState::Stopped => throw new \LogicException('A stopped question has no resolution.'),
         };
 
         return json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);

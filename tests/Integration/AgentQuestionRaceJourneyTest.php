@@ -100,6 +100,8 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
 
         config(['llm-client.run_trace.enabled' => true]);
         config(['llm-client.agent_questions.expiry_minutes' => 1]);
+        // The period under test is shorter than the shipped minimum.
+        config(['llm-client.agent_questions.min_expiry_minutes' => 1]);
 
         Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
 
@@ -439,6 +441,10 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
 
             $conversation = $this->newConversation();
             $question = $this->ask($conversation);
+            if (in_array('expire', [$a, $b], true)) {
+                // A question asked before unanswered policies existed: it expires as it always did.
+                DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+            }
 
             // Past the answerable period, not yet swept: all three
             // resolutions are possible.
@@ -499,6 +505,8 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
         for ($trial = 0; $trial < self::TRIALS; $trial++) {
             $conversation = $this->newConversation();
             $question = $this->ask($conversation);
+            // A question asked before unanswered policies existed: it expires as it always did.
+            DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
             $this->travel(2)->minutes();
 
             // The sweep has expired the question and queued its resume; no

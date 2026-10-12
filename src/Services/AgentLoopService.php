@@ -2584,11 +2584,7 @@ class AgentLoopService
         try {
             $opened = app(AgentQuestionService::class)->open(new OpenQuestionRequest(
                 conversation: $conversation,
-                request: new AskUserRequest(
-                    (string) ($marker['question'] ?? ''),
-                    array_values($marker['choices'] ?? []),
-                    (bool) ($marker['allow_multiple'] ?? false),
-                ),
+                request: AskUserRequest::fromMarker($marker),
                 runId: $runId,
                 stepId: $stepId,
                 actionId: $actionId,

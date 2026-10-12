@@ -61,6 +61,8 @@ class ResolveExpiredQuestionsCommandTest extends TestCase
 
         config(['llm-client.run_trace.enabled' => true]);
         config(['llm-client.agent_questions.expiry_minutes' => 10]);
+        // The periods under test here are shorter than the shipped minimum.
+        config(['llm-client.agent_questions.min_expiry_minutes' => 1]);
         config(['llm-client.agent_questions.resume_grace_seconds' => 60]);
         config(['llm-client.agent_questions.sweep_batch_size' => 100]);
 
@@ -106,6 +108,10 @@ class ResolveExpiredQuestionsCommandTest extends TestCase
      * A pending three-choice question opened the way the streamed pause
      * site opens it. Deliveries made while opening it are cleared, so later
      * assertions see only what the sweep delivers.
+     *
+     * Every question here is marked as asked before unanswered policies
+     * existed: this suite covers the original expiry, which such questions
+     * keep.
      */
     private function openQuestion(?Conversation $conversation = null): AgentQuestion
     {
@@ -149,6 +155,9 @@ class ResolveExpiredQuestionsCommandTest extends TestCase
 
         $this->assertInstanceOf(OpenedQuestion::class, $opened, 'precondition: the question opened');
         $this->web->deliveries = [];
+
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $opened->question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
 
         return AgentQuestion::findOrFail($opened->question->id);
     }
@@ -375,6 +384,14 @@ class ResolveExpiredQuestionsCommandTest extends TestCase
         if (getenv('LLM_CLIENT_QUESTION_EXPIRY_MINUTES') === false) {
             $shipped = require __DIR__.'/../../config/llm-client.php';
             $this->assertSame(1440, $shipped['agent_questions']['expiry_minutes'], 'the shipped default is 24 hours');
+        }
+        if (getenv('LLM_CLIENT_QUESTION_MIN_EXPIRY_MINUTES') === false) {
+            $shipped = require __DIR__.'/../../config/llm-client.php';
+            $this->assertSame(60, $shipped['agent_questions']['min_expiry_minutes'], 'the shipped minimum is one hour');
+        }
+        if (getenv('LLM_CLIENT_QUESTION_MAX_EXPIRY_MINUTES') === false) {
+            $shipped = require __DIR__.'/../../config/llm-client.php';
+            $this->assertSame(10080, $shipped['agent_questions']['max_expiry_minutes'], 'the shipped maximum is one week');
         }
     }
 

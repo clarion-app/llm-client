@@ -613,6 +613,9 @@ class AgentControllerQuestionIntakeTest extends TestCase
     {
         $waiting = $this->conversation();
         $question = $this->pendingQuestion($waiting);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $question->refresh();
         $expired = $this->expireWhenIntakeReads($question);
         $this->replies = [$this->textReply('A fresh start.')];
 
@@ -638,6 +641,9 @@ class AgentControllerQuestionIntakeTest extends TestCase
     {
         $conversation = $this->conversation();
         $question = $this->pendingQuestion($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $question->refresh();
         $expired = $this->expireWhenIntakeReads($question);
 
         $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [

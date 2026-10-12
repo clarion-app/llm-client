@@ -231,7 +231,13 @@ class QuestionPresentationUpdaterTest extends TestCase
     public function an_expiry_on_either_channel(): void
     {
         $telegram = $this->telegramQuestion();
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $telegram->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $telegram->refresh();
         $web = $this->webQuestion();
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $web->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $web->refresh();
 
         $this->assertTrue(app(AgentQuestionService::class)->expire($telegram));
         $this->assertTrue(app(AgentQuestionService::class)->expire($web));
@@ -299,6 +305,9 @@ class QuestionPresentationUpdaterTest extends TestCase
     public function nothing_is_refreshed_before_the_resolution_commits(): void
     {
         $question = $this->telegramQuestion();
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $question->refresh();
 
         DB::transaction(function () use ($question) {
             $this->assertTrue(app(AgentQuestionService::class)->expire($question));

@@ -25,10 +25,10 @@ use Illuminate\Support\Facades\Log;
 /**
  * Every write to `agent_questions` goes through this service.
  *
- * Each way a question can leave `pending` — answered, expired, withdrawn,
- * undeliverable — is the single compare-and-set in transition(), so racing
- * resolutions always produce exactly one winner, and only the winner
- * delivers a notice or resumes the run.
+ * Each way a question can leave a waiting state (`pending`, or `stopped`
+ * for a late answer or a discard) is the single compare-and-set in
+ * transition(), so racing resolutions always produce exactly one winner,
+ * and only the winner delivers a notice or resumes the run.
  */
 class AgentQuestionService
 {
@@ -221,7 +221,7 @@ class AgentQuestionService
      */
     public function expire(AgentQuestion $question): bool
     {
-        return $this->resolveWithNotice($question, QuestionState::Expired, [], true);
+        return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::Expired, [], true);
     }
 
     /**
@@ -246,7 +246,7 @@ class AgentQuestionService
             return false;
         }
 
-        if (!$this->resolveWithNotice($question, QuestionState::Withdrawn, [], false)) {
+        if (!$this->resolveWithNotice($question, [QuestionState::Pending, QuestionState::Stopped], QuestionState::Withdrawn, [], false)) {
             return false;
         }
 
@@ -282,7 +282,7 @@ class AgentQuestionService
             $reason = mb_substr($reason, 0, self::MAX_FAILURE_REASON_CHARS - 1).'…';
         }
 
-        return $this->resolveWithNotice($question, QuestionState::Undeliverable, [
+        return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::Undeliverable, [
             'delivery_failure_reason' => $reason,
         ], true);
     }
@@ -294,14 +294,16 @@ class AgentQuestionService
      * so a notice exists exactly when the resolution happened. No notice is
      * written or delivered when the conversation no longer exists.
      *
+     * $from lists the states the question may be resolved from;
      * $setProcessing is true for every resolution that continues the run.
      *
+     * @param  list<QuestionState>  $from
      * @param  array<string, mixed>  $fields
      */
-    private function resolveWithNotice(AgentQuestion $question, QuestionState $to, array $fields, bool $setProcessing): bool
+    private function resolveWithNotice(AgentQuestion $question, array $from, QuestionState $to, array $fields, bool $setProcessing): bool
     {
-        $result = DB::transaction(function () use ($question, $to, $fields, $setProcessing) {
-            if (!$this->transition($question->id, $to, $fields, $setProcessing)) {
+        $result = DB::transaction(function () use ($question, $from, $to, $fields, $setProcessing) {
+            if (!$this->transition($question->id, $from, $to, $fields, $setProcessing)) {
                 return null;
             }
 
@@ -374,7 +376,7 @@ class AgentQuestionService
         }
 
         return DB::transaction(function () use ($question, $answer, $userId, $rawContent, $method) {
-            $won = $this->transition($question->id, QuestionState::Answered, [
+            $won = $this->transition($question->id, [QuestionState::Pending, QuestionState::Stopped], QuestionState::Answered, [
                 'answer_raw' => $rawContent,
                 'answer_selected' => json_encode($answer->selected),
                 'answer_method' => $method->value,
@@ -424,39 +426,58 @@ class AgentQuestionService
     }
 
     /**
-     * Move a pending question to a terminal state, if it is still pending.
+     * Move a question out of a waiting state, if it is still in one of
+     * the $from states.
      *
-     * The winning caller (returns true) sets the state and `resolved_at`,
-     * releases the one-pending-per-conversation latch and writes $fields
-     * (raw column values). When $setProcessing is true the conversation is
-     * marked processing in the same commit, so a second message arriving
-     * between this resolution and the resume can never start a concurrent
-     * run. A losing caller (returns false) changes nothing.
+     * The winning caller (returns true) sets the state and writes $fields
+     * (raw column values). When $resolves is true it also sets
+     * `resolved_at`; when $releaseSlot is true it releases the
+     * one-question-per-conversation latch. Every resolution does both; only
+     * the stop, which leaves the question waiting for a late answer, does
+     * neither. When $setProcessing is true the conversation is marked
+     * processing in the same commit, so a second message arriving between
+     * this resolution and the resume can never start a concurrent run. A
+     * losing caller (returns false) changes nothing.
      *
      * The winner also schedules QuestionPresentationUpdater to run once the
      * outermost transaction commits, so every place the question is shown
-     * learns of the resolution — and never of one that rolled back.
+     * learns of the change — and never of one that rolled back.
      *
+     * @param  list<QuestionState>  $from
      * @param  array<string, mixed>  $fields
      */
-    private function transition(string $id, QuestionState $to, array $fields, bool $setProcessing): bool
-    {
+    private function transition(
+        string $id,
+        array $from,
+        QuestionState $to,
+        array $fields,
+        bool $setProcessing,
+        bool $releaseSlot = true,
+        bool $resolves = true,
+    ): bool {
         if ($to === QuestionState::Pending) {
-            throw new \InvalidArgumentException('A question can only transition to a terminal state.');
+            throw new \InvalidArgumentException('A question can never transition back to pending.');
         }
 
-        return DB::transaction(function () use ($id, $to, $fields, $setProcessing) {
+        if ($from === []) {
+            throw new \InvalidArgumentException('A transition needs at least one state to leave.');
+        }
+
+        return DB::transaction(function () use ($id, $from, $to, $fields, $setProcessing, $releaseSlot, $resolves) {
             $now = now();
+
+            $changes = ['state' => $to->value, 'updated_at' => $now];
+            if ($resolves) {
+                $changes['resolved_at'] = $now;
+            }
+            if ($releaseSlot) {
+                $changes['pending_conversation_id'] = null;
+            }
 
             $affected = DB::table('agent_questions')
                 ->where('id', $id)
-                ->where('state', QuestionState::Pending->value)
-                ->update(array_merge($fields, [
-                    'state' => $to->value,
-                    'resolved_at' => $now,
-                    'pending_conversation_id' => null,
-                    'updated_at' => $now,
-                ]));
+                ->whereIn('state', array_map(fn (QuestionState $state) => $state->value, $from))
+                ->update(array_merge($fields, $changes));
 
             if ($affected !== 1) {
                 return false;

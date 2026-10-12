@@ -195,7 +195,9 @@ class QuestionResumer
 
         $claimed = DB::table('agent_questions')
             ->where('id', $questionId)
-            ->where('state', '<>', QuestionState::Pending->value)
+            // A waiting question — pending, or stopped until a late answer or
+            // a discard — has nothing to resume yet.
+            ->whereNotIn('state', [QuestionState::Pending->value, QuestionState::Stopped->value])
             ->whereNull('resumed_at')
             ->update(['resumed_at' => $now, 'updated_at' => $now]);
 

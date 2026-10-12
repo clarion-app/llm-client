@@ -119,7 +119,9 @@ class ResolveExpiredQuestionsCommand extends Command
 
         DB::table('agent_questions')
             ->select('id')
-            ->where('state', '<>', QuestionState::Pending->value)
+            // A stopped question is still waiting, however long ago its
+            // period passed; it is resumed only by a late answer or a discard.
+            ->whereNotIn('state', [QuestionState::Pending->value, QuestionState::Stopped->value])
             ->whereNull('resumed_at')
             ->where('resolved_at', '<', $cutoff)
             ->orderBy('id')

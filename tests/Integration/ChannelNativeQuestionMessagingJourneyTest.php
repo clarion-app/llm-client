@@ -345,6 +345,8 @@ class ChannelNativeQuestionMessagingJourneyTest extends AssembledSystemTestCase
         $conversation = $this->telegramConversation();
         $this->script()->toolRequest('ask_user', ['question' => self::QUESTION, 'choices' => self::CHOICES]);
         $question = $this->ask($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
 
         $service = $this->app->make(AgentQuestionService::class);
         $this->assertTrue($service->expire($question->fresh()));

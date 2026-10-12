@@ -1105,8 +1105,16 @@ return [
     |
     */
     'agent_questions' => [
-        // Minutes a question stays answerable. Clamped to at least 1.
+        // Default minutes a question stays answerable when the agent asks
+        // for no period. Clamped to at least 1, and brought within the
+        // bounds below when a question is asked.
         'expiry_minutes' => max(1, (int) env('LLM_CLIENT_QUESTION_EXPIRY_MINUTES', 1440)),
+        // No question expires sooner than this, whatever the agent asks
+        // for. Operators may lower it, e.g. for testing.
+        'min_expiry_minutes' => max(1, (int) env('LLM_CLIENT_QUESTION_MIN_EXPIRY_MINUTES', 60)),
+        // No question waits longer than this. A maximum below the minimum
+        // yields to the minimum; every value is capped at one year.
+        'max_expiry_minutes' => max(1, (int) env('LLM_CLIENT_QUESTION_MAX_EXPIRY_MINUTES', 10080)),
         // A resolved question not yet resumed after this many seconds is
         // re-driven by the expiry sweep.
         'resume_grace_seconds' => 60,

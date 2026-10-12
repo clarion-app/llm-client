@@ -459,11 +459,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             $opened = app(\ClarionApp\LlmClient\Services\AgentQuestionService::class)->open(
                 new \ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest(
                     conversation: $conversation,
-                    request: new \ClarionApp\LlmClient\ValueObjects\AskUserRequest(
-                        (string) ($marker['question'] ?? ''),
-                        array_values($marker['choices'] ?? []),
-                        (bool) ($marker['allow_multiple'] ?? false),
-                    ),
+                    request: \ClarionApp\LlmClient\ValueObjects\AskUserRequest::fromMarker($marker),
                     runId: $this->runId,
                     stepId: $this->stepId,
                     actionId: $toolActionId,

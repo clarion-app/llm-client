@@ -56,6 +56,8 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
         config(['llm-client.run_trace.enabled' => true]);
         config(['llm-client.conversation.inactivity_threshold_hours' => 4]);
         config(['llm-client.agent_questions.expiry_minutes' => self::EXPIRY_MINUTES]);
+        // The period under test is shorter than the shipped minimum.
+        config(['llm-client.agent_questions.min_expiry_minutes' => self::EXPIRY_MINUTES]);
 
         // Resume jobs are held on the fake queue, as a real queue holds them
         // until a worker picks them up.
@@ -228,6 +230,8 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
             'arguments' => AgentQuestionWebJourneyTest::threeChoiceAskArguments(),
         ]]);
         $question = $this->questionIn($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
         $this->assertSame(QuestionState::Pending, $question->state);
         $this->assertSame(self::EXPIRY_MINUTES * 60, $question->expires_at->getTimestamp() - $question->asked_at->getTimestamp());
 
@@ -331,6 +335,8 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
         ])->assertStatus(202)->assertJson(['status' => 'awaiting_user']);
 
         $question = $this->questionIn($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
         $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES], $this->telegram->textsFor($conversation->id));
 
         $this->travel(self::EXPIRY_MINUTES * 60 + 30)->seconds();

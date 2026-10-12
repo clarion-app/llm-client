@@ -13,6 +13,9 @@ final readonly class QuestionRefusal
     public const QUESTION_ALREADY_PENDING = 'question_already_pending';
     public const NO_REACHABLE_USER = 'no_reachable_user';
 
+    /** The `ask_user` arguments that decide what happens if nobody answers. */
+    public const POLICY_ARGUMENTS = ['if_unanswered', 'assumed_choices', 'assumed_text', 'consequential', 'wait_minutes'];
+
     public const ALREADY_PENDING_REASON = "A question is already waiting for the user's answer in this conversation. Wait for it to be resolved before asking another.";
 
     public const NO_USER_REASON = 'This task has no user to ask.';
@@ -61,8 +64,9 @@ final readonly class QuestionRefusal
 
     /**
      * The run-record snapshot of the refused ask. No question row exists,
-     * so `question_id` is null; the question and choices are recorded as
-     * the agent submitted them, and there is no expiry, wait or answer.
+     * so `question_id` is null; the question and choices, and those of the
+     * policy arguments the ask sent, are recorded as the agent submitted
+     * them, and there is no expiry, wait or answer.
      *
      * @param  array<string, mixed>  $arguments  the call's arguments as given
      */
@@ -70,11 +74,16 @@ final readonly class QuestionRefusal
     {
         $time = \DateTimeImmutable::createFromInterface($at)->format('Y-m-d\\TH:i:s.vP');
 
+        // The policy arguments the ask sent, as given; one it did not send is
+        // not added.
+        $policy = array_intersect_key($arguments, array_flip(self::POLICY_ARGUMENTS));
+
         return json_encode([
             'question_id' => null,
             'question' => $arguments['question'] ?? null,
             'choices' => $arguments['choices'] ?? [],
             'allow_multiple' => (bool) ($arguments['allow_multiple'] ?? false),
+        ] + $policy + [
             'asked_at' => $time,
             'expires_at' => null,
             'resolution' => 'refused:'.$this->code,

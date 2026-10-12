@@ -486,6 +486,8 @@ class QuestionReturningUserJourneyTest extends AssembledSystemTestCase
                 $this->workedJobs = Queue::pushed(ResumeAfterQuestionJob::class)->count();
             })(),
             'expire' => (function () use ($question) {
+                // A question asked before unanswered policies existed: it expires as it always did.
+                DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
                 DB::table('agent_questions')->where('id', $question->id)->update(['expires_at' => now()->subMinute()]);
                 $this->assertSame(0, Artisan::call(self::SWEEP));
             })(),

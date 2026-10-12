@@ -281,7 +281,8 @@ abstract class AssembledSystemTestCase extends TestCase
 
         // agent_questions table (questions agents ask users mid-task). Kept
         // identical to the 2026_10_11_000000 migration plus the four columns
-        // added by 2026_10_12_000000, including the UNIQUE latch on
+        // added by 2026_10_12_000000 and the eight added by
+        // 2026_10_13_000000, including the UNIQUE latch on
         // pending_conversation_id that allows at most one pending question
         // per conversation.
         if (!Schema::hasTable('agent_questions')) {
@@ -317,6 +318,14 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->string('presentation', 16)->nullable();
                 $table->string('presentation_fallback_reason', 32)->nullable();
                 $table->string('answer_method', 24)->nullable();
+                $table->string('unanswered_policy', 32)->nullable();
+                $table->boolean('consequential')->default(false);
+                $table->text('assumed_answer_raw')->nullable();
+                $table->json('assumed_answer_selected')->nullable();
+                $table->integer('requested_wait_minutes')->nullable();
+                $table->unsignedInteger('effective_wait_minutes')->nullable();
+                $table->timestamp('stopped_at', 6)->nullable();
+                $table->timestamp('late_reply_noticed_at', 6)->nullable();
 
                 $table->unique('pending_conversation_id');
                 $table->index('conversation_id');

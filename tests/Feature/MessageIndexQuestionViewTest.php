@@ -242,6 +242,9 @@ class MessageIndexQuestionViewTest extends TestCase
         $first = AgentQuestion::findOrFail($this->openQuestion($conversation)->question->id);
         $this->answerTyped($first, '2');
         $second = AgentQuestion::findOrFail($this->openQuestion($conversation)->question->id);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $second->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $second->refresh();
         $this->assertTrue(app(AgentQuestionService::class)->expire($second), 'precondition: the second question expired');
         $third = AgentQuestion::findOrFail($this->openQuestion($conversation)->question->id);
 

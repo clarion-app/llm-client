@@ -633,6 +633,10 @@ class InteractiveAnswerRaceJourneyTest extends AssembledSystemTestCase
             $this->scriptAsk(continues: $state !== 'withdrawn');
             $conversation = $this->telegramConversation();
             $question = $this->ask($conversation);
+            if (in_array('expire', [$first, $second], true)) {
+                // A question asked before unanswered policies existed: it expires as it always did.
+                DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+            }
             // Past its answerable period, not yet swept: every resolution is possible.
             $this->pastItsAnswerablePeriod($question);
 
@@ -665,6 +669,8 @@ class InteractiveAnswerRaceJourneyTest extends AssembledSystemTestCase
         $this->scriptAsk(continues: true);
         $conversation = $this->telegramConversation();
         $question = $this->ask($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
 
         $this->pastItsAnswerablePeriod($question);
         $this->assertSame(0, Artisan::call(self::SWEEP));

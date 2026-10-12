@@ -111,6 +111,11 @@ class QuestionControllerAnswerTest extends TestCase
     private function resolved(QuestionState $state): AgentQuestion
     {
         $question = $this->pending();
+        if ($state === QuestionState::Expired) {
+            // A question asked before unanswered policies existed: it expires as it always did.
+            DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+            $question->refresh();
+        }
         $service = app(AgentQuestionService::class);
 
         $won = match ($state) {
