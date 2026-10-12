@@ -81,6 +81,9 @@ class AgentLoopService
      */
     public const REQUIRES_USER_INPUT = '__requires_user_input';
 
+    /** The channel of a delegated helper's own conversation. */
+    private const DELEGATION_CHANNEL = 'agent-delegation';
+
     public const PAGE_TEXT_OPERATION_ID = 'clarionApp.llmClient.fetchPage.getTextFromUrl';
 
     /**
@@ -2000,7 +2003,15 @@ class AgentLoopService
                         $actionContent = ($toolName === 'execute_operation' && ($arguments['operationId'] ?? '') === self::PAGE_TEXT_OPERATION_ID)
                             ? $result
                             : null;
-                        if (is_array($decoded) && is_string($decoded['error'] ?? null)) {
+                        $refusedAsk = $toolName === 'ask_user' ? QuestionRefusal::fromToolResult($decoded) : null;
+                        if ($refusedAsk !== null) {
+                            $this->runTraceRecorder->closeAction(
+                                $activeActionId,
+                                ActionOutcome::Failure,
+                                $refusedAsk->actionFailureReason(),
+                                $refusedAsk->snapshot($arguments, now()),
+                            );
+                        } elseif (is_array($decoded) && is_string($decoded['error'] ?? null)) {
                             $this->runTraceRecorder->closeAction(
                                 $activeActionId,
                                 ActionOutcome::Failure,
@@ -3035,7 +3046,17 @@ class AgentLoopService
                     $actionContent = ($toolName === 'execute_operation' && ($arguments['operationId'] ?? '') === self::PAGE_TEXT_OPERATION_ID)
                         ? $result
                         : null;
-                    $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success, null, $actionContent);
+                    $refusedAsk = $toolName === 'ask_user' ? QuestionRefusal::fromToolResult($decoded) : null;
+                    if ($refusedAsk !== null) {
+                        $this->runTraceRecorder->closeAction(
+                            $toolActionId,
+                            ActionOutcome::Failure,
+                            $refusedAsk->actionFailureReason(),
+                            $refusedAsk->snapshot($arguments, now()),
+                        );
+                    } else {
+                        $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success, null, $actionContent);
+                    }
                 }
 
                 // Tool executed (not a confirmation pause) — record its outcome.
@@ -3914,29 +3935,72 @@ class AgentLoopService
             'report_shortfall' => $this->handleReportShortfall($arguments, $conversation),
             'finalize_task' => $this->handleFinalizeTask($arguments, $conversation),
             'record_task_note' => $this->handleRecordTaskNote($arguments, $conversation),
-            'ask_user' => $this->handleAskUser($arguments),
+            'ask_user' => $this->handleAskUser($arguments, $conversation, $unattended),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
     }
 
     /**
-     * The checks an `ask_user` call gets before any pause. An invalid
-     * question is refused here, and the refusal is the call's result. A
-     * valid one comes back as a marker carrying the normalized question; the
-     * pause site that receives it opens the question and suspends the run.
+     * The checks an `ask_user` call gets before any pause. An ask nobody
+     * could answer, or an invalid question, is refused here, and the refusal
+     * is the call's result. A valid one comes back as a marker carrying the
+     * normalized question; the pause site that receives it opens the
+     * question and suspends the run.
      */
-    private function handleAskUser(array $arguments): string
+    private function handleAskUser(array $arguments, Conversation $conversation, bool $unattended): string
     {
-        $validated = (new AgentQuestionValidator())->validate($arguments);
+        $refusal = $this->askReachabilityRefusal($conversation, $unattended)
+            ?? (new AgentQuestionValidator())->validate($arguments);
 
-        if ($validated instanceof QuestionRefusal) {
-            return $validated->toToolResult();
+        if ($refusal instanceof QuestionRefusal) {
+            return $refusal->toToolResult();
         }
 
         return json_encode(
-            [self::REQUIRES_USER_INPUT => true] + $validated->toArray(),
+            [self::REQUIRES_USER_INPUT => true] + $refusal->toArray(),
             JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
         );
+    }
+
+    /**
+     * Why nobody can be asked from $conversation, or null when its user can
+     * be. Only a user-facing conversation on a channel that can deliver a
+     * question, in a run someone is attending, can pause to ask.
+     *
+     * A delegated helper runs inside its caller's tool call and cannot
+     * pause; when the root conversation of its delegation chain is already
+     * waiting on its user, it is told so, since that is the question it
+     * would have to wait behind.
+     */
+    private function askReachabilityRefusal(Conversation $conversation, bool $unattended): ?QuestionRefusal
+    {
+        if ($conversation->user_id === null || $conversation->user_id === '') {
+            return QuestionRefusal::noReachableUser(QuestionRefusal::NO_USER_REASON);
+        }
+
+        if ($unattended) {
+            return QuestionRefusal::noReachableUser(QuestionRefusal::UNATTENDED_REASON);
+        }
+
+        $channel = (string) ($conversation->channel ?? 'web');
+
+        if ($channel === self::DELEGATION_CHANNEL) {
+            $rootId = DelegationService::chainRootConversationId((string) $conversation->id);
+
+            if ($rootId !== (string) $conversation->id
+                && AgentQuestion::where('pending_conversation_id', $rootId)->exists()
+            ) {
+                return QuestionRefusal::alreadyPending();
+            }
+
+            return QuestionRefusal::noReachableUser(QuestionRefusal::HELPER_REASON);
+        }
+
+        if (!app(ConversationChannelRegistry::class)->has($channel)) {
+            return QuestionRefusal::noReachableUser("Questions cannot be delivered on the '{$channel}' channel.");
+        }
+
+        return null;
     }
 
     private function handleMemoryCreate(array $arguments, Conversation $conversation): string

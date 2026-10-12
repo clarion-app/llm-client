@@ -207,7 +207,48 @@ class AgentQuestionService
      */
     public function expire(AgentQuestion $question): bool
     {
-        return $this->resolveWithNotice($question, QuestionState::Expired, []);
+        return $this->resolveWithNotice($question, QuestionState::Expired, [], true);
+    }
+
+    /**
+     * Withdraw the question waiting in $conversation, because its user
+     * stopped the conversation's work (ended or deleted it).
+     *
+     * Only the winner (true) tells the user the question no longer needs a
+     * reply and ends the waiting run: the paused call is answered with the
+     * withdrawn outcome so the stored history stays valid, and the run
+     * closes without another model call. The conversation is not marked
+     * processing, since nothing continues. With no pending question, or one
+     * resolved by anything else first, nothing changes (false) — an answer
+     * accepted a moment earlier stands and its run continues.
+     */
+    public function withdrawForConversation(Conversation $conversation): bool
+    {
+        // Loaded as a model, as every other resolver loads it, before its
+        // compare-and-set.
+        $question = AgentQuestion::where('pending_conversation_id', $conversation->id)->first();
+
+        if ($question === null) {
+            return false;
+        }
+
+        if (!$this->resolveWithNotice($question, QuestionState::Withdrawn, [], false)) {
+            return false;
+        }
+
+        try {
+            app(QuestionResumer::class)->resume($question->id, ResumeCaller::HttpRequest);
+        } catch (\Throwable $e) {
+            // The withdrawal stands; a resolved question that never resumed
+            // is picked up by the re-drive sweep, which closes its run.
+            Log::warning('AgentQuestionService: the withdrawn question\'s run could not be closed', [
+                'question_id' => $question->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return true;
     }
 
     /**
@@ -223,7 +264,7 @@ class AgentQuestionService
     {
         return $this->resolveWithNotice($question, QuestionState::Undeliverable, [
             'delivery_failure_reason' => $reason,
-        ]);
+        ], true);
     }
 
     /**
@@ -233,12 +274,14 @@ class AgentQuestionService
      * so a notice exists exactly when the resolution happened. No notice is
      * written or delivered when the conversation no longer exists.
      *
+     * $setProcessing is true for every resolution that continues the run.
+     *
      * @param  array<string, mixed>  $fields
      */
-    private function resolveWithNotice(AgentQuestion $question, QuestionState $to, array $fields): bool
+    private function resolveWithNotice(AgentQuestion $question, QuestionState $to, array $fields, bool $setProcessing): bool
     {
-        $result = DB::transaction(function () use ($question, $to, $fields) {
-            if (!$this->transition($question->id, $to, $fields, true)) {
+        $result = DB::transaction(function () use ($question, $to, $fields, $setProcessing) {
+            if (!$this->transition($question->id, $to, $fields, $setProcessing)) {
                 return null;
             }
 

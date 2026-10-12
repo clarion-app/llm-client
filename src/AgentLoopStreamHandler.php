@@ -805,6 +805,16 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         && ($arguments['operationId'] ?? '') === AgentLoopService::PAGE_TEXT_OPERATION_ID)
                         ? $result
                         : null;
+                    // A refused ask is a failed call in the run record,
+                    // whatever the metrics recorder made of its result.
+                    $refusedAsk = $toolName === 'ask_user'
+                        ? \ClarionApp\LlmClient\ValueObjects\QuestionRefusal::fromToolResult(json_decode($result, true))
+                        : null;
+                    if ($refusedAsk !== null) {
+                        $outcome = \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Failure;
+                        $toolError = $refusedAsk->actionFailureReason();
+                        $actionContent = $refusedAsk->snapshot($arguments, now());
+                    }
                     $this->runTraceRecorder->closeAction(
                         $toolActionId,
                         $outcome,
