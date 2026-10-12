@@ -92,6 +92,7 @@ class DelegationBatchBudgetParityTest extends TestCase
         Carbon::setTestNow(Carbon::parse('2026-08-14 10:00:00', 'UTC'));
         config(['llm-client.run_trace.enabled' => true]);
         config(['queue.default' => 'sync']);
+        config(['llm-client.task_budget.default_max_spend' => '25.00']); // spec 133: these helpers spend 4.50 in total; the default task budget is 1.00 (FR-002).
 
         $this->createSupportingTables();
         $this->seedOperationCatalog();

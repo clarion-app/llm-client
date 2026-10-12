@@ -237,6 +237,12 @@ class AgentLoopStreamHandlerTest extends TestCase
     #[Test]
     public function max_iteration_limit_triggers_error_message()
     {
+        // spec 133: the handler no longer closes out at iteration =
+        // agent_loop.max_iterations; a streamed root run is bounded by its
+        // task budget, checked before the next iteration's model call. A
+        // task already at its step ceiling: this iteration's tool call
+        // still executes, then the next start() is refused, the task
+        // pauses and nothing is finished or dispatched.
         Event::fake([
             UpdateOpenAIConversationResponseEvent::class,
             FinishOpenAIConversationResponseEvent::class,
@@ -244,8 +250,12 @@ class AgentLoopStreamHandlerTest extends TestCase
             ToolExecutionEvent::class,
             \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
         ]);
+        \Illuminate\Support\Facades\Queue::fake([\ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest::class]);
 
-        $conversation = Conversation::factory()->create(['is_processing' => true]);
+        $server = \ClarionApp\LlmClient\Models\Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
+        $conversation = Conversation::factory()->create(['is_processing' => true, 'server_id' => $server->id]);
+        $task = app(\ClarionApp\LlmClient\Services\TaskBudgetService::class)->openLazily($conversation, null);
+        \Illuminate\Support\Facades\DB::table('task_budgets')->where('id', $task->id)->update(['steps_used' => $task->max_steps]);
 
         $handler = new AgentLoopStreamHandler();
         $handler->toolCalls = [
@@ -262,21 +272,29 @@ class AgentLoopStreamHandlerTest extends TestCase
             'content' => '',
             'responseTime' => 0,
         ]);
-
-        $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
+        $this->mockToolExecution('contacts.store', '{"id": "uuid-123"}');
 
         $data = json_encode([
             'conversation_id' => $conversation->id,
-            'iteration' => $maxIterations,
+            'iteration' => (int) $task->max_steps,
         ]);
 
         $handler->finish($data, 2);
 
-        // Should have saved an error message and cleared is_processing
+        $handler->message->refresh();
+        $this->assertSame('call_abc', $handler->message->tool_data['tool_results'][0]['tool_call_id'] ?? null, 'the tool call of the last claimed step executed');
+        Event::assertDispatched(ToolExecutionEvent::class);
+
+        $row = \Illuminate\Support\Facades\DB::table('task_budgets')->where('id', $task->id)->first();
+        $this->assertSame('paused', $row->state);
+        $this->assertSame('steps', $row->pause_reason);
+        $this->assertSame((int) $task->max_steps, (int) $row->steps_used, 'no step was claimed past the ceiling');
+
         $conversation->refresh();
         $this->assertFalse($conversation->is_processing);
 
-        Event::assertDispatched(FinishOpenAIConversationResponseEvent::class);
+        Event::assertNotDispatched(FinishOpenAIConversationResponseEvent::class);
+        \Illuminate\Support\Facades\Queue::assertNotPushed(\ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest::class);
     }
 
     protected function mockToolExecution(string $toolName, string $result)

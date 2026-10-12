@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Models\TaskBudgetEvent;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\StatedCeilings;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetStanding;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
@@ -55,7 +56,9 @@ class TaskBudgetService
                 if ($root === null) {
                     return $this->openLazily($conversation, $runId);
                 }
-                $task = $this->currentFor($root) ?? $this->openLazily($root, $runId);
+                // The helper's run is not the root's, so the root's task is
+                // opened with no run of its own: no helper run's close ends it.
+                $task = $this->currentFor($root) ?? $this->openLazily($root, null);
                 $this->point($conversation, $task->id);
 
                 return $task;
@@ -112,6 +115,37 @@ class TaskBudgetService
         }
 
         return $task;
+    }
+
+    /**
+     * The root run of a running task closed: the task ends with it —
+     * completed when the run completed, ended (with the run's end state as
+     * its reason) otherwise. A task in any other state already decided its
+     * own state and is left alone. Best-effort: never throws.
+     */
+    public function rootRunClosed(string $runId, RunEndState $endState, ?string $reason): void
+    {
+        try {
+            $task = TaskBudget::where('root_run_id', $runId)->where('state', TaskBudgetState::Running->value)->first();
+            if ($task === null) {
+                return;
+            }
+
+            $completed = $endState === RunEndState::Completed;
+            $now = now()->format('Y-m-d H:i:s.u');
+            $won = DB::table('task_budgets')->where('id', $task->id)->where('state', TaskBudgetState::Running->value)->update([
+                'state' => $completed ? TaskBudgetState::Completed->value : TaskBudgetState::Ended->value,
+                'end_reason' => $completed ? null : $endState->value,
+                'ended_at' => $now,
+                'updated_at' => $now,
+            ]);
+
+            if ($won === 1) {
+                $this->appendEvent($task, 'ended', ['reason' => $completed ? 'completed' : $endState->value, 'run_end_reason' => $reason]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning("Task budget could not be ended for run {$runId}", ['run_id' => $runId, 'error' => $e->getMessage()]);
+        }
     }
 
     public function supersede(TaskBudget $predecessor): void

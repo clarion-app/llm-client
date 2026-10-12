@@ -66,7 +66,10 @@ class EvalCaseExecutor
                 ->orderBy('created_at')
                 ->get();
 
-            $assistantMessages = $messages->where('role', 'assistant');
+            // Messages written for the user only (a question, a notice, a
+            // task-budget report) are not the agent's response.
+            $assistantMessages = $messages->where('role', 'assistant')
+                ->reject(fn (Message $message) => in_array($message->tool_data['kind'] ?? null, AgentQuestionService::CONVERSATION_ONLY_KINDS, true));
 
             $producedResponse = $assistantMessages->last()?->content;
 

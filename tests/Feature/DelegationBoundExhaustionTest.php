@@ -295,16 +295,13 @@ class DelegationBoundExhaustionTest extends TestCase
     #[Test]
     public function a_delegation_exhausting_its_iteration_ceiling_reports_status_exhausted_with_incomplete_because_iteration_limit(): void
     {
-        // Both configured to the same low value: `delegation.max_iterations`
-        // is what T041 will actually thread through as the nested run's
-        // own override, while `agent_loop.max_iterations` is the plain,
-        // pre-existing ceiling that governs both the parent's own outer
-        // loop AND (today, since the override does not exist yet) the
-        // nested helper loop too -- keeping this test's own provider
-        // script deterministic in both the current and the implemented
-        // state.
+        // `delegation.max_iterations` is the nested run's own override.
+        // spec 133: `agent_loop.max_iterations` = 2 is no longer set here --
+        // it is now the default step ceiling of the one task the parent and
+        // its helper share (parent 1 + helper 2 + parent 1 = 4 steps), so
+        // at 2 the task budget, not the helper's own bound, would stop the
+        // helper. The helper is still bounded by its own override of 2.
         config(['llm-client.delegation.max_iterations' => 2]);
-        config(['llm-client.agent_loop.max_iterations' => 2]);
 
         $parent = $this->makeAgent('parent-agent-exhaustion-iterations');
         $helper = $this->makeAgent('helper-agent-exhaustion-iterations');

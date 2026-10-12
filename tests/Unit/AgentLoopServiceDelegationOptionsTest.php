@@ -389,12 +389,15 @@ class AgentLoopServiceDelegationOptionsTest extends TestCase
 
         $result = $service->run($conversation, 'Keep going forever.');
 
-        $this->assertSame('error', $result['status'] ?? null);
-        $this->assertSame('max_iterations', $result['code'] ?? null);
+        // spec 133: with no explicit bound the run is bounded by its task
+        // budget, whose default step ceiling is agent_loop.max_iterations;
+        // the conversation has a user to ask, so the task pauses there.
+        $this->assertSame('awaiting_user', $result['status'] ?? null);
+        $this->assertTaskPausedAtItsStepCeiling($conversation, 2);
         $this->assertSame(
             2,
             $callCount,
-            'a plain call with no $options argument at all must still stop exactly at the configured ceiling, identically to before this feature',
+            'a plain call with no $options argument at all must still stop exactly at the configured ceiling',
         );
     }
 
@@ -418,8 +421,10 @@ class AgentLoopServiceDelegationOptionsTest extends TestCase
         // absent, not merely "usually absent."
         $result = $service->run($conversation, 'Keep going forever.', ['retry_on_validation_failure' => false]);
 
-        $this->assertSame('error', $result['status'] ?? null);
-        $this->assertSame('max_iterations', $result['code'] ?? null);
+        // spec 133: bounded by the task budget's default step ceiling
+        // (agent_loop.max_iterations), pausing for the user's decision.
+        $this->assertSame('awaiting_user', $result['status'] ?? null);
+        $this->assertTaskPausedAtItsStepCeiling($conversation, 2);
         $this->assertSame(2, $callCount);
     }
 
@@ -441,5 +446,16 @@ class AgentLoopServiceDelegationOptionsTest extends TestCase
         $run = DB::table('agent_runs')->where('conversation_id', $conversation->id)->first();
         $this->assertNotNull($run);
         $this->assertSame('completed', $run->end_state);
+    }
+
+    /** The conversation's task is paused at its step ceiling after exactly $steps claimed steps. */
+    private function assertTaskPausedAtItsStepCeiling(Conversation $conversation, int $steps): void
+    {
+        $task = DB::table('task_budgets')->where('id', $conversation->fresh()->active_task_budget_id)->first();
+        $this->assertNotNull($task, 'the run opened a task');
+        $this->assertSame('paused', $task->state);
+        $this->assertSame('steps', $task->pause_reason);
+        $this->assertSame($steps, (int) $task->steps_used);
+        $this->assertSame($steps, (int) $task->max_steps);
     }
 }

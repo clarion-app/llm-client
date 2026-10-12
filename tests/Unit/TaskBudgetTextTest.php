@@ -141,6 +141,25 @@ class TaskBudgetTextTest extends TestCase
                 $t->reportHeadline($this->standing(['stepsUsed' => 12, 'maxSteps' => 10])),
                 $t->reportHeadline($s),
             ],
+            'reportConsumption' => [
+                $t->reportConsumption($reachedSteps),
+                $t->reportConsumption($this->standing(['approximate' => true])),
+                $t->reportConsumption($this->standing(['unpricedRequestCount' => 1])),
+                $t->reportConsumption($this->standing(['approximate' => true, 'unpricedRequestCount' => 3])),
+            ],
+            'reportDone' => [
+                $t->reportDone([]),
+                $t->reportDone(['execute_operation' => 3, 'list_applications' => 1]),
+            ],
+            'reportLatestProgress' => [$t->reportLatestProgress('Two of the three files are converted.')],
+            'reportNothingOutstanding' => [$t->reportNothingOutstanding()],
+            'reportNext' => [
+                $t->reportNext('paused'),
+                $t->reportNext('accepted'),
+                $t->reportNext('stopped'),
+                $t->reportNext('expired'),
+                $t->reportNext('halted'),
+            ],
         ];
     }
 
@@ -419,6 +438,64 @@ class TaskBudgetTextTest extends TestCase
             $t->reportHeadline($this->standing(['stepsUsed' => 12, 'maxSteps' => 10]))
         );
         $this->assertSame($t->unavailable(), $t->reportHeadline($this->standing()), 'nothing reached: the budget could not be checked');
+    }
+
+    #[Test]
+    public function the_report_sections(): void
+    {
+        $t = $this->text;
+
+        $this->assertSame(
+            "Used under this task's budget: 20 of 20 steps, 0.41 of 1.00 USD.",
+            $t->reportConsumption($this->standing(['stepsUsed' => 20]))
+        );
+        $this->assertSame(
+            "Used under this task's budget: 16 of 20 steps, 0.41 of 1.00 USD. Spend is approximate (some usage was estimated).",
+            $t->reportConsumption($this->standing(['approximate' => true]))
+        );
+        $this->assertSame(
+            "Used under this task's budget: 16 of 20 steps, 0.41 of 1.00 USD. Spend is incomplete (1 request had no configured price).",
+            $t->reportConsumption($this->standing(['unpricedRequestCount' => 1]))
+        );
+        $this->assertSame(
+            "Used under this task's budget: 16 of 20 steps, 0.41 of 1.00 USD. Spend is approximate (some usage was estimated). Spend is incomplete (3 requests had no configured price).",
+            $t->reportConsumption($this->standing(['approximate' => true, 'unpricedRequestCount' => 3]))
+        );
+        $this->assertSame("Nothing was completed under this task's budget yet.", $t->reportDone([]));
+        $this->assertSame(
+            "Completed under this task's budget: execute_operation (3), list_applications (1).",
+            $t->reportDone(['execute_operation' => 3, 'list_applications' => 1])
+        );
+        $this->assertSame(
+            "Latest progress under this task's budget: Two of the three files are converted.",
+            $t->reportLatestProgress('Two of the three files are converted.')
+        );
+        $this->assertSame(
+            "Anything the agent had not started yet under this task's budget is not recorded.",
+            $t->reportNothingOutstanding()
+        );
+        $this->assertSame(
+            "This task's budget needs your decision: continue with more allowance, accept what has been done, or stop.",
+            $t->reportNext('paused')
+        );
+        $this->assertSame(
+            "This task is closed at this task's budget ceiling; its completed work above is the result.",
+            $t->reportNext('accepted')
+        );
+        $stopped = "Work has stopped at this task's budget ceiling. Reply 'continue' to resume with more allowance or 'accept' to close the task with what has been done.";
+        $this->assertSame($stopped, $t->reportNext('stopped'));
+        $this->assertSame($stopped, $t->reportNext('expired'));
+        $this->assertSame(
+            "Nobody could be asked about this task's budget, so the task stopped. The work above is kept.",
+            $t->reportNext('halted')
+        );
+    }
+
+    #[Test]
+    public function an_unknown_report_occasion_is_a_programming_error(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->text->reportNext('finished');
     }
 
     #[Test]

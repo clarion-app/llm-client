@@ -103,6 +103,11 @@ class ManagerService
             'started_at' => now(),
         ]);
 
+        // One task budget for the whole managed task: every manager round
+        // and every helper it assigns claims against it. Nobody is present
+        // to be asked, so at its ceiling it halts.
+        app(TaskBudgetService::class)->openForRequest($conversation, \ClarionApp\LlmClient\Models\TaskBudget::SCOPE_MANAGED_TASK, null, $task->id, true);
+
         $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
 
         return $task;

@@ -702,6 +702,18 @@ class RunTraceRecorder
                 ]);
             }
 
+            // The task this run is the root of ends with it. Isolated like
+            // the writes above: a task-budget failure must never suppress
+            // forwarding or the broadcast below.
+            try {
+                app(TaskBudgetService::class)->rootRunClosed($runId, $endState, $reason);
+            } catch (\Throwable $e) {
+                Log::warning('RunTraceRecorder: failed to end the task of a closed run', [
+                    'run_id' => $runId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
             $this->enqueueForwarding($runId);
 
             $this->broadcast(fn () => event(new RunUpdated($runId)));

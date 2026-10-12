@@ -198,6 +198,55 @@ class TaskBudgetText
         return "This task's budget ceiling was reached: ".implode(' and ', $parts).'.';
     }
 
+    public function reportConsumption(TaskBudgetStanding $s): string
+    {
+        $text = "Used under this task's budget: {$s->stepsUsed} of {$s->maxSteps} steps, ".$this->amount($s->spendUsed).' of '.$this->amount($s->maxSpend).' '.$s->currency.'.';
+        if ($s->approximate) {
+            $text .= ' Spend is approximate (some usage was estimated).';
+        }
+        if ($s->unpricedRequestCount > 0) {
+            $text .= ' Spend is incomplete ('.$s->unpricedRequestCount.($s->unpricedRequestCount === 1 ? ' request' : ' requests').' had no configured price).';
+        }
+
+        return $text;
+    }
+
+    /** @param array<string, int> $toolCounts completed tool calls by name, in first-seen order */
+    public function reportDone(array $toolCounts): string
+    {
+        if ($toolCounts === []) {
+            return "Nothing was completed under this task's budget yet.";
+        }
+
+        $parts = [];
+        foreach ($toolCounts as $name => $count) {
+            $parts[] = "{$name} ({$count})";
+        }
+
+        return "Completed under this task's budget: ".implode(', ', $parts).'.';
+    }
+
+    public function reportLatestProgress(string $progress): string
+    {
+        return "Latest progress under this task's budget: {$progress}";
+    }
+
+    public function reportNothingOutstanding(): string
+    {
+        return "Anything the agent had not started yet under this task's budget is not recorded.";
+    }
+
+    public function reportNext(string $occasion): string
+    {
+        return match ($occasion) {
+            'paused' => "This task's budget needs your decision: continue with more allowance, accept what has been done, or stop.",
+            'accepted' => "This task is closed at this task's budget ceiling; its completed work above is the result.",
+            'stopped', 'expired' => "Work has stopped at this task's budget ceiling. Reply 'continue' to resume with more allowance or 'accept' to close the task with what has been done.",
+            'halted' => "Nobody could be asked about this task's budget, so the task stopped. The work above is kept.",
+            default => throw new \InvalidArgumentException("Unknown report occasion: {$occasion}"),
+        };
+    }
+
     private function figures(TaskBudgetStanding $s): string
     {
         $text = "{$s->stepsUsed} of {$s->maxSteps} steps, ".$this->amount($s->spendUsed).' of '.$this->amount($s->maxSpend).' '.$s->currency;

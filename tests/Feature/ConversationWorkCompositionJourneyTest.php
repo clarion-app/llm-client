@@ -324,8 +324,16 @@ class ConversationWorkCompositionJourneyTest extends TestCase
 
         $maxIterationsResult = $serviceMaxIterations->run($conversationMaxIterations, 'Keep going, one small step at a time.');
 
-        $this->assertSame('error', $maxIterationsResult['status']);
-        $this->assertSame('max_iterations', $maxIterationsResult['code'] ?? null);
+        // spec 133: the per-run iteration bound is now the task budget's
+        // default step ceiling (agent_loop.max_iterations); the
+        // conversation has a user to ask, so the task pauses at it after
+        // the same two calls.
+        $this->assertSame('awaiting_user', $maxIterationsResult['status']);
+        $task = \Illuminate\Support\Facades\DB::table('task_budgets')->where('id', $conversationMaxIterations->fresh()->active_task_budget_id)->first();
+        $this->assertNotNull($task);
+        $this->assertSame('paused', $task->state);
+        $this->assertSame('steps', $task->pause_reason);
+        $this->assertSame(2, (int) $task->steps_used);
 
         // Case 2 — a tight conversation_default ceiling, a generous
         // max_iterations restored to its normal default, and a single LLM
@@ -377,6 +385,8 @@ class ConversationWorkCompositionJourneyTest extends TestCase
         // a response that stays comfortably within a generous
         // max_iterations — each catching a case the other structurally
         // cannot.
-        $this->assertNotSame($maxIterationsResult['code'], $workCeilingResult['code']);
+        // spec 133: case 1's outcome is now the task budget's pause, which
+        // carries a status rather than a code; the two outcomes still differ.
+        $this->assertNotSame($maxIterationsResult['status'], $workCeilingResult['status']);
     }
 }
