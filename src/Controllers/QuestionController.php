@@ -96,9 +96,10 @@ class QuestionController extends Controller
     }
 
     /**
-     * The submitted answer, or the reason the body is not one. Read from
-     * the raw JSON body so free text reaches the question exactly as typed,
-     * untouched by any input trimming.
+     * The submitted answer, or the reason the body is not one. Which keys
+     * were sent, and their types, are read from the raw JSON body (input
+     * normalisation turns a blank string into null, which would hide that
+     * text was sent); the words themselves are read like any other input.
      */
     private function answerFrom(Request $request): InteractiveAnswer|string
     {
@@ -119,9 +120,16 @@ class QuestionController extends Controller
                 return 'Your own words must be text.';
             }
 
-            return strlen($body['text']) > self::MAX_TEXT_BYTES
+            // The words as the application's request middleware leaves them
+            // (trimmed, a blank one turned into null), exactly as a typed
+            // reply's are, so the same words mean the same answer whichever
+            // way they were given.
+            $text = $request->input('text');
+            $text = is_string($text) ? $text : '';
+
+            return strlen($text) > self::MAX_TEXT_BYTES
                 ? 'Your answer is too long.'
-                : InteractiveAnswer::freeText($body['text']);
+                : InteractiveAnswer::freeText($text);
         }
 
         $selected = $body['selected'];

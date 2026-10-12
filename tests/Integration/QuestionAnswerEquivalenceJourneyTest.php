@@ -558,6 +558,30 @@ class QuestionAnswerEquivalenceJourneyTest extends AssembledSystemTestCase
     }
 
     #[Test]
+    public function own_words_with_surrounding_whitespace_mean_the_same_from_the_form_as_typed(): void
+    {
+        $this->scenario = 'question_equivalence_padded_free_text';
+        $ask = ['question' => self::QUESTION, 'choices' => self::CHOICES];
+        $padded = "  none of these — use a fourth approach \n";
+
+        // The ways a person can type words: a tap carries no text.
+        $conversations = $this->conversations();
+        $runs = [];
+        foreach (['web form', 'web typed', 'messaging typed'] as $way) {
+            $runs[$way] = $this->runWay($way, $conversations[$way], $ask, $padded);
+        }
+
+        // Typed replies reach the question through the host's request
+        // normalisation; the form's words must arrive the same way.
+        $reference = $runs['web typed']['result'];
+        $this->assertFalse($reference['answer']['is_selection']);
+        foreach ($runs as $way => $run) {
+            $this->assertSame($reference, $run['result'], "{$way}: the same words reach the agent as typed in the message box");
+            $this->assertSame($reference['answer']['raw_reply'], $run['question']->answer_raw, "{$way}: the same words are stored");
+        }
+    }
+
+    #[Test]
     public function free_text_naming_a_choice_selects_it_however_and_wherever_it_is_given(): void
     {
         $this->scenario = 'question_equivalence_free_text_number';
