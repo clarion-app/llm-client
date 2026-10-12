@@ -345,6 +345,26 @@ class AgentQuestionServiceTransitionTest extends TestCase
     }
 
     #[Test]
+    public function mark_undeliverable_keeps_an_overlong_reason_within_its_column(): void
+    {
+        // `delivery_failure_reason` is a 512-character column; an adapter's
+        // reason is free text (an exception class and message), and a longer
+        // one would make the resolving UPDATE fail on a strict database,
+        // leaving the question pending though the user never saw it.
+        $this->recordingWebChannel();
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation);
+        $reason = 'RuntimeException: '.str_repeat('é', 700);
+
+        $won = app(AgentQuestionService::class)->markUndeliverable(AgentQuestion::findOrFail($id), $reason);
+
+        $this->assertTrue($won);
+        $stored = (string) $this->row($id)->delivery_failure_reason;
+        $this->assertLessThanOrEqual(512, mb_strlen($stored), 'the stored reason fits the column');
+        $this->assertStringStartsWith('RuntimeException: éé', $stored, 'the reason is shortened, not replaced');
+    }
+
+    #[Test]
     public function mark_undeliverable_loses_on_a_resolved_question_and_changes_nothing(): void
     {
         $web = $this->recordingWebChannel();

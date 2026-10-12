@@ -43,6 +43,9 @@ class AgentQuestionService
     /** Every message kind that exists only for the user, never for the model. */
     public const CONVERSATION_ONLY_KINDS = [self::KIND_QUESTION, self::KIND_NOTICE, self::KIND_ANSWER];
 
+    /** Length of the `agent_questions.delivery_failure_reason` column. */
+    private const MAX_FAILURE_REASON_CHARS = 512;
+
     /**
      * Turn a validated `ask_user` call into a pending question.
      *
@@ -269,6 +272,12 @@ class AgentQuestionService
      */
     public function markUndeliverable(AgentQuestion $question, string $reason): bool
     {
+        // An adapter's reason is free text; it is kept within its column so
+        // an overlong one can never make the resolution itself fail.
+        if (mb_strlen($reason) > self::MAX_FAILURE_REASON_CHARS) {
+            $reason = mb_substr($reason, 0, self::MAX_FAILURE_REASON_CHARS - 1).'…';
+        }
+
         return $this->resolveWithNotice($question, QuestionState::Undeliverable, [
             'delivery_failure_reason' => $reason,
         ], true);
