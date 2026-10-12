@@ -285,7 +285,7 @@ class AgentQuestionServiceTransitionTest extends TestCase
         $this->assertSame('assistant', $notices[0]->role);
         $this->assertSame($expected, $notices[0]->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'expired'],
+            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'expired', 'delivered' => true],
             $notices[0]->tool_data,
         );
 
@@ -341,7 +341,7 @@ class AgentQuestionServiceTransitionTest extends TestCase
         $this->assertCount(1, $notices);
         $this->assertSame($expected, $notices[0]->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'undeliverable'],
+            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'undeliverable', 'delivered' => false, 'delivery_failure_reason' => 'telegram account not linked'],
             $notices[0]->tool_data,
         );
 

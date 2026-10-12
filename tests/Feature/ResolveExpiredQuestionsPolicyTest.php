@@ -240,7 +240,7 @@ class ResolveExpiredQuestionsPolicyTest extends TestCase
         $this->assertCount(1, $legacyNotices);
         $this->assertSame(self::EXPIRED_NOTICE, $legacyNotices[0]->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $legacy->id, 'state' => 'expired'],
+            ['kind' => 'agent_question_notice', 'question_id' => $legacy->id, 'state' => 'expired', 'delivered' => true],
             $legacyNotices[0]->tool_data,
         );
         $this->assertSame([self::EXPIRED_NOTICE], $this->deliveredTo($legacy));
@@ -262,7 +262,7 @@ class ResolveExpiredQuestionsPolicyTest extends TestCase
             $this->assertSame('assistant', $notices[0]->role);
             $this->assertSame(self::STOPPED_NOTICE, $notices[0]->content);
             $this->assertEquals(
-                ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'stopped'],
+                ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'stopped', 'delivered' => true],
                 $notices[0]->tool_data,
             );
             $this->assertSame([self::STOPPED_NOTICE], $this->deliveredTo($question), 'the stop notice is delivered once on the conversation\'s channel');
@@ -304,7 +304,7 @@ class ResolveExpiredQuestionsPolicyTest extends TestCase
         $this->assertSame('assistant', $notices[0]->role);
         $this->assertSame(self::ASSUMED_NOTICE, $notices[0]->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $proceed->id, 'state' => 'expired_assumed'],
+            ['kind' => 'agent_question_notice', 'question_id' => $proceed->id, 'state' => 'expired_assumed', 'delivered' => true],
             $notices[0]->tool_data,
         );
         $this->assertSame([self::ASSUMED_NOTICE], $this->deliveredTo($proceed), 'the notice is delivered once on the conversation\'s channel');

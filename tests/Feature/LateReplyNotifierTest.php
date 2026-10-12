@@ -211,7 +211,7 @@ class LateReplyNotifierTest extends TestCase
         $this->assertSame('assistant', $stored->role, 'written by the system, not by the user');
         $this->assertSame(self::LATE_REPLY_NOTICE, $stored->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'expired_assumed', 'notice' => 'late_reply'],
+            ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'expired_assumed', 'notice' => 'late_reply', 'delivered' => true],
             $stored->tool_data,
         );
 

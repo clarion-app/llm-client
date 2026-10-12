@@ -364,17 +364,15 @@ class AgentQuestionService
      * recording why.
      *
      * The winner (true) writes a notice and attempts to deliver it once; a
-     * failure of that follow-up delivery is only logged, since the channel
-     * has just failed and the agent is told regardless. Resuming the run is
-     * the caller's job.
+     * failure of that follow-up delivery is logged and recorded on the
+     * notice, never retried, since the channel has just failed and the agent
+     * is told regardless. Resuming the run is the caller's job.
      */
     public function markUndeliverable(AgentQuestion $question, string $reason): bool
     {
         // An adapter's reason is free text; it is kept within its column so
         // an overlong one can never make the resolution itself fail.
-        if (mb_strlen($reason) > self::MAX_FAILURE_REASON_CHARS) {
-            $reason = mb_substr($reason, 0, self::MAX_FAILURE_REASON_CHARS - 1).'…';
-        }
+        $reason = self::recordableReason($reason);
 
         return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::Undeliverable, [
             'delivery_failure_reason' => $reason,
@@ -447,17 +445,12 @@ class AgentQuestionService
         [$resolved, $conversation, $notice] = $result;
 
         if ($conversation !== null && $notice !== null) {
-            $delivery = $this->deliver($conversation, (string) $notice->content);
-
-            if (!$delivery->delivered) {
-                Log::warning('AgentQuestionService: question notice could not be delivered', [
-                    'question_id' => $resolved->id,
-                    'conversation_id' => $conversation->id,
-                    'channel' => $resolved->channel,
-                    'state' => $to->value,
-                    'reason' => $delivery->failureReason,
-                ]);
-            }
+            $this->deliverNotice($conversation, $notice, 'AgentQuestionService: question notice could not be delivered', [
+                'question_id' => $resolved->id,
+                'conversation_id' => $conversation->id,
+                'channel' => $resolved->channel,
+                'state' => $to->value,
+            ]);
         }
 
         return true;
@@ -578,18 +571,63 @@ class AgentQuestionService
             return null;
         }
 
-        $delivery = $this->deliver($conversation, (string) $notice->content);
-
-        if (!$delivery->delivered) {
-            Log::warning('AgentQuestionService: late-reply notice could not be delivered', [
-                'question_id' => $question->id,
-                'conversation_id' => $conversation->id,
-                'channel' => $conversation->channel,
-                'reason' => $delivery->failureReason,
-            ]);
-        }
+        $this->deliverNotice($conversation, $notice, 'AgentQuestionService: late-reply notice could not be delivered', [
+            'question_id' => $question->id,
+            'conversation_id' => $conversation->id,
+            'channel' => $conversation->channel,
+        ]);
 
         return $notice;
+    }
+
+    /**
+     * Deliver a notice already written to $conversation and record on it
+     * whether it arrived: `delivered`, and for a failure a bounded
+     * `delivery_failure_reason`. A failure is logged. The notice and the
+     * resolution it describes stand either way, so nothing here throws.
+     *
+     * @param  array<string, mixed>  $logContext
+     */
+    private function deliverNotice(Conversation $conversation, Message $notice, string $failureLog, array $logContext): void
+    {
+        $delivery = $this->deliver($conversation, (string) $notice->content);
+        $reason = $delivery->delivered ? null : self::recordableReason($delivery->failureReason ?? 'unknown reason');
+
+        if (!$delivery->delivered) {
+            Log::warning($failureLog, $logContext + ['reason' => $reason]);
+        }
+
+        try {
+            $toolData = is_array($notice->tool_data) ? $notice->tool_data : [];
+            $toolData['delivered'] = $delivery->delivered;
+            if ($reason !== null) {
+                $toolData['delivery_failure_reason'] = $reason;
+            }
+            $notice->tool_data = $toolData;
+            $notice->save();
+        } catch (\Throwable $e) {
+            Log::warning('AgentQuestionService: the notice\'s delivery could not be recorded', $logContext + [
+                'notice_id' => $notice->id,
+                'error' => self::recordableReason($e->getMessage()),
+            ]);
+        }
+    }
+
+    /**
+     * A delivery failure reason fit to store and log: any bot token an
+     * adapter's error carried (in an API URL or on its own) is removed, and
+     * the text is cut to the reason column's length.
+     */
+    private static function recordableReason(string $reason): string
+    {
+        $reason = (string) preg_replace('~/bot\d+:[A-Za-z0-9_-]+~', '/bot[bot token]', $reason);
+        $reason = (string) preg_replace('~\b\d{5,}:[A-Za-z0-9_-]{20,}~', '[bot token]', $reason);
+
+        if (mb_strlen($reason) > self::MAX_FAILURE_REASON_CHARS) {
+            $reason = mb_substr($reason, 0, self::MAX_FAILURE_REASON_CHARS - 1).'…';
+        }
+
+        return $reason;
     }
 
     /**
@@ -609,7 +647,9 @@ class AgentQuestionService
         try {
             return $adapter->deliver($conversation, $text);
         } catch (\Throwable $e) {
-            return DeliveryResult::failed(get_class($e).': '.$e->getMessage());
+            // An exception's message can carry the request URL, and with it
+            // a bot token.
+            return DeliveryResult::failed(self::recordableReason(get_class($e).': '.$e->getMessage()));
         }
     }
 

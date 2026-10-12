@@ -381,12 +381,90 @@ class StoppedQuestionExemptionsTest extends TestCase
         $question = $this->stoppedThirtyDaysAgo();
         $this->resolve($question, $how);
 
+        // A late answer leaves the run open until its continuation runs; if
+        // that never happens within the abandonment threshold, the run is
+        // swept like any other. A discard has already ended it, and the
+        // sweep leaves an ended run alone.
+        $this->travel(61)->minutes();
         $this->runCommand('llm-client:resolve-abandoned-runs');
 
-        // A late answer leaves the run open until its continuation runs, so
-        // an inactive one is swept like any other; a discard has already
-        // ended it, and the sweep leaves an ended run alone.
         $this->assertSame($how === 'answer' ? 'abandoned' : 'stopped_early', $this->runEndState($question));
+    }
+
+    // ---------------------------------------------------------------
+    // Resolved, its run about to continue
+    // ---------------------------------------------------------------
+
+    /** @return array<string, array{0: string}> */
+    public static function resolvedAwaitingResume(): array
+    {
+        return [
+            'proceeded on its assumption' => ['proceed'],
+            'expired as before policies' => ['legacy'],
+            'answered after it stopped' => ['late'],
+        ];
+    }
+
+    /**
+     * A question asked 61 minutes ago with a one-hour period, resolved now
+     * the way $how names, its resume queued but not yet worked.
+     */
+    private function resolvedAwaitingItsResume(string $how): AgentQuestion
+    {
+        if ($how === 'late') {
+            $question = $this->stoppedThirtyDaysAgo();
+            $this->resolve($question, 'answer');
+
+            return $question->fresh();
+        }
+
+        $question = $this->askedAgo(61);
+        DB::table('agent_questions')->where('id', $question->id)->update($how === 'proceed'
+            ? ['unanswered_policy' => 'proceed_on_assumption', 'assumed_answer_raw' => '1', 'assumed_answer_selected' => json_encode([['number' => 1, 'text' => 'Backend']])]
+            // A question asked before unanswered policies existed: it expires as it always did.
+            : ['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+
+        // On a five-minute boundary the abandoned-run sweep runs first; the
+        // question is still pending then.
+        $this->runCommand('llm-client:resolve-abandoned-runs');
+        $this->runCommand('llm-client:resolve-expired-questions');
+        $this->assertSame($how === 'proceed' ? QuestionState::ExpiredAssumed : QuestionState::Expired, $question->fresh()->state, 'precondition: resolved by the sweep');
+        Queue::assertPushed(\ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob::class, 1);
+
+        return $question->fresh();
+    }
+
+    #[Test]
+    #[DataProvider('resolvedAwaitingResume')]
+    public function a_run_about_to_continue_is_not_abandoned_while_its_resume_waits_in_the_queue(string $how): void
+    {
+        $question = $this->resolvedAwaitingItsResume($how);
+        $this->assertNull($question->resumed_at, 'precondition: not resumed yet');
+        $this->assertSame('in_progress', $this->runEndState($question), 'precondition: the run is waiting');
+
+        // The next abandoned-run sweep comes round before a busy worker
+        // reaches the queued resume.
+        $this->travel(4)->minutes();
+        $this->runCommand('llm-client:resolve-abandoned-runs');
+
+        $this->assertSame('in_progress', $this->runEndState($question), 'a run whose question was just resolved is about to continue, not abandoned');
+        $this->assertSame(
+            'in_progress',
+            DB::table('agent_run_steps')->where('id', $question->step_id)->value('end_state'),
+            'its paused step is left for the resume to close',
+        );
+    }
+
+    #[Test]
+    #[DataProvider('resolvedAwaitingResume')]
+    public function a_resolution_whose_resume_never_comes_is_abandoned_after_the_threshold(string $how): void
+    {
+        $question = $this->resolvedAwaitingItsResume($how);
+
+        $this->travel(61)->minutes();
+        $this->runCommand('llm-client:resolve-abandoned-runs');
+
+        $this->assertSame('abandoned', $this->runEndState($question), 'a resume that never came does not hold the run open forever');
     }
 
     #[Test]
@@ -421,5 +499,19 @@ class StoppedQuestionExemptionsTest extends TestCase
             $this->runRecordCounts($question),
             'the run record ages out like any other',
         );
+    }
+
+    #[Test]
+    public function the_purge_keeps_the_record_of_a_run_about_to_continue(): void
+    {
+        // Answered thirty days after it stopped; the purge comes round before
+        // a busy worker reaches the queued resume.
+        $question = $this->stoppedThirtyDaysAgo();
+        $this->resolve($question, 'answer');
+        $before = $this->runRecordCounts($question);
+
+        $this->runCommand('llm-client:purge-run-traces');
+
+        $this->assertSame($before, $this->runRecordCounts($question), 'the run the resume continues into is kept');
     }
 }

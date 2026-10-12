@@ -185,7 +185,7 @@ class MessageControllerLateReplyTest extends TestCase
         $this->assertSame(self::LATE_REPLY_NOTICE, $notice['content'], 'the notice follows the reply');
         $this->assertSame('assistant', $notice['role']);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'expired_assumed', 'notice' => 'late_reply'],
+            ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'expired_assumed', 'notice' => 'late_reply', 'delivered' => true],
             $notice['tool_data'],
         );
         $this->assertSame([self::LATE_REPLY_NOTICE], $this->web->textsFor($conversation->id), 'delivered once on the conversation\'s channel');

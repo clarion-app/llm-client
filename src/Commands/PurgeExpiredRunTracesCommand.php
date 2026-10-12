@@ -144,7 +144,9 @@ class PurgeExpiredRunTracesCommand extends Command
      *
      * A run paused on a question that can still be answered — pending, or
      * stopped until a late answer or a discard — is kept however old it is:
-     * the paused turn resumes into it.
+     * the paused turn resumes into it. So is one whose question was resolved
+     * within the retention period and whose resume has not run yet (an
+     * answer to a long-stopped question, its resume still queued).
      */
     private function expiredRunsQuery($cutoffDate)
     {
@@ -158,11 +160,17 @@ class PurgeExpiredRunTracesCommand extends Command
             });
 
         if (DB::getSchemaBuilder()->hasTable('agent_questions')) {
-            $query->whereNotExists(function ($waiting) {
+            $query->whereNotExists(function ($waiting) use ($cutoffDate) {
                 $waiting->select(DB::raw(1))
                     ->from('agent_questions')
                     ->whereColumn('agent_questions.run_id', 'agent_runs.id')
-                    ->whereIn('agent_questions.state', [QuestionState::Pending->value, QuestionState::Stopped->value]);
+                    ->where(function ($question) use ($cutoffDate) {
+                        $question->whereIn('agent_questions.state', [QuestionState::Pending->value, QuestionState::Stopped->value])
+                            ->orWhere(function ($resuming) use ($cutoffDate) {
+                                $resuming->whereNull('agent_questions.resumed_at')
+                                    ->where('agent_questions.resolved_at', '>', $cutoffDate);
+                            });
+                    });
             });
         }
 

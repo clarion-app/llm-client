@@ -213,7 +213,7 @@ class ResolveExpiredQuestionsCommandTest extends TestCase
         $this->assertSame('assistant', $notices[0]->role);
         $this->assertSame(self::EXPIRED_NOTICE, $notices[0]->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'expired'],
+            ['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'expired', 'delivered' => true],
             $notices[0]->tool_data,
         );
         $this->assertSame(

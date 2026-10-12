@@ -107,6 +107,9 @@ class ResolveAbandonedRunsQuestionExemptionTest extends TestCase
             'asked_at' => $askedAt,
             'expires_at' => $expiresAt,
             'resolved_at' => $pending ? null : CarbonImmutable::now()->subMinutes(5),
+            // A resolved question's run has resumed (and then gone quiet); one
+            // still waiting for its resume is about to continue instead.
+            'resumed_at' => $pending ? null : CarbonImmutable::now()->subMinutes(5),
             'created_at' => $askedAt,
             'updated_at' => $askedAt,
         ]);

@@ -58,7 +58,7 @@ class ResolveAbandonedRunsCommand extends Command
         // for the same reason.
         $exemptRunIds = array_values(array_unique(array_merge(
             $this->getPendingConfirmationRunIds(),
-            $this->getPendingQuestionRunIds(),
+            $this->getPendingQuestionRunIds($cutoff),
         )));
 
         // Find eligible abandoned runs: in_progress, latest activity older than cutoff,
@@ -275,20 +275,31 @@ class ResolveAbandonedRunsCommand extends Command
      * exemption when the expiry sweep has stalled, so a stalled sweep can
      * never pin a run open forever.
      *
+     * A question resolved since $cutoff whose run has not resumed yet (its
+     * resume is queued — an expiry, an answer tapped after the work stopped)
+     * is the run's latest activity: the run is about to continue, not
+     * abandoned. Once the threshold has passed with no resume, it is swept
+     * like any other.
+     *
      * @return array<string>
      */
-    private function getPendingQuestionRunIds(): array
+    private function getPendingQuestionRunIds(\DateTimeInterface $cutoff): array
     {
         if (!DB::getSchemaBuilder()->hasTable('agent_questions')) {
             return [];
         }
 
         return DB::table('agent_questions')
-            ->where(function ($query) {
+            ->where(function ($query) use ($cutoff) {
                 $query->where(function ($pending) {
                     $pending->where('state', QuestionState::Pending->value)
                         ->where('expires_at', '>', now()->subMinutes(self::PENDING_QUESTION_GRACE_MINUTES));
-                })->orWhere('state', QuestionState::Stopped->value);
+                })->orWhere('state', QuestionState::Stopped->value)
+                    ->orWhere(function ($resolved) use ($cutoff) {
+                        $resolved->whereNotIn('state', [QuestionState::Pending->value, QuestionState::Stopped->value])
+                            ->whereNull('resumed_at')
+                            ->where('resolved_at', '>', $cutoff);
+                    });
             })
             ->whereNotNull('run_id')
             ->distinct()

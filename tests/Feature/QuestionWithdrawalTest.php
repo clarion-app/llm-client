@@ -377,7 +377,7 @@ class QuestionWithdrawalTest extends TestCase
         $this->assertCount(1, $notices, 'one withdrawal notice is written');
         $this->assertSame(self::WITHDRAWN_NOTICE, $notices[0]->content);
         $this->assertSame('assistant', $notices[0]->role);
-        $this->assertSame(['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'withdrawn'], $notices[0]->tool_data);
+        $this->assertSame(['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'withdrawn', 'delivered' => true], $notices[0]->tool_data);
         $this->assertSame(
             [self::GOLDEN_THREE_CHOICES, self::WITHDRAWN_NOTICE],
             $this->recorderFor($conversation)->textsFor($conversation->id),
