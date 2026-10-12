@@ -247,4 +247,73 @@ class AgentQuestionMessagingJourneyTest extends AssembledSystemTestCase
         $this->assertSame('2', $question->answer_raw);
         $this->assertSame([['number' => 2, 'text' => 'Frontend']], $question->answer_selected);
     }
+
+    #[Test]
+    public function undeliverable_question_resumes_agent(): void
+    {
+        $this->scenario = 'messaging_question_undeliverable';
+        // The failed question and the failed follow-up notice are both
+        // logged; nothing else may degrade.
+        $this->ledger()->expect('AgentQuestionService:*');
+
+        $conversation = $this->telegramFixture();
+        $this->telegram->failWith('telegram account not linked');
+
+        $this->script()
+            ->toolRequest('ask_user', ['question' => AgentQuestionWebJourneyTest::QUESTION, 'choices' => AgentQuestionWebJourneyTest::CHOICES])
+            ->finalAnswer('I could not reach you, so I will start with the backend.');
+
+        $response = $this->send('Help me tidy up the project.', $conversation->id);
+
+        // The run did not wait for an answer that cannot come: it was
+        // resumed in the same request and its reply is the response.
+        $response->assertStatus(200);
+        $response->assertJson([
+            'conversation_id' => $conversation->id,
+            'status' => 'completed',
+            'content' => 'I could not reach you, so I will start with the backend.',
+        ]);
+
+        $question = $this->questionIn($conversation);
+        $this->assertSame(QuestionState::Undeliverable, $question->state, 'a failed delivery resolves the question');
+        $this->assertSame('telegram account not linked', $question->delivery_failure_reason);
+        $this->assertNull($question->delivered_at);
+        $this->assertNull($question->pending_conversation_id, 'the conversation\'s question slot is free');
+        $this->assertNotNull($question->resolved_at);
+        $this->assertNotNull($question->resumed_at);
+
+        $this->assertCount(2, $this->transport()->capturedChatPayloads(), 'the ask and exactly one continuation');
+        $raw = $this->toolResultFor($this->chatPayloadMessages(1), $question->tool_call_id);
+        $this->assertNotNull($raw, 'the continuation answers the ask_user call');
+        $this->assertSame([
+            'outcome' => 'undeliverable',
+            'question_id' => $question->id,
+            'message' => 'The question could not be delivered to the user: telegram account not linked. The user has not seen it.',
+        ], json_decode($raw, true));
+
+        // The question was attempted, then the follow-up notice was
+        // attempted once; the reply went back in the HTTP response.
+        $notice = 'The question "Which part should I change first?" could not be delivered (telegram account not linked). '
+            .'The agent was told and will continue without an answer.';
+        $this->assertSame(
+            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, $notice],
+            $this->telegram->textsFor($conversation->id),
+        );
+        $notices = Message::where('conversation_id', $conversation->id)->get()
+            ->filter(fn (Message $m) => ($m->tool_data['kind'] ?? null) === 'agent_question_notice')
+            ->values();
+        $this->assertCount(1, $notices);
+        $this->assertSame($notice, $notices[0]->content);
+        $this->assertSame('undeliverable', $notices[0]->tool_data['state'] ?? null);
+        $this->assertSame('undeliverable', Message::findOrFail($question->display_message_id)->tool_data['state'] ?? null);
+
+        $this->assertSame('completed', DB::table('agent_runs')->where('id', $question->run_id)->value('end_state'));
+        $action = DB::table('agent_run_actions')->where('id', $question->action_id)->first();
+        $this->assertSame('failure', $action->outcome);
+        $this->assertSame('question undeliverable', $action->failure_reason);
+        $this->assertFalse((bool) $conversation->fresh()->is_processing);
+
+        // The freed slot accepts the next ask.
+        $this->assertFalse(AgentQuestion::where('pending_conversation_id', $conversation->id)->exists());
+    }
 }

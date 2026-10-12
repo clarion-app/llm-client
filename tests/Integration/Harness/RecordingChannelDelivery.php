@@ -19,6 +19,8 @@ class RecordingChannelDelivery implements ConversationChannelDelivery
 
     private ?string $failureReason = null;
 
+    private ?string $throwMessage = null;
+
     public function __construct(private string $channelName = 'telegram')
     {
     }
@@ -31,6 +33,12 @@ class RecordingChannelDelivery implements ConversationChannelDelivery
     public function deliver(Conversation $conversation, string $text): DeliveryResult
     {
         $this->deliveries[] = ['conversation_id' => $conversation->id, 'text' => $text];
+
+        if ($this->throwMessage !== null) {
+            // Deliberately breaks the contract's "MUST NOT throw", to prove
+            // callers treat a throwing adapter as a failed delivery.
+            throw new \RuntimeException($this->throwMessage);
+        }
 
         return $this->failureReason === null
             ? DeliveryResult::ok()
@@ -45,10 +53,22 @@ class RecordingChannelDelivery implements ConversationChannelDelivery
         return $this;
     }
 
+    /**
+     * Make every later delivery throw a RuntimeException with $message
+     * (after recording the attempt).
+     */
+    public function throwWith(string $message): self
+    {
+        $this->throwMessage = $message;
+
+        return $this;
+    }
+
     /** Make every later delivery succeed again. */
     public function succeed(): self
     {
         $this->failureReason = null;
+        $this->throwMessage = null;
 
         return $this;
     }

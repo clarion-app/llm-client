@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Exceptions\UnattendedActionRefusedException;
 use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\Delegation;
@@ -2588,6 +2589,14 @@ class AgentLoopService
                 iteration: $iteration,
             ));
         } catch (\Throwable $e) {
+            // Once the question is committed the paused turn belongs to it:
+            // the failure came from resuming an undeliverable question
+            // inline, which has already closed the run, so it propagates
+            // like any other failure of the synchronous loop.
+            if (AgentQuestion::where('paused_message_id', $paused->id)->exists()) {
+                throw $e;
+            }
+
             $paused->delete();
             Log::error('AgentLoopService: could not open the question', [
                 'conversation_id' => $conversation->id,

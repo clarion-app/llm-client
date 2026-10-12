@@ -6,17 +6,22 @@ use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
+use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Integration\Harness\CapturedPayload;
 use Tests\Integration\Harness\OperationCatalogue;
+use Tests\Integration\Harness\RecordingChannelDelivery;
 
 /**
  * A web conversation, end to end: the agent asks a question mid-task on the
@@ -480,5 +485,64 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
 
         $this->playTurn(1, 'Frontend first.');
         $this->assertRunCompleted($question->fresh());
+    }
+
+    public function test_undeliverable_question_resumes_agent_through_the_queued_job(): void
+    {
+        $this->scenario = 'web_question_undeliverable';
+        // The failed question and the failed follow-up notice are both
+        // logged; nothing else may degrade.
+        $this->ledger()->expect('AgentQuestionService:*');
+
+        // Resume jobs are held on the fake queue until a worker runs them.
+        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+
+        $this->fixture()->build();
+        $web = (new RecordingChannelDelivery('web'))->throwWith('broadcaster unreachable');
+        $this->app->make(ConversationChannelRegistry::class)->register($web);
+
+        $this->reply('Help me tidy up the project.')->assertStatus(201);
+        $this->playTurn(0, '', [$this->askCall()]);
+
+        $question = $this->pendingQuestion()->fresh();
+        $this->assertSame(QuestionState::Undeliverable, $question->state, 'an adapter that throws is a failed delivery');
+        $this->assertSame('RuntimeException: broadcaster unreachable', $question->delivery_failure_reason);
+        $this->assertNull($question->delivered_at);
+        $this->assertNull($question->pending_conversation_id, 'the conversation\'s question slot is free');
+        $this->assertNull($question->resumed_at, 'the streamed run is resumed by a queued job, not inline');
+        $this->assertSame(1, $this->turnCount(), 'nothing continues the run before the job runs');
+
+        $jobs = Queue::pushed(ResumeAfterQuestionJob::class)->values()->all();
+        $this->assertCount(1, $jobs, 'one resume is queued');
+        $this->assertSame($question->id, $jobs[0]->questionId);
+
+        // The follow-up notice was attempted once, after the question.
+        $notice = 'The question "Which part should I change first?" could not be delivered '
+            .'(RuntimeException: broadcaster unreachable). The agent was told and will continue without an answer.';
+        $this->assertSame(
+            [self::GOLDEN_THREE_CHOICES, $notice],
+            $web->textsFor($this->fixture()->conversation->id),
+        );
+
+        $this->app->call([$jobs[0], 'handle']);
+
+        $this->assertSame(2, $this->turnCount(), 'the job resumes the run with exactly one continuation request');
+        $raw = $this->toolResultFor($this->payloadMessages(1), 'call_ask');
+        $this->assertNotNull($raw, 'the continuation answers the ask_user call');
+        $this->assertSame([
+            'outcome' => 'undeliverable',
+            'question_id' => $question->id,
+            'message' => 'The question could not be delivered to the user: RuntimeException: broadcaster unreachable. The user has not seen it.',
+        ], json_decode($raw, true));
+
+        $this->playTurn(1, 'I could not reach you, so I will start with the backend.');
+
+        $question->refresh();
+        $this->assertRunCompleted($question);
+        $this->assertSame('undeliverable', Message::findOrFail($question->display_message_id)->tool_data['state'] ?? null);
+        $action = DB::table('agent_run_actions')->where('id', $question->action_id)->first();
+        $this->assertSame('failure', $action->outcome);
+        $this->assertSame('question undeliverable', $action->failure_reason);
+        $this->assertCount(2, $web->deliveries, 'a streamed reply is never pushed through the adapter');
     }
 }

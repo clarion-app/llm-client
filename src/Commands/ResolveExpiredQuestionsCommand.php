@@ -3,6 +3,8 @@
 namespace ClarionApp\LlmClient\Commands;
 
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
+use ClarionApp\LlmClient\Models\AgentQuestion;
+use ClarionApp\LlmClient\Services\AgentQuestionService;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -10,6 +12,13 @@ use Illuminate\Support\Facades\Log;
 
 /**
  * Artisan command that keeps agent questions from stalling a run forever.
+ *
+ * Expire: a pending question past its `expires_at` (fixed when it was
+ * asked) becomes `expired`; the winner of that compare-and-set tells the
+ * user on the conversation's channel and a ResumeAfterQuestionJob is queued
+ * so the agent learns no answer will come. An expiry that loses to an
+ * answer, withdrawal or failed delivery committed a moment earlier does
+ * nothing; whoever won resumes.
  *
  * Re-drive: a question resolved more than `resume_grace_seconds` ago whose
  * run never resumed (the process that resolved it died before resuming)
@@ -25,7 +34,7 @@ class ResolveExpiredQuestionsCommand extends Command
     protected $signature = 'llm-client:resolve-expired-questions
                             {--dry-run : Show what would be done without doing it}';
 
-    protected $description = 'Resume agent runs whose question was resolved but never resumed';
+    protected $description = 'Expire overdue agent questions and resume runs whose question was resolved but never resumed';
 
     public function handle(): int
     {
@@ -34,6 +43,10 @@ class ResolveExpiredQuestionsCommand extends Command
         if ($dryRun) {
             $this->warn('Dry-run mode — no changes will be made');
         }
+
+        $expired = $this->expire($dryRun);
+
+        $this->info(($dryRun ? 'Questions that would be expired: ' : 'Questions expired: ') . $expired);
 
         $redriven = $this->redrive($dryRun);
 
@@ -44,6 +57,53 @@ class ResolveExpiredQuestionsCommand extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Expire every pending question whose answerable period has passed and
+     * queue a resume for each one this tick won.
+     *
+     * Read by id in chunks, so rows leaving the pending set as they expire
+     * never cause a later chunk to skip one.
+     */
+    private function expire(bool $dryRun): int
+    {
+        $query = AgentQuestion::query()
+            ->where('state', QuestionState::Pending->value)
+            ->where('expires_at', '<=', now());
+
+        if ($dryRun) {
+            return $query->count();
+        }
+
+        $batchSize = max(1, (int) config('llm-client.agent_questions.sweep_batch_size', 100));
+        $service = app(AgentQuestionService::class);
+        $won = 0;
+
+        $query->chunkById($batchSize, function ($questions) use ($service, &$won) {
+            foreach ($questions as $question) {
+                if (!$service->expire($question)) {
+                    continue;
+                }
+
+                $won++;
+
+                Log::info('Agent question expired', ['question_id' => $question->id]);
+
+                try {
+                    ResumeAfterQuestionJob::dispatch($question->id);
+                } catch (\Throwable $e) {
+                    // The question is resolved and unresumed, so the re-drive
+                    // step queues it once the grace window has passed.
+                    Log::warning('Resume of an expired question could not be queued', [
+                        'question_id' => $question->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+        });
+
+        return $won;
     }
 
     /**

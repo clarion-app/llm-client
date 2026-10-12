@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\Backend\Models\User;
+use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
@@ -15,6 +16,7 @@ use ClarionApp\LlmClient\ValueObjects\PauseKind;
 use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
 use ClarionApp\LlmClient\ValueObjects\QuestionRefusal;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -52,8 +54,11 @@ class AgentQuestionService
      * already taken nothing is written and the ask is refused.
      *
      * Delivery to the user's channel is an external side effect, so it
-     * happens only after the commit. A failed delivery is reported on the
-     * returned OpenedQuestion; it never throws.
+     * happens only after the commit. A failed delivery never throws: it is
+     * reported on the returned OpenedQuestion, the question is resolved as
+     * undeliverable, and the run is resumed with that outcome (inline on the
+     * synchronous path, whose result is returned as `resumeResult`; a
+     * failure of that continuation propagates like any synchronous run's).
      */
     public function open(OpenQuestionRequest $request): OpenedQuestion|QuestionRefusal
     {
@@ -146,9 +151,141 @@ class AgentQuestionService
                 'channel' => $question->channel,
                 'reason' => $delivery->failureReason,
             ]);
+
+            // A question the user never saw cannot be answered, so the run
+            // must not wait for one: resolve it as undeliverable and resume
+            // the agent with that outcome.
+            if ($this->markUndeliverable($question, (string) $delivery->failureReason)) {
+                $question->refresh();
+
+                return new OpenedQuestion($question, $display, $delivery, $this->resumeUndeliverable($question));
+            }
+
+            $question->refresh();
         }
 
         return new OpenedQuestion($question, $display, $delivery);
+    }
+
+    /**
+     * Resume a run whose question could not be delivered, on the path it
+     * paused on: inline for the synchronous path (the pause site returns the
+     * continuation's result to its caller), through a queued job for the
+     * streamed path.
+     *
+     * A failure of the inline continuation propagates to the synchronous
+     * caller, after the resumer has already reset the conversation and
+     * closed the run. A job that cannot be queued is left to the re-drive
+     * sweep, which picks up every resolved question that never resumed.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function resumeUndeliverable(AgentQuestion $question): ?array
+    {
+        if ($question->resume_mode === OpenQuestionRequest::RESUME_SYNC) {
+            return app(QuestionResumer::class)->resume($question->id, ResumeCaller::HttpRequest);
+        }
+
+        try {
+            ResumeAfterQuestionJob::dispatch($question->id);
+        } catch (\Throwable $e) {
+            Log::warning('AgentQuestionService: the resume of an undeliverable question could not be queued', [
+                'question_id' => $question->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve a pending question whose answerable period has passed.
+     *
+     * Only the winner (true) writes the expiry notice into the conversation
+     * and delivers it; resuming the run is the caller's job. A question
+     * already resolved by anything else loses (false) and nothing changes.
+     */
+    public function expire(AgentQuestion $question): bool
+    {
+        return $this->resolveWithNotice($question, QuestionState::Expired, []);
+    }
+
+    /**
+     * Resolve a pending question that could not be delivered to its user,
+     * recording why.
+     *
+     * The winner (true) writes a notice and attempts to deliver it once; a
+     * failure of that follow-up delivery is only logged, since the channel
+     * has just failed and the agent is told regardless. Resuming the run is
+     * the caller's job.
+     */
+    public function markUndeliverable(AgentQuestion $question, string $reason): bool
+    {
+        return $this->resolveWithNotice($question, QuestionState::Undeliverable, [
+            'delivery_failure_reason' => $reason,
+        ]);
+    }
+
+    /**
+     * Resolve a pending question without an answer and tell the user.
+     *
+     * The notice message is written in the winning transition's transaction,
+     * so a notice exists exactly when the resolution happened. No notice is
+     * written or delivered when the conversation no longer exists.
+     *
+     * @param  array<string, mixed>  $fields
+     */
+    private function resolveWithNotice(AgentQuestion $question, QuestionState $to, array $fields): bool
+    {
+        $result = DB::transaction(function () use ($question, $to, $fields) {
+            if (!$this->transition($question->id, $to, $fields, true)) {
+                return null;
+            }
+
+            $resolved = AgentQuestion::findOrFail($question->id);
+            $conversation = Conversation::find($resolved->conversation_id);
+
+            if ($conversation === null) {
+                return [$resolved, null, null];
+            }
+
+            $notice = Message::create([
+                'conversation_id' => $conversation->id,
+                'role' => 'assistant',
+                'user' => $conversation->character,
+                'content' => app(QuestionRenderer::class)->renderNotice($resolved),
+                'responseTime' => 0,
+                'tool_data' => [
+                    'kind' => self::KIND_NOTICE,
+                    'question_id' => $resolved->id,
+                    'state' => $to->value,
+                ],
+            ]);
+
+            return [$resolved, $conversation, $notice];
+        });
+
+        if ($result === null) {
+            return false;
+        }
+
+        [$resolved, $conversation, $notice] = $result;
+
+        if ($conversation !== null && $notice !== null) {
+            $delivery = $this->deliver($conversation, (string) $notice->content);
+
+            if (!$delivery->delivered) {
+                Log::warning('AgentQuestionService: question notice could not be delivered', [
+                    'question_id' => $resolved->id,
+                    'conversation_id' => $conversation->id,
+                    'channel' => $resolved->channel,
+                    'state' => $to->value,
+                    'reason' => $delivery->failureReason,
+                ]);
+            }
+        }
+
+        return true;
     }
 
     /**
