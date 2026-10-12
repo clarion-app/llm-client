@@ -20,6 +20,7 @@ class TaskBudgetText
     public const PROBLEM_INVALID_SPEND = 'invalid_spend';
     public const PROBLEM_NO_ROOM_STEPS = 'no_room_steps';
     public const PROBLEM_NO_ROOM_SPEND = 'no_room_spend';
+    public const PROBLEM_AT_MAXIMUM = 'at_maximum';
 
     public function standing(TaskBudgetStanding $s): string
     {
@@ -72,6 +73,22 @@ class TaskBudgetText
         return "No answer arrived to this task's budget prompt, so work has stopped at the ceiling until you decide. Reply 'continue' to resume with more allowance, 'accept' to close the task with what has been done, or 'stop' to leave it stopped.";
     }
 
+    public function outcomeContinued(): string
+    {
+        return "Continued under this task's budget with more allowance.";
+    }
+
+    public function outcomeAccepted(): string
+    {
+        return "Accepted at this task's budget ceiling: the task is closed with what has been done.";
+    }
+
+    /** What a ceiling prompt says, in advance, about a missing answer. */
+    public function promptExpiryStatement(string $deadline): string
+    {
+        return "Work on this task will not continue until you decide. If there is no answer by {$deadline}, it stays stopped at this task's budget ceiling until you reply.";
+    }
+
     public function alreadyStopped(): string
     {
         return "Already stopped at this task's budget ceiling. Reply 'continue' to resume it or 'accept' to close it.";
@@ -92,6 +109,7 @@ class TaskBudgetText
             self::PROBLEM_INVALID_SPEND => "spend={$params['value']} is not an amount greater than 0",
             self::PROBLEM_NO_ROOM_STEPS => "steps={$params['given']} would not allow another step: {$params['used']} already used",
             self::PROBLEM_NO_ROOM_SPEND => "spend={$params['given']} would not allow another step: ".$this->amount((string) $params['used'])." {$params['currency']} already spent",
+            self::PROBLEM_AT_MAXIMUM => 'no more allowance is available, because this task is at the installation maximum',
             default => throw new \InvalidArgumentException("Unknown problem: {$problem}"),
         };
 

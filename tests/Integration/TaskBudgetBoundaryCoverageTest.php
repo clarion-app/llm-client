@@ -53,15 +53,17 @@ use Tests\Integration\Harness\TaskBudgetHelperJourneys;
  *   B1, in a helper's own run           rows 4, 5, 6, 17, 18
  *   B2 (a synchronous continuation)     rows 8, 9
  *   B3 (start of a streamed request)    rows 11, 12, 13
- *   B4 (a streamed continuation)        rows 14, 15
+ *   B4 (a streamed continuation)        rows 14, 15, 16
+ *   B2, after a ceiling decision        row 10
  *
  * (A continuation row's first request starts the ordinary way, so it also
  * crosses B1 or B3 before reaching its own boundary.) In the helper rows the
  * requests counted are those of the whole tree — the delegating agent and
  * every helper — since all of them claim against the one task.
  *
- * The continue-after-the-ceiling rows (10, 16) are added with the story
- * that introduces them.
+ * Rows 10 and 16 continue a task past its ceiling after the user's
+ * decision: the continuation's own request is claimed against the raised
+ * ceiling, and once that allowance is used up the task pauses again.
  */
 class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
 {
@@ -123,11 +125,13 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
             'row 7: schema-validation retry inside a sync run' => [7],
             'row 8: resumeSync() after a confirmation' => [8],
             'row 9: resumeQuestionSync() after a question' => [9],
+            'row 10: resumeAfterTaskBudgetSync() after a continue' => [10],
             'row 11: POST message → start()' => [11],
             'row 12: next streaming iteration' => [12],
             'row 13: unprocessed-message pickup' => [13],
             'row 14: stream continuation after a confirmation' => [14],
             'row 15: stream continuation after a question' => [15],
+            'row 16: resumeAfterTaskBudget() after a continue' => [16],
             'row 17: sequence stage job → helper run()' => [17],
             'row 18: consensus request → helper run()' => [18],
         ];
@@ -138,7 +142,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
     public function every_model_request_on_this_path_claimed_a_step_and_none_is_made_past_the_ceiling(int|string $row): void
     {
         $this->scenario = 'task_budget_boundary_row_'.$row;
-        $this->entryPath = in_array($row, [11, 12, 13, 14, 15], true) ? 'stream' : 'sync';
+        $this->entryPath = in_array($row, [11, 12, 13, 14, 15, 16], true) ? 'stream' : 'sync';
 
         $this->{'row'.$row}();
     }
@@ -301,6 +305,32 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertNoStepLeftOpen($question->run_id);
     }
 
+    private function row10(): void
+    {
+        config(['llm-client.agent_loop.max_iterations' => 2]);
+        $conversation = $this->conversationFor('sync');
+        $this->scriptSteps(1, 2);
+        $this->send('sync', $conversation, 'Store notes.')->assertStatus(202)->assertJson(['status' => 'awaiting_user']);
+        $first = $this->promptOf($conversation);
+        $this->assertNotNull($first, 'precondition: paused at the ceiling, the prompt waiting');
+        $runId = $this->latestRunIdOf($conversation);
+
+        // One more step: it runs, and the task pauses again at the next loop head.
+        $this->scriptSteps(3, 3);
+        $this->send('sync', $conversation, 'continue steps=1')->assertStatus(202)->assertJson(['status' => 'awaiting_user']);
+
+        $task = $this->taskRowOf($conversation);
+        $this->assertSame(3, $this->modelRequests('sync'));
+        $this->assertSame(3, (int) $task->steps_used, 'the continuation\'s request claimed a step');
+        $this->assertSame(3, (int) $task->max_steps);
+        $this->assertSame('paused', $task->state, 'its allowance used, the task paused again');
+        $second = $this->promptOf($conversation);
+        $this->assertNotSame($first->id, $second->id);
+        $this->assertSame(QuestionState::Pending, $second->state);
+        $this->assertSame($runId, $second->run_id, 'still the same run');
+        $this->assertNoStepLeftOpen($runId);
+    }
+
     // ---------------------------------------------------------------
     // B3 — the start of a streamed request
     // ---------------------------------------------------------------
@@ -409,6 +439,35 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame('paused', $task->state);
         $this->assertNotNull($this->promptOf($conversation));
         $this->assertNoStepLeftOpen($question->run_id);
+    }
+
+    private function row16(): void
+    {
+        config(['llm-client.agent_loop.max_iterations' => 1]);
+        $conversation = $this->conversationFor('stream');
+        $this->send('stream', $conversation, 'Store notes.')->assertStatus(201);
+        $this->playSteps(1, 1);
+        $first = $this->promptOf($conversation);
+        $this->assertNotNull($first, 'precondition: paused at the ceiling, the prompt waiting');
+        $runId = $this->latestRunIdOf($conversation);
+
+        $this->send('stream', $conversation, 'continue steps=1')->assertStatus(201);
+
+        $task = $this->taskRowOf($conversation);
+        $this->assertSame(2, $this->modelRequests('stream'), 'the continuation was dispatched');
+        $this->assertSame(2, (int) $task->steps_used, 'and claimed before it was dispatched');
+        $this->assertSame('running', $task->state);
+
+        $this->playSteps(2, 2);
+
+        $task = $this->taskRowOf($conversation);
+        $this->assertSame(2, $this->modelRequests('stream'), 'its allowance used, no further request');
+        $this->assertSame(2, (int) $task->steps_used);
+        $this->assertSame('paused', $task->state);
+        $second = $this->promptOf($conversation);
+        $this->assertNotSame($first->id, $second->id);
+        $this->assertSame($runId, $second->run_id, 'still the same run');
+        $this->assertNoStepLeftOpen($runId);
     }
 
     // ---------------------------------------------------------------

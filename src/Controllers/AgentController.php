@@ -225,6 +225,7 @@ class AgentController extends Controller
             // deserves its own, more precise status than the sibling
             // max_iterations outcome currently, imprecisely, falls into.
             'stopped' => 200,
+            'decision_required' => 200,
             default => 500,
         };
 
@@ -319,6 +320,23 @@ class AgentController extends Controller
                 'code' => 'answer_required',
                 'error' => 'An answer is required to reply to the pending question.',
             ], 422)];
+        }
+
+        if ($intake->kind === IntakeResult::DECISION_REQUIRED) {
+            return [null, response()->json([
+                'status' => 'decision_required',
+                'content' => $intake->guidance,
+                'conversation_id' => $conversation->id,
+            ], 200)];
+        }
+
+        if ($intake->kind === IntakeResult::DECISION_RECORDED) {
+            return [null, response()->json([
+                'status' => 'awaiting_user',
+                'content' => '',
+                'question_id' => $intake->question?->id,
+                'conversation_id' => $conversation->id,
+            ], 202)];
         }
 
         if ($intake->kind === IntakeResult::ANSWERED) {

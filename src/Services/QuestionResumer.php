@@ -57,6 +57,11 @@ class QuestionResumer
         // The run is no longer waiting on its user.
         $recorder->announceRunChanged($question->run_id);
 
+        // A ceiling prompt has no paused turn: the task budget applies it.
+        if ($question->isCeilingPrompt()) {
+            return app(TaskBudgetResumer::class)->resume($question, $conversation, $caller);
+        }
+
         // The conversation or the paused turn is gone: nothing can continue.
         if ($conversation === null || $paused === null) {
             $conversation?->update(['is_processing' => false]);
@@ -191,7 +196,7 @@ class QuestionResumer
      * Take the one-time resume claim and, when the context still exists,
      * consume the paused turn. Runs inside the caller's transaction.
      *
-     * @return array{0: AgentQuestion, 1: QuestionResolution, 2: ?Conversation, 3: ?Message}|null
+     * @return array{0: AgentQuestion, 1: ?QuestionResolution, 2: ?Conversation, 3: ?Message}|null
      */
     private function claim(string $questionId): ?array
     {
@@ -210,6 +215,13 @@ class QuestionResumer
         }
 
         $question = AgentQuestion::findOrFail($questionId);
+
+        if ($question->isCeilingPrompt()) {
+            $this->markDisplayMessage($question);
+
+            return [$question, null, Conversation::find($question->conversation_id), null];
+        }
+
         $resolution = $this->resolutionFor($question);
         $recorder = app(RunTraceRecorder::class);
 

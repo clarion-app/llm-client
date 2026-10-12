@@ -41,6 +41,10 @@ class QuestionAnswerIntake
             return IntakeResult::answerRequired($question);
         }
 
+        if ($question->isCeilingPrompt()) {
+            return app(CeilingPromptAnswers::class)->typed($question, $userId, $rawContent);
+        }
+
         $message = $this->questions->answer(
             $question,
             $this->parser->parse($rawContent, $question),

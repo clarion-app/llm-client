@@ -28,7 +28,6 @@ class TaskBudgetPauser
     public function __construct(
         private TaskBudgetService $tasks,
         private TaskBudgetText $text,
-        private TaskBudgetLimits $limits,
         private TaskBudgetReport $report,
     ) {
     }
@@ -116,24 +115,7 @@ class TaskBudgetPauser
     {
         $standing = $this->tasks->standing($task);
         $report = $this->report->compose($task, $standing, TaskBudgetReport::OCCASION_PAUSED);
-        $reached = $standing->reached();
-
-        $offeredSteps = null;
-        $offeredSpend = null;
-        $stepsReduced = false;
-        $spendReduced = false;
-        if ($reached !== []) {
-            $allowance = $this->limits->clampAllowance(
-                (int) $task->max_steps,
-                in_array('steps', $reached, true) ? (int) $task->original_max_steps : null,
-                (string) $task->max_spend,
-                in_array('spend', $reached, true) ? (string) $task->original_max_spend : null,
-            );
-            $offeredSteps = $allowance['add_steps'];
-            $offeredSpend = $allowance['add_spend'];
-            $stepsReduced = $allowance['steps_reduced'];
-            $spendReduced = $allowance['spend_reduced'];
-        }
+        $offered = $this->tasks->offeredAllowance($task, $standing);
 
         $opened = app(AgentQuestionService::class)->openCeilingPrompt(new CeilingPromptRequest(
             conversation: $conversation,
@@ -142,10 +124,10 @@ class TaskBudgetPauser
             resumeMode: $resumeMode,
             report: $report,
             standing: $standing,
-            offeredSteps: $offeredSteps,
-            offeredSpend: $offeredSpend,
-            stepsReducedToMaximum: $stepsReduced,
-            spendReducedToMaximum: $spendReduced,
+            offeredSteps: $offered['steps'],
+            offeredSpend: $offered['spend'],
+            stepsReducedToMaximum: $offered['steps_reduced'],
+            spendReducedToMaximum: $offered['spend_reduced'],
         ));
 
         if (!$opened instanceof OpenedQuestion) {

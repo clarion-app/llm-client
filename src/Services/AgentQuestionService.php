@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\CeilingPromptRequest;
@@ -306,6 +307,78 @@ class AgentQuestionService
         return new OpenedQuestion($question, $display, $delivery);
     }
 
+    private function answerToolData(AgentQuestion $question): array
+    {
+        $toolData = ['kind' => self::KIND_ANSWER, 'question_id' => $question->id];
+        if ($question->isCeilingPrompt()) {
+            $toolData['origin'] = AgentQuestion::ORIGIN_TASK_BUDGET;
+        }
+
+        return $toolData;
+    }
+
+    /**
+     * Park a pending ceiling prompt at the user's request (or because it
+     * could not be delivered): stopped, keeping the question slot. The
+     * user's reply is kept in the conversation and a notice says so.
+     * Returns the stored reply, or null when the prompt was not pending.
+     */
+    public function stopCeilingPrompt(AgentQuestion $question, ?string $userId = null, ?string $rawContent = null, ?string $deliveryFailureReason = null): ?Message
+    {
+        $stoppedAt = now()->format('Y-m-d H:i:s.u');
+        $fields = ['stopped_at' => $stoppedAt];
+        if ($deliveryFailureReason !== null) {
+            $fields['delivery_failure_reason'] = self::recordableReason($deliveryFailureReason);
+        }
+
+        $result = DB::transaction(function () use ($question, $fields, $userId, $rawContent) {
+            if (!$this->transition($question->id, [QuestionState::Pending], QuestionState::Stopped, $fields, false, false, false)) {
+                return null;
+            }
+            $stopped = AgentQuestion::findOrFail($question->id);
+            $this->markDisplayMessage($stopped);
+            $conversation = Conversation::find($stopped->conversation_id);
+            $reply = null;
+            if ($userId !== null && $rawContent !== null) {
+                $reply = Message::create([
+                    'conversation_id' => $stopped->conversation_id,
+                    'role' => 'user',
+                    'user' => User::find($userId)?->name,
+                    'content' => $rawContent,
+                    'tool_data' => $this->answerToolData($stopped),
+                ]);
+            }
+            $notice = $conversation === null ? null : Message::create([
+                'conversation_id' => $conversation->id,
+                'role' => 'assistant',
+                'user' => $conversation->character,
+                'content' => app(TaskBudgetText::class)->stoppedByChoice(),
+                'responseTime' => 0,
+                'tool_data' => ['kind' => self::KIND_NOTICE, 'question_id' => $stopped->id, 'state' => QuestionState::Stopped->value],
+            ]);
+
+            return [$stopped, $conversation, $reply, $notice];
+        });
+
+        if ($result === null) {
+            return null;
+        }
+        [$stopped, $conversation, $reply, $notice] = $result;
+
+        if ($stopped->task_budget_id !== null && ($task = TaskBudget::find($stopped->task_budget_id)) !== null) {
+            app(TaskBudgetService::class)->appendEvent($task, 'decision', ['decision' => 'stop', 'question_id' => $stopped->id], $userId);
+        }
+        if ($conversation !== null && $notice !== null) {
+            $this->deliverNotice($conversation, $notice, 'AgentQuestionService: the stop notice could not be delivered', ['question_id' => $stopped->id, 'conversation_id' => $conversation->id]);
+        }
+        try {
+            app(RunTraceRecorder::class)->announceRunChanged($stopped->run_id);
+        } catch (\Throwable) {
+        }
+
+        return $reply ?? $notice;
+    }
+
     /**
      * Resume a run whose question could not be delivered, on the path it
      * paused on: inline for the synchronous path (the pause site returns the
@@ -598,14 +671,15 @@ class AgentQuestionService
         string $userId,
         string $rawContent,
         AnswerMethod $method = AnswerMethod::TypedReply,
+        ?string $recordedRaw = null,
     ): ?Message {
         if ((string) $question->user_id !== $userId) {
             throw new \LogicException('Only the user who was asked may answer a question.');
         }
 
-        return DB::transaction(function () use ($question, $answer, $userId, $rawContent, $method) {
+        return DB::transaction(function () use ($question, $answer, $userId, $rawContent, $method, $recordedRaw) {
             $won = $this->transition($question->id, [QuestionState::Pending, QuestionState::Stopped], QuestionState::Answered, [
-                'answer_raw' => $rawContent,
+                'answer_raw' => $recordedRaw ?? $rawContent,
                 'answer_selected' => json_encode($answer->selected),
                 'answer_method' => $method->value,
                 'answered_by' => $userId,
@@ -620,10 +694,7 @@ class AgentQuestionService
                 'role' => 'user',
                 'user' => User::find($userId)?->name,
                 'content' => $rawContent,
-                'tool_data' => [
-                    'kind' => self::KIND_ANSWER,
-                    'question_id' => $question->id,
-                ],
+                'tool_data' => $this->answerToolData($question),
             ]);
 
             DB::table('agent_questions')->where('id', $question->id)->update(['answer_message_id' => $message->id]);

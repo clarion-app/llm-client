@@ -124,6 +124,14 @@ class MessageController extends Controller
             ], 422);
         }
 
+        if ($intake->kind === IntakeResult::DECISION_REQUIRED) {
+            return response()->json(['code' => 'decision_required', 'message' => $intake->guidance], 422);
+        }
+
+        if ($intake->kind === IntakeResult::DECISION_RECORDED) {
+            return response()->json($intake->message, 201);
+        }
+
         if ($intake->kind === IntakeResult::ANSWERED) {
             // This response carries only the answer message. A question
             // paused on the streaming path continues over the conversation's

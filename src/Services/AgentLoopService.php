@@ -888,6 +888,34 @@ class AgentLoopService
         $this->dispatchResumedStream($conversation, $runId, ($toolData['iteration'] ?? 1) + 1);
     }
 
+    /** The shared resume prologue, for a task resumed after its ceiling prompt. */
+    public function resumeTaskBudgetPrologue(Conversation $conversation, ?string $runId): ?array
+    {
+        return $this->resumePrologue($conversation, $runId, null);
+    }
+
+    /** Continue a streamed task after the user chose to continue at its ceiling. */
+    public function resumeAfterTaskBudget(Conversation $conversation, ?string $runId, int $iteration): void
+    {
+        if ($runId !== null) {
+            Context::add('run_id', $runId);
+        }
+        $this->dispatchResumedStream($conversation, $runId, $iteration);
+    }
+
+    /** Continue a synchronous task after the user chose to continue at its ceiling. */
+    public function resumeAfterTaskBudgetSync(Conversation $conversation, ?string $runId, int $iteration): array
+    {
+        $attemptGroupId = (string) Str::uuid();
+        $stepId = null;
+        if ($runId !== null && $this->runTraceRecorder !== null) {
+            Context::add('run_id', $runId);
+            $stepId = $this->runTraceRecorder->openStep($runId, null, $attemptGroupId);
+        }
+
+        return $this->continueSyncAfterPause($conversation, $runId, $stepId, $attemptGroupId, $iteration);
+    }
+
     /**
      * Rebuild the payload from the stored conversation and dispatch the
      * next streamed request of a resumed run.
@@ -6085,14 +6113,26 @@ class AgentLoopService
     }
 
     /**
-     * Get the most recent user message in a conversation.
+     * Get the most recent user message in a conversation. A decision typed
+     * at a task's budget ceiling ("continue steps=20") is stored as a user
+     * message but is not a request, so it is skipped: a resumed task keeps
+     * routing and recalling memory on what the user actually asked.
      */
     private function getLastUserMessage(Conversation $conversation): ?Message
     {
-        return Message::where('conversation_id', $conversation->id)
+        $messages = Message::where('conversation_id', $conversation->id)
             ->where('role', 'user')
             ->latest('created_at')
-            ->first();
+            ->cursor();
+
+        foreach ($messages as $message) {
+            $toolData = is_array($message->tool_data) ? $message->tool_data : [];
+            if (($toolData['origin'] ?? null) !== AgentQuestion::ORIGIN_TASK_BUDGET) {
+                return $message;
+            }
+        }
+
+        return null;
     }
 
     /**

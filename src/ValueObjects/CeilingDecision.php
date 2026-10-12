@@ -2,6 +2,8 @@
 
 namespace ClarionApp\LlmClient\ValueObjects;
 
+use ClarionApp\LlmClient\Support\Decimal;
+
 /**
  * A user's parsed reply to a task-budget ceiling prompt: continue (with an
  * optional additional allowance of steps and/or spend), accept what has been
@@ -22,15 +24,17 @@ final readonly class CeilingDecision
         public ?int $addSteps = null,
         public ?string $addSpend = null,
         public ?string $guidance = null,
+        public bool $stepsReduced = false,
+        public bool $spendReduced = false,
     ) {
         if (!in_array($kind, self::KINDS, true)) {
             throw new \InvalidArgumentException("Unknown ceiling decision: {$kind}");
         }
     }
 
-    public static function continue(?int $addSteps = null, ?string $addSpend = null): self
+    public static function continue(?int $addSteps = null, ?string $addSpend = null, bool $stepsReduced = false, bool $spendReduced = false): self
     {
-        return new self(self::CONTINUE, $addSteps, $addSpend);
+        return new self(self::CONTINUE, $addSteps, $addSpend, null, $stepsReduced, $spendReduced);
     }
 
     public static function accept(): self
@@ -51,5 +55,29 @@ final readonly class CeilingDecision
     public function isInvalid(): bool
     {
         return $this->kind === self::INVALID;
+    }
+
+    /** The normalized reply: "continue steps=20 spend=1.00", "accept", "stop". */
+    public function toReply(): string
+    {
+        if ($this->kind === self::INVALID) {
+            throw new \LogicException('An invalid reply has no normalized form.');
+        }
+        if ($this->kind !== self::CONTINUE) {
+            return $this->kind;
+        }
+        $reply = 'continue';
+        if ($this->addSteps !== null) {
+            $reply .= ' steps='.$this->addSteps;
+        }
+        if ($this->addSpend !== null) {
+            $plain = Decimal::toPlainNotation($this->addSpend);
+            [$whole, $fraction] = array_pad(explode('.', $plain, 2), 2, '');
+            $fraction = rtrim($fraction, '0');
+            $fraction = str_pad($fraction, 2, '0');
+            $reply .= ' spend='.$whole.'.'.$fraction;
+        }
+
+        return $reply;
     }
 }

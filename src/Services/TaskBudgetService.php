@@ -226,6 +226,34 @@ class TaskBudgetService
         );
     }
 
+    /**
+     * What continuing would add for each reached ceiling: the task's
+     * original ceiling, cut to the installation maximum (0 / zero spend
+     * when nothing is left).
+     *
+     * @return array{steps: ?int, spend: ?string, steps_reduced: bool, spend_reduced: bool}
+     */
+    public function offeredAllowance(TaskBudget $task, TaskBudgetStanding $standing): array
+    {
+        $reached = $standing->reached();
+        if ($reached === []) {
+            return ['steps' => null, 'spend' => null, 'steps_reduced' => false, 'spend_reduced' => false];
+        }
+        $allowance = $this->limits->clampAllowance(
+            (int) $task->max_steps,
+            in_array('steps', $reached, true) ? (int) $task->original_max_steps : null,
+            (string) $task->max_spend,
+            in_array('spend', $reached, true) ? (string) $task->original_max_spend : null,
+        );
+
+        return [
+            'steps' => $allowance['add_steps'],
+            'spend' => $allowance['add_spend'],
+            'steps_reduced' => $allowance['steps_reduced'],
+            'spend_reduced' => $allowance['spend_reduced'],
+        ];
+    }
+
     /** Best-effort: a failed write is logged and never thrown. */
     public function appendEvent(TaskBudget $task, string $kind, array $payload, ?string $actorUserId = null): void
     {

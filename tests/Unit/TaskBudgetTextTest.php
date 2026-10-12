@@ -114,7 +114,11 @@ class TaskBudgetTextTest extends TestCase
                 $t->decisionGuidance(TaskBudgetText::PROBLEM_INVALID_SPEND, ['value' => 'abc']),
                 $t->decisionGuidance(TaskBudgetText::PROBLEM_NO_ROOM_STEPS, ['given' => 5, 'used' => 20]),
                 $t->decisionGuidance(TaskBudgetText::PROBLEM_NO_ROOM_SPEND, ['given' => '0.10', 'used' => '1.2000000000', 'currency' => 'USD']),
+                $t->decisionGuidance(TaskBudgetText::PROBLEM_AT_MAXIMUM),
             ],
+            'outcomeContinued' => [$t->outcomeContinued()],
+            'outcomeAccepted' => [$t->outcomeAccepted()],
+            'promptExpiryStatement' => [$t->promptExpiryStatement('Oct 12, 2026 at 18:00 UTC')],
             'reducedToMaximum' => [
                 $t->reducedToMaximum(1000, 200, null, null, 'USD'),
                 $t->reducedToMaximum(null, null, '50.00', '25.0000000000', 'USD'),
@@ -385,6 +389,23 @@ class TaskBudgetTextTest extends TestCase
         $this->assertSame($base.' This reply was not accepted: spend=abc is not an amount greater than 0.', $t->decisionGuidance(TaskBudgetText::PROBLEM_INVALID_SPEND, ['value' => 'abc']));
         $this->assertSame($base.' This reply was not accepted: steps=5 would not allow another step: 20 already used.', $t->decisionGuidance(TaskBudgetText::PROBLEM_NO_ROOM_STEPS, ['given' => 5, 'used' => 20]));
         $this->assertSame($base.' This reply was not accepted: spend=0.10 would not allow another step: 1.20 USD already spent.', $t->decisionGuidance(TaskBudgetText::PROBLEM_NO_ROOM_SPEND, ['given' => '0.10', 'used' => '1.2000000000', 'currency' => 'USD']));
+        $this->assertSame($base.' This reply was not accepted: no more allowance is available, because this task is at the installation maximum.', $t->decisionGuidance(TaskBudgetText::PROBLEM_AT_MAXIMUM));
+    }
+
+    #[Test]
+    public function the_outcome_of_a_decided_prompt(): void
+    {
+        $this->assertSame("Continued under this task's budget with more allowance.", $this->text->outcomeContinued());
+        $this->assertSame("Accepted at this task's budget ceiling: the task is closed with what has been done.", $this->text->outcomeAccepted());
+    }
+
+    #[Test]
+    public function the_prompt_says_in_advance_what_happens_without_an_answer(): void
+    {
+        $this->assertSame(
+            "Work on this task will not continue until you decide. If there is no answer by Oct 12, 2026 at 18:00 UTC, it stays stopped at this task's budget ceiling until you reply.",
+            $this->text->promptExpiryStatement('Oct 12, 2026 at 18:00 UTC')
+        );
     }
 
     #[Test]

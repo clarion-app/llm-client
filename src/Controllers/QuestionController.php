@@ -77,7 +77,7 @@ class QuestionController extends Controller
             case InteractiveAnswerStatus::InvalidAnswer:
                 return response()->json([
                     'code' => 'invalid_answer',
-                    'message' => 'That answer does not fit this question\'s choices.',
+                    'message' => $outcome->guidance ?? 'That answer does not fit this question\'s choices.',
                 ], 422);
 
             case InteractiveAnswerStatus::NotPending:
