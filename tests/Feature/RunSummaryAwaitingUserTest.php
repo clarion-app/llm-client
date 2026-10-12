@@ -285,7 +285,7 @@ class RunSummaryAwaitingUserTest extends TestCase
         }
         $sixRuns = $this->questionQueriesWhileListing();
 
-        $this->assertLessThanOrEqual(1, $oneRun, 'one batched question lookup per page');
+        $this->assertLessThanOrEqual(2, $oneRun, 'one batched question lookup per flag per page');
         $this->assertSame($oneRun, $sixRuns, 'the number of question lookups does not grow with the number of runs listed');
 
         $listed = $this->listed();

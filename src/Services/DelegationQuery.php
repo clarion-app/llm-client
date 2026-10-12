@@ -203,6 +203,7 @@ class DelegationQuery
             ->pluck('cnt', 'run_id');
 
         $awaitingUser = $this->runTraceQuery->runIdsAwaitingUser($referencedRunIds);
+        $questionStopped = $this->runTraceQuery->runIdsStoppedOnQuestion($referencedRunIds);
 
         $runsMap = [];
         foreach ($runs as $id => $runRow) {
@@ -210,6 +211,7 @@ class DelegationQuery
                 $runRow,
                 (int) ($actionCounts[$id] ?? 0),
                 isset($awaitingUser[$id]),
+                isset($questionStopped[$id]),
             );
         }
 

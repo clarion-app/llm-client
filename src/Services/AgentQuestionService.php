@@ -269,7 +269,7 @@ class AgentQuestionService
         // on MySQL.
         $stoppedAt = now()->format('Y-m-d H:i:s.u');
 
-        return $this->resolveWithNotice(
+        $won = $this->resolveWithNotice(
             $question,
             [QuestionState::Pending],
             QuestionState::Stopped,
@@ -277,7 +277,36 @@ class AgentQuestionService
             setProcessing: false,
             releaseSlot: false,
             resolves: false,
-        ) ? QuestionState::Stopped : null;
+        );
+
+        if (!$won) {
+            return null;
+        }
+
+        $this->recordStop($question);
+
+        return QuestionState::Stopped;
+    }
+
+    /**
+     * Show the stop in the run record: the waiting `ask_user` action keeps
+     * waiting, its content now saying the work stopped, and the run's
+     * watchers are told. The stop already stands, so nothing here may throw
+     * out of the sweep.
+     */
+    private function recordStop(AgentQuestion $question): void
+    {
+        try {
+            $fresh = $question->fresh() ?? $question;
+            $recorder = app(RunTraceRecorder::class);
+            $recorder->updateSuspendedActionContent($fresh->action_id, $fresh->runRecordSnapshot());
+            $recorder->announceRunChanged($fresh->run_id);
+        } catch (\Throwable $e) {
+            Log::warning('AgentQuestionService: the stop could not be shown in the run record', [
+                'question_id' => $question->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**

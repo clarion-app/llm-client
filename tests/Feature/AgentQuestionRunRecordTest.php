@@ -71,7 +71,7 @@ class AgentQuestionRunRecordTest extends TestCase
     private const CHOICES = ['Backend', 'Frontend', 'Docs'];
 
     private const SNAPSHOT_KEYS = [
-        'question_id', 'question', 'choices', 'allow_multiple', 'asked_at',
+        'question_id', 'outcome', 'stopped_at', 'stopped_ms', 'policy', 'question', 'choices', 'allow_multiple', 'asked_at',
         'expires_at', 'resolution', 'resolved_at', 'waited_ms', 'answer',
         'presentation',
     ];
