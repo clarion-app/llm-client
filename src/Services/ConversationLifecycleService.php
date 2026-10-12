@@ -4,7 +4,9 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Models\Conversation;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Owns the conversation session boundary.
@@ -69,17 +71,34 @@ class ConversationLifecycleService
 
         $ended = 0;
 
-        Conversation::whereNotNull('user_id')
+        $query = Conversation::whereNotNull('user_id')
             ->whereNull('ended_at')
             ->where('is_processing', false)
-            ->where('updated_at', '<', $cutoff)
-            ->chunkById(100, function ($conversations) use (&$ended) {
-                foreach ($conversations as $conversation) {
-                    if ($this->end($conversation)) {
-                        $ended++;
-                    }
-                }
+            ->where('updated_at', '<', $cutoff);
+
+        // A conversation waiting on its user's answer is quiet and not
+        // processing for as long as the user takes, but its run is about to
+        // resume: ending it would clear the agent's short-term memory under
+        // that run. The idle timeout is not a cancellation, so the question
+        // is left alone. Skipped when the table does not exist yet (the
+        // package's migration has not been run).
+        if (Schema::hasTable('agent_questions')) {
+            $conversationKey = $query->getModel()->getQualifiedKeyName();
+
+            $query->whereNotExists(function ($pending) use ($conversationKey) {
+                $pending->select(DB::raw(1))
+                    ->from('agent_questions')
+                    ->whereColumn('agent_questions.pending_conversation_id', $conversationKey);
             });
+        }
+
+        $query->chunkById(100, function ($conversations) use (&$ended) {
+            foreach ($conversations as $conversation) {
+                if ($this->end($conversation)) {
+                    $ended++;
+                }
+            }
+        });
 
         return $ended;
     }

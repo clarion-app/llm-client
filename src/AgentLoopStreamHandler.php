@@ -391,6 +391,107 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $this->checkForUnprocessedMessages($conversation);
     }
 
+    /**
+     * Record a confirmation pause on this turn's assistant message. Results of
+     * the calls that already ran earlier in the batch are kept, and every
+     * call after the paused one is answered as not executed, so resuming only
+     * adds the paused call's result.
+     *
+     * The top-level action_id stays unset on the streamed path, exactly as
+     * before; the execute_operation branch carries it inside the pending
+     * confirmation instead.
+     *
+     * @param  list<array<string, mixed>>  $toolResults
+     */
+    private function storePausedTurn(array $pendingConfirmation, string $pausedToolCallId, array $toolResults, int $iteration): void
+    {
+        $this->message->update([
+            'content' => $this->reply ?: '',
+            'tool_data' => ['tool_calls' => $this->toolCalls],
+        ]);
+
+        app(\ClarionApp\LlmClient\Services\PausedTurnWriter::class)->pause(
+            $this->message,
+            \ClarionApp\LlmClient\ValueObjects\PauseKind::Confirmation,
+            $pendingConfirmation,
+            new \ClarionApp\LlmClient\ValueObjects\PausedTurnContext(
+                pausedToolCallId: $pausedToolCallId,
+                pendingToolResults: $toolResults,
+                iteration: $iteration,
+                runId: $this->runId,
+                stepId: $this->stepId,
+                actionId: null,
+            ),
+        );
+    }
+
+    /**
+     * Pause this turn on an `ask_user` call: store the turn's tool calls on
+     * its assistant message and open the question, which records the pause,
+     * shows and delivers the question, and suspends the call's action.
+     * Nothing further is dispatched until the question is resolved.
+     *
+     * The turn's assistant text has already been streamed to the user as
+     * this message, so it is not repeated above the question.
+     *
+     * Returns null when the run is suspended, otherwise the tool result to
+     * give the call instead (the question was refused or could not be
+     * opened).
+     *
+     * @param  array<string, mixed>  $marker  the normalized question
+     * @param  list<array<string, mixed>>  $toolResults  results of the calls
+     *   already executed in this batch
+     */
+    private function openQuestion(
+        Conversation $conversation,
+        array $marker,
+        string $toolCallId,
+        ?string $toolActionId,
+        array $toolResults,
+        int $iteration,
+    ): ?string {
+        $this->message->update([
+            'content' => $this->reply ?: '',
+            'tool_data' => ['tool_calls' => $this->toolCalls],
+        ]);
+
+        try {
+            $opened = app(\ClarionApp\LlmClient\Services\AgentQuestionService::class)->open(
+                new \ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest(
+                    conversation: $conversation,
+                    request: new \ClarionApp\LlmClient\ValueObjects\AskUserRequest(
+                        (string) ($marker['question'] ?? ''),
+                        array_values($marker['choices'] ?? []),
+                        (bool) ($marker['allow_multiple'] ?? false),
+                    ),
+                    runId: $this->runId,
+                    stepId: $this->stepId,
+                    actionId: $toolActionId,
+                    pausedMessage: $this->message,
+                    toolCallId: $toolCallId,
+                    resumeMode: \ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest::RESUME_STREAM,
+                    preamble: null,
+                    pendingToolResults: $toolResults,
+                    iteration: $iteration,
+                ),
+            );
+        } catch (\Throwable $e) {
+            Log::error('AgentLoopStreamHandler: could not open the question', [
+                'conversation_id' => $conversation->id,
+                'tool_call_id' => $toolCallId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return json_encode(['error' => 'The question could not be asked: '.$e->getMessage()]);
+        }
+
+        if ($opened instanceof \ClarionApp\LlmClient\ValueObjects\QuestionRefusal) {
+            return $opened->toToolResult();
+        }
+
+        return null;
+    }
+
     private function handleToolCalls(Conversation $conversation, int $iteration): void
     {
         $conversationId = $conversation->id;
@@ -409,7 +510,9 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         }
 
         $toolResults = [];
-        $metaToolNames = ['list_applications', 'execute_operation', 'search_operations'];
+        // Named explicitly so a registry tool can never shadow them; ask_user
+        // in particular must always reach the loop's own handler.
+        $metaToolNames = ['list_applications', 'execute_operation', 'search_operations', 'ask_user'];
         $registry = app(\ClarionApp\LlmClient\Services\McpToolRegistry::class);
 
         // Resolved once, before the loop below — the whole batch uses one
@@ -501,20 +604,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                             'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
                         ];
 
-                        $toolData = [
-                            'tool_calls' => $this->toolCalls,
-                            'tool_results' => null,
-                            'iteration' => $iteration,
-                            'pending_confirmation' => $pendingConfirmation,
-                            'run_id' => $this->runId,
-                            'step_id' => $this->stepId,
-                            'paused_at' => now()->toIso8601String(),
-                        ];
-
-                        $this->message->update([
-                            'content' => $this->reply ?: '',
-                            'tool_data' => $toolData,
-                        ]);
+                        $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
 
                         event(new ApiCallConfirmationRequiredEvent(
                             $conversationId,
@@ -563,6 +653,20 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
                 // Check if execute_operation needs confirmation
                 $decoded = json_decode($result, true);
+
+                // A valid ask_user call: open the question and suspend. A
+                // refused one (e.g. a question is already pending) gives its
+                // refusal as this call's result and the batch continues.
+                if (is_array($decoded) && !empty($decoded[AgentLoopService::REQUIRES_USER_INPUT])) {
+                    $refusal = $this->openQuestion($conversation, $decoded, $toolCallId, $toolActionId, $toolResults, $iteration);
+
+                    if ($refusal === null) {
+                        return; // Suspended until the question is resolved
+                    }
+
+                    $result = $refusal;
+                    $decoded = json_decode($result, true);
+                }
                 if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
                     // Read back the same way the synchronous
                     // run()/resumeSync() pause-construction does —
@@ -594,20 +698,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
                     }
 
-                    $toolData = [
-                        'tool_calls' => $this->toolCalls,
-                        'tool_results' => null,
-                        'iteration' => $iteration,
-                        'pending_confirmation' => $pendingConfirmation,
-                        'run_id' => $this->runId,
-                        'step_id' => $this->stepId,
-                        'paused_at' => now()->toIso8601String(),
-                    ];
-
-                    $this->message->update([
-                        'content' => $this->reply ?: '',
-                        'tool_data' => $toolData,
-                    ]);
+                    $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
 
                     event(new ApiCallConfirmationRequiredEvent(
                         $conversationId,
@@ -714,6 +805,16 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         && ($arguments['operationId'] ?? '') === AgentLoopService::PAGE_TEXT_OPERATION_ID)
                         ? $result
                         : null;
+                    // A refused ask is a failed call in the run record,
+                    // whatever the metrics recorder made of its result.
+                    $refusedAsk = $toolName === 'ask_user'
+                        ? \ClarionApp\LlmClient\ValueObjects\QuestionRefusal::fromToolResult(json_decode($result, true))
+                        : null;
+                    if ($refusedAsk !== null) {
+                        $outcome = \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Failure;
+                        $toolError = $refusedAsk->actionFailureReason();
+                        $actionContent = $refusedAsk->snapshot($arguments, now());
+                    }
                     $this->runTraceRecorder->closeAction(
                         $toolActionId,
                         $outcome,

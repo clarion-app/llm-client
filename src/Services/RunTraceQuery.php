@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Models\AgentRunStep;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\ToolInvocationRecord;
 use ClarionApp\LlmClient\Models\UsageRecord;
+use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use Illuminate\Support\Facades\DB;
 
@@ -730,6 +731,29 @@ class RunTraceQuery
     }
 
     /**
+     * The subset of $runIds that have a pending question waiting on the
+     * user, in one query however many runs are asked about, so a list of
+     * run summaries never costs a lookup per row.
+     *
+     * @param  list<string>  $runIds
+     * @return array<string, true> keyed by run id
+     */
+    public function runIdsAwaitingUser(array $runIds): array
+    {
+        if ($runIds === []) {
+            return [];
+        }
+
+        return DB::table('agent_questions')
+            ->whereIn('run_id', $runIds)
+            ->where('state', QuestionState::Pending->value)
+            ->distinct()
+            ->pluck('run_id')
+            ->mapWithKeys(fn ($id) => [(string) $id => true])
+            ->all();
+    }
+
+    /**
      * Project an already-loaded AgentRun (+ its action_count aggregate) to
      * the RunSummary wire shape — the single source of truth both
      * RunController (GET /agent-runs, GET /agent-runs/{id}) and
@@ -739,8 +763,12 @@ class RunTraceQuery
      *
      * @return array<string, mixed>
      */
-    public function runSummaryRow(AgentRun $run, int $actionCount): array
+    public function runSummaryRow(AgentRun $run, int $actionCount, ?bool $awaitingUser = null): array
     {
+        // Callers projecting many runs pass the flag from one batched
+        // runIdsAwaitingUser() lookup; a single summary looks it up itself.
+        $awaitingUser ??= isset($this->runIdsAwaitingUser([$run->id])[$run->id]);
+
         return [
             'id' => $run->id,
             'kind' => $run->kind->value,
@@ -760,6 +788,7 @@ class RunTraceQuery
             'tool_exec_ms' => $run->tool_exec_ms,
             'confirm_wait_ms' => $run->confirm_wait_ms,
             'product_ms' => $run->product_ms,
+            'awaiting_user' => $awaitingUser,
         ];
     }
 

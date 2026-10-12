@@ -1094,5 +1094,24 @@ return [
         // scratch state, not a durable audit trail.
         'connection_test_retention_hours' => (int) env('LLM_CLIENT_MCP_CLIENT_CONNECTION_TEST_RETENTION_HOURS', 1),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Agent questions (the ask_user tool)
+    |--------------------------------------------------------------------------
+    |
+    | A question's expiry is fixed when it is asked, so changing
+    | expiry_minutes affects only questions asked afterwards.
+    |
+    */
+    'agent_questions' => [
+        // Minutes a question stays answerable. Clamped to at least 1.
+        'expiry_minutes' => max(1, (int) env('LLM_CLIENT_QUESTION_EXPIRY_MINUTES', 1440)),
+        // A resolved question not yet resumed after this many seconds is
+        // re-driven by the expiry sweep.
+        'resume_grace_seconds' => 60,
+        // Rows handled per sweep chunk.
+        'sweep_batch_size' => 100,
+    ],
 ];
 

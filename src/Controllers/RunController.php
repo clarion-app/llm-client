@@ -55,8 +55,14 @@ class RunController extends Controller
             ->groupBy('run_id')
             ->pluck('cnt', 'run_id');
 
+        $awaitingUser = $this->runTraceQuery->runIdsAwaitingUser($runIds);
+
         $data = array_map(
-            fn (AgentRun $run) => $this->runSummary($run, (int) ($actionCounts[$run->id] ?? 0)),
+            fn (AgentRun $run) => $this->runSummary(
+                $run,
+                (int) ($actionCounts[$run->id] ?? 0),
+                isset($awaitingUser[$run->id]),
+            ),
             $result['data'],
         );
 
@@ -234,9 +240,9 @@ class RunController extends Controller
      * runSummaryById() uses for the RunUpdated broadcast payload — so this
      * endpoint and that broadcast can never disagree on shape or value.
      */
-    private function runSummary(AgentRun $run, int $actionCount): array
+    private function runSummary(AgentRun $run, int $actionCount, ?bool $awaitingUser = null): array
     {
-        return $this->runTraceQuery->runSummaryRow($run, $actionCount);
+        return $this->runTraceQuery->runSummaryRow($run, $actionCount, $awaitingUser);
     }
 
     /**

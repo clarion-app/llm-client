@@ -9,6 +9,7 @@ use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Exceptions\UnattendedActionRefusedException;
 use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
 use ClarionApp\LlmClient\Models\Delegation;
@@ -45,6 +46,12 @@ use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
+use ClarionApp\LlmClient\ValueObjects\PauseKind;
+use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
+use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
+use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
+use ClarionApp\LlmClient\ValueObjects\QuestionRefusal;
+use ClarionApp\LlmClient\ValueObjects\QuestionResolution;
 use ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision;
 use ClarionApp\LlmClient\ValueObjects\DegradationDecision;
 use ClarionApp\LlmClient\ValueObjects\RateLimitDecision;
@@ -67,6 +74,16 @@ class AgentLoopService
      * Public because AgentLoopStreamHandler records the same envelope on the
      * streaming path and must recognise the same operation.
      */
+    /**
+     * Marker key in an `ask_user` result meaning "pause this turn and ask
+     * the user": the pause site opens the question instead of returning
+     * the result to the model.
+     */
+    public const REQUIRES_USER_INPUT = '__requires_user_input';
+
+    /** The channel of a delegated helper's own conversation. */
+    private const DELEGATION_CHANNEL = 'agent-delegation';
+
     public const PAGE_TEXT_OPERATION_ID = 'clarionApp.llmClient.fetchPage.getTextFromUrl';
 
     /**
@@ -262,6 +279,62 @@ class AgentLoopService
         }
 
         return max(0, (int) round($pausedAt->diffInMilliseconds(now(), false)));
+    }
+
+    /**
+     * Store a model turn that paused on one of its tool calls: the assistant
+     * message carrying the turn's tool calls, with the pause recorded on it
+     * by PausedTurnWriter.
+     *
+     * @param  array<string, mixed>  $pendingPayload
+     */
+    private function storePausedTurn(
+        Conversation $conversation,
+        string $content,
+        array $toolCalls,
+        PauseKind $kind,
+        array $pendingPayload,
+        PausedTurnContext $context,
+    ): Message {
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $content,
+            'role' => 'assistant',
+            'user' => $conversation->character,
+            'responseTime' => 0,
+            'tool_data' => ['tool_calls' => $toolCalls],
+        ]);
+
+        app(PausedTurnWriter::class)->pause($message, $kind, $pendingPayload, $context);
+
+        return $message;
+    }
+
+    /**
+     * Results for delegate_to_helper/assign_part calls after position
+     * $pausedIndex that already ran as part of this iteration's parallel
+     * burst. They executed before the pause, so they are kept rather than
+     * reported as not executed.
+     *
+     * @return list<array{tool_call_id: string, content: string}>
+     */
+    private function laterBatchDelegationResults(array $toolCalls, int $pausedIndex, ?array $batchDelegationResults): array
+    {
+        if ($batchDelegationResults === null) {
+            return [];
+        }
+
+        $results = [];
+        foreach (array_slice(array_values($toolCalls), $pausedIndex + 1) as $call) {
+            $id = $call['id'] ?? '';
+            if (in_array($call['function']['name'] ?? '', ['delegate_to_helper', 'assign_part'], true)
+                && array_key_exists($id, $batchDelegationResults)
+            ) {
+                $results[] = ['tool_call_id' => $id, 'content' => json_encode($batchDelegationResults[$id])];
+            }
+        }
+
+        return $results;
     }
 
     /**
@@ -470,41 +543,18 @@ class AgentLoopService
         // do not need: this method is entered with is_processing already true
         // and a run already open, so "gate before anything is set" is not
         // available to it. Mirrors the expired-confirmation branch just below.
-        $this->admitResumedWork($conversation, $runId);
-
-        // Revocation check (096-agent-sharing, research.md D5) — the async
-        // confirmation-continuation path must be refused identically to
-        // resumeSync()'s own sibling call below; omitting it here would let
-        // a revoked recipient's approved/declined tool call keep executing.
-        // A run/step is already open at this point (the original turn's),
-        // so this closes it in place rather than minting a new one.
-        if ($this->checkSharedAgentAccessRevoked($conversation, $runId, $toolData['step_id'] ?? null) !== null) {
+        //
+        // The shared prologue also re-checks shared-agent revocation (a run/
+        // step is already open at this point, so a refusal closes it in
+        // place) and re-runs routing/specialist fallback. This is the
+        // production confirmation-continuation path
+        // (ConversationController::confirmApiCall() calls resume()), so
+        // omitting those would let a confirmation approved after its bound
+        // specialist was deactivated during the pending window keep
+        // answering under the deactivated agent's identity.
+        if ($this->resumePrologue($conversation, $runId, $toolData['step_id'] ?? null) !== null) {
             return;
         }
-
-        // Automatic routing / unavailability fallback (102-router-pattern,
-        // US1/US4, research.md D2/D7) — mirrors resumeSync()'s own identical
-        // pair of calls at the same relative point. This is the *production*
-        // confirmation-continuation path (ConversationController::
-        // confirmApiCall() calls resume(), never resumeSync() — confirmed no
-        // controller/job calls resumeSync() at all); omitting these calls
-        // here would let a confirmation approved after its bound specialist
-        // was deactivated during the pending window (up to
-        // confirmation_timeout, default 300s — the same time-window
-        // reasoning the ancestor-chain re-check just above already applies)
-        // execute and keep answering under the deactivated agent's identity
-        // indefinitely, since no other call site in this turn would ever
-        // trigger the fallback handoff. attemptInitialRouting() is a no-op
-        // here in the overwhelming majority of cases (a pending confirmation
-        // implies a prior turn already bound the conversation), but is
-        // included for the same defensive-symmetry reason
-        // checkSharedAgentAccessRevoked() is present at every entry point
-        // regardless of whether it is expected to fire.
-        $this->attemptInitialRouting(
-            $conversation,
-            Message::where('conversation_id', $conversation->id)->where('role', 'user')->first()?->content ?? '',
-        );
-        $this->ensureSpecialistAvailable($conversation);
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
@@ -517,7 +567,7 @@ class AgentLoopService
             throw new \RuntimeException('Confirmation has expired.');
         }
 
-        $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
+        $toolCallId = PausedTurnWriter::pausedToolCallId($toolData);
         $iteration = ($toolData['iteration'] ?? 1) + 1;
 
         // 112-coding-agent (US1, data-model.md §6): only ever set by the
@@ -529,19 +579,7 @@ class AgentLoopService
         // read back once the call is approved and executed.
         $inboundActionId = $toolData['action_id'] ?? null;
 
-        // Close the step that spanned the confirmation pause, recording the human
-        // wait portion (FR-004, SC-012). The continuation's own step is opened by
-        // dispatchStreamRequest() below, so the streamed path records the same
-        // shape the synchronous path does (FR-008).
-        $pendingStepId = $toolData['step_id'] ?? null;
-        if ($this->runTraceRecorder !== null && $pendingStepId !== null) {
-            $this->runTraceRecorder->closeStep(
-                $pendingStepId,
-                RunEndState::Completed,
-                null,
-                $this->confirmationWaitMs($toolData, $message),
-            );
-        }
+        $this->closePausedStreamStep($toolData, $message);
 
         $confirmationType = $pending['confirmation_type'] ?? 'api_call';
 
@@ -580,9 +618,7 @@ class AgentLoopService
                 }
 
                 $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'declarative_memory');
-                $toolData['tool_results'] = [
-                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
-                ];
+                $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
             } elseif ($confirmationType === 'scope_surface') {
                 // Approving the aggregate scope acknowledgment never
                 // itself writes or deletes the file that triggered it —
@@ -601,9 +637,7 @@ class AgentLoopService
                 ]);
 
                 $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
-                $toolData['tool_results'] = [
-                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
-                ];
+                $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
             } elseif ($confirmationType === 'external_tool') {
                 // 116-mcp-client-support (Foundational, research.md D6):
                 // re-resolved from the local cache by operationId rather
@@ -629,9 +663,7 @@ class AgentLoopService
                 }
 
                 $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
-                $toolData['tool_results'] = [
-                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
-                ];
+                $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
             } else {
                 // Re-check the ancestor-chain bound at the moment of
                 // execution (100-subagent-tool-restrictions, FR-004/
@@ -663,14 +695,10 @@ class AgentLoopService
                 }
 
                 $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
-                $toolData['tool_results'] = [
-                    ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY),
-                ];
+                $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
             }
         } else {
-            $toolData['tool_results'] = [
-                ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'],
-            ];
+            $pausedResult = ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'];
 
             $this->recordDeclinedCommandExecution($pending, $conversation);
         }
@@ -719,13 +747,119 @@ class AgentLoopService
             }
         }
 
-        $toolData['pending_confirmation'] = null;
-        $message->update(['tool_data' => $toolData]);
+        $this->resumeStreamEpilogue($conversation, $message, $runId, $iteration, $pausedResult);
+    }
 
-        // Continue the agent loop. Resolved once, before buildToolsPayload()/
-        // applyContextWindowTrim() (085-graceful-degradation, tasks.md T001
-        // point 1) — resume() never mints a run of its own, so this reads
-        // back whatever the original start()/run() dispatch decided.
+    /**
+     * The part of resuming a paused turn every pause kind shares, run before
+     * the kind computes the paused call's result: re-admission (the pause is
+     * a person deciding, and a ceiling can be crossed meanwhile), the shared-
+     * agent revocation check, and routing/specialist fallback.
+     *
+     * Returns the stop array when access to a shared agent was revoked (the
+     * open run/step are already closed), otherwise null.
+     */
+    private function resumePrologue(Conversation $conversation, ?string $runId, ?string $pausedStepId): ?array
+    {
+        $this->admitResumedWork($conversation, $runId);
+
+        // Revocation check: a run/step is
+        // already open at this point (the original turn's), so a refusal
+        // closes it in place rather than minting a new one.
+        if (($revokedStop = $this->checkSharedAgentAccessRevoked($conversation, $runId, $pausedStepId)) !== null) {
+            return $revokedStop;
+        }
+
+        // Automatic routing / unavailability fallback.
+        // attemptInitialRouting() is a no-op in
+        // the overwhelming majority of cases (a pause implies a prior turn
+        // already bound the conversation), but is included for the same
+        // defensive-symmetry reason checkSharedAgentAccessRevoked() is
+        // present at every entry point.
+        $this->attemptInitialRouting(
+            $conversation,
+            Message::where('conversation_id', $conversation->id)->where('role', 'user')->first()?->content ?? '',
+        );
+        $this->ensureSpecialistAvailable($conversation);
+
+        return null;
+    }
+
+    /**
+     * Close the step that spanned a streamed pause, recording the human wait
+     * portion. The continuation's own step is opened by
+     * dispatchStreamRequest(), so the streamed path records the same shape
+     * the synchronous path does.
+     */
+    private function closePausedStreamStep(array $toolData, Message $message): void
+    {
+        $pendingStepId = $toolData['step_id'] ?? null;
+        if ($this->runTraceRecorder !== null && $pendingStepId !== null) {
+            $this->runTraceRecorder->closeStep(
+                $pendingStepId,
+                RunEndState::Completed,
+                null,
+                $this->confirmationWaitMs($toolData, $message),
+            );
+        }
+    }
+
+    /**
+     * Finish resuming a streamed pause: answer the paused call (keeping every
+     * result recorded at the pause), then rebuild the payload from the stored
+     * conversation and dispatch the next streamed request.
+     *
+     * @param  array{content: string}  $pausedResult  the paused call's result,
+     *   plus any condensation metadata to store beside it
+     */
+    private function resumeStreamEpilogue(Conversation $conversation, Message $message, ?string $runId, int $iteration, array $pausedResult): void
+    {
+        app(PausedTurnWriter::class)->consume(
+            $message,
+            (string) $pausedResult['content'],
+            array_diff_key($pausedResult, ['tool_call_id' => true, 'content' => true]),
+        );
+
+        $this->dispatchResumedStream($conversation, $runId, $iteration);
+    }
+
+    /**
+     * Continue a streamed run whose question was resolved.
+     *
+     * QuestionResumer has already answered the paused `ask_user` call with
+     * $resolution's outcome (in the same transaction that claimed the
+     * resume), so this runs the shared resume prologue, closes the step that
+     * spanned the wait, and dispatches the next streamed request from the
+     * stored conversation.
+     */
+    public function resumeQuestion(Conversation $conversation, Message $message, QuestionResolution $resolution): void
+    {
+        if (!$resolution->state->continuesRun()) {
+            throw new \LogicException("A question resolved as {$resolution->state->value} does not continue its run.");
+        }
+
+        $toolData = is_array($message->tool_data) ? $message->tool_data : [];
+        $runId = $toolData['run_id'] ?? null;
+
+        if ($this->resumePrologue($conversation, $runId, $toolData['step_id'] ?? null) !== null) {
+            return;
+        }
+
+        $this->closePausedStreamStep($toolData, $message);
+
+        $this->dispatchResumedStream($conversation, $runId, ($toolData['iteration'] ?? 1) + 1);
+    }
+
+    /**
+     * Rebuild the payload from the stored conversation and dispatch the
+     * next streamed request of a resumed run.
+     */
+    private function dispatchResumedStream(Conversation $conversation, ?string $runId, int $iteration): void
+    {
+        // Resolved once, before buildToolsPayload()/applyContextWindowTrim()
+        // — resuming never
+        // mints a run of its own, so this reads back whatever the original
+        // start()/run() dispatch decided.
         $decision = app(DegradationGate::class)->forRun($runId);
 
         $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
@@ -1647,6 +1781,31 @@ class AgentLoopService
                         $decoded = json_decode($result, true);
                     }
 
+                    // A valid ask_user call: pause until the user answers. A
+                    // refused one gives its refusal as this call's result and
+                    // the batch continues.
+                    if (is_array($decoded) && !empty($decoded[self::REQUIRES_USER_INPUT])) {
+                        $asked = $this->pauseSyncForQuestion(
+                            $conversation,
+                            $content ?: '',
+                            $toolCalls,
+                            $decoded,
+                            $toolCallId,
+                            $activeActionId,
+                            array_merge($toolResults, $this->laterBatchDelegationResults($toolCalls, $tcIndex, $batchDelegationResults)),
+                            $iteration,
+                            $runId,
+                            $currentStepId,
+                        );
+
+                        if (is_array($asked)) {
+                            return $asked;
+                        }
+
+                        $result = $asked;
+                        $decoded = json_decode($result, true);
+                    }
+
                     if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
                         $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
 
@@ -1797,25 +1956,25 @@ class AgentLoopService
 
                         // Store message with pending confirmation. The step stays
                         // open across the pause; step_id and paused_at let the
-                        // resuming process close it with its human-wait portion
-                        // (contracts §3.2, FR-004).
-                        $assistantMessage = Message::create([
-                            'conversation_id' => $conversation->id,
-                            'content' => $content ?: '',
-                            'role' => 'assistant',
-                            'user' => $conversation->character,
-                            'responseTime' => 0,
-                            'tool_data' => [
-                                'tool_calls' => $toolCalls,
-                                'tool_results' => null,
-                                'iteration' => $iteration,
-                                'pending_confirmation' => $pendingConfirmation,
-                                'run_id' => $runId,
-                                'step_id' => $currentStepId,
-                                'paused_at' => now()->toIso8601String(),
-                                'action_id' => $activeActionId,
-                            ],
-                        ]);
+                        // resuming process close it with its human-wait portion.
+                        // Results of calls that already
+                        // ran earlier in this batch are kept, and the calls after
+                        // this one are answered as not executed.
+                        $assistantMessage = $this->storePausedTurn(
+                            $conversation,
+                            $content ?: '',
+                            $toolCalls,
+                            PauseKind::Confirmation,
+                            $pendingConfirmation,
+                            new PausedTurnContext(
+                                pausedToolCallId: $toolCallId,
+                                pendingToolResults: array_merge($toolResults, $this->laterBatchDelegationResults($toolCalls, $tcIndex, $batchDelegationResults)),
+                                iteration: $iteration,
+                                runId: $runId,
+                                stepId: $currentStepId,
+                                actionId: $activeActionId,
+                            ),
+                        );
 
                         return [
                             'status' => 'confirmation_required',
@@ -1844,7 +2003,15 @@ class AgentLoopService
                         $actionContent = ($toolName === 'execute_operation' && ($arguments['operationId'] ?? '') === self::PAGE_TEXT_OPERATION_ID)
                             ? $result
                             : null;
-                        if (is_array($decoded) && is_string($decoded['error'] ?? null)) {
+                        $refusedAsk = $toolName === 'ask_user' ? QuestionRefusal::fromToolResult($decoded) : null;
+                        if ($refusedAsk !== null) {
+                            $this->runTraceRecorder->closeAction(
+                                $activeActionId,
+                                ActionOutcome::Failure,
+                                $refusedAsk->actionFailureReason(),
+                                $refusedAsk->snapshot($arguments, now()),
+                            );
+                        } elseif (is_array($decoded) && is_string($decoded['error'] ?? null)) {
                             $this->runTraceRecorder->closeAction(
                                 $activeActionId,
                                 ActionOutcome::Failure,
@@ -2120,25 +2287,11 @@ class AgentLoopService
         // See resume() — the synchronous sibling is gated identically, and for
         // the same reason: a human wait of up to confirmation_timeout is a
         // window in which the ceiling can be crossed by somebody else.
-        $this->admitResumedWork($conversation, $runId);
-
-        // Revocation check (096-agent-sharing, research.md D5) — see
-        // resume()'s identical call, immediately above the same relative
-        // point in that sibling method.
-        if (($revokedStop = $this->checkSharedAgentAccessRevoked($conversation, $runId, $toolData['step_id'] ?? null)) !== null) {
+        // The shared prologue also re-checks shared-agent revocation and
+        // re-runs routing/specialist fallback; see resume().
+        if (($revokedStop = $this->resumePrologue($conversation, $runId, $toolData['step_id'] ?? null)) !== null) {
             return $revokedStop;
         }
-
-        // Automatic routing (102-router-pattern, US1, research.md D2) —
-        // defensive, mirroring checkSharedAgentAccessRevoked()'s own
-        // defensive presence at this same site; a no-op unless this is
-        // genuinely the conversation's first turn and no agent is already
-        // bound.
-        $this->attemptInitialRouting(
-            $conversation,
-            Message::where('conversation_id', $conversation->id)->where('role', 'user')->first()?->content ?? '',
-        );
-        $this->ensureSpecialistAvailable($conversation);
 
         if (!$pending) {
             throw new \RuntimeException('No pending confirmation found on this message.');
@@ -2153,7 +2306,7 @@ class AgentLoopService
             throw new \RuntimeException('Confirmation has expired.');
         }
 
-        $toolCallId = $toolData['tool_calls'][0]['id'] ?? null;
+        $toolCallId = PausedTurnWriter::pausedToolCallId($toolData);
         $pendingStepId = $toolData['step_id'] ?? null;
 
         // Read inbound paused action id (T029c). Null if the message was paused
@@ -2167,42 +2320,7 @@ class AgentLoopService
         // Recover run_id and step_id from tool_data.
         // If step_id is present, close it with wait_ms (T059) — the step spans
         // the confirmation pause. If run_id is null (pre-feature), mint a fresh run.
-        $currentStepId = null;
-        $waitMs = $this->confirmationWaitMs($toolData, $message);
-        if ($this->runTraceRecorder !== null) {
-            if ($runId !== null) {
-                // Close the step that spanned the confirmation pause (T059).
-                if ($pendingStepId !== null) {
-                    $this->runTraceRecorder->closeStep(
-                        $pendingStepId,
-                        RunEndState::Completed,
-                        null,
-                        $waitMs, // wait_ms for the human wait portion
-                    );
-                }
-                // Open a new step for the resumed work.
-                $currentStepId = $this->runTraceRecorder->openStep(
-                    $runId,
-                    null, // position auto-assigned
-                    $attemptGroupId,
-                );
-            } else {
-                // Pre-feature tool_data — mint a fresh run for the resumed portion.
-                $runId = $this->runTraceRecorder->openRun(
-                    \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
-                    (string) $conversation->user_id,
-                    $conversation->id,
-                    streamed: false,
-                    model: $conversation->model,
-                    agentId: $conversation->character ?? $conversation->id,
-                );
-                $currentStepId = $this->runTraceRecorder->openStep(
-                    $runId,
-                    null, // position auto-assigned
-                    $attemptGroupId,
-                );
-            }
-        }
+        [$runId, $currentStepId] = $this->openResumedSyncStep($conversation, $message, $toolData, $runId, $attemptGroupId);
 
         // 112-coding-agent (US1, data-model.md §6): tracks whether
         // executeApiCall() genuinely ran, so a chain-check rejection below
@@ -2232,9 +2350,7 @@ class AgentLoopService
                 'message' => 'Scope confirmed. Reissue the file operation to proceed with its own confirmation.',
             ]);
 
-            $toolData['tool_results'] = [
-                ['tool_call_id' => $toolCallId, 'content' => $resultContent],
-            ];
+            $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
         } elseif ($approved && $confirmationType === 'external_tool') {
             // See resume()'s identical branch for the full rationale:
             // re-resolved from the local cache by operationId rather than
@@ -2258,9 +2374,7 @@ class AgentLoopService
                 json_decode($resultContent, true),
             );
 
-            $toolData['tool_results'] = [
-                ['tool_call_id' => $toolCallId, 'content' => $resultContent],
-            ];
+            $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
         } elseif ($approved) {
             try {
                 // See resume()'s identical re-check, immediately above the
@@ -2295,9 +2409,7 @@ class AgentLoopService
                     json_decode($resultContent, true),
                 );
 
-                $toolData['tool_results'] = [
-                    ['tool_call_id' => $toolCallId, 'content' => $resultContent],
-                ];
+                $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
             } catch (\Throwable $e) {
                 // Close inbound action with Failure on execution error.
                 if ($this->runTraceRecorder !== null && $inboundActionId !== null) {
@@ -2310,9 +2422,7 @@ class AgentLoopService
                 throw $e;
             }
         } else {
-            $toolData['tool_results'] = [
-                ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'],
-            ];
+            $pausedResult = ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'];
 
             $this->recordDeclinedCommandExecution($pending, $conversation);
         }
@@ -2349,20 +2459,205 @@ class AgentLoopService
             }
         }
 
-        $toolData['pending_confirmation'] = null;
-        $message->update(['tool_data' => $toolData]);
+        app(PausedTurnWriter::class)->consume($message, (string) $pausedResult['content']);
 
-        // Continue with synchronous loop. Resolved once, before
-        // buildToolsPayload()/applyContextWindowTrim() are called
-        // (085-graceful-degradation, tasks.md T001 point 1) — never
-        // re-evaluated inside this method's own loop, so every iteration
-        // of this continuation uses one frozen decision (FR-006/SC-003).
+        return $this->continueSyncAfterPause(
+            $conversation,
+            $runId,
+            $currentStepId,
+            $attemptGroupId,
+            ($toolData['iteration'] ?? 1) + 1,
+        );
+    }
+
+    /**
+     * Close the step that spanned a synchronous pause, recording the human
+     * wait portion, and open the step the resumed work runs in. A paused
+     * message from before run tracing has no run, so one is minted for the
+     * resumed portion.
+     *
+     * @return array{0: ?string, 1: ?string}  the run id and the new step id
+     */
+    private function openResumedSyncStep(Conversation $conversation, Message $message, array $toolData, ?string $runId, string $attemptGroupId): array
+    {
+        if ($this->runTraceRecorder === null) {
+            return [$runId, null];
+        }
+
+        $pendingStepId = $toolData['step_id'] ?? null;
+
+        if ($runId !== null) {
+            if ($pendingStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $pendingStepId,
+                    RunEndState::Completed,
+                    null,
+                    $this->confirmationWaitMs($toolData, $message),
+                );
+            }
+
+            return [$runId, $this->runTraceRecorder->openStep($runId, null, $attemptGroupId)];
+        }
+
+        $runId = $this->runTraceRecorder->openRun(
+            \ClarionApp\LlmClient\ValueObjects\RunKind::Interactive,
+            (string) $conversation->user_id,
+            $conversation->id,
+            streamed: false,
+            model: $conversation->model,
+            agentId: $conversation->character ?? $conversation->id,
+        );
+
+        return [$runId, $this->runTraceRecorder->openStep($runId, null, $attemptGroupId)];
+    }
+
+    /**
+     * Continue a synchronous run whose question was resolved, returning the
+     * continuation's result exactly as run() would (including another
+     * `awaiting_user` when the agent asks again).
+     *
+     * QuestionResumer has already answered the paused `ask_user` call with
+     * $resolution's outcome, so this runs the shared resume prologue, closes
+     * the step that spanned the wait, and continues the synchronous loop.
+     */
+    public function resumeQuestionSync(Conversation $conversation, Message $message, QuestionResolution $resolution): array
+    {
+        if (!$resolution->state->continuesRun()) {
+            throw new \LogicException("A question resolved as {$resolution->state->value} does not continue its run.");
+        }
+
+        $toolData = is_array($message->tool_data) ? $message->tool_data : [];
+        $runId = $toolData['run_id'] ?? null;
+
+        if (($revokedStop = $this->resumePrologue($conversation, $runId, $toolData['step_id'] ?? null)) !== null) {
+            return $revokedStop;
+        }
+
+        $attemptGroupId = (string) \Illuminate\Support\Str::uuid();
+        [$runId, $currentStepId] = $this->openResumedSyncStep($conversation, $message, $toolData, $runId, $attemptGroupId);
+
+        return $this->continueSyncAfterPause(
+            $conversation,
+            $runId,
+            $currentStepId,
+            $attemptGroupId,
+            ($toolData['iteration'] ?? 1) + 1,
+        );
+    }
+
+    /**
+     * Pause a synchronous turn on a valid `ask_user` call: store the turn as
+     * its paused assistant message and open the question, which records the
+     * pause, shows the question (with the turn's assistant text above it,
+     * since a synchronous caller receives no reply content) and delivers it
+     * through the conversation's channel before this returns.
+     *
+     * Returns the `awaiting_user` result when the run is suspended, or the
+     * tool result to give the call instead when the question was refused.
+     *
+     * @param  array<string, mixed>  $marker  the normalized question
+     * @param  list<array<string, mixed>>  $pendingToolResults  results of the
+     *   calls already executed in this batch
+     * @return array<string, mixed>|string
+     */
+    private function pauseSyncForQuestion(
+        Conversation $conversation,
+        string $content,
+        array $toolCalls,
+        array $marker,
+        string $toolCallId,
+        ?string $actionId,
+        array $pendingToolResults,
+        int $iteration,
+        ?string $runId,
+        ?string $stepId,
+    ): array|string {
+        $paused = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $content,
+            'role' => 'assistant',
+            'user' => $conversation->character,
+            'responseTime' => 0,
+            'tool_data' => ['tool_calls' => $toolCalls],
+        ]);
+
+        try {
+            $opened = app(AgentQuestionService::class)->open(new OpenQuestionRequest(
+                conversation: $conversation,
+                request: new AskUserRequest(
+                    (string) ($marker['question'] ?? ''),
+                    array_values($marker['choices'] ?? []),
+                    (bool) ($marker['allow_multiple'] ?? false),
+                ),
+                runId: $runId,
+                stepId: $stepId,
+                actionId: $actionId,
+                pausedMessage: $paused,
+                toolCallId: $toolCallId,
+                resumeMode: OpenQuestionRequest::RESUME_SYNC,
+                preamble: $content,
+                pendingToolResults: $pendingToolResults,
+                iteration: $iteration,
+            ));
+        } catch (\Throwable $e) {
+            // Once the question is committed the paused turn belongs to it:
+            // the failure came from resuming an undeliverable question
+            // inline, which has already closed the run, so it propagates
+            // like any other failure of the synchronous loop.
+            if (AgentQuestion::where('paused_message_id', $paused->id)->exists()) {
+                throw $e;
+            }
+
+            $paused->delete();
+            Log::error('AgentLoopService: could not open the question', [
+                'conversation_id' => $conversation->id,
+                'tool_call_id' => $toolCallId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return json_encode(['error' => 'The question could not be asked: '.$e->getMessage()]);
+        }
+
+        if ($opened instanceof QuestionRefusal) {
+            // The turn is stored once, with every result, when the batch
+            // completes; this paused copy was never used.
+            $paused->delete();
+
+            return $opened->toToolResult();
+        }
+
+        if ($opened->resumeResult !== null) {
+            return $opened->resumeResult;
+        }
+
+        return [
+            'status' => 'awaiting_user',
+            'conversation_id' => $conversation->id,
+            'message_id' => $opened->displayMessage->id,
+            'question_id' => $opened->question->id,
+            'content' => '',
+        ];
+    }
+
+    /**
+     * Continue the synchronous agent loop after a paused turn was answered,
+     * from $iteration, on the step already opened for the resumed work.
+     */
+    private function continueSyncAfterPause(
+        Conversation $conversation,
+        ?string $runId,
+        ?string $currentStepId,
+        string $attemptGroupId,
+        int $iteration,
+    ): array {
+        // Resolved once, before buildToolsPayload()/applyContextWindowTrim()
+        // are called — never re-evaluated inside this method's own loop, so
+        // every iteration of this continuation uses one frozen decision.
         $decision = app(DegradationGate::class)->forRun($runId);
 
         $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
         $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
-        $iteration = ($toolData['iteration'] ?? 1) + 1;
 
         for (; $iteration <= $maxIterations; $iteration++) {
             $rawMessages = $this->buildMessagesPayload($conversation, $runId);
@@ -2578,6 +2873,29 @@ class AgentLoopService
                 }
                 $decoded = json_decode($result, true);
 
+                // See the identical ask_user pause in run()'s tool-call loop.
+                if (is_array($decoded) && !empty($decoded[self::REQUIRES_USER_INPUT])) {
+                    $asked = $this->pauseSyncForQuestion(
+                        $conversation,
+                        $content ?: '',
+                        $toolCalls,
+                        $decoded,
+                        $toolCall['id'] ?? '',
+                        $toolActionId,
+                        array_merge($toolResults, $this->laterBatchDelegationResults($toolCalls, $tcIndex, $batchDelegationResults)),
+                        $iteration,
+                        $runId,
+                        $currentStepId,
+                    );
+
+                    if (is_array($asked)) {
+                        return $asked;
+                    }
+
+                    $result = $asked;
+                    $decoded = json_decode($result, true);
+                }
+
                 if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
                     $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
 
@@ -2697,23 +3015,21 @@ class AgentLoopService
                     // with the wait portion recorded. Closing it here instead would
                     // leave a second pause in the same run with no wait_ms at all,
                     // since the resumed close would hit the terminal guard.
-                    $assistantMessage = Message::create([
-                        'conversation_id' => $conversation->id,
-                        'content' => $content ?: '',
-                        'role' => 'assistant',
-                        'user' => $conversation->character,
-                        'responseTime' => 0,
-                        'tool_data' => [
-                            'tool_calls' => $toolCalls,
-                            'tool_results' => null,
-                            'iteration' => $iteration,
-                            'pending_confirmation' => $pendingConfirmation,
-                            'run_id' => $runId,
-                            'step_id' => $currentStepId,
-                            'paused_at' => now()->toIso8601String(),
-                            'action_id' => $toolActionId,
-                        ],
-                    ]);
+                    $assistantMessage = $this->storePausedTurn(
+                        $conversation,
+                        $content ?: '',
+                        $toolCalls,
+                        PauseKind::Confirmation,
+                        $pendingConfirmation,
+                        new PausedTurnContext(
+                            pausedToolCallId: $toolCall['id'] ?? '',
+                            pendingToolResults: array_merge($toolResults, $this->laterBatchDelegationResults($toolCalls, $tcIndex, $batchDelegationResults)),
+                            iteration: $iteration,
+                            runId: $runId,
+                            stepId: $currentStepId,
+                            actionId: $toolActionId,
+                        ),
+                    );
 
                     return [
                         'status' => 'confirmation_required',
@@ -2730,7 +3046,17 @@ class AgentLoopService
                     $actionContent = ($toolName === 'execute_operation' && ($arguments['operationId'] ?? '') === self::PAGE_TEXT_OPERATION_ID)
                         ? $result
                         : null;
-                    $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success, null, $actionContent);
+                    $refusedAsk = $toolName === 'ask_user' ? QuestionRefusal::fromToolResult($decoded) : null;
+                    if ($refusedAsk !== null) {
+                        $this->runTraceRecorder->closeAction(
+                            $toolActionId,
+                            ActionOutcome::Failure,
+                            $refusedAsk->actionFailureReason(),
+                            $refusedAsk->snapshot($arguments, now()),
+                        );
+                    } else {
+                        $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success, null, $actionContent);
+                    }
                 }
 
                 // Tool executed (not a confirmation pause) — record its outcome.
@@ -3253,6 +3579,33 @@ class AgentLoopService
                     ],
                 ],
             ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'ask_user',
+                    'description' => 'Pause this task and ask the user a question. The task resumes when the user answers, or when the question expires or is withdrawn; the outcome is returned as this tool\'s result. Offer up to 10 choices when the answer is one of a known set; the user may always answer in their own words. Only one question can be pending in a conversation at a time.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'question' => [
+                                'type' => 'string',
+                                'description' => 'The question to ask, in plain text.',
+                            ],
+                            'choices' => [
+                                'type' => 'array',
+                                'items' => ['type' => 'string'],
+                                'maxItems' => 10,
+                                'description' => 'Optional choices, shown numbered from 1.',
+                            ],
+                            'allow_multiple' => [
+                                'type' => 'boolean',
+                                'description' => 'Whether several choices may be selected. Requires choices.',
+                            ],
+                        ],
+                        'required' => ['question'],
+                    ],
+                ],
+            ],
         ];
 
         // 103-manager-agent (US1, contracts/manager-agent-meta-tools.md
@@ -3582,8 +3935,72 @@ class AgentLoopService
             'report_shortfall' => $this->handleReportShortfall($arguments, $conversation),
             'finalize_task' => $this->handleFinalizeTask($arguments, $conversation),
             'record_task_note' => $this->handleRecordTaskNote($arguments, $conversation),
+            'ask_user' => $this->handleAskUser($arguments, $conversation, $unattended),
             default => json_encode(['error' => "Unknown tool: {$toolName}"]),
         };
+    }
+
+    /**
+     * The checks an `ask_user` call gets before any pause. An ask nobody
+     * could answer, or an invalid question, is refused here, and the refusal
+     * is the call's result. A valid one comes back as a marker carrying the
+     * normalized question; the pause site that receives it opens the
+     * question and suspends the run.
+     */
+    private function handleAskUser(array $arguments, Conversation $conversation, bool $unattended): string
+    {
+        $refusal = $this->askReachabilityRefusal($conversation, $unattended)
+            ?? (new AgentQuestionValidator())->validate($arguments);
+
+        if ($refusal instanceof QuestionRefusal) {
+            return $refusal->toToolResult();
+        }
+
+        return json_encode(
+            [self::REQUIRES_USER_INPUT => true] + $refusal->toArray(),
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
+        );
+    }
+
+    /**
+     * Why nobody can be asked from $conversation, or null when its user can
+     * be. Only a user-facing conversation on a channel that can deliver a
+     * question, in a run someone is attending, can pause to ask.
+     *
+     * A delegated helper runs inside its caller's tool call and cannot
+     * pause; when the root conversation of its delegation chain is already
+     * waiting on its user, it is told so, since that is the question it
+     * would have to wait behind.
+     */
+    private function askReachabilityRefusal(Conversation $conversation, bool $unattended): ?QuestionRefusal
+    {
+        if ($conversation->user_id === null || $conversation->user_id === '') {
+            return QuestionRefusal::noReachableUser(QuestionRefusal::NO_USER_REASON);
+        }
+
+        if ($unattended) {
+            return QuestionRefusal::noReachableUser(QuestionRefusal::UNATTENDED_REASON);
+        }
+
+        $channel = (string) ($conversation->channel ?? 'web');
+
+        if ($channel === self::DELEGATION_CHANNEL) {
+            $rootId = DelegationService::chainRootConversationId((string) $conversation->id);
+
+            if ($rootId !== (string) $conversation->id
+                && AgentQuestion::where('pending_conversation_id', $rootId)->exists()
+            ) {
+                return QuestionRefusal::alreadyPending();
+            }
+
+            return QuestionRefusal::noReachableUser(QuestionRefusal::HELPER_REASON);
+        }
+
+        if (!app(ConversationChannelRegistry::class)->has($channel)) {
+            return QuestionRefusal::noReachableUser("Questions cannot be delivered on the '{$channel}' channel.");
+        }
+
+        return null;
     }
 
     private function handleMemoryCreate(array $arguments, Conversation $conversation): string
@@ -5578,6 +5995,15 @@ class AgentLoopService
         $payload = [];
 
         foreach ($dbMessages as $msg) {
+            // A question shown to the user, a notice about it, and the
+            // user's answer exist only in the conversation: the model gets
+            // the outcome once, as the ask_user call's result.
+            if (is_array($msg->tool_data)
+                && in_array($msg->tool_data['kind'] ?? null, AgentQuestionService::CONVERSATION_ONLY_KINDS, true)
+            ) {
+                continue;
+            }
+
             if ($msg->tool_data && !empty($msg->tool_data['tool_calls'])) {
                 // Assistant message with tool calls
                 $assistantMsg = [

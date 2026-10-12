@@ -307,4 +307,43 @@ class EpisodicMemorySearchServiceTest extends TestCase
         // Falls back to keyword search which returns empty
         $this->assertIsArray($results);
     }
+
+    #[Test]
+    public function semanticSearch_ranks_stored_embeddings_on_sqlite()
+    {
+        // The model's embedding cast already hands back a float array, so
+        // the SQLite fallback must score that array rather than decode it.
+        $embeddingMock = \Mockery::mock(EmbeddingService::class);
+        $embeddingMock->shouldReceive('isEnabled')->andReturn(true);
+        $embeddingMock->shouldNotReceive('generate');
+
+        $service = new EpisodicMemorySearchService($embeddingMock);
+
+        EpisodicMemory::create([
+            'user_id' => $this->user->id,
+            'conversation_id' => 'conv-far',
+            'summary' => 'Unrelated memory',
+            'topics' => ['other'],
+            'word_count' => 10,
+            'summary_word_count' => 2,
+            'embedding' => [0.0, 1.0, 0.0],
+        ]);
+        EpisodicMemory::create([
+            'user_id' => $this->user->id,
+            'conversation_id' => 'conv-near',
+            'summary' => 'Closely related memory',
+            'topics' => ['near'],
+            'word_count' => 10,
+            'summary_word_count' => 3,
+            'embedding' => [1.0, 0.1, 0.0],
+        ]);
+
+        $results = $service->semanticSearch($this->user->id, 'test query', 20, [1.0, 0.0, 0.0]);
+
+        $this->assertCount(2, $results);
+        $this->assertSame('conv-near', $results[0]['conversation_id']);
+        $this->assertSame('conv-far', $results[1]['conversation_id']);
+        $this->assertGreaterThan($results[1]['similarity_score'], $results[0]['similarity_score']);
+        $this->assertEqualsWithDelta(0.0, $results[1]['similarity_score'], 0.000001);
+    }
 }

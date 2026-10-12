@@ -16,6 +16,12 @@ use ClarionApp\LlmClient\OpenAIConversationStreamRequest;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\BudgetGate;
 use ClarionApp\LlmClient\Services\RateLimitGate;
+use ClarionApp\LlmClient\Models\AgentQuestion;
+use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
+use ClarionApp\LlmClient\Services\QuestionResumer;
+use ClarionApp\LlmClient\ValueObjects\IntakeResult;
+use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
+use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
 
 class MessageController extends Controller
@@ -38,10 +44,25 @@ class MessageController extends Controller
 
     public function store(Request $request)
     {
+        // `content` may be blank only so a blank reply to a pending question
+        // can be refused with answer_required; without a pending question a
+        // blank message is the same validation error it always was.
         $validatedData = $request->validate([
-            'content' => 'required|string',
+            'content' => 'present|nullable|string',
             'conversation_id' => 'required|exists:conversations,id'
         ]);
+        $content = (string) ($validatedData['content'] ?? '');
+
+        // Only the requester's own pending question lets a blank message
+        // through, so a blank message can never reveal whether someone
+        // else's conversation is waiting on its user.
+        if (trim($content) === ''
+            && !AgentQuestion::where('pending_conversation_id', $validatedData['conversation_id'])
+                ->where('user_id', Auth::id())
+                ->exists()
+        ) {
+            $request->validate(['content' => 'required|string']);
+        }
 
         $conversation = Conversation::ownedByRealUser()->find($validatedData['conversation_id']);
         if(!$conversation || $conversation->user_id != Auth::id())
@@ -77,12 +98,43 @@ class MessageController extends Controller
             $conversation->id,
         );
 
+        // A reply to the conversation's pending question is recorded as its
+        // answer (intake stores the message itself) and resumes the paused
+        // run; the continuation arrives over the conversation's broadcasts.
+        $intake = app(QuestionAnswerIntake::class)->accept($conversation, (string) Auth::id(), $content);
+
+        if ($intake->kind === IntakeResult::ANSWER_REQUIRED) {
+            return response()->json([
+                'code' => 'answer_required',
+                'message' => 'An answer is required to reply to the pending question.',
+            ], 422);
+        }
+
+        if ($intake->kind === IntakeResult::ANSWERED) {
+            // This response carries only the answer message. A question
+            // paused on the streaming path continues over the conversation's
+            // broadcasts; one paused on the synchronous path (a Telegram
+            // conversation answered from this screen) returns its reply
+            // here, so the resumer pushes it to the conversation's own
+            // channel, as it does when no request is waiting at all.
+            $caller = $intake->question->resume_mode === OpenQuestionRequest::RESUME_SYNC
+                ? ResumeCaller::Background
+                : ResumeCaller::HttpRequest;
+            app(QuestionResumer::class)->resume($intake->question->id, $caller);
+
+            return response()->json($intake->message, 201);
+        }
+
+        $validatedData['content'] = $content;
         $validatedData['role'] = "user";
         $validatedData['user'] = Auth::user()->name;
 
         $message = Message::create($validatedData);
 
-        if (!$conversation->is_processing) {
+        // Read fresh: a question resolved a moment ago (e.g. by expiry) has
+        // already marked the conversation processing for its resumed run, and
+        // this message must not start a second, concurrent one.
+        if (!Conversation::whereKey($conversation->id)->value('is_processing')) {
             $agentLoopService = app(AgentLoopService::class);
             $agentLoopService->start($conversation, 1, null, $message->id);
         }

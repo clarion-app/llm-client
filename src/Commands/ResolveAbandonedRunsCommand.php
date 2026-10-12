@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Commands;
 
 use ClarionApp\LlmClient\Services\RunTraceRecorder;
+use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -12,7 +13,8 @@ use Illuminate\Support\Facades\Log;
  *
  * Finds runs that are still `in_progress` but whose latest activity exceeds
  * the abandonment threshold, and transitions them and their open steps to
- * `abandoned`. Runs with a pending human confirmation are exempted.
+ * `abandoned`. Runs with a pending human confirmation, or a pending
+ * question their user can still answer, are exempted.
  *
  * Eligibility (data-model.md §4):
  *   end_state = 'in_progress' AND
@@ -45,7 +47,12 @@ class ResolveAbandonedRunsCommand extends Command
 
         // Collect run ids that have a pending confirmation still within the
         // confirmation_timeout window. These runs are exempt from the sweep.
-        $exemptRunIds = $this->getPendingConfirmationRunIds();
+        // Runs waiting on a pending, still-answerable question are exempt
+        // for the same reason.
+        $exemptRunIds = array_values(array_unique(array_merge(
+            $this->getPendingConfirmationRunIds(),
+            $this->getPendingQuestionRunIds(),
+        )));
 
         // Find eligible abandoned runs: in_progress, latest activity older than cutoff,
         // and not exempt (pending confirmation).
@@ -244,6 +251,32 @@ class ResolveAbandonedRunsCommand extends Command
         }
 
         return array_values(array_unique($exemptRunIds));
+    }
+
+    /**
+     * Get run ids paused on a pending question that can still be answered.
+     *
+     * The paused step stays open for as long as the user takes to answer,
+     * which is exactly what this sweep looks for. The exemption ends at the
+     * question's `expires_at` even when the expiry sweep has not run yet, so
+     * a stalled expiry sweep can never pin a run open forever.
+     *
+     * @return array<string>
+     */
+    private function getPendingQuestionRunIds(): array
+    {
+        if (!DB::getSchemaBuilder()->hasTable('agent_questions')) {
+            return [];
+        }
+
+        return DB::table('agent_questions')
+            ->where('state', QuestionState::Pending->value)
+            ->where('expires_at', '>', now())
+            ->whereNotNull('run_id')
+            ->distinct()
+            ->pluck('run_id')
+            ->map(fn ($runId) => (string) $runId)
+            ->all();
     }
 
     /**

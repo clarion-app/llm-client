@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\ConversationLifecycleService;
+use ClarionApp\LlmClient\Services\AgentQuestionService;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\RoleResolver;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
@@ -281,6 +282,10 @@ class ConversationController extends Controller
             return response()->json(['message' => 'Forbidden'], 403);
         }
 
+        // Deleting stops the conversation's work: a question waiting on the
+        // user is withdrawn (and told) before the conversation goes.
+        app(AgentQuestionService::class)->withdrawForConversation($conversation);
+
         $conversation->delete();
 
         return response()->noContent();
@@ -300,6 +305,10 @@ class ConversationController extends Controller
         if ($conversation->user_id !== Auth::id()) {
             return response()->json(['message' => 'Forbidden'], 403);
         }
+
+        // Before end(), whose already-ended early return must not keep a
+        // waiting question alive.
+        app(AgentQuestionService::class)->withdrawForConversation($conversation);
 
         $ended = $lifecycle->end($conversation);
 

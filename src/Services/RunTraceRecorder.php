@@ -560,6 +560,21 @@ class RunTraceRecorder
     }
 
     /**
+     * Push a fresh run summary to its owner when something the summary
+     * derives from changed without a write to the run row itself (a
+     * question to the user opening or being resolved flips
+     * `awaiting_user`). Never throws.
+     */
+    public function announceRunChanged(?string $runId): void
+    {
+        if ($runId === null || !$this->enabled()) {
+            return;
+        }
+
+        $this->broadcast(fn () => event(new RunUpdated($runId)));
+    }
+
+    /**
      * Close a run with an end state, computing step_count and duration_ms in the same UPDATE (contract C4).
      */
     public function closeRun(
@@ -1097,12 +1112,21 @@ class RunTraceRecorder
                     return;
                 }
 
+                $suspend = [
+                    'outcome' => ActionOutcome::AwaitingConfirmation->value,
+                    'paused_at' => now()->format(self::TIMESTAMP_FORMAT),
+                ];
+
+                // Content describing what the action waits on (e.g. a
+                // question to the user) is visible while it waits; without
+                // any, existing content is left untouched.
+                if ($content !== null) {
+                    $suspend['content'] = $this->sanitizer->prepare($content);
+                }
+
                 DB::table('agent_run_actions')
                     ->where('id', $actionId)
-                    ->update([
-                        'outcome' => ActionOutcome::AwaitingConfirmation->value,
-                        'paused_at' => now()->format(self::TIMESTAMP_FORMAT),
-                    ]);
+                    ->update($suspend);
 
                 $this->broadcast(fn () => event(new RunActionUpdated($actionId)));
 

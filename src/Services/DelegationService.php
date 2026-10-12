@@ -801,6 +801,40 @@ class DelegationService
     }
 
     /**
+     * The conversation at the root of the delegation chain $conversationId
+     * belongs to: the same backward walk as chainRootStartedAt() (helper
+     * conversation -> its delegation row -> the caller's conversation,
+     * guarded against a data-level cycle), returning the last conversation
+     * reached. A conversation that is no one's helper is its own root.
+     *
+     * Static and query-only, so callers that only need the root never
+     * construct this service.
+     */
+    public static function chainRootConversationId(string $conversationId): string
+    {
+        $visitedConversationIds = [];
+        $currentConversationId = $conversationId;
+
+        while (true) {
+            if (isset($visitedConversationIds[$currentConversationId])) {
+                break;
+            }
+            $visitedConversationIds[$currentConversationId] = true;
+
+            $delegation = Delegation::where('helper_conversation_id', $currentConversationId)
+                ->latest('started_at')
+                ->first();
+            if ($delegation === null || $delegation->parent_conversation_id === null) {
+                break;
+            }
+
+            $currentConversationId = (string) $delegation->parent_conversation_id;
+        }
+
+        return $currentConversationId;
+    }
+
+    /**
      * 110-delegation-deadlock-timeout (Phase 2, research.md D1,
      * data-model.md "Chain root start time"): mirrors ancestorAgentIds()'s
      * own backward walk exactly in structure (same `while (true)` loop,

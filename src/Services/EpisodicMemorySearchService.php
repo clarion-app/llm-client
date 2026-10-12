@@ -152,11 +152,13 @@ class EpisodicMemorySearchService
 
             $results = collect();
             foreach ($memories as $memory) {
-                $embedding = json_decode($memory->embedding, true);
-                if ($embedding === null) continue;
+                // VectorEmbeddingCast already returns the stored vector as a
+                // float array (or null when it cannot be parsed).
+                $embedding = $memory->embedding;
+                if (!is_array($embedding) || $embedding === []) continue;
 
                 $score = $this->cosineSimilarity($queryEmbedding, $embedding);
-                $memory->attributes['similarity_score'] = round($score, 6);
+                $memory->setAttribute('similarity_score', round($score, 6));
                 $results->push($memory);
             }
 
