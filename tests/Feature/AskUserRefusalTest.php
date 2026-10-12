@@ -654,4 +654,110 @@ class AskUserRefusalTest extends TestCase
 
         $this->assertRefusedAndContinued($result, $conversation, $this->refusal('invalid_question', $reason));
     }
+
+    // ---------------------------------------------------------------
+    // What happens if nobody answers: malformed or contradictory asks
+    // ---------------------------------------------------------------
+
+    /** @return array<string, array{array<string, mixed>, string}> */
+    public static function refusedPolicyAsks(): array
+    {
+        return [
+            'proceed with no assumption' => [
+                ['if_unanswered' => 'proceed_on_assumption'],
+                'if_unanswered is "proceed_on_assumption" but no assumed answer was given',
+            ],
+            'stop with an assumption' => [
+                ['if_unanswered' => 'stop', 'assumed_choices' => [1]],
+                'if_unanswered is "stop" but an assumed answer was given; a question that stops when unanswered cannot also assume an answer',
+            ],
+            'consequential with an assumed choice' => [
+                ['consequential' => true, 'assumed_choices' => [1]],
+                'a consequential question cannot proceed on an assumed answer; it always stops until the user answers',
+            ],
+            'consequential with the proceed policy and assumed text' => [
+                ['consequential' => true, 'if_unanswered' => 'proceed_on_assumption', 'assumed_text' => 'Backend'],
+                'a consequential question cannot proceed on an assumed answer; it always stops until the user answers',
+            ],
+            'assumed choice out of range' => [
+                ['assumed_choices' => [4]],
+                'assumed choice 4 does not exist (the question has 3 choices)',
+            ],
+            'two assumed choices on a single-selection question' => [
+                ['assumed_choices' => [1, 2]],
+                'a single-selection question can assume only one choice',
+            ],
+            'a wait that is not a whole number' => [
+                ['wait_minutes' => 'ninety'],
+                'wait_minutes must be a whole number of minutes',
+            ],
+        ];
+    }
+
+    /**
+     * The refused ask's run-record content carries the policy arguments
+     * exactly as the ask sent them, and none it did not send.
+     */
+    private function assertRefusedSnapshotCarries(Conversation $conversation, array $askArguments): void
+    {
+        $runIds = DB::table('agent_runs')->where('conversation_id', $conversation->id)->pluck('id');
+        $content = DB::table('agent_run_actions')->whereIn('run_id', $runIds)->where('target', 'ask_user')->value('content');
+        $snapshot = json_decode((string) $content, true);
+        $this->assertIsArray($snapshot, 'the refused ask is recorded with its snapshot');
+
+        $sent = ['if_unanswered', 'assumed_choices', 'assumed_text', 'consequential', 'wait_minutes'];
+        foreach ($sent as $key) {
+            if (array_key_exists($key, $askArguments)) {
+                $this->assertArrayHasKey($key, $snapshot, "the {$key} the ask sent is recorded");
+                $this->assertSame($askArguments[$key], $snapshot[$key], "{$key} is recorded as given");
+            } else {
+                $this->assertArrayNotHasKey($key, $snapshot, "the ask did not send {$key}, so it is not recorded");
+            }
+        }
+        $this->assertSame(self::QUESTION, $snapshot['question'] ?? null);
+        $this->assertArrayHasKey('question_id', $snapshot);
+        $this->assertNull($snapshot['question_id'], 'no question was written');
+        $this->assertSame('refused:invalid_question', $snapshot['resolution'] ?? null);
+    }
+
+    #[Test]
+    #[DataProvider('refusedPolicyAsks')]
+    public function a_malformed_policy_ask_is_refused_before_anything_is_written_or_shown(array $askArguments, string $reason): void
+    {
+        $conversation = $this->conversation('telegram');
+
+        $result = $this->runAsking($conversation, $askArguments);
+
+        $this->assertRefusedAndContinued($result, $conversation, $this->refusal('invalid_question', $reason));
+        $this->assertSame([], $this->telegram->deliveries, 'no delivery of any kind');
+        $this->assertSame([], $this->web->deliveries, 'no delivery of any kind');
+        $this->assertRefusedSnapshotCarries($conversation, $askArguments);
+    }
+
+    #[Test]
+    #[DataProvider('refusedPolicyAsks')]
+    public function a_malformed_policy_ask_is_refused_on_the_streaming_path_too(array $askArguments, string $reason): void
+    {
+        $conversation = $this->conversation('web');
+
+        $message = $this->streamTurn($conversation, [$this->askCall('call_ask', $askArguments)]);
+
+        $this->assertArrayNotHasKey('pause_kind', (array) $message->tool_data, 'a refused ask does not pause the turn');
+        $this->assertSame(
+            $this->refusal('invalid_question', $reason),
+            json_decode((string) ($message->tool_data['tool_results'][0]['content'] ?? ''), true),
+            'the refusal is the call\'s result in the same iteration',
+        );
+        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        $this->assertSame(0, AgentQuestion::count(), 'a refused ask writes no question');
+        $this->assertSame(
+            1,
+            Message::where('conversation_id', $conversation->id)->count(),
+            'no display message: the paused-turn message is the only one',
+        );
+        $this->assertSame([], $this->web->deliveries);
+        $this->assertSame([], $this->telegram->deliveries);
+        $this->assertRefusedAction($conversation, 'invalid_question');
+        $this->assertRefusedSnapshotCarries($conversation, $askArguments);
+    }
 }

@@ -19,6 +19,7 @@ use ClarionApp\LlmClient\ValueObjects\QuestionOption;
 use ClarionApp\LlmClient\ValueObjects\QuestionOutcomeView;
 use ClarionApp\LlmClient\ValueObjects\QuestionPresentation;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Testing\TestResponse;
@@ -54,6 +55,9 @@ class ChannelNativeQuestionMessagingJourneyTest extends AssembledSystemTestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse(AgentQuestionWebJourneyTest::ASKED_AT, 'UTC'));
 
         $this->entryPath = 'sync';
         config(['llm-client.run_trace.enabled' => true]);
@@ -164,14 +168,14 @@ class ChannelNativeQuestionMessagingJourneyTest extends AssembledSystemTestCase
         $renderer = $this->app->make(QuestionRenderer::class);
         $question->refresh();
         $this->assertSame($renderer->renderWithOptions($question, $question->preamble), $presentation->bodyText);
-        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, $presentation->plainText, 'the plain fallback is the plain-text question');
+        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED, $presentation->plainText, 'the plain fallback is the plain-text question');
         $this->assertSame([], $this->telegram->deliveries, 'nothing was sent as plain text');
 
         $this->assertSame(PresentationMode::Rich, $question->presentation);
         $this->assertNull($question->presentation_fallback_reason);
         $this->assertNotNull($question->delivered_at);
         $this->assertSame(
-            AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES,
+            AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED,
             Message::findOrFail($question->display_message_id)->content,
             'the conversation stores the same question text as before',
         );
@@ -345,6 +349,8 @@ class ChannelNativeQuestionMessagingJourneyTest extends AssembledSystemTestCase
         $conversation = $this->telegramConversation();
         $this->script()->toolRequest('ask_user', ['question' => self::QUESTION, 'choices' => self::CHOICES]);
         $question = $this->ask($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
 
         $service = $this->app->make(AgentQuestionService::class);
         $this->assertTrue($service->expire($question->fresh()));

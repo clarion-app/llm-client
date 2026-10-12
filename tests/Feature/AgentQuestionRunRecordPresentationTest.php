@@ -55,7 +55,7 @@ class AgentQuestionRunRecordPresentationTest extends TestCase
 
     /** The fields the record showed before presentation was tracked. */
     private const EARLIER_SNAPSHOT_KEYS = [
-        'question_id', 'question', 'choices', 'allow_multiple', 'asked_at',
+        'question_id', 'outcome', 'stopped_at', 'stopped_ms', 'policy', 'question', 'choices', 'allow_multiple', 'asked_at',
         'expires_at', 'resolution', 'resolved_at', 'waited_ms', 'answer',
     ];
 

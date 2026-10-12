@@ -731,7 +731,7 @@ class RunTraceQuery
     }
 
     /**
-     * The subset of $runIds that have a pending question waiting on the
+     * The subset of $runIds that have a question waiting on the
      * user, in one query however many runs are asked about, so a list of
      * run summaries never costs a lookup per row.
      *
@@ -746,7 +746,31 @@ class RunTraceQuery
 
         return DB::table('agent_questions')
             ->whereIn('run_id', $runIds)
-            ->where('state', QuestionState::Pending->value)
+            // Stopped questions still wait on their user, for a late answer.
+            ->whereIn('state', [QuestionState::Pending->value, QuestionState::Stopped->value])
+            ->distinct()
+            ->pluck('run_id')
+            ->mapWithKeys(fn ($id) => [(string) $id => true])
+            ->all();
+    }
+
+    /**
+     * The subset of $runIds whose work stopped on an unanswered question
+     * (waiting for a late answer), in one query however many runs are asked
+     * about.
+     *
+     * @param  list<string>  $runIds
+     * @return array<string, true> keyed by run id
+     */
+    public function runIdsStoppedOnQuestion(array $runIds): array
+    {
+        if ($runIds === []) {
+            return [];
+        }
+
+        return DB::table('agent_questions')
+            ->whereIn('run_id', $runIds)
+            ->where('state', QuestionState::Stopped->value)
             ->distinct()
             ->pluck('run_id')
             ->mapWithKeys(fn ($id) => [(string) $id => true])
@@ -763,11 +787,16 @@ class RunTraceQuery
      *
      * @return array<string, mixed>
      */
-    public function runSummaryRow(AgentRun $run, int $actionCount, ?bool $awaitingUser = null): array
-    {
-        // Callers projecting many runs pass the flag from one batched
-        // runIdsAwaitingUser() lookup; a single summary looks it up itself.
+    public function runSummaryRow(
+        AgentRun $run,
+        int $actionCount,
+        ?bool $awaitingUser = null,
+        ?bool $questionStopped = null,
+    ): array {
+        // Callers projecting many runs pass the flags from one batched
+        // lookup each; a single summary looks them up itself.
         $awaitingUser ??= isset($this->runIdsAwaitingUser([$run->id])[$run->id]);
+        $questionStopped ??= isset($this->runIdsStoppedOnQuestion([$run->id])[$run->id]);
 
         return [
             'id' => $run->id,
@@ -789,6 +818,7 @@ class RunTraceQuery
             'confirm_wait_ms' => $run->confirm_wait_ms,
             'product_ms' => $run->product_ms,
             'awaiting_user' => $awaitingUser,
+            'question_stopped' => $questionStopped,
         ];
     }
 

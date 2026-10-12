@@ -17,8 +17,20 @@ class AnswerParser
 {
     public function parse(string $raw, AgentQuestion $question): ParsedAnswer
     {
+        return $this->parseAgainst($raw, $question->choiceList(), (bool) $question->allow_multiple);
+    }
+
+    /**
+     * Interpret a reply against a question's choices before any question
+     * row exists (an assumed answer is read exactly as the same typed reply
+     * would be).
+     *
+     * @param  list<string>  $choices
+     */
+    public function parseAgainst(string $raw, array $choices, bool $allowMultiple): ParsedAnswer
+    {
         $trimmed = trim($raw);
-        $choices = $question->choiceList();
+        $choices = array_values($choices);
 
         if ($trimmed === '' || $choices === [] || !preg_match('/^\d+(?:[\s,]+\d+)*$/', $trimmed)) {
             return new ParsedAnswer($raw, false);
@@ -26,7 +38,7 @@ class AnswerParser
 
         $numbers = array_map('intval', preg_split('/[\s,]+/', $trimmed));
 
-        if (!$question->allow_multiple && count($numbers) !== 1) {
+        if (!$allowMultiple && count($numbers) !== 1) {
             return new ParsedAnswer($raw, false);
         }
 

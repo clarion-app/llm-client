@@ -26,9 +26,11 @@ interface PresentsQuestions
     public function presentQuestion(Conversation $conversation, QuestionPresentation $presentation): DeliveryResult;
 
     /**
-     * Show that a question is resolved wherever this channel presented it, and stop offering its options.
-     * Best effort: MUST NOT throw; failure MUST NOT be reported back (the resolution already stands).
-     * Called at most once per question, after the resolving transaction commits.
+     * Show a question's outcome wherever this channel presented it. Called once when the question stops, if it
+     * does, and once when it is finally resolved, each after the committing transaction. When
+     * `$outcome->answerable` is true (the question stopped and still takes an answer) keep offering its options
+     * and show `$outcome->summary`; otherwise show the summary and stop offering them.
+     * Best effort: MUST NOT throw; failure MUST NOT be reported back (the outcome already stands).
      */
     public function presentResolution(Conversation $conversation, QuestionOutcomeView $outcome): void;
 }

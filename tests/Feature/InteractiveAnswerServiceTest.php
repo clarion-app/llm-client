@@ -85,6 +85,11 @@ class InteractiveAnswerServiceTest extends TestCase
     private function resolved(QuestionState $state): AgentQuestion
     {
         $question = $this->pending();
+        if ($state === QuestionState::Expired) {
+            // A question asked before unanswered policies existed: it expires as it always did.
+            DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+            $question->refresh();
+        }
         $service = app(AgentQuestionService::class);
 
         $won = match ($state) {
@@ -304,6 +309,9 @@ class InteractiveAnswerServiceTest extends TestCase
     public function losing_the_compare_and_set_to_an_expiry_reports_the_winners_state_and_writes_nothing(): void
     {
         $question = $this->pending();
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $question->refresh();
         $expired = new \ArrayObject(['done' => false]);
         Event::listen('eloquent.retrieved: '.AgentQuestion::class, function (AgentQuestion $retrieved) use ($expired, $question) {
             if ($expired['done'] || $retrieved->id !== $question->id) {

@@ -21,9 +21,12 @@ use ClarionApp\LlmClient\Services\SpendingCeilingService;
 use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\BudgetScope;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
+use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
 use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
+use ClarionApp\LlmClient\ValueObjects\ParsedAnswer;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\RateLimitScope;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -49,6 +52,11 @@ use Tests\TestCase;
  * with the reply pushed to the conversation's own channel for a
  * synchronous one. A question that is no longer pending is reported with
  * its state, and nothing is written, started or resumed.
+ *
+ * A question that proceeded on its stated assumption at its deadline takes
+ * no late answer: the stale form is told, in the question's view, what was
+ * assumed. A question whose work stopped at its deadline still takes one,
+ * and it resumes the work.
  */
 class QuestionControllerAnswerTest extends TestCase
 {
@@ -111,6 +119,11 @@ class QuestionControllerAnswerTest extends TestCase
     private function resolved(QuestionState $state): AgentQuestion
     {
         $question = $this->pending();
+        if ($state === QuestionState::Expired) {
+            // A question asked before unanswered policies existed: it expires as it always did.
+            DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+            $question->refresh();
+        }
         $service = app(AgentQuestionService::class);
 
         $won = match ($state) {
@@ -548,5 +561,80 @@ class QuestionControllerAnswerTest extends TestCase
             'the continuation\'s reply reaches the chat the conversation lives on',
         );
         Queue::assertNotPushed(SendHttpStreamRequest::class);
+    }
+
+    // ---------------------------------------------------------------
+    // After the deadline
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_stale_form_on_a_question_that_proceeded_on_its_assumption_is_told_what_was_assumed_and_nothing_happens(): void
+    {
+        $conversation = $this->questionConversation($this->user, 'web');
+        $question = AgentQuestion::findOrFail($this->openQuestion($conversation, request: new AskUserRequest(
+            'Which part should I change first?',
+            ['Backend', 'Frontend', 'Docs'],
+            false,
+            policy: UnansweredPolicy::ProceedOnAssumption,
+            assumedAnswer: new ParsedAnswer('1', true, [['number' => 1, 'text' => 'Backend']]),
+            requestedWaitMinutes: 60,
+        ))->question->id);
+        $this->assertSame(QuestionState::ExpiredAssumed, app(AgentQuestionService::class)->expireWithPolicy($question), 'precondition: proceeded on its assumption');
+        $rowBefore = $this->row($question->id);
+        $footprintBefore = $this->footprint();
+        $chatCallsBefore = $this->scriptedChatCalls;
+        $deliveriesBefore = $this->telegram->deliveries;
+
+        $response = $this->submit($question->id, ['selected' => [2]]);
+
+        $response->assertStatus(409);
+        $this->assertSame('question_not_pending', $response->json('code'));
+        $this->assertSame('expired_assumed', $response->json('state'));
+        $this->assertSame($question->id, $response->json('question.id'));
+        $this->assertSame('expired_assumed', $response->json('question.state'));
+        $this->assertFalse($response->json('question.answerable'));
+        $this->assertSame(
+            'Expired — no answer arrived in time; the agent continued assuming: 1. Backend',
+            $response->json('question.outcome_text'),
+            'the stale form is told what was assumed',
+        );
+
+        $this->assertSame($rowBefore, $this->row($question->id), 'the question row and its assumption are untouched');
+        $this->assertSame($footprintBefore, $this->footprint(), 'no message, no run, no resume');
+        $this->assertSame($chatCallsBefore, $this->scriptedChatCalls, 'no model request');
+        $this->assertSame($deliveriesBefore, $this->telegram->deliveries, 'nothing is delivered');
+    }
+
+    #[Test]
+    public function a_form_answer_to_a_question_whose_work_stopped_answers_it_late_and_resumes_the_work(): void
+    {
+        $question = $this->pending();
+        DB::table('agent_questions')->where('id', $question->id)->update([
+            'state' => QuestionState::Stopped->value,
+            'stopped_at' => now()->subMinutes(5)->format('Y-m-d H:i:s'),
+        ]);
+        $stoppedAt = $this->row($question->id)['stopped_at'];
+        Queue::assertNotPushed(SendHttpStreamRequest::class);
+
+        $response = $this->submit($question->id, ['selected' => [2]]);
+
+        $response->assertStatus(201);
+        $this->assertSame('answered', $response->json('status'));
+        $this->assertSame('answered', $response->json('question.state'));
+        $this->assertTrue($response->json('question.answered_late'));
+        $this->assertSame('2', $response->json('message.content'));
+
+        $question->refresh();
+        $this->assertSame(QuestionState::Answered, $question->state);
+        $this->assertSame($stoppedAt, $this->row($question->id)['stopped_at'], 'when work stopped is kept');
+        $this->assertNotNull($question->resumed_at, 'the stopped work resumed in this request');
+        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertNotPushed(ResumeAfterQuestionJob::class);
+
+        $results = Message::findOrFail($question->paused_message_id)->tool_data['tool_results'] ?? null;
+        $this->assertIsArray($results);
+        $outcome = json_decode((string) $results[0]['content'], true);
+        $this->assertSame('answered_late', $outcome['outcome'] ?? null);
+        $this->assertSame([['number' => 2, 'text' => 'Frontend']], $outcome['answer']['selected'] ?? null);
     }
 }

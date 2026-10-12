@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -56,6 +57,9 @@ class AgentQuestionRestartJourneyTest extends AssembledSystemTestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse(AgentQuestionWebJourneyTest::ASKED_AT, 'UTC'));
 
         config(['llm-client.run_trace.enabled' => true]);
         config(['llm-client.conversation.inactivity_threshold_hours' => 4]);
@@ -270,7 +274,7 @@ class AgentQuestionRestartJourneyTest extends AssembledSystemTestCase
 
         $question = $this->questionIn($fixture->conversation);
         $this->assertSame(
-            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES],
+            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED],
             $this->telegram->textsFor($fixture->conversation->id),
             'precondition: the question reached the chat',
         );
@@ -334,7 +338,7 @@ class AgentQuestionRestartJourneyTest extends AssembledSystemTestCase
             ->json();
         $shown = array_values(array_filter($listed, fn (array $m) => ($m['id'] ?? null) === $fresh->display_message_id));
         $this->assertCount(1, $shown, 'the conversation lists the question');
-        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, $shown[0]['content']);
+        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED, $shown[0]['content']);
         $this->assertSame('pending', $shown[0]['tool_data']['state'] ?? null);
     }
 
@@ -556,7 +560,7 @@ class AgentQuestionRestartJourneyTest extends AssembledSystemTestCase
         // Nobody waits on an HTTP response for a re-driven run, so its reply
         // is pushed to the chat — once.
         $this->assertSame(
-            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, 'Starting with the backend.'],
+            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED, 'Starting with the backend.'],
             $this->telegram->textsFor($question->conversation_id),
         );
         $this->assertRunCompleted($question);

@@ -33,6 +33,9 @@ class QuestionResumer
 
     public const WITHDRAWN_REASON = 'question withdrawn';
 
+    /** A question whose work had stopped at its deadline, withdrawn when its conversation ended. */
+    public const DISCARDED_REASON = 'stopped question discarded';
+
     /**
      * @return array<string, mixed>|null  the synchronous continuation's
      *   result; null when there is none (a streamed continuation, a run
@@ -65,8 +68,9 @@ class QuestionResumer
 
         // A withdrawn question ends its run without another model call.
         if (!$question->state->continuesRun()) {
-            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON, $this->waitMs($question, $paused));
-            $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, self::WITHDRAWN_REASON);
+            $reason = $question->stopped_at !== null ? self::DISCARDED_REASON : self::WITHDRAWN_REASON;
+            $recorder->closeStep($question->step_id, RunEndState::StoppedEarly, $reason, $this->waitMs($question, $paused));
+            $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, $reason);
 
             return null;
         }
@@ -195,7 +199,9 @@ class QuestionResumer
 
         $claimed = DB::table('agent_questions')
             ->where('id', $questionId)
-            ->where('state', '<>', QuestionState::Pending->value)
+            // A waiting question — pending, or stopped until a late answer or
+            // a discard — has nothing to resume yet.
+            ->whereNotIn('state', [QuestionState::Pending->value, QuestionState::Stopped->value])
             ->whereNull('resumed_at')
             ->update(['resumed_at' => $now, 'updated_at' => $now]);
 
@@ -242,6 +248,10 @@ class QuestionResumer
                 QuestionState::Answered,
                 new ParsedAnswer((string) $question->answer_raw, $selected !== [], $selected),
             );
+        }
+
+        if ($question->state === QuestionState::ExpiredAssumed) {
+            return new QuestionResolution(QuestionState::ExpiredAssumed, $question->assumedAnswer());
         }
 
         return new QuestionResolution($question->state, null, $question->delivery_failure_reason);

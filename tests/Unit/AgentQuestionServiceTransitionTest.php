@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentQuestionService;
+use ClarionApp\LlmClient\Services\AnswerParser;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Support\Facades\DB;
@@ -14,6 +15,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Integration\Harness\RecordingChannelDelivery;
 use Tests\TestCase;
@@ -25,8 +27,11 @@ use Tests\TestCase;
  * reflection, as the narrowest seam) because every public resolving
  * method depends on exactly these properties:
  *
- *  - only a `pending` row can transition; the first caller wins (`true`),
- *    every later caller loses (`false`) and changes nothing;
+ *  - only a row in one of the caller's `from` states can transition (a
+ *    `pending` row for every 130 resolution; `answer()` and
+ *    `withdrawForConversation()` also accept a `stopped` row); the first
+ *    caller wins (`true`), every later caller loses (`false`) and changes
+ *    nothing;
  *  - the winner sets the state, `resolved_at`, clears the one-pending-per-
  *    conversation latch (`pending_conversation_id`) and applies its fields;
  *  - a run-continuing outcome marks the conversation processing in the same
@@ -76,13 +81,31 @@ class AgentQuestionServiceTransitionTest extends TestCase
         return $id;
     }
 
-    private function transition(string $id, QuestionState $to, array $fields, bool $setProcessing): bool
-    {
+    /**
+     * @param  list<QuestionState>  $from  the states the compare-and-set accepts
+     */
+    private function transition(
+        string $id,
+        QuestionState $to,
+        array $fields,
+        bool $setProcessing,
+        array $from = [QuestionState::Pending],
+        bool $releaseSlot = true,
+        bool $resolves = true,
+    ): bool {
         $service = app(AgentQuestionService::class);
         $method = new \ReflectionMethod($service, 'transition');
         $method->setAccessible(true);
 
-        return $method->invoke($service, $id, $to, $fields, $setProcessing);
+        return $method->invokeArgs($service, [
+            'id' => $id,
+            'from' => $from,
+            'to' => $to,
+            'fields' => $fields,
+            'setProcessing' => $setProcessing,
+            'releaseSlot' => $releaseSlot,
+            'resolves' => $resolves,
+        ]);
     }
 
     private function row(string $id): object
@@ -262,7 +285,7 @@ class AgentQuestionServiceTransitionTest extends TestCase
         $this->assertSame('assistant', $notices[0]->role);
         $this->assertSame($expected, $notices[0]->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'expired'],
+            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'expired', 'delivered' => true],
             $notices[0]->tool_data,
         );
 
@@ -318,7 +341,7 @@ class AgentQuestionServiceTransitionTest extends TestCase
         $this->assertCount(1, $notices);
         $this->assertSame($expected, $notices[0]->content);
         $this->assertEquals(
-            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'undeliverable'],
+            ['kind' => 'agent_question_notice', 'question_id' => $id, 'state' => 'undeliverable', 'delivered' => false, 'delivery_failure_reason' => 'telegram account not linked'],
             $notices[0]->tool_data,
         );
 
@@ -384,5 +407,297 @@ class AgentQuestionServiceTransitionTest extends TestCase
         $this->assertFalse((bool) $conversation->fresh()->is_processing);
         $this->assertCount(1, $this->noticesFor($id), 'only the expiry\'s notice exists');
         $this->assertSame([], $web->deliveries, 'the loser delivers nothing');
+    }
+    // ---------------------------------------------------------------
+    // The second waiting state: `stopped`. A stop-policy question whose
+    // period passed keeps its slot and waits for a late answer or a
+    // discard; nothing else may resolve it.
+    // ---------------------------------------------------------------
+
+    private const POLICY_COLUMNS = [
+        'unanswered_policy',
+        'consequential',
+        'assumed_answer_raw',
+        'assumed_answer_selected',
+        'requested_wait_minutes',
+        'effective_wait_minutes',
+        'expires_at',
+    ];
+
+    /** A question asked with a policy, as open() stores one. */
+    private function policyQuestion(Conversation $conversation, array $overrides = []): string
+    {
+        $now = now();
+
+        return $this->pendingQuestion($conversation, $overrides + [
+            'unanswered_policy' => 'proceed_on_assumption',
+            'consequential' => false,
+            'assumed_answer_raw' => '1',
+            'assumed_answer_selected' => json_encode([['number' => 1, 'text' => 'Backend']]),
+            'requested_wait_minutes' => 5,
+            'effective_wait_minutes' => 60,
+            'expires_at' => $now->copy()->addMinutes(60),
+        ]);
+    }
+
+    /** Force a question into `stopped` the way the stop transition leaves it: slot kept, unresolved. */
+    private function forceStopped(string $id): void
+    {
+        DB::table('agent_questions')->where('id', $id)->update(['state' => 'stopped', 'stopped_at' => now()]);
+
+        $row = $this->row($id);
+        $this->assertSame('stopped', $row->state, 'precondition: stopped');
+        $this->assertNotNull($row->pending_conversation_id, 'precondition: a stopped question keeps its slot');
+        $this->assertNull($row->resolved_at, 'precondition: a stopped question is unresolved');
+    }
+
+    /** @return array<string, mixed> */
+    private function policyColumns(string $id): array
+    {
+        return array_intersect_key((array) $this->row($id), array_flip(self::POLICY_COLUMNS));
+    }
+
+    #[Test]
+    public function a_late_answer_wins_on_a_stopped_question(): void
+    {
+        $this->recordingWebChannel();
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation, ['unanswered_policy' => 'stop']);
+        $this->forceStopped($id);
+        $stoppedAt = $this->row($id)->stopped_at;
+        $question = AgentQuestion::findOrFail($id);
+
+        $message = app(AgentQuestionService::class)->answer(
+            $question,
+            (new AnswerParser())->parse('2', $question),
+            (string) $conversation->user_id,
+            '2',
+        );
+
+        $this->assertNotNull($message, 'the late answer wins the compare-and-set');
+        $row = $this->row($id);
+        $this->assertSame('answered', $row->state);
+        $this->assertNotNull($row->resolved_at);
+        $this->assertNull($row->pending_conversation_id, 'the answer releases the slot');
+        $this->assertSame('2', $row->answer_raw);
+        $this->assertNotNull($row->stopped_at, 'stopped_at survives, marking the answer late');
+        $this->assertEquals($stoppedAt, $row->stopped_at);
+        $this->assertTrue((bool) $conversation->fresh()->is_processing, 'a late answer continues the run');
+    }
+
+    #[Test]
+    public function ending_the_conversation_discards_a_stopped_question(): void
+    {
+        $this->recordingWebChannel();
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation, ['unanswered_policy' => 'stop']);
+        $this->forceStopped($id);
+        $stoppedAt = $this->row($id)->stopped_at;
+
+        $won = app(AgentQuestionService::class)->withdrawForConversation($conversation);
+
+        $this->assertTrue($won, 'the stopped question is found through its slot and withdrawn');
+        $row = $this->row($id);
+        $this->assertSame('withdrawn', $row->state);
+        $this->assertNotNull($row->resolved_at);
+        $this->assertNull($row->pending_conversation_id);
+        $this->assertEquals($stoppedAt, $row->stopped_at, 'stopped_at survives, marking a discarded stopped task');
+        $this->assertFalse((bool) $conversation->fresh()->is_processing, 'a discard continues nothing');
+    }
+
+    #[Test]
+    public function expiry_and_undeliverable_lose_on_a_stopped_question(): void
+    {
+        $web = $this->recordingWebChannel();
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation, ['unanswered_policy' => 'stop']);
+        $this->forceStopped($id);
+        $before = (array) $this->row($id);
+
+        $service = app(AgentQuestionService::class);
+
+        $this->assertFalse($service->expire(AgentQuestion::findOrFail($id)), 'a stopped question has already expired');
+        $this->assertFalse(
+            $service->markUndeliverable(AgentQuestion::findOrFail($id), 'telegram account not linked'),
+            'a stopped question was delivered long ago',
+        );
+
+        $this->assertSame($before, (array) $this->row($id), 'losing transitions must not touch the row');
+        $this->assertFalse((bool) $conversation->fresh()->is_processing);
+        $this->assertSame([], $this->noticesFor($id));
+        $this->assertSame([], $web->deliveries);
+    }
+
+    #[Test]
+    public function all_four_resolutions_still_win_on_a_pending_question(): void
+    {
+        $this->recordingWebChannel();
+        $service = app(AgentQuestionService::class);
+
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation);
+        $question = AgentQuestion::findOrFail($id);
+        $this->assertNotNull($service->answer(
+            $question,
+            (new AnswerParser())->parse('1', $question),
+            (string) $conversation->user_id,
+            '1',
+        ));
+        $this->assertSame('answered', $this->row($id)->state);
+        $this->assertNull($this->row($id)->stopped_at, 'an on-time answer is not late');
+
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation);
+        $this->assertTrue($service->withdrawForConversation($conversation));
+        $this->assertSame('withdrawn', $this->row($id)->state);
+        $this->assertNull($this->row($id)->stopped_at);
+
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation);
+        $this->assertTrue($service->expire(AgentQuestion::findOrFail($id)));
+        $this->assertSame('expired', $this->row($id)->state);
+
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->pendingQuestion($conversation);
+        $this->assertTrue($service->markUndeliverable(AgentQuestion::findOrFail($id), 'no route'));
+        $this->assertSame('undeliverable', $this->row($id)->state);
+    }
+
+    #[Test]
+    public function the_compare_and_set_accepts_only_its_from_states(): void
+    {
+        $conversation = Conversation::factory()->create(['is_processing' => false]);
+        $id = $this->pendingQuestion($conversation);
+        $this->forceStopped($id);
+        $before = (array) $this->row($id);
+
+        $this->assertFalse($this->transition($id, QuestionState::Answered, ['answer_raw' => '2'], true, from: [QuestionState::Pending]));
+        $this->assertSame($before, (array) $this->row($id), 'a stopped row is not in [pending]');
+
+        $this->assertTrue($this->transition($id, QuestionState::Answered, ['answer_raw' => '2'], true, from: [QuestionState::Pending, QuestionState::Stopped]));
+        $this->assertSame('answered', $this->row($id)->state);
+        $this->assertFalse(
+            $this->transition($id, QuestionState::Withdrawn, [], false, from: [QuestionState::Pending, QuestionState::Stopped]),
+            'an answered row is in neither waiting state',
+        );
+    }
+
+    #[Test]
+    public function the_stop_transition_keeps_the_slot_and_leaves_the_question_unresolved(): void
+    {
+        $conversation = Conversation::factory()->create(['is_processing' => false]);
+        $id = $this->pendingQuestion($conversation, ['unanswered_policy' => 'stop']);
+        $stoppedAt = now();
+
+        $won = $this->transition(
+            $id,
+            QuestionState::Stopped,
+            ['stopped_at' => $stoppedAt],
+            false,
+            from: [QuestionState::Pending],
+            releaseSlot: false,
+            resolves: false,
+        );
+
+        $this->assertTrue($won);
+        $row = $this->row($id);
+        $this->assertSame('stopped', $row->state);
+        $this->assertSame($conversation->id, $row->pending_conversation_id, 'the slot is kept: the next message is still the answer');
+        $this->assertNull($row->resolved_at, 'a stopped question is not resolved');
+        $this->assertNotNull($row->stopped_at);
+        $this->assertFalse((bool) $conversation->fresh()->is_processing, 'nothing continues while stopped');
+
+        $this->assertFalse(
+            $this->transition($id, QuestionState::Stopped, ['stopped_at' => now()], false, from: [QuestionState::Pending], releaseSlot: false, resolves: false),
+            'a question stops at most once',
+        );
+    }
+
+    #[Test]
+    public function pending_is_never_the_target_of_a_transition(): void
+    {
+        $conversation = Conversation::factory()->create(['is_processing' => false]);
+        $id = $this->pendingQuestion($conversation);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->transition($id, QuestionState::Pending, [], false, from: [QuestionState::Stopped]);
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function resolutionsFromPending(): array
+    {
+        return [
+            'answer' => ['answer'],
+            'withdraw' => ['withdraw'],
+            'expire' => ['expire'],
+            'undeliverable' => ['undeliverable'],
+        ];
+    }
+
+    private function resolve(string $how, Conversation $conversation, string $id): void
+    {
+        $service = app(AgentQuestionService::class);
+        $question = AgentQuestion::findOrFail($id);
+
+        $won = match ($how) {
+            'answer' => $service->answer(
+                $question,
+                (new AnswerParser())->parse('2', $question),
+                (string) $conversation->user_id,
+                '2',
+            ) !== null,
+            'withdraw' => $service->withdrawForConversation($conversation),
+            'expire' => $service->expire($question),
+            'undeliverable' => $service->markUndeliverable($question, 'no route'),
+        };
+
+        $this->assertTrue($won, "precondition: {$how} wins");
+    }
+
+    #[Test]
+    #[DataProvider('resolutionsFromPending')]
+    public function no_resolution_of_a_pending_question_changes_what_was_decided_at_ask_time(string $how): void
+    {
+        $this->recordingWebChannel();
+        $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+        $id = $this->policyQuestion($conversation);
+        $before = $this->policyColumns($id);
+        $this->assertCount(count(self::POLICY_COLUMNS), $before, 'precondition: every policy column exists');
+        $this->assertSame('proceed_on_assumption', $before['unanswered_policy'], 'precondition: the policy was stored');
+
+        $this->travel(2)->hours();
+
+        $this->resolve($how, $conversation, $id);
+
+        $this->assertSame($before, $this->policyColumns($id));
+    }
+
+    #[Test]
+    public function no_resolution_of_a_stopped_question_changes_what_was_decided_at_ask_time(): void
+    {
+        $this->recordingWebChannel();
+
+        foreach (['answer', 'withdraw'] as $how) {
+            $conversation = Conversation::factory()->create(['is_processing' => false, 'channel' => 'web']);
+            $id = $this->policyQuestion($conversation, [
+                'unanswered_policy' => 'stop',
+                'consequential' => true,
+                'assumed_answer_raw' => null,
+                'assumed_answer_selected' => null,
+                'requested_wait_minutes' => 30,
+            ]);
+            $before = $this->policyColumns($id);
+            $this->assertSame('stop', $before['unanswered_policy'], 'precondition: the policy was stored');
+
+            $this->travel(2)->hours();
+            $this->assertTrue($this->transition($id, QuestionState::Stopped, ['stopped_at' => now()], false, from: [QuestionState::Pending], releaseSlot: false, resolves: false));
+            $this->assertSame($before, $this->policyColumns($id), 'stopping changes nothing decided at ask time');
+            $this->assertSame('stopped', $this->row($id)->state);
+
+            $this->travel(1)->days();
+            $this->resolve($how, $conversation, $id);
+
+            $this->assertSame($before, $this->policyColumns($id), "a late {$how} changes nothing decided at ask time");
+        }
     }
 }

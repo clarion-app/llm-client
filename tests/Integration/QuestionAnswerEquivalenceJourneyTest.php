@@ -426,7 +426,10 @@ class QuestionAnswerEquivalenceJourneyTest extends AssembledSystemTestCase
         $this->assertSame('ask_user', $call['function']['name']);
         $this->assertSame($askArguments, json_decode($call['function']['arguments'], true), 'exactly what the agent asked, nothing added');
         $tool = json_decode($reference['ask_tool'], true);
-        $this->assertSame(['question', 'choices', 'allow_multiple'], array_keys($tool['function']['parameters']['properties']));
+        $this->assertSame(
+            ['question', 'choices', 'allow_multiple', 'if_unanswered', 'assumed_choices', 'assumed_text', 'consequential', 'wait_minutes'],
+            array_keys($tool['function']['parameters']['properties']),
+        );
         foreach (['telegram', 'channel', 'button', 'presentation', 'keyboard', 'web_form'] as $word) {
             $this->assertStringNotContainsStringIgnoringCase($word, $reference['ask_call']);
             $this->assertStringNotContainsStringIgnoringCase($word, $reference['ask_tool']);

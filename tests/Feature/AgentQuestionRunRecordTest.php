@@ -71,7 +71,7 @@ class AgentQuestionRunRecordTest extends TestCase
     private const CHOICES = ['Backend', 'Frontend', 'Docs'];
 
     private const SNAPSHOT_KEYS = [
-        'question_id', 'question', 'choices', 'allow_multiple', 'asked_at',
+        'question_id', 'outcome', 'stopped_at', 'stopped_ms', 'policy', 'question', 'choices', 'allow_multiple', 'asked_at',
         'expires_at', 'resolution', 'resolved_at', 'waited_ms', 'answer',
         'presentation',
     ];
@@ -546,8 +546,13 @@ class AgentQuestionRunRecordTest extends TestCase
     public function an_expired_question_is_shown_as_expired(): void
     {
         config(['llm-client.agent_questions.expiry_minutes' => 2]);
+        // The period under test is shorter than the shipped minimum.
+        config(['llm-client.agent_questions.min_expiry_minutes' => 2]);
         $conversation = $this->conversation('telegram');
         $question = $this->askIn($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $question->refresh();
 
         $this->travel(3)->minutes();
         Artisan::call('llm-client:resolve-expired-questions');

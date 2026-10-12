@@ -33,6 +33,7 @@ use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
 use Dedoc\Scramble\Generator;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -70,7 +71,12 @@ class QuestionWithdrawalTest extends TestCase
         ."2. Frontend\n"
         ."3. Docs\n"
         ."\n"
-        .'Reply with the number of your choice, or answer in your own words.';
+        .'Reply with the number of your choice, or answer in your own words.'
+        ."\n"
+        ."\n"
+        // Asked at the frozen 09:00 UTC on 12 Oct 2026 (see setUp()) with the
+        // default one-day period and no policy, so the work stops if unanswered.
+        .'If there is no answer by 09:00 UTC on 13 Oct 2026 (1 day after this was asked), work on this task will pause until you reply.';
 
     private const WITHDRAWN_NOTICE = 'The question "Which part should I change first?" was withdrawn because the task was stopped. '
         .'It no longer needs a reply.';
@@ -94,6 +100,9 @@ class QuestionWithdrawalTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse('2026-10-12 09:00:00', 'UTC'));
 
         $this->user = User::factory()->create();
         $this->server = Server::create([
@@ -368,7 +377,7 @@ class QuestionWithdrawalTest extends TestCase
         $this->assertCount(1, $notices, 'one withdrawal notice is written');
         $this->assertSame(self::WITHDRAWN_NOTICE, $notices[0]->content);
         $this->assertSame('assistant', $notices[0]->role);
-        $this->assertSame(['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'withdrawn'], $notices[0]->tool_data);
+        $this->assertSame(['kind' => 'agent_question_notice', 'question_id' => $question->id, 'state' => 'withdrawn', 'delivered' => true], $notices[0]->tool_data);
         $this->assertSame(
             [self::GOLDEN_THREE_CHOICES, self::WITHDRAWN_NOTICE],
             $this->recorderFor($conversation)->textsFor($conversation->id),

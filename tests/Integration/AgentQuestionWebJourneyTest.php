@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
@@ -53,6 +54,19 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
         .'Reply with the number of your choice, or answer in your own words.';
 
     /**
+     * The instant the journeys that check a question's exact text freeze
+     * the clock at, so the deadline it states is known.
+     */
+    public const ASKED_AT = '2026-10-12 09:00:00';
+
+    /** What a question asked at ASKED_AT with the default one-day period and no policy says happens if it goes unanswered. */
+    public const DEFAULT_STOP_STATEMENT = 'If there is no answer by 09:00 UTC on 13 Oct 2026 (1 day after this was asked), '
+        .'work on this task will pause until you reply.';
+
+    /** The three-choice question exactly as it is shown when asked at ASKED_AT. */
+    public const GOLDEN_THREE_CHOICES_ASKED = self::GOLDEN_THREE_CHOICES."\n\n".self::DEFAULT_STOP_STATEMENT;
+
+    /**
      * The exact `ask_user` arguments the model sends in the three-choice
      * scenario. The messaging journey asserts its model sent these same
      * bytes: the asking side never differs by channel.
@@ -65,6 +79,9 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse(self::ASKED_AT, 'UTC'));
 
         $this->entryPath = 'stream';
         config(['llm-client.run_trace.enabled' => true]);
@@ -278,13 +295,13 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
             'the ask_user arguments the model sent are stored verbatim',
         );
         $display = Message::findOrFail($question->display_message_id);
-        $this->assertSame(self::GOLDEN_THREE_CHOICES, $display->content);
+        $this->assertSame(self::GOLDEN_THREE_CHOICES_ASKED, $display->content);
 
         $listed = $this->actingAs($fixture->user, 'api')
             ->getJson("/api/clarion-app/llm-client/conversation/{$fixture->conversation->id}/message")
             ->assertStatus(200)
             ->json();
-        $this->assertContains(self::GOLDEN_THREE_CHOICES, array_column($listed, 'content'), 'the conversation screen lists the question');
+        $this->assertContains(self::GOLDEN_THREE_CHOICES_ASKED, array_column($listed, 'content'), 'the conversation screen lists the question');
 
         // The run is waiting on the user, and nothing else is asked of the model.
         $this->assertSame(1, $this->turnCount());
@@ -329,7 +346,7 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
 
         $question = $this->pendingQuestion();
         $this->assertSame($preamble, Message::findOrFail($question->paused_message_id)->content, 'the streamed text is the paused message');
-        $this->assertSame(self::GOLDEN_THREE_CHOICES, Message::findOrFail($question->display_message_id)->content, 'the display message does not repeat it');
+        $this->assertSame(self::GOLDEN_THREE_CHOICES_ASKED, Message::findOrFail($question->display_message_id)->content, 'the display message does not repeat it');
 
         $occurrences = Message::where('conversation_id', $fixture->conversation->id)
             ->get()
@@ -380,7 +397,7 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
 
         $question = $this->pendingQuestion();
         $this->assertSame(
-            "What time works for you?\n\nReply with your answer.",
+            "What time works for you?\n\nReply with your answer.\n\n".self::DEFAULT_STOP_STATEMENT,
             Message::findOrFail($question->display_message_id)->content,
         );
 
@@ -477,7 +494,7 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
         // ask_user result, never as a user turn.
         foreach ($messages as $message) {
             $content = is_string($message['content'] ?? null) ? $message['content'] : '';
-            $this->assertNotSame(self::GOLDEN_THREE_CHOICES, $content, 'the display message is not part of the payload');
+            $this->assertNotSame(self::GOLDEN_THREE_CHOICES_ASKED, $content, 'the display message is not part of the payload');
             if (($message['role'] ?? null) === 'user') {
                 $this->assertNotSame('2', trim($content), 'the answer is not sent as a user message');
             }
@@ -520,7 +537,7 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
         $notice = 'The question "Which part should I change first?" could not be delivered '
             .'(RuntimeException: broadcaster unreachable). The agent was told and will continue without an answer.';
         $this->assertSame(
-            [self::GOLDEN_THREE_CHOICES, $notice],
+            [self::GOLDEN_THREE_CHOICES_ASKED, $notice],
             $web->textsFor($this->fixture()->conversation->id),
         );
 

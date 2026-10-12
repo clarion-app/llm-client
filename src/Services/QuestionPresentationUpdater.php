@@ -12,12 +12,14 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Refreshes every place a question is shown once it has been resolved.
+ * Refreshes every place a question is shown once it has stopped or been
+ * resolved.
  *
- * Runs after the resolving transaction commits (AgentQuestionService
- * schedules it from the winning compare-and-set), so it happens exactly
- * once per question, whichever route resolved it, and never for a
- * resolution that rolled back. An open conversation screen is told to
+ * Runs after the committing transaction (AgentQuestionService schedules it
+ * from every winning compare-and-set), so it happens once when the question
+ * stops, if it does, and once when it is finally resolved, whichever route
+ * did it, and never for a change that rolled back. A stopped question's
+ * outcome is marked answerable, so a channel keeps offering its options. An open conversation screen is told to
  * refetch on every channel; a messaging channel that presents questions is
  * also shown the outcome. Best effort throughout: a failure is logged and
  * can never undo or delay the resolution.

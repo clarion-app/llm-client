@@ -73,6 +73,42 @@ class ResponseScript
     }
 
     /**
+     * Add one step whose response makes several tool calls at once
+     * (OpenAI chat completion format), in the order given.
+     *
+     * @param list<array{name: string, arguments: array<string, mixed>, id?: string}> $calls
+     *   each call's function name and arguments; `id` fixes the tool call id
+     *   (a random one otherwise).
+     */
+    public function toolRequests(array $calls): self
+    {
+        $toolCalls = [];
+        foreach ($calls as $call) {
+            $toolCalls[] = [
+                'id' => $call['id'] ?? 'call_' . bin2hex(random_bytes(8)),
+                'type' => 'function',
+                'function' => [
+                    'name' => $call['name'],
+                    'arguments' => json_encode($call['arguments']),
+                ],
+            ];
+        }
+
+        $this->steps[] = [
+            'choices' => [
+                [
+                    'message' => [
+                        'role' => 'assistant',
+                        'tool_calls' => $toolCalls,
+                    ],
+                    'finish_reason' => 'tool_calls',
+                ],
+            ],
+        ];
+        return $this;
+    }
+
+    /**
      * Add a final answer step (OpenAI chat completion format).
      *
      * @param string $content The assistant's text response.

@@ -2,8 +2,10 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use Carbon\CarbonInterface;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 
 /**
  * The only renderer of a question and of its follow-up notices. The output
@@ -82,29 +84,134 @@ class QuestionRenderer
     {
         $state = $question->state instanceof QuestionState ? $question->state : QuestionState::tryFrom((string) $question->state);
 
+        $stopped = $question->stopped_at !== null;
+
         return match ($state) {
-            QuestionState::Answered => $this->renderAnswered($question),
+            QuestionState::Answered => $this->renderAnswered($question, $stopped),
             QuestionState::Expired => 'This question expired and is no longer awaiting a reply.',
-            QuestionState::Withdrawn => 'This question was withdrawn and is no longer awaiting a reply.',
+            QuestionState::ExpiredAssumed => 'Expired — no answer arrived in time; the agent continued assuming: '
+                .$this->assumptionText($question),
+            QuestionState::Stopped => 'Expired — work stopped. Answer to resume.',
+            QuestionState::Withdrawn => $stopped
+                ? 'Discarded — the conversation was ended or deleted while work was stopped.'
+                : 'This question was withdrawn and is no longer awaiting a reply.',
             QuestionState::Undeliverable => 'This question could not be delivered.',
             default => throw new \LogicException("No outcome exists for a question in state {$state?->value}."),
         };
     }
 
-    private function renderAnswered(AgentQuestion $question): string
+    private function renderAnswered(AgentQuestion $question, bool $late): string
     {
         $selected = array_values($question->answer_selected ?? []);
 
         if ($selected === []) {
-            return 'Answered in your own words.';
+            return $late ? 'Answered in your own words after work stopped.' : 'Answered in your own words.';
         }
 
-        $labels = array_map(
+        $labels = implode(', ', array_map(
             fn (array $choice) => $this->optionLabel((int) $choice['number'], (string) $choice['text'], null),
             $selected,
-        );
+        ));
 
-        return 'Answered: '.implode(', ', $labels);
+        return ($late ? 'Answered after work stopped: ' : 'Answered: ').$labels;
+    }
+
+    /**
+     * What the question says, in advance, about what happens if nobody
+     * answers it by its deadline. Null for a question asked before
+     * unanswered policies existed, which renders exactly as it always did.
+     */
+    public function expiryStatement(AgentQuestion $question): ?string
+    {
+        $policy = $question->unanswered_policy instanceof UnansweredPolicy
+            ? $question->unanswered_policy
+            : UnansweredPolicy::tryFrom((string) $question->unanswered_policy);
+
+        if ($policy === null) {
+            return null;
+        }
+
+        $deadline = $this->deadlineText($question);
+
+        if ($policy === UnansweredPolicy::ProceedOnAssumption) {
+            return "If there is no answer by {$deadline}, the agent will continue assuming: ".$this->assumptionText($question);
+        }
+
+        if ($question->consequential) {
+            return 'Work on this task will not continue without your answer. '
+                ."If there is no answer by {$deadline}, it will pause until you reply.";
+        }
+
+        return "If there is no answer by {$deadline}, work on this task will pause until you reply.";
+    }
+
+    /**
+     * The answer the question said it would assume if nobody answered it,
+     * in full: the chosen choices by number and text ("1. Backend, 3. Docs"),
+     * or the assumed free text in quotes. Null when it assumes nothing.
+     */
+    public function assumptionText(AgentQuestion $question): ?string
+    {
+        if ($question->assumed_answer_raw === null) {
+            return null;
+        }
+
+        $selected = array_values($question->assumed_answer_selected ?? []);
+
+        if ($selected === []) {
+            return '"'.$question->assumed_answer_raw.'"';
+        }
+
+        return implode(', ', array_map(
+            fn (array $choice) => $this->optionLabel((int) $choice['number'], (string) $choice['text'], null),
+            $selected,
+        ));
+    }
+
+    /**
+     * The question's deadline, always in UTC, with the waiting period fixed
+     * when it was asked: "14:00 UTC on 13 Oct 2026 (1 day after this was asked)".
+     */
+    public function deadlineText(AgentQuestion $question): string
+    {
+        $expiresAt = $question->expires_at instanceof CarbonInterface ? $question->expires_at->copy()->utc() : null;
+        $when = $expiresAt === null ? 'the deadline' : $expiresAt->format('H:i').' UTC on '.$expiresAt->format('j M Y');
+
+        return $when.' ('.self::periodWords($this->periodMinutes($question)).' after this was asked)';
+    }
+
+    /** The waiting period in whole minutes: the stored one, else the ask-to-deadline gap. */
+    private function periodMinutes(AgentQuestion $question): int
+    {
+        if ($question->effective_wait_minutes !== null) {
+            return (int) $question->effective_wait_minutes;
+        }
+
+        if ($question->asked_at === null || $question->expires_at === null) {
+            return 0;
+        }
+
+        return intdiv(max(0, $question->expires_at->getTimestamp() - $question->asked_at->getTimestamp()), 60);
+    }
+
+    /** "1 minute", "2 hours", "1 day", "1 hour 30 minutes", "25 hours". */
+    private static function periodWords(int $minutes): string
+    {
+        $unit = fn (int $count, string $name) => $count.' '.$name.($count === 1 ? '' : 's');
+
+        if ($minutes < 60) {
+            return $unit($minutes, 'minute');
+        }
+
+        if ($minutes % 1440 === 0) {
+            return $unit(intdiv($minutes, 1440), 'day');
+        }
+
+        if ($minutes % 60 === 0) {
+            return $unit(intdiv($minutes, 60), 'hour');
+        }
+
+        return $unit(intdiv($minutes, 60), 'hour').' '.$unit($minutes % 60, 'minute');
     }
 
     private function compose(AgentQuestion $question, ?string $preamble, string $singleInstruction, string $multiInstruction): string
@@ -130,7 +237,24 @@ class QuestionRenderer
             $blocks[] = self::FREE_TEXT_INSTRUCTION;
         }
 
+        $statement = $this->expiryStatement($question);
+        if ($statement !== null) {
+            $blocks[] = $statement;
+        }
+
         return implode("\n\n", $blocks);
+    }
+
+    /**
+     * The one-time notice for a reply typed after a question already
+     * expired on the assumption it stated: the reply is not applied to the
+     * question, and is handled as a new message instead.
+     */
+    public function renderLateReplyNotice(AgentQuestion $question): string
+    {
+        return 'Your reply arrived after the question "'.$question->question.'" had expired. '
+            .'The agent had already continued assuming: '.$this->assumptionText($question).'. '
+            .'Your reply is being handled as a new message.';
     }
 
     /** The notice shown when a question is resolved without an answer. */
@@ -141,8 +265,16 @@ class QuestionRenderer
         return match ($question->state) {
             QuestionState::Expired => "The question {$quoted} expired without an answer. "
                 .'The agent will continue without it; replies sent now are treated as new messages.',
-            QuestionState::Withdrawn => "The question {$quoted} was withdrawn because the task was stopped. "
-                .'It no longer needs a reply.',
+            QuestionState::ExpiredAssumed => "No answer to {$quoted} was received by the deadline ({$this->deadlineText($question)}). "
+                .'The agent is continuing on the assumption it stated: '.$this->assumptionText($question).'. '
+                .'Replies sent now are treated as new messages and will not change that assumption.',
+            QuestionState::Stopped => "No answer to {$quoted} was received by the deadline ({$this->deadlineText($question)}). "
+                .'Work on this task has stopped. It will continue when you answer the question above.',
+            QuestionState::Withdrawn => $question->stopped_at !== null
+                ? "The stopped task waiting on {$quoted} was discarded because the conversation was ended or deleted. "
+                    .'It no longer needs a reply.'
+                : "The question {$quoted} was withdrawn because the task was stopped. "
+                    .'It no longer needs a reply.',
             QuestionState::Undeliverable => "The question {$quoted} could not be delivered ("
                 .($question->delivery_failure_reason ?? 'unknown reason').'). '
                 .'The agent was told and will continue without an answer.',

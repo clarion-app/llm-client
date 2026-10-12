@@ -21,6 +21,7 @@ use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
 use ClarionApp\LlmClient\ValueObjects\QuestionPresentation;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Log\Events\MessageLogged;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -51,7 +52,12 @@ class QuestionPresenterTest extends TestCase
         ."2. Frontend\n"
         ."3. Docs\n"
         ."\n"
-        .'Reply with the number of your choice, or answer in your own words.';
+        .'Reply with the number of your choice, or answer in your own words.'
+        ."\n"
+        ."\n"
+        // Asked at the frozen 09:00 UTC on 12 Oct 2026 (see setUp()) with the
+        // default one-day period and no policy, so the work stops if unanswered.
+        .'If there is no answer by 09:00 UTC on 13 Oct 2026 (1 day after this was asked), work on this task will pause until you reply.';
 
     private const PREAMBLE = 'I found three areas that need work.';
 
@@ -63,6 +69,9 @@ class QuestionPresenterTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse('2026-10-12 09:00:00', 'UTC'));
 
         $this->user = User::factory()->create();
         $this->setUpQuestionEndpoints([$this->user]);

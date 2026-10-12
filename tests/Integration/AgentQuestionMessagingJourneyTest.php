@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\Test;
@@ -35,6 +36,9 @@ class AgentQuestionMessagingJourneyTest extends AssembledSystemTestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse(AgentQuestionWebJourneyTest::ASKED_AT, 'UTC'));
 
         $this->entryPath = 'sync';
         config(['llm-client.run_trace.enabled' => true]);
@@ -150,12 +154,12 @@ class AgentQuestionMessagingJourneyTest extends AssembledSystemTestCase
         // The chat received exactly the rendered question, numbered — the
         // same text the web conversation shows.
         $this->assertSame(
-            [['conversation_id' => $conversation->id, 'text' => AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES]],
+            [['conversation_id' => $conversation->id, 'text' => AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED]],
             $this->telegram->deliveries,
             'one delivery, to this conversation only, of the rendered question',
         );
         $this->assertSame([], $this->telegram->textsFor($other->id));
-        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, Message::findOrFail($question->display_message_id)->content);
+        $this->assertSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED, Message::findOrFail($question->display_message_id)->content);
 
         // The model's ask is byte-identical to the web journey's.
         $toolCall = Message::findOrFail($question->paused_message_id)->tool_data['tool_calls'][0] ?? [];
@@ -296,7 +300,7 @@ class AgentQuestionMessagingJourneyTest extends AssembledSystemTestCase
         $notice = 'The question "Which part should I change first?" could not be delivered (telegram account not linked). '
             .'The agent was told and will continue without an answer.';
         $this->assertSame(
-            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, $notice],
+            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES_ASKED, $notice],
             $this->telegram->textsFor($conversation->id),
         );
         $notices = Message::where('conversation_id', $conversation->id)->get()

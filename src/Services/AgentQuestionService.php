@@ -18,6 +18,7 @@ use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
 use ClarionApp\LlmClient\ValueObjects\QuestionRefusal;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
+use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -25,10 +26,10 @@ use Illuminate\Support\Facades\Log;
 /**
  * Every write to `agent_questions` goes through this service.
  *
- * Each way a question can leave `pending` — answered, expired, withdrawn,
- * undeliverable — is the single compare-and-set in transition(), so racing
- * resolutions always produce exactly one winner, and only the winner
- * delivers a notice or resumes the run.
+ * Each way a question can leave a waiting state (`pending`, or `stopped`
+ * for a late answer or a discard) is the single compare-and-set in
+ * transition(), so racing resolutions always produce exactly one winner,
+ * and only the winner delivers a notice or resumes the run.
  */
 class AgentQuestionService
 {
@@ -78,7 +79,13 @@ class AgentQuestionService
         try {
             [$question, $display] = DB::transaction(function () use ($request, $conversation, $preamble) {
                 $now = now();
-                $expiryMinutes = max(1, (int) config('llm-client.agent_questions.expiry_minutes', 1440));
+                $ask = $request->request;
+                $assumed = $ask->assumedAnswer;
+
+                // The waiting period the agent asked for, brought within the
+                // installation's bounds. It and the policy are fixed here, at
+                // ask time, and nothing changes them afterwards.
+                $effectiveMinutes = app(QuestionWaitingPeriod::class)->effectiveMinutes($ask->requestedWaitMinutes);
 
                 // Inserted first: the UNIQUE slot latch refuses a second
                 // pending question before anything else is written.
@@ -99,7 +106,15 @@ class AgentQuestionService
                     'preamble' => $preamble,
                     'state' => QuestionState::Pending,
                     'asked_at' => $now,
-                    'expires_at' => $now->copy()->addMinutes($expiryMinutes),
+                    'expires_at' => $now->copy()->addMinutes($effectiveMinutes),
+                    // Written in this insert, so the display message rendered
+                    // below from this in-memory model already carries them.
+                    'unanswered_policy' => $ask->policy,
+                    'consequential' => $ask->consequential,
+                    'assumed_answer_raw' => $assumed?->rawReply,
+                    'assumed_answer_selected' => $assumed?->selected,
+                    'requested_wait_minutes' => $ask->requestedWaitMinutes,
+                    'effective_wait_minutes' => $effectiveMinutes,
                 ]);
 
                 $display = Message::create([
@@ -213,15 +228,94 @@ class AgentQuestionService
     }
 
     /**
-     * Resolve a pending question whose answerable period has passed.
+     * Resolve a pending question whose answerable period has passed,
+     * following the policy it was asked with.
      *
-     * Only the winner (true) writes the expiry notice into the conversation
-     * and delivers it; resuming the run is the caller's job. A question
-     * already resolved by anything else loses (false) and nothing changes.
+     * A question asked before unanswered policies existed expires as it
+     * always did. A `proceed_on_assumption` question resolves the same way
+     * but its run continues on the answer it said it would assume. A `stop`
+     * question stops instead: it keeps its
+     * conversation's question slot so a late reply still reaches it, stays
+     * unresolved, leaves the conversation not processing, and its run waits
+     * for a late answer or a discard.
+     *
+     * Only the winner writes the notice into the conversation and delivers
+     * it; resuming the run (for a state that continues it) is the caller's
+     * job. Returns the state won, or null when anything else resolved the
+     * question first — nothing changes then.
+     */
+    public function expireWithPolicy(AgentQuestion $question): ?QuestionState
+    {
+        $policy = $question->unanswered_policy instanceof UnansweredPolicy
+            ? $question->unanswered_policy
+            : UnansweredPolicy::tryFrom((string) $question->unanswered_policy);
+
+        if ($policy === null) {
+            return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::Expired, [], true)
+                ? QuestionState::Expired
+                : null;
+        }
+
+        if ($policy === UnansweredPolicy::ProceedOnAssumption) {
+            // Resolved like any expiry: the slot is released and the
+            // conversation marked processing, since the run continues on
+            // the assumption the question stated.
+            return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::ExpiredAssumed, [], true)
+                ? QuestionState::ExpiredAssumed
+                : null;
+        }
+
+        // Written with its fraction of a second, which a bound date loses
+        // on MySQL.
+        $stoppedAt = now()->format('Y-m-d H:i:s.u');
+
+        $won = $this->resolveWithNotice(
+            $question,
+            [QuestionState::Pending],
+            QuestionState::Stopped,
+            ['stopped_at' => $stoppedAt],
+            setProcessing: false,
+            releaseSlot: false,
+            resolves: false,
+        );
+
+        if (!$won) {
+            return null;
+        }
+
+        $this->recordStop($question);
+
+        return QuestionState::Stopped;
+    }
+
+    /**
+     * Show the stop in the run record: the waiting `ask_user` action keeps
+     * waiting, its content now saying the work stopped, and the run's
+     * watchers are told. The stop already stands, so nothing here may throw
+     * out of the sweep.
+     */
+    private function recordStop(AgentQuestion $question): void
+    {
+        try {
+            $fresh = $question->fresh() ?? $question;
+            $recorder = app(RunTraceRecorder::class);
+            $recorder->updateSuspendedActionContent($fresh->action_id, $fresh->runRecordSnapshot());
+            $recorder->announceRunChanged($fresh->run_id);
+        } catch (\Throwable $e) {
+            Log::warning('AgentQuestionService: the stop could not be shown in the run record', [
+                'question_id' => $question->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Expire a pending question by its policy (see expireWithPolicy()):
+     * true when this call won.
      */
     public function expire(AgentQuestion $question): bool
     {
-        return $this->resolveWithNotice($question, QuestionState::Expired, [], true);
+        return $this->expireWithPolicy($question) !== null;
     }
 
     /**
@@ -246,7 +340,7 @@ class AgentQuestionService
             return false;
         }
 
-        if (!$this->resolveWithNotice($question, QuestionState::Withdrawn, [], false)) {
+        if (!$this->resolveWithNotice($question, [QuestionState::Pending, QuestionState::Stopped], QuestionState::Withdrawn, [], false)) {
             return false;
         }
 
@@ -270,42 +364,58 @@ class AgentQuestionService
      * recording why.
      *
      * The winner (true) writes a notice and attempts to deliver it once; a
-     * failure of that follow-up delivery is only logged, since the channel
-     * has just failed and the agent is told regardless. Resuming the run is
-     * the caller's job.
+     * failure of that follow-up delivery is logged and recorded on the
+     * notice, never retried, since the channel has just failed and the agent
+     * is told regardless. Resuming the run is the caller's job.
      */
     public function markUndeliverable(AgentQuestion $question, string $reason): bool
     {
         // An adapter's reason is free text; it is kept within its column so
         // an overlong one can never make the resolution itself fail.
-        if (mb_strlen($reason) > self::MAX_FAILURE_REASON_CHARS) {
-            $reason = mb_substr($reason, 0, self::MAX_FAILURE_REASON_CHARS - 1).'…';
-        }
+        $reason = self::recordableReason($reason);
 
-        return $this->resolveWithNotice($question, QuestionState::Undeliverable, [
+        return $this->resolveWithNotice($question, [QuestionState::Pending], QuestionState::Undeliverable, [
             'delivery_failure_reason' => $reason,
         ], true);
     }
 
     /**
-     * Resolve a pending question without an answer and tell the user.
+     * Move a question out of a waiting state without an answer and tell the
+     * user.
      *
      * The notice message is written in the winning transition's transaction,
-     * so a notice exists exactly when the resolution happened. No notice is
+     * so a notice exists exactly when the transition happened. No notice is
      * written or delivered when the conversation no longer exists.
      *
-     * $setProcessing is true for every resolution that continues the run.
+     * $from lists the states the question may leave; $setProcessing is true
+     * for every resolution that continues the run. A transition that keeps
+     * the question waiting ($resolves false — the stop) also records its new
+     * state on the message showing the question, in the same commit; a
+     * resolution's is recorded when its run resumes.
      *
+     * @param  list<QuestionState>  $from
      * @param  array<string, mixed>  $fields
      */
-    private function resolveWithNotice(AgentQuestion $question, QuestionState $to, array $fields, bool $setProcessing): bool
-    {
-        $result = DB::transaction(function () use ($question, $to, $fields, $setProcessing) {
-            if (!$this->transition($question->id, $to, $fields, $setProcessing)) {
+    private function resolveWithNotice(
+        AgentQuestion $question,
+        array $from,
+        QuestionState $to,
+        array $fields,
+        bool $setProcessing,
+        bool $releaseSlot = true,
+        bool $resolves = true,
+    ): bool {
+        $result = DB::transaction(function () use ($question, $from, $to, $fields, $setProcessing, $releaseSlot, $resolves) {
+            if (!$this->transition($question->id, $from, $to, $fields, $setProcessing, $releaseSlot, $resolves)) {
                 return null;
             }
 
             $resolved = AgentQuestion::findOrFail($question->id);
+
+            if (!$resolves) {
+                $this->markDisplayMessage($resolved);
+            }
+
             $conversation = Conversation::find($resolved->conversation_id);
 
             if ($conversation === null) {
@@ -335,20 +445,30 @@ class AgentQuestionService
         [$resolved, $conversation, $notice] = $result;
 
         if ($conversation !== null && $notice !== null) {
-            $delivery = $this->deliver($conversation, (string) $notice->content);
-
-            if (!$delivery->delivered) {
-                Log::warning('AgentQuestionService: question notice could not be delivered', [
-                    'question_id' => $resolved->id,
-                    'conversation_id' => $conversation->id,
-                    'channel' => $resolved->channel,
-                    'state' => $to->value,
-                    'reason' => $delivery->failureReason,
-                ]);
-            }
+            $this->deliverNotice($conversation, $notice, 'AgentQuestionService: question notice could not be delivered', [
+                'question_id' => $resolved->id,
+                'conversation_id' => $conversation->id,
+                'channel' => $resolved->channel,
+                'state' => $to->value,
+            ]);
         }
 
         return true;
+    }
+
+    /** Record the question's current state on the message showing it. */
+    private function markDisplayMessage(AgentQuestion $question): void
+    {
+        $display = $question->display_message_id === null ? null : Message::find($question->display_message_id);
+
+        if ($display === null) {
+            return;
+        }
+
+        $toolData = is_array($display->tool_data) ? $display->tool_data : [];
+        $toolData['state'] = $question->state->value;
+        $display->tool_data = $toolData;
+        $display->save();
     }
 
     /**
@@ -374,7 +494,7 @@ class AgentQuestionService
         }
 
         return DB::transaction(function () use ($question, $answer, $userId, $rawContent, $method) {
-            $won = $this->transition($question->id, QuestionState::Answered, [
+            $won = $this->transition($question->id, [QuestionState::Pending, QuestionState::Stopped], QuestionState::Answered, [
                 'answer_raw' => $rawContent,
                 'answer_selected' => json_encode($answer->selected),
                 'answer_method' => $method->value,
@@ -403,6 +523,114 @@ class AgentQuestionService
     }
 
     /**
+     * Claim the one late-reply notice a question that expired on its
+     * assumption is owed. A compare-and-set: of any number of concurrent
+     * callers exactly one gets true, and every later call gets false.
+     */
+    public function claimLateReplyNotice(string $id): bool
+    {
+        $now = now()->format('Y-m-d H:i:s.u');
+
+        return DB::table('agent_questions')
+            ->where('id', $id)
+            ->where('state', QuestionState::ExpiredAssumed->value)
+            ->whereNull('late_reply_noticed_at')
+            ->update(['late_reply_noticed_at' => $now, 'updated_at' => $now]) === 1;
+    }
+
+    /**
+     * Post the late-reply notice for $question in $conversation, if it is
+     * still owed: the claim and the notice message are written in one
+     * transaction, and the notice is delivered on the conversation's channel
+     * once that commits. Returns the notice, or null when another reply
+     * already claimed it. A failed delivery is logged; the notice stands.
+     */
+    public function postLateReplyNotice(AgentQuestion $question, Conversation $conversation): ?Message
+    {
+        $notice = DB::transaction(function () use ($question, $conversation) {
+            if (!$this->claimLateReplyNotice($question->id)) {
+                return null;
+            }
+
+            return Message::create([
+                'conversation_id' => $conversation->id,
+                'role' => 'assistant',
+                'user' => $conversation->character,
+                'content' => app(QuestionRenderer::class)->renderLateReplyNotice($question),
+                'responseTime' => 0,
+                'tool_data' => [
+                    'kind' => self::KIND_NOTICE,
+                    'question_id' => $question->id,
+                    'state' => QuestionState::ExpiredAssumed->value,
+                    'notice' => 'late_reply',
+                ],
+            ]);
+        });
+
+        if ($notice === null) {
+            return null;
+        }
+
+        $this->deliverNotice($conversation, $notice, 'AgentQuestionService: late-reply notice could not be delivered', [
+            'question_id' => $question->id,
+            'conversation_id' => $conversation->id,
+            'channel' => $conversation->channel,
+        ]);
+
+        return $notice;
+    }
+
+    /**
+     * Deliver a notice already written to $conversation and record on it
+     * whether it arrived: `delivered`, and for a failure a bounded
+     * `delivery_failure_reason`. A failure is logged. The notice and the
+     * resolution it describes stand either way, so nothing here throws.
+     *
+     * @param  array<string, mixed>  $logContext
+     */
+    private function deliverNotice(Conversation $conversation, Message $notice, string $failureLog, array $logContext): void
+    {
+        $delivery = $this->deliver($conversation, (string) $notice->content);
+        $reason = $delivery->delivered ? null : self::recordableReason($delivery->failureReason ?? 'unknown reason');
+
+        if (!$delivery->delivered) {
+            Log::warning($failureLog, $logContext + ['reason' => $reason]);
+        }
+
+        try {
+            $toolData = is_array($notice->tool_data) ? $notice->tool_data : [];
+            $toolData['delivered'] = $delivery->delivered;
+            if ($reason !== null) {
+                $toolData['delivery_failure_reason'] = $reason;
+            }
+            $notice->tool_data = $toolData;
+            $notice->save();
+        } catch (\Throwable $e) {
+            Log::warning('AgentQuestionService: the notice\'s delivery could not be recorded', $logContext + [
+                'notice_id' => $notice->id,
+                'error' => self::recordableReason($e->getMessage()),
+            ]);
+        }
+    }
+
+    /**
+     * A delivery failure reason fit to store and log: any bot token an
+     * adapter's error carried (in an API URL or on its own) is removed, and
+     * the text is cut to the reason column's length.
+     */
+    private static function recordableReason(string $reason): string
+    {
+        $reason = (string) preg_replace('~/bot\d+:[A-Za-z0-9_-]+~', '/bot[bot token]', $reason);
+        $reason = (string) preg_replace('~\b\d{5,}:[A-Za-z0-9_-]{20,}~', '[bot token]', $reason);
+
+        if (mb_strlen($reason) > self::MAX_FAILURE_REASON_CHARS) {
+            $reason = mb_substr($reason, 0, self::MAX_FAILURE_REASON_CHARS - 1).'…';
+        }
+
+        return $reason;
+    }
+
+    /**
      * Hand text to the conversation's channel adapter. An adapter that
      * throws, or a channel with no adapter, is a failed delivery; this
      * never throws.
@@ -419,44 +647,65 @@ class AgentQuestionService
         try {
             return $adapter->deliver($conversation, $text);
         } catch (\Throwable $e) {
-            return DeliveryResult::failed(get_class($e).': '.$e->getMessage());
+            // An exception's message can carry the request URL, and with it
+            // a bot token.
+            return DeliveryResult::failed(self::recordableReason(get_class($e).': '.$e->getMessage()));
         }
     }
 
     /**
-     * Move a pending question to a terminal state, if it is still pending.
+     * Move a question out of a waiting state, if it is still in one of
+     * the $from states.
      *
-     * The winning caller (returns true) sets the state and `resolved_at`,
-     * releases the one-pending-per-conversation latch and writes $fields
-     * (raw column values). When $setProcessing is true the conversation is
-     * marked processing in the same commit, so a second message arriving
-     * between this resolution and the resume can never start a concurrent
-     * run. A losing caller (returns false) changes nothing.
+     * The winning caller (returns true) sets the state and writes $fields
+     * (raw column values). When $resolves is true it also sets
+     * `resolved_at`; when $releaseSlot is true it releases the
+     * one-question-per-conversation latch. Every resolution does both; only
+     * the stop, which leaves the question waiting for a late answer, does
+     * neither. When $setProcessing is true the conversation is marked
+     * processing in the same commit, so a second message arriving between
+     * this resolution and the resume can never start a concurrent run. A
+     * losing caller (returns false) changes nothing.
      *
      * The winner also schedules QuestionPresentationUpdater to run once the
      * outermost transaction commits, so every place the question is shown
-     * learns of the resolution — and never of one that rolled back.
+     * learns of the change — and never of one that rolled back.
      *
+     * @param  list<QuestionState>  $from
      * @param  array<string, mixed>  $fields
      */
-    private function transition(string $id, QuestionState $to, array $fields, bool $setProcessing): bool
-    {
+    private function transition(
+        string $id,
+        array $from,
+        QuestionState $to,
+        array $fields,
+        bool $setProcessing,
+        bool $releaseSlot = true,
+        bool $resolves = true,
+    ): bool {
         if ($to === QuestionState::Pending) {
-            throw new \InvalidArgumentException('A question can only transition to a terminal state.');
+            throw new \InvalidArgumentException('A question can never transition back to pending.');
         }
 
-        return DB::transaction(function () use ($id, $to, $fields, $setProcessing) {
+        if ($from === []) {
+            throw new \InvalidArgumentException('A transition needs at least one state to leave.');
+        }
+
+        return DB::transaction(function () use ($id, $from, $to, $fields, $setProcessing, $releaseSlot, $resolves) {
             $now = now();
+
+            $changes = ['state' => $to->value, 'updated_at' => $now];
+            if ($resolves) {
+                $changes['resolved_at'] = $now;
+            }
+            if ($releaseSlot) {
+                $changes['pending_conversation_id'] = null;
+            }
 
             $affected = DB::table('agent_questions')
                 ->where('id', $id)
-                ->where('state', QuestionState::Pending->value)
-                ->update(array_merge($fields, [
-                    'state' => $to->value,
-                    'resolved_at' => $now,
-                    'pending_conversation_id' => null,
-                    'updated_at' => $now,
-                ]));
+                ->whereIn('state', array_map(fn (QuestionState $state) => $state->value, $from))
+                ->update(array_merge($fields, $changes));
 
             if ($affected !== 1) {
                 return false;

@@ -107,6 +107,9 @@ class ResolveAbandonedRunsQuestionExemptionTest extends TestCase
             'asked_at' => $askedAt,
             'expires_at' => $expiresAt,
             'resolved_at' => $pending ? null : CarbonImmutable::now()->subMinutes(5),
+            // A resolved question's run has resumed (and then gone quiet); one
+            // still waiting for its resume is about to continue instead.
+            'resumed_at' => $pending ? null : CarbonImmutable::now()->subMinutes(5),
             'created_at' => $askedAt,
             'updated_at' => $askedAt,
         ]);
@@ -143,9 +146,10 @@ class ResolveAbandonedRunsQuestionExemptionTest extends TestCase
     #[Test]
     public function the_exemption_lapses_once_the_question_can_no_longer_be_answered(): void
     {
-        // Past its expiry, but the expiry sweep has not run: still pending.
+        // Past its expiry and the short grace after it, but the expiry sweep
+        // has not run: still pending.
         $runId = $this->staleRun();
-        $this->question($runId, 'pending', CarbonImmutable::now()->subMinute());
+        $this->question($runId, 'pending', CarbonImmutable::now()->subMinutes(11));
 
         $this->sweep();
 
@@ -161,7 +165,8 @@ class ResolveAbandonedRunsQuestionExemptionTest extends TestCase
         $this->sweep();
         $this->assertSame('in_progress', $this->endState($runId), 'precondition: exempt while answerable');
 
-        $this->travel(31)->minutes();
+        // Past its expiry and the short grace after it.
+        $this->travel(41)->minutes();
         $this->sweep();
 
         $this->assertSame('abandoned', $this->endState($runId), 'no longer exempt once the question is past its expiry');

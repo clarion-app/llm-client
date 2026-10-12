@@ -156,4 +156,90 @@ class AnswerParserTest extends TestCase
         $this->assertSame([], $answer->selected);
         $this->assertSame($raw, $answer->rawReply);
     }
+    // ---------------------------------------------------------------
+    // parseAgainst(): the same rules, before a question row exists
+    // ---------------------------------------------------------------
+
+    /** @return array<string, array{0: string, 1: list<string>, 2: bool}> */
+    public static function equivalenceCases(): array
+    {
+        $three = ['Backend', 'Frontend', 'Docs'];
+        $replies = [
+            'single number' => '2',
+            'padded number' => " 3\n",
+            'comma list' => '1, 3',
+            'space list' => '3 1 3',
+            'out of range' => '7',
+            'zero' => '0',
+            'mixed list' => '1, 7',
+            'trailing period' => '2.',
+            'hash prefix' => '#2',
+            'negative' => '-1',
+            'a word' => 'Frontend',
+            'a sentence' => '2, but only for the backend',
+            'empty' => '',
+            'blank' => "  \n\t ",
+        ];
+
+        $cases = [];
+        foreach ($replies as $name => $raw) {
+            $cases["{$name}, single-select"] = [$raw, $three, false];
+            $cases["{$name}, multi-select"] = [$raw, $three, true];
+            $cases["{$name}, no choices"] = [$raw, [], false];
+        }
+
+        return $cases;
+    }
+
+    #[Test]
+    #[DataProvider('equivalenceCases')]
+    public function parse_against_reads_a_reply_exactly_as_parse_does_for_the_same_question(string $raw, array $choices, bool $allowMultiple): void
+    {
+        $parser = new AnswerParser();
+
+        $this->assertEquals(
+            $parser->parse($raw, $this->question($choices, $allowMultiple)),
+            $parser->parseAgainst($raw, $choices, $allowMultiple),
+        );
+    }
+
+    #[Test]
+    public function parse_against_selects_by_the_choices_it_is_given(): void
+    {
+        $answer = (new AnswerParser())->parseAgainst('3, 1', ['PHPUnit', 'Pest', 'Codeception'], true);
+
+        $this->assertEquals(
+            new ParsedAnswer('3, 1', true, [
+                ['number' => 1, 'text' => 'PHPUnit'],
+                ['number' => 3, 'text' => 'Codeception'],
+            ]),
+            $answer,
+        );
+    }
+
+    #[Test]
+    public function parse_delegates_to_parse_against(): void
+    {
+        $sentinel = new ParsedAnswer('delegated', false);
+        $parser = new class($sentinel) extends AnswerParser {
+            /** @var list<array{0: string, 1: array, 2: bool}> */
+            public array $calls = [];
+
+            public function __construct(private ParsedAnswer $sentinel)
+            {
+            }
+
+            public function parseAgainst(string $raw, array $choices, bool $allowMultiple): ParsedAnswer
+            {
+                $this->calls[] = [$raw, $choices, $allowMultiple];
+
+                return $this->sentinel;
+            }
+        };
+
+        $result = $parser->parse('2', $this->question(['Backend', 'Frontend'], true));
+
+        $this->assertSame($sentinel, $result, 'parse() returns what parseAgainst() returns: one copy of the rules');
+        $this->assertSame([['2', ['Backend', 'Frontend'], true]], $parser->calls);
+    }
 }

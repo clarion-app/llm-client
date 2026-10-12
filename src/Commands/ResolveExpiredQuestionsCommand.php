@@ -14,9 +14,11 @@ use Illuminate\Support\Facades\Log;
  * Artisan command that keeps agent questions from stalling a run forever.
  *
  * Expire: a pending question past its `expires_at` (fixed when it was
- * asked) becomes `expired`; the winner of that compare-and-set tells the
- * user on the conversation's channel and a ResumeAfterQuestionJob is queued
- * so the agent learns no answer will come. An expiry that loses to an
+ * asked) is resolved by its unanswered policy — `expired` for a question
+ * asked before policies existed, `stopped` for a `stop` question; the
+ * winner of that compare-and-set tells the user on the conversation's
+ * channel, and a ResumeAfterQuestionJob is queued when the outcome
+ * continues the run (a stopped run waits for a late answer or a discard). An expiry that loses to an
  * answer, withdrawal or failed delivery committed a moment earlier does
  * nothing; whoever won resumes.
  *
@@ -82,13 +84,21 @@ class ResolveExpiredQuestionsCommand extends Command
 
         $query->chunkById($batchSize, function ($questions) use ($service, &$won) {
             foreach ($questions as $question) {
-                if (!$service->expire($question)) {
+                $state = $service->expireWithPolicy($question);
+
+                if ($state === null) {
                     continue;
                 }
 
                 $won++;
 
-                Log::info('Agent question expired', ['question_id' => $question->id]);
+                Log::info('Agent question expired', ['question_id' => $question->id, 'state' => $state->value]);
+
+                // A stopped question's run waits for a late answer or a
+                // discard; only an outcome that continues the run resumes it.
+                if (!$state->continuesRun()) {
+                    continue;
+                }
 
                 try {
                     ResumeAfterQuestionJob::dispatch($question->id);
@@ -119,7 +129,9 @@ class ResolveExpiredQuestionsCommand extends Command
 
         DB::table('agent_questions')
             ->select('id')
-            ->where('state', '<>', QuestionState::Pending->value)
+            // A stopped question is still waiting, however long ago its
+            // period passed; it is resumed only by a late answer or a discard.
+            ->whereNotIn('state', [QuestionState::Pending->value, QuestionState::Stopped->value])
             ->whereNull('resumed_at')
             ->where('resolved_at', '<', $cutoff)
             ->orderBy('id')

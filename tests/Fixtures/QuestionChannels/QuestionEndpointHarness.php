@@ -184,6 +184,7 @@ trait QuestionEndpointHarness
         bool $allowMultiple = false,
         ?string $preamble = null,
         string $question = 'Which part should I change first?',
+        ?AskUserRequest $request = null,
     ): OpenedQuestion {
         $conversation->update(['is_processing' => true]);
 
@@ -220,7 +221,9 @@ trait QuestionEndpointHarness
 
         $opened = app(AgentQuestionService::class)->open(new OpenQuestionRequest(
             conversation: $conversation->fresh(),
-            request: new AskUserRequest($question, $choices, $allowMultiple),
+            // A caller-built request carries its own unanswered policy;
+            // otherwise the ask names none.
+            request: $request ?? new AskUserRequest($question, $choices, $allowMultiple),
             runId: $runId,
             stepId: $stepId,
             actionId: $actionId,

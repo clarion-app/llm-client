@@ -13,6 +13,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -47,15 +48,28 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
     private const EXPIRED_NOTICE = 'The question "Which part should I change first?" expired without an answer. '
         .'The agent will continue without it; replies sent now are treated as new messages.';
 
+    /**
+     * The three-choice question exactly as shown when asked at the frozen
+     * start (see setUp()) with this file's two-minute period.
+     */
+    private const ASKED_QUESTION = AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES."\n\n"
+        .'If there is no answer by 09:02 UTC on 12 Oct 2026 (2 minutes after this was asked), '
+        .'work on this task will pause until you reply.';
+
     private RecordingChannelDelivery $telegram;
 
     protected function setUp(): void
     {
         parent::setUp();
 
+        // Frozen, so the deadline every question states is known exactly.
+        $this->travelTo(Carbon::parse(AgentQuestionWebJourneyTest::ASKED_AT, 'UTC'));
+
         config(['llm-client.run_trace.enabled' => true]);
         config(['llm-client.conversation.inactivity_threshold_hours' => 4]);
         config(['llm-client.agent_questions.expiry_minutes' => self::EXPIRY_MINUTES]);
+        // The period under test is shorter than the shipped minimum.
+        config(['llm-client.agent_questions.min_expiry_minutes' => self::EXPIRY_MINUTES]);
 
         // Resume jobs are held on the fake queue, as a real queue holds them
         // until a worker picks them up.
@@ -201,7 +215,7 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
     {
         foreach ($messages as $message) {
             $this->assertNotSame(self::EXPIRED_NOTICE, $message['content'] ?? null, 'the expiry notice is shown to the user, never sent to the model');
-            $this->assertNotSame(AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, $message['content'] ?? null, 'the rendered question is never sent to the model');
+            $this->assertNotSame(self::ASKED_QUESTION, $message['content'] ?? null, 'the rendered question is never sent to the model');
         }
     }
 
@@ -228,6 +242,8 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
             'arguments' => AgentQuestionWebJourneyTest::threeChoiceAskArguments(),
         ]]);
         $question = $this->questionIn($conversation);
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
         $this->assertSame(QuestionState::Pending, $question->state);
         $this->assertSame(self::EXPIRY_MINUTES * 60, $question->expires_at->getTimestamp() - $question->asked_at->getTimestamp());
 
@@ -331,14 +347,16 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
         ])->assertStatus(202)->assertJson(['status' => 'awaiting_user']);
 
         $question = $this->questionIn($conversation);
-        $this->assertSame([AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES], $this->telegram->textsFor($conversation->id));
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $this->assertSame([self::ASKED_QUESTION], $this->telegram->textsFor($conversation->id));
 
         $this->travel(self::EXPIRY_MINUTES * 60 + 30)->seconds();
         $this->sweep();
 
         $this->assertExpiredAndUnanswered($question);
         $this->assertSame(
-            [AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES, self::EXPIRED_NOTICE],
+            [self::ASKED_QUESTION, self::EXPIRED_NOTICE],
             $this->telegram->textsFor($conversation->id),
             'the chat is told the question expired',
         );
@@ -359,7 +377,7 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
 
         $this->assertSame(
             [
-                AgentQuestionWebJourneyTest::GOLDEN_THREE_CHOICES,
+                self::ASKED_QUESTION,
                 self::EXPIRED_NOTICE,
                 'No answer came, so I will start with the backend.',
             ],

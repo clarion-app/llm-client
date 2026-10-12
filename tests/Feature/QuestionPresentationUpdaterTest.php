@@ -231,7 +231,13 @@ class QuestionPresentationUpdaterTest extends TestCase
     public function an_expiry_on_either_channel(): void
     {
         $telegram = $this->telegramQuestion();
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $telegram->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $telegram->refresh();
         $web = $this->webQuestion();
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $web->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $web->refresh();
 
         $this->assertTrue(app(AgentQuestionService::class)->expire($telegram));
         $this->assertTrue(app(AgentQuestionService::class)->expire($web));
@@ -299,6 +305,9 @@ class QuestionPresentationUpdaterTest extends TestCase
     public function nothing_is_refreshed_before_the_resolution_commits(): void
     {
         $question = $this->telegramQuestion();
+        // A question asked before unanswered policies existed: it expires as it always did.
+        DB::table('agent_questions')->where('id', $question->id)->update(['unanswered_policy' => null, 'effective_wait_minutes' => null]);
+        $question->refresh();
 
         DB::transaction(function () use ($question) {
             $this->assertTrue(app(AgentQuestionService::class)->expire($question));
@@ -400,5 +409,93 @@ class QuestionPresentationUpdaterTest extends TestCase
 
         $this->assertSame($before, Event::dispatched(NewConversationMessageEvent::class)->count());
         $this->assertSame([], $this->telegram->resolutions);
+    }
+
+    // ---------------------------------------------------------------
+    // A stopped question is shown twice: when it stops, and when it is
+    // finally answered
+    // ---------------------------------------------------------------
+
+    /** The answerable flag on an outcome view, read defensively: null when the view has no such flag. */
+    private function answerableOf(QuestionOutcomeView $outcome): ?bool
+    {
+        return $outcome->answerable ?? null;
+    }
+
+    #[Test]
+    public function the_stop_is_shown_once_and_keeps_the_question_answerable(): void
+    {
+        $question = $this->telegramQuestion();
+        $this->assertSame('stop', DB::table('agent_questions')->where('id', $question->id)->value('unanswered_policy'), 'precondition: stop is the default');
+
+        $this->assertTrue(app(AgentQuestionService::class)->expire($question), 'precondition: the expiry won');
+
+        $this->assertSame(QuestionState::Stopped, $question->fresh()->state, 'a stop question stops when it expires');
+        $this->assertRefreshedOnce($question);
+        $view = $this->assertOutcomePresentedOnce($question, QuestionState::Stopped, null, []);
+        $this->assertTrue($this->answerableOf($view), 'the channel keeps offering the options');
+        $this->assertSame('Expired — work stopped. Answer to resume.', $view->summary);
+    }
+
+    #[Test]
+    public function the_late_answer_is_shown_once_more_and_closes_the_question(): void
+    {
+        $question = $this->telegramQuestion();
+        $this->assertTrue(app(AgentQuestionService::class)->expire($question), 'precondition: the expiry won');
+        $this->assertSame(QuestionState::Stopped, $question->fresh()->state, 'a stop question stops when it expires');
+
+        $outcome = app(InteractiveAnswerService::class)->submit($question->id, (string) $this->user->id, InteractiveAnswer::selection([2]), AnswerMethod::MessagingOption);
+
+        $this->assertSame(InteractiveAnswerStatus::Answered, $outcome->status, 'the stopped question accepted the tap');
+        $this->assertSame(2, $this->refreshesFor($question), 'one refresh for the stop, one for the late answer');
+
+        $resolutions = $this->telegram->resolutionsFor($question->id);
+        $this->assertCount(2, $resolutions, 'the outcome is shown once for the stop and once for the late answer');
+        $this->assertSame('stopped', $resolutions[0]['row_state']);
+        $this->assertTrue($this->answerableOf($resolutions[0]['outcome']));
+        $this->assertSame('answered', $resolutions[1]['row_state']);
+        $this->assertSame(0, $resolutions[1]['transaction_level'], 'shown only after the late answer committed');
+        $late = $resolutions[1]['outcome'];
+        $this->assertSame(QuestionState::Answered, $late->state);
+        $this->assertFalse($this->answerableOf($late), 'the channel stops offering the options');
+        $this->assertSame([['number' => 2, 'text' => 'Frontend']], $late->selected);
+        $this->assertSame(AnswerMethod::MessagingOption, $late->method);
+        $this->assertSame('Answered after work stopped: 2. Frontend', $late->summary);
+    }
+
+    #[Test]
+    public function the_outcome_view_is_answerable_exactly_when_the_question_still_accepts_answers(): void
+    {
+        $answered = $this->telegramQuestion();
+        app(InteractiveAnswerService::class)->record($answered->id, (string) $this->user->id, InteractiveAnswer::selection([2]), AnswerMethod::WebForm);
+        $withdrawn = $this->telegramQuestion();
+        $this->assertTrue(app(AgentQuestionService::class)->withdrawForConversation(Conversation::findOrFail($withdrawn->conversation_id)));
+        $stopped = $this->telegramQuestion();
+        DB::table('agent_questions')->where('id', $stopped->id)->update(['state' => 'stopped', 'stopped_at' => now()]);
+
+        $this->assertSame(QuestionState::Answered, $answered->fresh()->state, 'precondition');
+        $this->assertSame(QuestionState::Withdrawn, $withdrawn->fresh()->state, 'precondition');
+        $this->assertSame(QuestionState::Stopped, $stopped->fresh()->state, 'precondition');
+
+        $this->assertFalse($this->answerableOf(QuestionOutcomeView::fromQuestion($answered->fresh())));
+        $this->assertFalse($this->answerableOf(QuestionOutcomeView::fromQuestion($withdrawn->fresh())));
+        $this->assertTrue($this->answerableOf(QuestionOutcomeView::fromQuestion($stopped->fresh())));
+    }
+
+    #[Test]
+    public function an_outcome_view_built_without_the_flag_is_not_answerable(): void
+    {
+        $named = new QuestionOutcomeView(
+            questionId: 'q-1',
+            state: QuestionState::Expired,
+            selected: [],
+            isSelection: false,
+            method: null,
+            summary: 'This question expired and is no longer awaiting a reply.',
+        );
+        $positional = new QuestionOutcomeView('q-2', QuestionState::Answered, [['number' => 1, 'text' => 'Backend']], true, AnswerMethod::TypedReply, 'Answered: 1. Backend');
+
+        $this->assertFalse($this->answerableOf($named));
+        $this->assertFalse($this->answerableOf($positional));
     }
 }
