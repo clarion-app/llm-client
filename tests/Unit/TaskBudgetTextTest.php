@@ -152,6 +152,20 @@ class TaskBudgetTextTest extends TestCase
                 $t->reportDone(['execute_operation' => 3, 'list_applications' => 1]),
             ],
             'reportLatestProgress' => [$t->reportLatestProgress('Two of the three files are converted.')],
+            'reportHelpers' => [
+                $t->reportHelpers([['name' => 'researcher', 'outcome' => 'completed', 'summary' => '']]),
+                $t->reportHelpers([
+                    ['name' => 'researcher', 'outcome' => 'completed', 'summary' => 'Found three sources.'],
+                    ['name' => 'writer', 'outcome' => 'partial', 'summary' => 'Drafted the intro.'],
+                    ['name' => 'checker', 'outcome' => 'stopped', 'summary' => ''],
+                    ['name' => 'fetcher', 'outcome' => 'failed', 'summary' => ''],
+                    ['name' => 'summarizer', 'outcome' => 'in_progress', 'summary' => ''],
+                ]),
+            ],
+            'reportPartsNotAccepted' => [
+                $t->reportPartsNotAccepted(['Write part two.']),
+                $t->reportPartsNotAccepted(['Write part two.', 'Check the sources.']),
+            ],
             'reportNothingOutstanding' => [$t->reportNothingOutstanding()],
             'reportNext' => [
                 $t->reportNext('paused'),
@@ -469,6 +483,36 @@ class TaskBudgetTextTest extends TestCase
         $this->assertSame(
             "Latest progress under this task's budget: Two of the three files are converted.",
             $t->reportLatestProgress('Two of the three files are converted.')
+        );
+        $this->assertSame(
+            "Helpers under this task's budget: researcher: completed — Found three sources.; writer: partial — Drafted the intro.; "
+            ."checker: stopped by this task's budget; fetcher: failed; summarizer: still in progress.",
+            $t->reportHelpers([
+                ['name' => 'researcher', 'outcome' => 'completed', 'summary' => 'Found three sources.'],
+                ['name' => 'writer', 'outcome' => 'partial', 'summary' => 'Drafted the intro.'],
+                ['name' => 'checker', 'outcome' => 'stopped', 'summary' => ''],
+                ['name' => 'fetcher', 'outcome' => 'failed', 'summary' => ''],
+                ['name' => 'summarizer', 'outcome' => 'in_progress', 'summary' => ''],
+            ])
+        );
+        $this->assertSame(
+            "Helpers under this task's budget: researcher: completed — ".str_repeat('a', 200).'.',
+            $t->reportHelpers([['name' => 'researcher', 'outcome' => 'completed', 'summary' => str_repeat('a', 250)]]),
+            'a helper\'s summary is cut at 200 characters'
+        );
+        $this->assertSame(
+            "Parts not accepted under this task's budget: Write part two.; Check the sources.",
+            $t->reportPartsNotAccepted(['Write part two.', 'Check the sources.']),
+            'a list ending in a full stop gets no second one'
+        );
+        $this->assertSame(
+            "Helpers under this task's budget: checker: stopped by this task's budget — Checked one of two.",
+            $t->reportHelpers([['name' => 'checker', 'outcome' => 'stopped', 'summary' => 'Checked one of two.']])
+        );
+        $this->assertSame(
+            "Parts not accepted under this task's budget: ".str_repeat('p', 200).'.',
+            $t->reportPartsNotAccepted([str_repeat('p', 250)]),
+            'a part\'s description is cut at 200 characters'
         );
         $this->assertSame(
             "Anything the agent had not started yet under this task's budget is not recorded.",

@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\ManagedTask;
 use ClarionApp\LlmClient\Models\ManagedTaskPart;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Services\Concerns\RetriesConcurrencyAborts;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Support\Facades\Log;
@@ -106,7 +107,7 @@ class ManagerService
         // One task budget for the whole managed task: every manager round
         // and every helper it assigns claims against it. Nobody is present
         // to be asked, so at its ceiling it halts.
-        app(TaskBudgetService::class)->openForRequest($conversation, \ClarionApp\LlmClient\Models\TaskBudget::SCOPE_MANAGED_TASK, null, $task->id, true);
+        app(TaskBudgetService::class)->openForRequest($conversation, TaskBudget::SCOPE_MANAGED_TASK, null, $task->id, true);
 
         $this->broadcast(fn () => event(new ManagedTaskUpdated($task->id)));
 
@@ -573,6 +574,8 @@ class ManagerService
             $shortfallParts[] = $part;
         }
 
+        $this->endTaskBudget($task, false, $reason);
+
         $task->status = 'completed_with_shortfalls';
         $task->final_response = empty($acceptedSummaries)
             ? 'No part of this task could be completed within the allowed rounds or time.'
@@ -608,6 +611,18 @@ class ManagerService
         );
 
         return sprintf('%s The following part(s) could not be completed: %s.', $reason, implode(', ', $descriptions));
+    }
+
+    /**
+     * Ends the managed task's task budget with it: completed, or ended with
+     * the given reason. A budget that already halted keeps its halt.
+     */
+    public function endTaskBudget(ManagedTask $task, bool $completed, ?string $reason): void
+    {
+        $budgetId = TaskBudget::where('managed_task_id', $task->id)->value('id');
+        if ($budgetId !== null) {
+            app(TaskBudgetService::class)->endRequestTask($budgetId, $completed, $reason);
+        }
     }
 
     /**

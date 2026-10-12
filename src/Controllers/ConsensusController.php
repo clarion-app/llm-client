@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use Auth;
 use ClarionApp\LlmClient\Exceptions\ConsensusNoEligibleContributorsException;
+use ClarionApp\LlmClient\Exceptions\ConsensusTaskBudgetUnavailableException;
 use ClarionApp\LlmClient\Models\ConsensusRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\ConsensusQuery;
@@ -57,6 +58,11 @@ class ConsensusController extends Controller
             $consensusRequest = $this->consensusService->dispatch($conversationOrResponse, $validated['question']);
         } catch (ConsensusNoEligibleContributorsException $e) {
             return $this->noEligibleContributorsResponse($e);
+        } catch (ConsensusTaskBudgetUnavailableException $e) {
+            return response()->json([
+                'error' => 'task_budget_unavailable',
+                'message' => $e->getMessage(),
+            ], 503);
         }
 
         return $this->responseForRequest($consensusRequest);

@@ -44,7 +44,7 @@ class TaskBudgetReportTest extends TestCase
 
     protected function tearDown(): void
     {
-        foreach (['task_budget_events', 'task_budgets', 'usage_records', 'messages', 'conversations'] as $table) {
+        foreach (['task_budget_events', 'task_budgets', 'usage_records', 'messages', 'agent_delegations', 'agents', 'managed_task_parts', 'conversations'] as $table) {
             if (Schema::hasTable($table)) {
                 DB::table($table)->delete();
             }
@@ -348,6 +348,112 @@ class TaskBudgetReportTest extends TestCase
         $sections = $this->sections($this->compose($task, TaskBudgetReport::OCCASION_PAUSED));
         $this->assertSame("Completed under this task's budget: execute_operation (3), list_applications (1).", $sections[2]);
         $this->assertSame("Latest progress under this task's budget: Converted two of three files.", $sections[3]);
+    }
+
+    /**
+     * A helper delegated within the task: its conversation points at the
+     * task (or, with $pointsAt, at another one).
+     */
+    private function helper(TaskBudget $task, string $name, string $status, ?string $resultStatus, ?string $resultReason, ?string $summary, ?string $pointsAt = null): void
+    {
+        $agentId = (string) Str::uuid();
+        DB::table('agents')->insert(['id' => $agentId, 'user_id' => (string) Str::uuid(), 'name' => $name, 'created_at' => now(), 'updated_at' => now()]);
+        $helperConversation = Conversation::create(['user_id' => (string) Str::uuid(), 'channel' => 'agent-delegation', 'title' => $name, 'character' => 'Clarion']);
+        DB::table('conversations')->where('id', $helperConversation->id)->update(['active_task_budget_id' => $pointsAt ?? $task->id]);
+        DB::table('agent_delegations')->insert([
+            'id' => (string) Str::uuid(),
+            'parent_conversation_id' => $task->root_conversation_id,
+            'helper_agent_id' => $agentId,
+            'helper_conversation_id' => $helperConversation->id,
+            'owner_user_id' => (string) Str::uuid(),
+            'task' => 'Help.',
+            'depth' => 1,
+            'status' => $status,
+            'result_status' => $resultStatus,
+            'result_reason' => $resultReason,
+            'result_summary' => $summary,
+            'started_at' => now()->format('Y-m-d H:i:s.u'),
+        ]);
+        $this->travel(1)->seconds();
+    }
+
+    #[Test]
+    public function each_helper_of_the_task_is_listed_oldest_first_with_its_outcome_and_summary(): void
+    {
+        [, $task] = $this->workedTask();
+        $this->helper($task, 'researcher', 'completed', 'success', null, 'Found three sources.');
+        $this->helper($task, 'writer', 'exhausted', 'partial', 'bound_exceeded', str_repeat('w', 250));
+        $this->helper($task, 'checker', 'exhausted', 'partial', 'task_budget', 'Checked one of two.');
+        $this->helper($task, 'fetcher', 'failed', 'failure', 'no_output', null);
+        $this->helper($task, 'formatter', 'completed', 'failure', 'schema_invalid', '');
+        // Another task's helper is not this task's.
+        $this->helper($task, 'stranger', 'completed', 'success', null, 'Not ours.', (string) Str::uuid());
+
+        $sections = $this->sections($this->compose($task, TaskBudgetReport::OCCASION_PAUSED));
+
+        $this->assertSame(
+            "Helpers under this task's budget: researcher: completed — Found three sources.; writer: partial — ".str_repeat('w', 200)
+            ."; checker: stopped by this task's budget — Checked one of two.; fetcher: failed; formatter: failed.",
+            $sections[4],
+            'after the latest progress, before what next',
+        );
+        $this->assertSame("Anything the agent had not started yet under this task's budget is not recorded.", $sections[5], 'nothing is still in progress');
+        $this->assertCount(7, $sections);
+    }
+
+    #[Test]
+    public function a_helper_still_working_is_listed_as_still_in_progress_instead_of_the_nothing_outstanding_line(): void
+    {
+        [, $task] = $this->workedTask();
+        $this->helper($task, 'researcher', 'completed', 'success', null, 'Found three sources.');
+        $this->helper($task, 'writer', 'in_progress', null, null, null);
+        $this->helper($task, 'checker', 'queued', null, null, null);
+
+        $sections = $this->sections($this->compose($task, TaskBudgetReport::OCCASION_PAUSED));
+
+        $this->assertSame(
+            "Helpers under this task's budget: researcher: completed — Found three sources.; writer: still in progress; checker: still in progress.",
+            $sections[4],
+        );
+        $this->assertSame((new TaskBudgetText())->reportNext('paused'), $sections[5], 'the helpers still working are what is not finished');
+        $this->assertCount(6, $sections);
+    }
+
+    #[Test]
+    public function a_task_without_helpers_has_no_helpers_section(): void
+    {
+        [, $task] = $this->workedTask();
+
+        $this->assertStringNotContainsString('Helpers under', $this->compose($task, TaskBudgetReport::OCCASION_PAUSED));
+    }
+
+    #[Test]
+    public function a_managed_tasks_parts_not_accepted_are_listed_as_not_finished(): void
+    {
+        [$conversation, $task] = $this->workedTask();
+        $managedTaskId = (string) Str::uuid();
+        DB::table('task_budgets')->where('id', $task->id)->update(['scope' => TaskBudget::SCOPE_MANAGED_TASK, 'managed_task_id' => $managedTaskId]);
+        foreach ([[1, 'Write part one.', 'accepted'], [3, str_repeat('p', 250), 'not_yet_assigned'], [2, 'Write part two.', 'out_for_assignment']] as [$sequence, $description, $state]) {
+            DB::table('managed_task_parts')->insert([
+                'id' => (string) Str::uuid(), 'managed_task_id' => $managedTaskId, 'sequence' => $sequence,
+                'description' => $description, 'state' => $state, 'created_at' => now(), 'updated_at' => now(),
+            ]);
+        }
+        // Another managed task's part is not this task's.
+        DB::table('managed_task_parts')->insert([
+            'id' => (string) Str::uuid(), 'managed_task_id' => (string) Str::uuid(), 'sequence' => 1,
+            'description' => 'Not ours.', 'state' => 'not_yet_assigned', 'created_at' => now(), 'updated_at' => now(),
+        ]);
+
+        $sections = $this->sections($this->compose($task, TaskBudgetReport::OCCASION_HALTED));
+
+        $this->assertSame(
+            "Parts not accepted under this task's budget: Write part two.; ".str_repeat('p', 200).'.',
+            $sections[4],
+            'in part order, the accepted part left out',
+        );
+        $this->assertSame((new TaskBudgetText())->reportNext('halted'), $sections[5]);
+        $this->assertCount(6, $sections);
     }
 
     #[Test]

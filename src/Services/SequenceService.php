@@ -12,6 +12,7 @@ use ClarionApp\LlmClient\Models\SequenceRun;
 use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageResult;
 use ClarionApp\LlmClient\Models\StageSequenceDefinition;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -194,6 +195,8 @@ class SequenceService
                 'agent_id' => $coordinatorAgent->id,
                 'agent_version_id' => $coordinatorAgent->current_version_id,
             ]);
+
+            app(TaskBudgetService::class)->openForRequest($conversation, TaskBudget::SCOPE_SEQUENCE_RUN, null, null, true);
 
             $run = SequenceRun::create([
                 'sequence_definition_id' => $definition->id,

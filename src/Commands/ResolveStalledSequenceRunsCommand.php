@@ -3,8 +3,10 @@
 namespace ClarionApp\LlmClient\Commands;
 
 use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\SequenceRun;
 use ClarionApp\LlmClient\Services\SequenceService;
+use ClarionApp\LlmClient\Services\TaskBudgetService;
 use Illuminate\Console\Command;
 
 /**
@@ -94,6 +96,11 @@ class ResolveStalledSequenceRunsCommand extends Command
                 $run->completed_at = now();
                 $run->last_progress_at = now();
                 $run->save();
+
+                $budgetId = Conversation::where('id', $run->conversation_id)->value('active_task_budget_id');
+                if ($budgetId !== null) {
+                    app(TaskBudgetService::class)->endRequestTask($budgetId, false, $run->failure_reason);
+                }
 
                 $sequenceService->broadcastRunUpdated($run->id);
                 $failed++;

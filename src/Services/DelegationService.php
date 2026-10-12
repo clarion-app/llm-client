@@ -79,7 +79,7 @@ class DelegationService
      *   completed-delegation result shape (contracts/
      *   delegation-protocol-meta-tool.md).
      */
-    public function delegate(Conversation $parentConversation, string $helperAgentId, string $task, ?string $context, ?string $managedTaskId = null, ?string $partId = null): array
+    public function delegate(Conversation $parentConversation, string $helperAgentId, string $task, ?string $context, ?string $managedTaskId = null, ?string $partId = null, ?string $taskBudgetId = null): array
     {
         $resolved = $this->resolveAndValidate($parentConversation, $helperAgentId);
         if (isset($resolved['error'])) {
@@ -105,6 +105,8 @@ class DelegationService
             null,
             $effectiveManagedTaskId,
             $partId,
+            'delegate_to_helper',
+            $taskBudgetId,
         );
 
         $helperConversation = Conversation::find($delegation->helper_conversation_id);
@@ -264,7 +266,7 @@ class DelegationService
      */
     private function translateCapabilityResult(array $sixFieldResult): array
     {
-        if (($sixFieldResult['reason'] ?? null) === 'bound_exceeded') {
+        if (in_array($sixFieldResult['reason'] ?? null, ['bound_exceeded', 'task_budget'], true)) {
             $message = $sixFieldResult['undone'] ?? 'Reached its limit before finishing.';
             $partial = $sixFieldResult['summary'] ?? '';
             if ($partial !== '') {
@@ -307,7 +309,7 @@ class DelegationService
      *   original $calls order (contracts §1's ordering guarantee) --
      *   regardless of which member actually finished first.
      */
-    public function delegateBatch(Conversation $parentConversation, array $calls): array
+    public function delegateBatch(Conversation $parentConversation, array $calls, ?string $taskBudgetId = null): array
     {
         $results = [];
         $validRows = [];
@@ -343,6 +345,8 @@ class DelegationService
                 $batchId,
                 $effectiveManagedTaskId,
                 $call['part_id'] ?? null,
+                'delegate_to_helper',
+                $taskBudgetId,
             );
         }
 
@@ -978,6 +982,7 @@ class DelegationService
         ?string $managedTaskId = null,
         ?string $partId = null,
         string $origin = 'delegate_to_helper',
+        ?string $taskBudgetId = null,
     ): Delegation {
         $ownerUserId = (string) $parentConversation->user_id;
 
@@ -997,6 +1002,7 @@ class DelegationService
             'channel' => 'agent-delegation',
             'agent_id' => $helperAgent->id,
             'agent_version_id' => $helperAgent->current_version_id,
+            'active_task_budget_id' => $taskBudgetId ?? $parentConversation->active_task_budget_id,
         ]);
 
         $parentRunId = Context::get('run_id');
@@ -1064,6 +1070,7 @@ class DelegationService
         // own run()) overwrite, then unconditionally clear, the ambient
         // Context slot with no awareness of nesting.
         $enclosingRunId = Context::get('run_id');
+        $enclosingTaskBudgetId = Context::get('task_budget_id');
 
         // D3: the delegation-specific bounds -- an $options override on the
         // nested run() call only, never mutating the shared config the
@@ -1164,6 +1171,9 @@ class DelegationService
             if ($enclosingRunId !== null) {
                 Context::add('run_id', $enclosingRunId);
             }
+            if ($enclosingTaskBudgetId !== null) {
+                Context::add('task_budget_id', $enclosingTaskBudgetId);
+            }
         }
 
         // 110-delegation-deadlock-timeout (FR-013): the same late-result
@@ -1185,6 +1195,7 @@ class DelegationService
         $exhaustionReasons = [
             'max_iterations' => 'iteration_limit',
             'time_ceiling_reached' => 'time_limit',
+            'task_budget_reached' => 'task_budget',
         ];
         $code = $rawResult['code'] ?? null;
 
@@ -1282,13 +1293,17 @@ class DelegationService
             // null since schema validation was never reached on an
             // exhausted run (research.md D3).
             $resultSummary = Str::limit($partialResult, 500);
-            $resultUndone = "Reached its {$incompleteBecause} before finishing.";
+            $stoppedByTaskBudget = $code === 'task_budget_reached';
+            $resultUndone = $stoppedByTaskBudget
+                ? app(TaskBudgetText::class)->helperStopped()
+                : "Reached its {$incompleteBecause} before finishing.";
+            $boundReason = $stoppedByTaskBudget ? 'task_budget' : 'bound_exceeded';
 
             $delegation->status = 'exhausted';
             $delegation->completed_at = now();
             $delegation->outcome_summary = $resultSummary;
             $delegation->result_status = 'partial';
-            $delegation->result_reason = 'bound_exceeded';
+            $delegation->result_reason = $boundReason;
             $delegation->result_output = null;
             $delegation->result_summary = $resultSummary;
             $delegation->result_undone = $resultUndone;
@@ -1303,8 +1318,11 @@ class DelegationService
                 'output' => null,
                 'undone' => $resultUndone,
                 'truncated' => false,
-                'reason' => 'bound_exceeded',
+                'reason' => $boundReason,
             ];
+            if ($stoppedByTaskBudget) {
+                $sixFieldResult['stopped_by'] = 'task_budget';
+            }
 
             $this->runTraceRecorder->closeAction(
                 $actionId,
@@ -1608,7 +1626,7 @@ class DelegationService
 
         $helperName = Agent::withTrashed()->find($delegation->helper_agent_id)?->name ?? $delegation->helper_agent_id;
 
-        return [
+        $result = [
             'delegation_id' => $delegation->id,
             'helper' => $helperName,
             'status' => $delegation->result_status,
@@ -1618,6 +1636,11 @@ class DelegationService
             'truncated' => (bool) $delegation->result_truncated,
             'reason' => $delegation->result_reason,
         ];
+        if ($delegation->result_reason === 'task_budget') {
+            $result['stopped_by'] = 'task_budget';
+        }
+
+        return $result;
     }
 
     /**

@@ -148,6 +148,34 @@ class TaskBudgetService
         }
     }
 
+    /**
+     * Ends the task of a request that runs without a root agent of its own
+     * (a managed task, a sequence run, a consensus request) when that request
+     * finishes. Only a running task is changed; a halted one keeps its halt.
+     * Never throws.
+     */
+    public function endRequestTask(string $taskBudgetId, bool $completed, ?string $reason): void
+    {
+        try {
+            $task = TaskBudget::find($taskBudgetId);
+            if ($task === null) {
+                return;
+            }
+            $now = now()->format('Y-m-d H:i:s.u');
+            $won = DB::table('task_budgets')->where('id', $task->id)->where('state', TaskBudgetState::Running->value)->update([
+                'state' => $completed ? TaskBudgetState::Completed->value : TaskBudgetState::Ended->value,
+                'end_reason' => $completed ? null : $reason,
+                'ended_at' => $now,
+                'updated_at' => $now,
+            ]);
+            if ($won === 1) {
+                $this->appendEvent($task, 'ended', ['reason' => $completed ? 'completed' : 'request_ended', 'request_end_reason' => $reason]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning("Task budget {$taskBudgetId} could not be ended", ['task_budget_id' => $taskBudgetId, 'error' => $e->getMessage()]);
+        }
+    }
+
     public function supersede(TaskBudget $predecessor): void
     {
         $now = now()->format('Y-m-d H:i:s.u');

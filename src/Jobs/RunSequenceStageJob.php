@@ -11,6 +11,9 @@ use ClarionApp\LlmClient\Services\ContentSanitizer;
 use ClarionApp\LlmClient\Services\DelegationService;
 use ClarionApp\LlmClient\Services\SchemaValidator;
 use ClarionApp\LlmClient\Services\SequenceService;
+use ClarionApp\LlmClient\Services\TaskBudgetGate;
+use ClarionApp\LlmClient\Services\TaskBudgetService;
+use ClarionApp\LlmClient\Services\TaskBudgetText;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -134,6 +137,13 @@ class RunSequenceStageJob implements ShouldQueue
             }
         }
 
+        $conversation = Conversation::find($run->conversation_id);
+        if ($conversation !== null && app(TaskBudgetGate::class)->wouldStop($conversation) !== null) {
+            $this->stopAtTaskBudget($run, $stageResult, $stage, null, $sequenceService);
+
+            return;
+        }
+
         $stageResult->status = 'running';
         $stageResult->input = $contentSanitizer->truncate((string) $inputPayload);
         $stageResult->started_at = now();
@@ -156,6 +166,12 @@ class RunSequenceStageJob implements ShouldQueue
         // carries a 'status' key -- checked first, before ever reading
         // 'status' (Grounding note item 2). Either shape means this
         // stage's own execution genuinely failed.
+        if (($result['reason'] ?? null) === 'task_budget') {
+            $this->stopAtTaskBudget($run, $stageResult, $stage, $result['delegation_id'] ?? null, $sequenceService);
+
+            return;
+        }
+
         if (isset($result['error']) || ($result['status'] ?? null) === 'failure') {
             $this->stopOnStageFailure($run, $stageResult, $stage, $result, $sequenceService);
 
@@ -197,6 +213,7 @@ class RunSequenceStageJob implements ShouldQueue
             $run->status = 'completed';
             $run->completed_at = now();
             $run->save();
+            $this->endTaskBudget($run, true, null);
 
             // research.md D8 (Phase 4/US2): run finalization is one of
             // the five named broadcast points -- distinct from the
@@ -281,6 +298,33 @@ class RunSequenceStageJob implements ShouldQueue
     }
 
     /**
+     * The sequence's task budget stopped this stage -- before it started, or
+     * its helper was stopped mid-way: the stage fails naming the task's
+     * budget and the run stops (never recorded as completed).
+     */
+    private function stopAtTaskBudget(SequenceRun $run, StageResult $stageResult, Stage $stage, ?string $delegationId, SequenceService $sequenceService): void
+    {
+        $reason = app(TaskBudgetText::class)->sequenceStopped();
+
+        $stageResult->status = 'failed';
+        $stageResult->failure_reason = $reason;
+        $stageResult->delegation_id = $delegationId;
+        $stageResult->completed_at = now();
+        $stageResult->save();
+
+        $this->finalizeRunAsFailed($run, "Stage '{$stage->name}' failed: {$reason}", $sequenceService);
+    }
+
+    /** Ends the run's task budget with the run (a no-op unless it is still running). */
+    private function endTaskBudget(SequenceRun $run, bool $completed, ?string $reason): void
+    {
+        $budgetId = Conversation::where('id', $run->conversation_id)->value('active_task_budget_id');
+        if ($budgetId !== null) {
+            app(TaskBudgetService::class)->endRequestTask($budgetId, $completed, $reason);
+        }
+    }
+
+    /**
      * Every Phase 5 stop (T044/T045/T046) ends here: SequenceRun.status =
      * 'failed' (FR-010, never 'completed'), no further job is ever
      * dispatched (this is a `return` inside handle(), never falling
@@ -295,6 +339,7 @@ class RunSequenceStageJob implements ShouldQueue
         $run->completed_at = now();
         $run->last_progress_at = now();
         $run->save();
+        $this->endTaskBudget($run, false, $failureReason);
 
         $sequenceService->broadcastRunUpdated($run->id);
     }

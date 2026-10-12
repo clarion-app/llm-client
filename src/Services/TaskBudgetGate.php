@@ -24,6 +24,38 @@ class TaskBudgetGate
     ) {
     }
 
+    /**
+     * Whether the next step of this conversation's task would be refused,
+     * without claiming it: null when it would be allowed (or there is no
+     * task yet), the refusal otherwise. Never throws; a failure is
+     * STOP(unavailable).
+     */
+    public function wouldStop(Conversation $conversation): ?TaskBudgetDecision
+    {
+        try {
+            $task = $conversation->active_task_budget_id === null ? null : TaskBudget::find($conversation->active_task_budget_id);
+            if ($task === null) {
+                return null;
+            }
+            if ($task->state !== TaskBudgetState::Running) {
+                return TaskBudgetDecision::stop(TaskBudgetDecision::REASON_NOT_RUNNING, $this->tasks->standing($task));
+            }
+            $stepsReached = (int) $task->steps_used >= (int) $task->max_steps;
+            $spendReached = bccomp($this->costs->taskTotal($task->id)['priced_cost_total'], $task->max_spend, 10) >= 0;
+            if ($stepsReached || $spendReached) {
+                $reason = $stepsReached && $spendReached ? TaskBudgetDecision::REASON_BOTH : ($stepsReached ? TaskBudgetDecision::REASON_STEPS : TaskBudgetDecision::REASON_SPEND);
+
+                return TaskBudgetDecision::stop($reason, $this->tasks->standing($task));
+            }
+
+            return null;
+        } catch (\Throwable $e) {
+            Log::error('Task budget could not be checked for conversation '.$conversation->id, ['conversation_id' => $conversation->id, 'error' => $e->getMessage()]);
+
+            return TaskBudgetDecision::unavailable();
+        }
+    }
+
     public function beforeStep(Conversation $conversation, ?string $runId): TaskBudgetDecision
     {
         try {

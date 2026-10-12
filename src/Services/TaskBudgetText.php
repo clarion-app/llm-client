@@ -231,6 +231,42 @@ class TaskBudgetText
         return "Latest progress under this task's budget: {$progress}";
     }
 
+    /**
+     * @param list<array{name: string, outcome: string, summary: string}> $helpers
+     *   outcome: completed|partial|stopped|failed|in_progress
+     */
+    public function reportHelpers(array $helpers): string
+    {
+        $words = [
+            'completed' => 'completed',
+            'partial' => 'partial',
+            'stopped' => "stopped by this task's budget",
+            'failed' => 'failed',
+            'in_progress' => 'still in progress',
+        ];
+        $parts = [];
+        foreach ($helpers as $helper) {
+            $line = $helper['name'].': '.($words[$helper['outcome']] ?? $helper['outcome']);
+            if ($helper['summary'] !== '') {
+                $line .= ' — '.mb_substr($helper['summary'], 0, 200);
+            }
+            $parts[] = $line;
+        }
+
+        return $this->sentence("Helpers under this task's budget: ".implode('; ', $parts));
+    }
+
+    /**
+     * @param list<string> $descriptions the descriptions of a managed task's
+     *   parts that were not accepted, in part order
+     */
+    public function reportPartsNotAccepted(array $descriptions): string
+    {
+        $parts = array_map(fn (string $description) => mb_substr($description, 0, 200), $descriptions);
+
+        return $this->sentence("Parts not accepted under this task's budget: ".implode('; ', $parts));
+    }
+
     public function reportNothingOutstanding(): string
     {
         return "Anything the agent had not started yet under this task's budget is not recorded.";
@@ -245,6 +281,12 @@ class TaskBudgetText
             'halted' => "Nobody could be asked about this task's budget, so the task stopped. The work above is kept.",
             default => throw new \InvalidArgumentException("Unknown report occasion: {$occasion}"),
         };
+    }
+
+    /** Ends a sentence with a full stop unless it already ends with one. */
+    private function sentence(string $text): string
+    {
+        return preg_match('/[.!?]$/u', $text) === 1 ? $text : $text.'.';
     }
 
     private function figures(TaskBudgetStanding $s): string
