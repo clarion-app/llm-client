@@ -348,6 +348,7 @@ class DelegationService
                 $call['part_id'] ?? null,
                 'delegate_to_helper',
                 $taskBudgetId,
+                $toolCallId,
             );
         }
 
@@ -984,6 +985,7 @@ class DelegationService
         ?string $partId = null,
         string $origin = 'delegate_to_helper',
         ?string $taskBudgetId = null,
+        ?string $parentToolCallId = null,
     ): Delegation {
         $ownerUserId = (string) $parentConversation->user_id;
 
@@ -1029,12 +1031,18 @@ class DelegationService
             'managed_task_id' => $managedTaskId,
             'part_id' => $partId,
             'origin' => $origin,
+            'parent_tool_call_id' => $this->parentToolCallIdOf($parentToolCallId),
         ]);
+
+        app(\ClarionApp\LlmClient\Contracts\FaultInjector::class)->reach('after_delegation_row');
 
         $actionId = $this->runTraceRecorder->openAction(
             $this->currentOpenStepId($parentRunId),
             ActionType::Delegation,
             $helperAgent->name,
+            null,
+            null,
+            $delegation->parent_tool_call_id,
         );
 
         if ($actionId !== null) {
@@ -1048,6 +1056,22 @@ class DelegationService
         $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
 
         return $delegation;
+    }
+
+    /**
+     * The provider's call id this delegation was created from: the explicit
+     * id a batch member passes (one ambient value cannot serve a batch),
+     * else the ambient tool-call id the funnel stamped, cut to the column
+     * width. Null when created outside a tool call.
+     */
+    private function parentToolCallIdOf(?string $explicit): ?string
+    {
+        $id = $explicit ?? Context::get('tool_call_id');
+        if ($id === null) {
+            return null;
+        }
+
+        return mb_substr((string) $id, 0, 255);
     }
 
     /**

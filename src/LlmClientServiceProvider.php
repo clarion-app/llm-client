@@ -524,6 +524,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         // contract §1): scoped, depends on the lease.
         $this->app->scoped(\ClarionApp\LlmClient\Services\RunCheckpoint::class);
 
+        // The effect classifier and the liveness bound: stateless, resolved
+        // on demand.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ToolEffectClassifier::class);
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ToolLivenessBound::class);
+
+        // The tool funnel: brackets every tool execution with the start and
+        // completion markers; stateless, depends on the checkpoint writer.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class);
+
         // Register role resolution services
         $this->app->singleton(\ClarionApp\LlmClient\Services\RoleResolver::class, function ($app) {
             return new \ClarionApp\LlmClient\Services\RoleResolver(

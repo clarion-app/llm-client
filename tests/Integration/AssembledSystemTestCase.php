@@ -25,6 +25,14 @@ abstract class AssembledSystemTestCase extends TestCase
     protected string $scenario = 'unnamed';
     protected string $entryPath = 'sync';
 
+    /**
+     * Set by a test that intentionally interrupts a run (e.g. a fault-injection
+     * kill at a checkpoint point). When true, the unconsumed-steps check in
+     * tearDown() is skipped: the run was killed before it could consume its
+     * remaining scripted steps, so a leftover is expected, not a defect.
+     */
+    protected bool $expectInterruptedRun = false;
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -70,8 +78,9 @@ abstract class AssembledSystemTestCase extends TestCase
             $this->ledger->reconcile($this->scenario, $this->entryPath);
         }
 
-        // Assert no unconsumed steps
-        if ($this->script && $this->script->hasUnconsumedSteps()) {
+        // Assert no unconsumed steps (skipped when the run was intentionally
+        // interrupted, where a leftover is expected).
+        if (!$this->expectInterruptedRun && $this->script && $this->script->hasUnconsumedSteps()) {
             $unconsumedCount = $this->script->unconsumedSteps();
             $this->fail(sprintf(
                 'Unconsumed script steps in [%s/%s]: %d steps remaining.',

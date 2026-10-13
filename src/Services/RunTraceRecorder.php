@@ -1044,6 +1044,7 @@ class RunTraceRecorder
         ?string $target = null,
         ?string $attemptGroupId = null,
         ?string $parentActionId = null,
+        ?string $toolCallId = null,
     ): ?string {
         if ($stepId === null || !$this->enabled()) {
             return null;
@@ -1087,6 +1088,7 @@ class RunTraceRecorder
                 'target' => $target,
                 'attempt_group_id' => $attemptGroupId,
                 'parent_action_id' => $parentActionId,
+                'tool_call_id' => $toolCallId === null ? null : mb_substr($toolCallId, 0, 255),
                 'outcome' => ActionOutcome::InProgress->value,
                 'failure_reason' => null,
                 'paused_at' => null,

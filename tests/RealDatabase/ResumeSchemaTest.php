@@ -2,6 +2,9 @@
 
 namespace Tests\RealDatabase;
 
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
+use ClarionApp\LlmClient\ValueObjects\ActionType;
+use ClarionApp\LlmClient\ValueObjects\RunKind;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\Group;
@@ -308,5 +311,31 @@ class ResumeSchemaTest extends RealDatabaseTestCase
 
         $stored = DB::table('agent_run_resume_events')->where('id', $eventId)->value('payload');
         $this->assertSame($payload, json_decode($stored, true), 'the payload decodes to the same document');
+    }
+
+    // ---------------------------------------------------------------
+    // D22: a 300-character tool_call_id is cut to 255 on the real engine
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_300_character_tool_call_id_is_cut_to_255_on_the_real_engine(): void
+    {
+        $this->assertReady();
+        $recorder = app(RunTraceRecorder::class);
+        $runId = $recorder->openRun(RunKind::Interactive, (string) Str::uuid());
+        $this->assertNotNull($runId, 'precondition: the run is opened');
+        $stepId = $recorder->openStep($runId);
+        $this->assertNotNull($stepId, 'precondition: the step is opened');
+
+        // A 300-character provider call id, longer than the varchar(255)
+        // column: openAction() must cut it to 255 before the insert, or
+        // strict MySQL/MariaDB would refuse the row.
+        $longId = str_repeat('x', 300);
+        $actionId = $recorder->openAction($stepId, ActionType::ToolInvocation, null, null, null, $longId);
+        $this->assertNotNull($actionId, 'the action is opened with the 300-character call id');
+
+        $stored = DB::table('agent_run_actions')->where('id', $actionId)->value('tool_call_id');
+        $this->assertSame(255, strlen((string) $stored), 'the 300-character call id is cut to 255');
+        $this->assertSame(str_repeat('x', 255), (string) $stored, 'the stored value is the first 255 characters');
     }
 }

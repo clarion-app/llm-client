@@ -641,8 +641,16 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     \ClarionApp\LlmClient\ValueObjects\ActionType::ToolInvocation,
                     $toolName,
                     $this->attemptGroupId,
+                    null,
+                    $toolCallId,
                 );
             }
+
+            // The step the funnel brackets this call in; null when the run
+            // is not checkpointed (the tool still runs, unbracketed).
+            $checkpointStepRef = ($this->runId !== null && $this->stepId !== null)
+                ? new \ClarionApp\LlmClient\ValueObjects\StepRef($this->runId, $this->stepId, $iteration)
+                : null;
 
             Log::info('AgentLoopStreamHandler: executing tool', [
                 'tool' => $toolName,
@@ -709,14 +717,35 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                             'protocol_version' => '2025-03-26',
                         ]);
                     }
-                    $execResult = $toolExecutor->executeTool($toolName, $arguments, $session);
-                    $result = json_encode($execResult);
+                    if ($checkpointStepRef !== null) {
+                        $result = app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->execute(
+                            $checkpointStepRef,
+                            $toolCall,
+                            fn () => json_encode($toolExecutor->executeTool($toolName, $arguments, $session)),
+                            $toolActionId,
+                            $conversation,
+                        );
+                        app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordCompleted($checkpointStepRef, $toolCallId, json_decode($result, true));
+                    } else {
+                        $execResult = $toolExecutor->executeTool($toolName, $arguments, $session);
+                        $result = json_encode($execResult);
+                    }
                 }
             }
 
             // Meta tools or unresolved non-meta tools: fall through to executeMetaTool
             if ($result === null) {
-                $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId);
+                if ($checkpointStepRef !== null) {
+                    $result = app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->execute(
+                        $checkpointStepRef,
+                        $toolCall,
+                        fn () => $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId),
+                        $toolActionId,
+                        $conversation,
+                    );
+                } else {
+                    $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId);
+                }
 
                 // Check if execute_operation needs confirmation
                 $decoded = json_decode($result, true);
@@ -728,6 +757,12 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     $refusal = $this->openQuestion($conversation, $decoded, $toolCallId, $toolActionId, $toolResults, $iteration);
 
                     if ($refusal === null) {
+                        // The question was opened: the call is paused (C6),
+                        // not completed with the marker as its result.
+                        if ($checkpointStepRef !== null) {
+                            app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordPaused($checkpointStepRef, $toolCallId);
+                        }
+
                         return; // Suspended until the question is resolved
                     }
 
@@ -742,11 +777,11 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
 
                     $pendingConfirmation = [
-                        'tool_name' => 'execute_operation',
+                        'tool_name' => $confirmationType === 'declarative_memory' ? 'propose_declarative_memory' : 'execute_operation',
                         'confirmation_type' => $confirmationType,
-                        'operationId' => $decoded['operationId'],
-                        'method' => $decoded['method'],
-                        'path' => $decoded['path'],
+                        'operationId' => $decoded['operationId'] ?? null,
+                        'method' => $decoded['method'] ?? null,
+                        'path' => $decoded['path'] ?? null,
                         'arguments' => $decoded['parameters'] ?? [],
                         'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
                         // 112-coding-agent (US1, data-model.md §6): lets
@@ -765,16 +800,33 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
                     }
 
+                    if ($confirmationType === 'declarative_memory') {
+                        // The declarative-memory proposal carries no
+                        // operationId/method/path — resume()'s
+                        // declarative_memory branch reads type/content/
+                        // existingId, so carry them the same way the
+                        // synchronous pause-construction does.
+                        $pendingConfirmation['type'] = $decoded['type'] ?? '';
+                        $pendingConfirmation['content'] = $decoded['content'] ?? '';
+                        $pendingConfirmation['existingId'] = $decoded['existingId'] ?? null;
+                    }
+
                     $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
 
-                    event(new ApiCallConfirmationRequiredEvent(
-                        $conversationId,
-                        $this->message->id,
-                        $decoded['method'],
-                        $decoded['path'],
-                        $decoded['parameters'] ?? [],
-                        'execute_operation'
-                    ));
+                    // The api_call confirmation event is specific to the
+                    // operation confirmations (which carry method/path); a
+                    // declarative-memory pause has neither, so fire only
+                    // when the method is present.
+                    if (($decoded['method'] ?? null) !== null) {
+                        event(new ApiCallConfirmationRequiredEvent(
+                            $conversationId,
+                            $this->message->id,
+                            $decoded['method'],
+                            $decoded['path'] ?? null,
+                            $decoded['parameters'] ?? [],
+                            'execute_operation'
+                        ));
+                    }
 
                     // Close tool action as awaiting_confirmation before suspend.
                     if ($toolActionId !== null && $this->runTraceRecorder !== null) {
@@ -791,7 +843,20 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         }
                     }
 
+                    // The confirmation pauses the call (C6), not completes
+                    // it with the marker as its result.
+                    if ($checkpointStepRef !== null) {
+                        app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordPaused($checkpointStepRef, $toolCallId);
+                    }
+
                     return; // Suspend for confirmation
+                }
+
+                // C4: only a call that actually ran is completed (a pause
+                // marker returned above, so this is reached only for an
+                // executed call).
+                if ($checkpointStepRef !== null) {
+                    app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordCompleted($checkpointStepRef, $toolCallId, $decoded);
                 }
             }
 

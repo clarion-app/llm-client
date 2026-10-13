@@ -49,6 +49,7 @@ use ClarionApp\LlmClient\ValueObjects\RunKind;
 use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use ClarionApp\LlmClient\ValueObjects\ResumeMode;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
+use ClarionApp\LlmClient\ValueObjects\StepRef;
 use ClarionApp\LlmClient\ValueObjects\PauseKind;
 use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
 use ClarionApp\LlmClient\ValueObjects\AskUserRequest;
@@ -292,6 +293,45 @@ class AgentLoopService
     private function checkpointNow(): bool
     {
         return \Illuminate\Support\Facades\DB::transactionLevel() === 0;
+    }
+
+    /**
+     * Extend the run's lease over the model call about to be made, so a
+     * live-but-slow run is never mistaken for dead while the model works.
+     * The driver is read back from the run row (C0's openRun() wrote it);
+     * a run without a stored driver is treated as a root run.
+     */
+    private function extendLeaseBeforeModelCall(?string $runId): void
+    {
+        if ($runId === null) {
+            return;
+        }
+
+        $value = DB::table('agent_runs')->where('id', $runId)->value('resume_driver');
+        $driver = $value === null
+            ? ResumeDriver::Root
+            : (ResumeDriver::tryFrom((string) $value) ?? ResumeDriver::Root);
+
+        $this->checkpoint(fn () => app(RunCheckpoint::class)->extendForModelCall($runId, $driver));
+    }
+
+    /**
+     * Cap the task budget's lazy seed at the paused step's position, so
+     * the continuation's own approved-call step (finished by the
+     * boundary) is not counted as earlier work. Keyed by run id and
+     * consumed one-shot by the seed; a no-op when tracing is off (no
+     * step row, nothing to cap).
+     */
+    private function capBudgetSeedAtPausedStep(?string $pausedStepId, ?string $runId): void
+    {
+        if ($pausedStepId === null || $runId === null) {
+            return;
+        }
+
+        $position = DB::table('agent_run_steps')->where('id', $pausedStepId)->value('position');
+        if ($position !== null) {
+            Context::add('resume_seed_step_cap:'.$runId, (int) $position);
+        }
     }
 
     /**
@@ -674,7 +714,42 @@ class AgentLoopService
         // read back once the call is approved and executed.
         $inboundActionId = $toolData['action_id'] ?? null;
 
+        $this->capBudgetSeedAtPausedStep($toolData['step_id'] ?? null, $runId);
         $this->closePausedStreamStep($toolData, $message);
+
+        // The approved call runs in its own step: open it (C1), record the
+        // model response (C2) so the call starts not_started, and open its
+        // tool action. A kill between C2 and the start marker leaves the
+        // call not_started, so a resume neither repeats it blindly nor
+        // assumes it did not happen.
+        $approvedCall = null;
+        $stepRef = null;
+        $approvedActionId = null;
+        if ($approved) {
+            foreach ($toolData['tool_calls'] ?? [] as $call) {
+                if (($call['id'] ?? null) === $toolCallId) {
+                    $approvedCall = $call;
+
+                    break;
+                }
+            }
+        }
+        if ($approved && $approvedCall !== null && $runId !== null && $this->runTraceRecorder !== null) {
+            $approvedStepId = $this->runTraceRecorder->openStep($runId, null, (string) Str::uuid());
+            if ($approvedStepId !== null) {
+                $this->checkpoint(fn () => app(RunCheckpoint::class)->openStep($runId, $approvedStepId, $iteration));
+                $this->checkpoint(fn () => app(RunCheckpoint::class)->recordModelResponse($approvedStepId, '', [$approvedCall]));
+                $stepRef = new StepRef($runId, $approvedStepId, $iteration);
+                $approvedActionId = $this->runTraceRecorder->openAction(
+                    $approvedStepId,
+                    ActionType::ToolInvocation,
+                    $pending['tool_name'] ?? 'execute_operation',
+                    null,
+                    null,
+                    $toolCallId,
+                );
+            }
+        }
 
         $confirmationType = $pending['confirmation_type'] ?? 'api_call';
 
@@ -686,7 +761,12 @@ class AgentLoopService
         // change either.
         $apiCallExecuted = false;
 
-        if ($approved) {
+        // The approved call's execution, extracted so the funnel can
+        // bracket it (C3 before, C4 after). It sets $resultContent and
+        // $pausedResult (and $apiCallExecuted) as side effects; the
+        // funnel's start marker is written before it runs and the
+        // completion marker after.
+        $executeApproved = function () use (&$resultContent, &$pausedResult, &$apiCallExecuted, $pending, $confirmationType, $conversation, $toolCallId) {
             if ($confirmationType === 'declarative_memory') {
                 // Route declarative_memory proposals to applyAgentWrite with confirmation
                 $type = $pending['type'] ?? '';
@@ -791,6 +871,29 @@ class AgentLoopService
 
                 $condensed = $this->condenseToolResult($resultContent, $conversation->id, 'execute_api_call');
                 $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $condensed['content']] + array_filter($condensed, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed']), ARRAY_FILTER_USE_KEY);
+            }
+
+            return $resultContent;
+        };
+
+        if ($approved) {
+            if ($stepRef !== null) {
+                app(CheckpointedToolExecutor::class)->execute($stepRef, $approvedCall, $executeApproved, $approvedActionId, $conversation);
+                app(CheckpointedToolExecutor::class)->recordCompleted($stepRef, $toolCallId, json_decode($resultContent, true));
+                // C5: the approved call's step is committed, naming the paused
+                // message that holds its result (the continuation opens its own
+                // step in the epilogue), then closed — the approved step is a
+                // standalone step holding the approved call, distinct from the
+                // step the continuation opens; leaving it open after the
+                // commit would leave a second in_progress step beside the one
+                // the pause sits on.
+                $this->checkpoint(fn () => app(RunCheckpoint::class)->commitStep($runId, $stepRef->stepId, (string) $message->id));
+                $this->runTraceRecorder->closeStep($stepRef->stepId, RunEndState::Completed);
+                if ($this->runTraceRecorder !== null && $approvedActionId !== null) {
+                    $this->runTraceRecorder->closeAction($approvedActionId, ActionOutcome::Success);
+                }
+            } else {
+                $executeApproved();
             }
         } else {
             $pausedResult = ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'];
@@ -1647,6 +1750,7 @@ class AgentLoopService
                             $this->runTraceRecorder->closeStep(
                                 $currentStepId,
                                 RunEndState::StoppedEarly,
+                                'Delegation time bound reached',
                             );
                         }
                         $this->runTraceRecorder->closeRun(
@@ -1732,6 +1836,10 @@ class AgentLoopService
                         $attemptGroupId,
                     );
                 }
+                // Extend the run's lease over the model call that follows,
+                // so a live-but-slow run is not mistaken for dead.
+                $this->extendLeaseBeforeModelCall($runId);
+
                 $response = $this->callLlmSync(
                     $conversation,
                     $formatted['messages'],
@@ -1952,7 +2060,7 @@ class AgentLoopService
                 // ever reaching any of them. null (0 or 1 such calls) means
                 // the existing inline per-call path is completely
                 // unaffected.
-                $batchDelegationResults = $this->resolveDelegateToHelperBatchResults($toolCalls, $conversation);
+                $batchDelegationResults = $this->resolveDelegateToHelperBatchResults($toolCalls, $conversation, $runId, $currentStepId, $iteration);
 
                 foreach ($toolCalls as $tcIndex => $toolCall) {
                     $toolName = $toolCall['function']['name'] ?? '';
@@ -2022,6 +2130,9 @@ class AgentLoopService
                     // execute_operation call, keeps this exact one-shot
                     // shape, byte-for-byte unchanged.
                     $activeActionId = null;
+                    // The step the funnel brackets this call in; null when the
+                    // run is not checkpointed (the tool still runs, unbracketed).
+                    $checkpointStepRef = null;
 
                     // 101-parallel-subagent-execution (US1, contracts §1):
                     // a delegate_to_helper call that was part of a 2+ burst
@@ -2041,14 +2152,52 @@ class AgentLoopService
                         $result = json_encode($batchDelegationResults[$toolCallId]);
                         $decoded = json_decode($result, true);
                     } elseif ($unattended && $toolName === 'execute_operation') {
-                        [$result, $decoded, $dispatchFailureReason] = $this->dispatchExecuteOperationWithRetry(
-                            $arguments,
-                            $conversation,
-                            $runId,
-                            $currentStepId,
-                            (int) ($options['retry_limit'] ?? 0),
-                            $activeActionId,
-                        );
+                        // The whole retry sequence is one checkpointed call:
+                        // the start marker is written once, before the first
+                        // attempt, and the completion marker once, after the
+                        // final outcome — so a transient failure that is
+                        // retried never re-runs the effect on a resume.
+                        if ($runId !== null && $currentStepId !== null) {
+                            $checkpointStepRef = new StepRef($runId, $currentStepId, $iteration);
+                            // A regular closure, not an arrow function: the
+                            // arrow form captures $activeActionId by value,
+                            // so the by-reference write inside
+                            // dispatchExecuteOperationWithRetry() (which
+                            // opens one ToolInvocation action per attempt
+                            // and leaves the final one for the loop's own
+                            // close block) would land in the closure's
+                            // private copy and the outer $activeActionId
+                            // would stay null -- the last attempt's action
+                            // left permanently unfinished. Capturing it by
+                            // reference keeps the loop's close block able
+                            // to see the final attempt's action id.
+                            $tuple = json_decode(app(CheckpointedToolExecutor::class)->execute(
+                                $checkpointStepRef,
+                                $toolCall,
+                                function () use (&$activeActionId, $arguments, $conversation, $runId, $currentStepId, $options) {
+                                    return json_encode($this->dispatchExecuteOperationWithRetry(
+                                        $arguments,
+                                        $conversation,
+                                        $runId,
+                                        $currentStepId,
+                                        (int) ($options['retry_limit'] ?? 0),
+                                        $activeActionId,
+                                    ));
+                                },
+                                null,
+                                $conversation,
+                            ), true);
+                            [$result, $decoded, $dispatchFailureReason] = $tuple;
+                        } else {
+                            [$result, $decoded, $dispatchFailureReason] = $this->dispatchExecuteOperationWithRetry(
+                                $arguments,
+                                $conversation,
+                                $runId,
+                                $currentStepId,
+                                (int) ($options['retry_limit'] ?? 0),
+                                $activeActionId,
+                            );
+                        }
 
                         // The model still gets its own turn to see this
                         // result and report on it below (FR-012), exactly
@@ -2066,9 +2215,22 @@ class AgentLoopService
                                 ActionType::ToolInvocation,
                                 $toolName,
                                 $attemptGroupId,
+                                null,
+                                $toolCallId,
                             );
                         }
-                        $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId, $unattended);
+                        if ($runId !== null && $currentStepId !== null) {
+                            $checkpointStepRef = new StepRef($runId, $currentStepId, $iteration);
+                            $result = app(CheckpointedToolExecutor::class)->execute(
+                                $checkpointStepRef,
+                                $toolCall,
+                                fn () => $this->executeMetaTool($toolName, $arguments, $conversation, $runId, $unattended),
+                                $activeActionId,
+                                $conversation,
+                            );
+                        } else {
+                            $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId, $unattended);
+                        }
                         $decoded = json_decode($result, true);
                     }
 
@@ -2331,6 +2493,24 @@ class AgentLoopService
                     // the loop, regardless of how its report words the
                     // outcome.
 
+                    // C4: the call is completed with its result (a pause
+                    // marker returns early above, so this is reached only
+                    // for an executed call). The batch path already
+                    // recorded its members in resolveDelegateToHelperBatchResults.
+                    // A failed (exhausted) call still completed -- it ran to
+                    // a conclusion -- so it is marked completed with its
+                    // error result rather than left started (a started-but-
+                    // uncompleted call would be re-run on a resume, the
+                    // silent re-execution this ledger exists to prevent).
+                    // A non-JSON error result is normalised to an object.
+                    if ($checkpointStepRef !== null) {
+                        app(CheckpointedToolExecutor::class)->recordCompleted(
+                            $checkpointStepRef,
+                            $toolCallId,
+                            is_array($decoded) ? $decoded : ['error' => (string) $result],
+                        );
+                    }
+
                     // Tool executed (not a confirmation pause) — record its outcome.
                     $this->recordToolMetric($conversation, $attemptGroupId, $toolName, $decoded);
 
@@ -2438,6 +2618,7 @@ class AgentLoopService
                     $this->runTraceRecorder->closeStep(
                         $currentStepId,
                         RunEndState::StoppedEarly,
+                        'Maximum iterations reached',
                     );
                 }
                 $this->runTraceRecorder->closeRun(
@@ -2557,6 +2738,7 @@ class AgentLoopService
                     $this->runTraceRecorder->closeStep(
                         $currentStepId,
                         RunEndState::Failed,
+                        Str::limit($e->getMessage(), 500),
                     );
                 }
                 $this->runTraceRecorder->closeRun(
@@ -2609,6 +2791,14 @@ class AgentLoopService
         // no run row to claim — the continuation simply runs.
         if ($runId !== null && $this->checkpointNow()) {
             $dispatch = app(RunLease::class)->mintDispatch($runId, ['paused']);
+            // A continuation that rewinds a run not in a paused state
+            // (a pre-lease run, or a reset end_state without a reset
+            // resume_state) still needs the lease for its model calls;
+            // fall back to minting for any live run. The claim below
+            // still loses to a live lease held by another process.
+            if ($dispatch === null) {
+                $dispatch = app(RunLease::class)->mintDispatchForLiveRun($runId);
+            }
             if ($dispatch !== null) {
                 if (!app(RunLease::class)->claim($runId, $dispatch)->won) {
                     return ['status' => 'superseded'];
@@ -2632,6 +2822,7 @@ class AgentLoopService
         // Recover run_id and step_id from tool_data.
         // If step_id is present, close it with wait_ms (T059) — the step spans
         // the confirmation pause. If run_id is null (pre-feature), mint a fresh run.
+        $this->capBudgetSeedAtPausedStep($pendingStepId, $runId);
         [$runId, $currentStepId] = $this->openResumedSyncStep($conversation, $message, $toolData, $runId, $attemptGroupId);
 
         // 112-coding-agent (US1, data-model.md §6): tracks whether
@@ -2648,72 +2839,77 @@ class AgentLoopService
         // approving it never executes the underlying operation.
         $confirmationType = $pending['confirmation_type'] ?? 'api_call';
 
-        if ($approved && $confirmationType === 'scope_surface') {
-            // See resume()'s identical branch for the full rationale:
-            // approving the aggregate scope acknowledgment never itself
-            // writes or deletes the file that triggered it — it only lets
-            // the loop continue so the model reissues that file's own
-            // operation, which this time reaches its ordinary per-file
-            // confirmation.
-            $resultContent = json_encode([
-                'scope_confirmed' => true,
-                'files_touched_so_far' => $pending['files_touched_so_far'] ?? [],
-                'would_add' => $pending['would_add'] ?? null,
-                'message' => 'Scope confirmed. Reissue the file operation to proceed with its own confirmation.',
-            ]);
+        // The approved call runs in its own step (distinct from the resumed
+        // step the continuation uses): open it (C1), record the model
+        // response (C2) so the call starts not_started, and open its tool
+        // action. A kill between C2 and the start marker leaves the call
+        // not_started, so a resume neither repeats it blindly nor assumes
+        // it did not happen.
+        $approvedCall = null;
+        $stepRef = null;
+        $approvedActionId = null;
+        if ($approved) {
+            foreach ($toolData['tool_calls'] ?? [] as $call) {
+                if (($call['id'] ?? null) === $toolCallId) {
+                    $approvedCall = $call;
 
-            $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
-        } elseif ($approved && $confirmationType === 'external_tool') {
-            // See resume()'s identical branch for the full rationale:
-            // re-resolved from the local cache by operationId rather than
-            // trusted from whatever the pause itself carried.
-            $externalTool = \ClarionApp\LlmClient\Models\McpClientTool::findBySyntheticId($pending['operationId'] ?? '');
-            $externalServer = $externalTool?->server;
-
-            if ($externalTool === null || $externalServer === null) {
-                $resultContent = json_encode([
-                    'error' => 'This tool is no longer offered by its server. Search again for a current capability.',
-                ]);
-            } else {
-                $resultContent = json_encode(app(McpClientToolExecutor::class)->execute($externalServer, $externalTool, $pending['arguments'] ?? []));
-                $apiCallExecuted = true;
+                    break;
+                }
             }
+        }
+        if ($approved && $approvedCall !== null && $runId !== null && $this->runTraceRecorder !== null) {
+            $resumedIteration = ($toolData['iteration'] ?? 1) + 1;
+            $approvedStepId = $this->runTraceRecorder->openStep($runId, null, (string) Str::uuid());
+            if ($approvedStepId !== null) {
+                $this->checkpoint(fn () => app(RunCheckpoint::class)->openStep($runId, $approvedStepId, $resumedIteration));
+                $this->checkpoint(fn () => app(RunCheckpoint::class)->recordModelResponse($approvedStepId, '', [$approvedCall]));
+                $stepRef = new StepRef($runId, $approvedStepId, $resumedIteration);
+                $approvedActionId = $this->runTraceRecorder->openAction(
+                    $approvedStepId,
+                    ActionType::ToolInvocation,
+                    $pending['tool_name'] ?? 'execute_operation',
+                    null,
+                    null,
+                    $toolCallId,
+                );
+            }
+        }
 
-            $this->recordToolMetric(
-                $conversation,
-                $attemptGroupId,
-                $pending['tool_name'] ?? 'execute_operation',
-                json_decode($resultContent, true),
-            );
+        // The approved call's execution, extracted so the funnel can
+        // bracket it (C3 before, C4 after). It sets $resultContent and
+        // $pausedResult (and $apiCallExecuted) as side effects.
+        $executeApproved = function () use (&$resultContent, &$pausedResult, &$apiCallExecuted, $pending, $confirmationType, $conversation, $attemptGroupId, $inboundActionId, $toolCallId) {
+            if ($confirmationType === 'scope_surface') {
+                // See resume()'s identical branch for the full rationale:
+                // approving the aggregate scope acknowledgment never itself
+                // writes or deletes the file that triggered it — it only lets
+                // the loop continue so the model reissues that file's own
+                // operation, which this time reaches its ordinary per-file
+                // confirmation.
+                $resultContent = json_encode([
+                    'scope_confirmed' => true,
+                    'files_touched_so_far' => $pending['files_touched_so_far'] ?? [],
+                    'would_add' => $pending['would_add'] ?? null,
+                    'message' => 'Scope confirmed. Reissue the file operation to proceed with its own confirmation.',
+                ]);
 
-            $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
-        } elseif ($approved) {
-            try {
-                // See resume()'s identical re-check, immediately above the
-                // same relative point in that sibling method
-                // (100-subagent-tool-restrictions, FR-004/FR-005/FR-006):
-                // resumeSync() also never routes through
-                // handleExecuteOperation() when resuming, so the ancestor-
-                // chain bound must be re-verified here rather than trusted
-                // from when the confirmation was first requested.
-                $chain = $this->effectiveBoundResolver->check($conversation, $pending['operationId']);
+                $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
+            } elseif ($confirmationType === 'external_tool') {
+                // See resume()'s identical branch for the full rationale:
+                // re-resolved from the local cache by operationId rather than
+                // trusted from whatever the pause itself carried.
+                $externalTool = \ClarionApp\LlmClient\Models\McpClientTool::findBySyntheticId($pending['operationId'] ?? '');
+                $externalServer = $externalTool?->server;
 
-                if (!$chain['allowed']) {
+                if ($externalTool === null || $externalServer === null) {
                     $resultContent = json_encode([
-                        'error' => "Operation not permitted: ancestor agent \"{$chain['blocking_agent_name']}\" ({$chain['levels_up']} level(s) up in this delegation chain) does not permit \"{$pending['operationId']}\".",
+                        'error' => 'This tool is no longer offered by its server. Search again for a current capability.',
                     ]);
                 } else {
-                    $resultContent = $this->executeApiCall(
-                        $pending['operationId'],
-                        $pending['method'],
-                        $pending['path'],
-                        $pending['arguments'] ?? [],
-                        $conversation
-                    );
+                    $resultContent = json_encode(app(McpClientToolExecutor::class)->execute($externalServer, $externalTool, $pending['arguments'] ?? []));
                     $apiCallExecuted = true;
                 }
 
-                // Record the confirmed operation's outcome (fire-and-forget).
                 $this->recordToolMetric(
                     $conversation,
                     $attemptGroupId,
@@ -2722,16 +2918,75 @@ class AgentLoopService
                 );
 
                 $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
-            } catch (\Throwable $e) {
-                // Close inbound action with Failure on execution error.
-                if ($this->runTraceRecorder !== null && $inboundActionId !== null) {
-                    $this->runTraceRecorder->closeAction(
-                        $inboundActionId,
-                        ActionOutcome::Failure,
-                        Str::limit($e->getMessage(), 500),
+            } else {
+                try {
+                    // See resume()'s identical re-check, immediately above the
+                    // same relative point in that sibling method
+                    // (100-subagent-tool-restrictions, FR-004/FR-005/FR-006):
+                    // resumeSync() also never routes through
+                    // handleExecuteOperation() when resuming, so the ancestor-
+                    // chain bound must be re-verified here rather than trusted
+                    // from when the confirmation was first requested.
+                    $chain = $this->effectiveBoundResolver->check($conversation, $pending['operationId']);
+
+                    if (!$chain['allowed']) {
+                        $resultContent = json_encode([
+                            'error' => "Operation not permitted: ancestor agent \"{$chain['blocking_agent_name']}\" ({$chain['levels_up']} level(s) up in this delegation chain) does not permit \"{$pending['operationId']}\".",
+                        ]);
+                    } else {
+                        $resultContent = $this->executeApiCall(
+                            $pending['operationId'],
+                            $pending['method'],
+                            $pending['path'],
+                            $pending['arguments'] ?? [],
+                            $conversation
+                        );
+                        $apiCallExecuted = true;
+                    }
+
+                    // Record the confirmed operation's outcome (fire-and-forget).
+                    $this->recordToolMetric(
+                        $conversation,
+                        $attemptGroupId,
+                        $pending['tool_name'] ?? 'execute_operation',
+                        json_decode($resultContent, true),
                     );
+
+                    $pausedResult = ['tool_call_id' => $toolCallId, 'content' => $resultContent];
+                } catch (\Throwable $e) {
+                    // Close inbound action with Failure on execution error.
+                    if ($this->runTraceRecorder !== null && $inboundActionId !== null) {
+                        $this->runTraceRecorder->closeAction(
+                            $inboundActionId,
+                            ActionOutcome::Failure,
+                            Str::limit($e->getMessage(), 500),
+                        );
+                    }
+                    throw $e;
                 }
-                throw $e;
+            }
+
+            return $resultContent;
+        };
+
+        if ($approved) {
+            if ($stepRef !== null) {
+                app(CheckpointedToolExecutor::class)->execute($stepRef, $approvedCall, $executeApproved, $approvedActionId, $conversation);
+                app(CheckpointedToolExecutor::class)->recordCompleted($stepRef, $toolCallId, json_decode($resultContent, true));
+                // C5: the approved call's step is committed, naming the paused
+                // message that holds its result (the continuation uses the
+                // resumed step opened by openResumedSyncStep), then closed —
+                // the approved step is a standalone step holding the approved
+                // call, distinct from the resumed step the continuation runs
+                // in; leaving it open after the commit would leave a second
+                // in_progress step beside the one the pause sits on.
+                $this->checkpoint(fn () => app(RunCheckpoint::class)->commitStep($runId, $stepRef->stepId, (string) $message->id));
+                $this->runTraceRecorder->closeStep($stepRef->stepId, RunEndState::Completed);
+                if ($this->runTraceRecorder !== null && $approvedActionId !== null) {
+                    $this->runTraceRecorder->closeAction($approvedActionId, ActionOutcome::Success);
+                }
+            } else {
+                $executeApproved();
             }
         } else {
             $pausedResult = ['tool_call_id' => $toolCallId, 'content' => 'User cancelled this operation.'];
@@ -3046,6 +3301,9 @@ class AgentLoopService
                     $attemptGroupId,
                 );
             }
+            // Extend the run's lease over the model call that follows.
+            $this->extendLeaseBeforeModelCall($runId);
+
             $response = $this->callLlmSync(
                 $conversation,
                 $formatted['messages'],
@@ -3165,11 +3423,12 @@ class AgentLoopService
             // -- Site 6): the identical batch-detection check run()'s own
             // loop makes above, ahead of resumeSync()'s own,
             // structurally-equivalent loop.
-            $batchDelegationResults = $this->resolveDelegateToHelperBatchResults($toolCalls, $conversation);
+            $batchDelegationResults = $this->resolveDelegateToHelperBatchResults($toolCalls, $conversation, $runId, $currentStepId, $iteration);
 
             foreach ($toolCalls as $tcIndex => $toolCall) {
                 $toolName = $toolCall['function']['name'] ?? '';
                 $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+                $toolCallId = $toolCall['id'] ?? '';
 
                 // See the identical check in run()'s own tool-call loop:
                 // checked before every individual tool-call execution so a
@@ -3226,17 +3485,35 @@ class AgentLoopService
                         ActionType::ToolInvocation,
                         $toolName,
                         $attemptGroupId,
+                        null,
+                        $toolCallId,
                     );
                 }
 
+                // The step the funnel brackets this call in; null when the
+                // run is not checkpointed (the tool still runs, unbracketed).
+                $checkpointStepRef = null;
+
                 // 101-parallel-subagent-execution (US1, contracts §1): see
                 // the identical check in run()'s own tool-call loop above.
-                if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCall['id'] ?? '', $batchDelegationResults)) {
-                    $result = json_encode($batchDelegationResults[$toolCall['id'] ?? '']);
+                if (in_array($toolName, ['delegate_to_helper', 'assign_part'], true) && $batchDelegationResults !== null && array_key_exists($toolCallId, $batchDelegationResults)) {
+                    $result = json_encode($batchDelegationResults[$toolCallId]);
+                    $decoded = json_decode($result, true);
                 } else {
-                    $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId);
+                    if ($runId !== null && $currentStepId !== null) {
+                        $checkpointStepRef = new StepRef($runId, $currentStepId, $iteration);
+                        $result = app(CheckpointedToolExecutor::class)->execute(
+                            $checkpointStepRef,
+                            $toolCall,
+                            fn () => $this->executeMetaTool($toolName, $arguments, $conversation, $runId),
+                            $toolActionId,
+                            $conversation,
+                        );
+                    } else {
+                        $result = $this->executeMetaTool($toolName, $arguments, $conversation, $runId);
+                    }
+                    $decoded = json_decode($result, true);
                 }
-                $decoded = json_decode($result, true);
 
                 // See the identical ask_user pause in run()'s tool-call loop.
                 if (is_array($decoded) && !empty($decoded[self::REQUIRES_USER_INPUT])) {
@@ -3422,6 +3699,14 @@ class AgentLoopService
                     } else {
                         $this->runTraceRecorder->closeAction($toolActionId, ActionOutcome::Success, null, $actionContent);
                     }
+                }
+
+                // C4: the call is completed with its result (a pause
+                // marker returns early above, so this is reached only
+                // for an executed call). The batch path already
+                // recorded its members in resolveDelegateToHelperBatchResults.
+                if ($checkpointStepRef !== null) {
+                    app(CheckpointedToolExecutor::class)->recordCompleted($checkpointStepRef, $toolCallId, $decoded);
                 }
 
                 // Tool executed (not a confirmation pause) — record its outcome.
@@ -5842,22 +6127,35 @@ class AgentLoopService
             $attempts++;
             $decoded = json_decode($result, true);
 
-            $failed = is_array($decoded)
-                && empty($decoded['__requires_confirmation'] ?? false)
-                && is_string($decoded['error'] ?? null);
+            $outcome = $this->lastOperationDispatchOutcome ?? ['status' => null];
+
+            // A failed attempt is one the dispatch itself flagged as an
+            // error (the executor's own isError/failed-status shape, whose
+            // tool result is a plain "Error: ..." string rather than JSON)
+            // or whose tool result is an error object -- but never a
+            // confirmation pause, which is a marker, not a failure.
+            $dispatchError = !empty($outcome['isError'])
+                || (is_int($outcome['status'] ?? null) && $outcome['status'] >= 400);
+            $errorMessage = (is_array($decoded) && is_string($decoded['error'] ?? null))
+                ? $decoded['error']
+                : ((is_int($outcome['status'] ?? null) && $outcome['status'] >= 400)
+                    ? 'HTTP ' . $outcome['status']
+                    : 'dispatch failed');
+
+            $failed = !empty($decoded['__requires_confirmation'] ?? false)
+                ? false
+                : ($dispatchError || (is_array($decoded) && is_string($decoded['error'] ?? null)));
 
             if (!$failed) {
                 return [$result, $decoded, null];
             }
-
-            $outcome = $this->lastOperationDispatchOutcome ?? ['status' => null];
 
             if (RetryEligibility::isTransient($outcome) && $attempts <= $retryLimit) {
                 if ($this->runTraceRecorder !== null && $activeActionId !== null) {
                     $this->runTraceRecorder->closeAction(
                         $activeActionId,
                         ActionOutcome::Failure,
-                        Str::limit((string) $decoded['error'], 500),
+                        Str::limit($errorMessage, 500),
                     );
                 }
 
@@ -5869,7 +6167,7 @@ class AgentLoopService
                 '%s failed after %d attempt(s): %s',
                 $operationId,
                 $attempts,
-                (string) $decoded['error'],
+                $errorMessage,
             );
 
             return [$result, $decoded, $reason];
@@ -7020,7 +7318,7 @@ class AgentLoopService
      * @param array<int, array<string, mixed>> $toolCalls
      * @return array<string, array<string, mixed>>|null
      */
-    private function resolveDelegateToHelperBatchResults(array $toolCalls, Conversation $conversation): ?array
+    private function resolveDelegateToHelperBatchResults(array $toolCalls, Conversation $conversation, ?string $runId = null, ?string $stepId = null, int $iteration = 1): ?array
     {
         $relevantCalls = array_values(array_filter(
             $toolCalls,
@@ -7038,6 +7336,9 @@ class AgentLoopService
         $results = [];
         $calls = [];
         $partIdByToolCallId = [];
+        // The original tool calls that will be dispatched, kept alongside
+        // $calls so the funnel's start half can classify and bound them.
+        $dispatchedToolCalls = [];
 
         foreach ($relevantCalls as $toolCall) {
             $name = $toolCall['function']['name'] ?? '';
@@ -7075,6 +7376,7 @@ class AgentLoopService
                     'managed_task_id' => $managedTask->id,
                     'part_id' => $part->id,
                 ];
+                $dispatchedToolCalls[] = $toolCall;
             } else {
                 $calls[] = [
                     'tool_call_id' => $toolCallId,
@@ -7082,14 +7384,31 @@ class AgentLoopService
                     'task' => $arguments['task'] ?? null,
                     'context' => $arguments['context'] ?? null,
                 ];
+                $dispatchedToolCalls[] = $toolCall;
             }
         }
 
         if (!empty($calls)) {
+            $stepRef = ($runId !== null && $stepId !== null)
+                ? new StepRef($runId, $stepId, $iteration)
+                : null;
+
+            // The start half runs before the batch is entered: every member
+            // is marked started (and the lease extended over the delegation
+            // bound) before any delegation row is created, so a kill inside
+            // the batch leaves every member coherently started.
+            if ($stepRef !== null) {
+                app(CheckpointedToolExecutor::class)->startBatch($stepRef, $dispatchedToolCalls, $conversation);
+            }
+
             $batchResults = app(DelegationService::class)->delegateBatch($conversation, $calls);
 
             foreach ($batchResults as $toolCallId => $result) {
                 $results[$toolCallId] = $result;
+
+                if ($stepRef !== null) {
+                    app(CheckpointedToolExecutor::class)->recordCompleted($stepRef, $toolCallId, $result);
+                }
 
                 if (isset($result['delegation_id'], $partIdByToolCallId[$toolCallId])) {
                     ManagedTaskPart::where('id', $partIdByToolCallId[$toolCallId])

@@ -7,6 +7,7 @@ use ClarionApp\LlmClient\Exceptions\LeaseLost;
 use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use ClarionApp\LlmClient\ValueObjects\ResumeMode;
 use ClarionApp\LlmClient\ValueObjects\ToolEffect;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
@@ -345,6 +346,39 @@ class RunCheckpoint
 
         if ($affected === 0) {
             throw new LeaseLost();
+        }
+    }
+
+    /**
+     * Extend this process's lease over a model call, so a helper run's
+     * short base lease does not expire while the model is still working
+     * (a parent waiting on a live member must not take it over). The
+     * extension is the model-call bound, capped by the run's own deadline
+     * when it has one.
+     */
+    public function extendForModelCall(string $runId, ResumeDriver $driver): void
+    {
+        $this->assertOutsideTransaction();
+        if ($runId === null || !$this->enabled()) {
+            return;
+        }
+
+        $seconds = app(ToolLivenessBound::class)->modelCallLeaseSeconds($driver, $this->deadlineOf($runId));
+        $this->renewLease($runId, $seconds);
+    }
+
+    /** The run's `deadline_at` option as a datetime, or null when it has none. */
+    private function deadlineOf(string $runId): ?\DateTimeInterface
+    {
+        $options = json_decode((string) DB::table('agent_runs')->where('id', $runId)->value('resume_options'), true);
+        if (!is_array($options) || !isset($options['deadline_at'])) {
+            return null;
+        }
+
+        try {
+            return Carbon::parse((string) $options['deadline_at']);
+        } catch (\Throwable) {
+            return null;
         }
     }
 

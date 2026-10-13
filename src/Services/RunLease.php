@@ -164,6 +164,30 @@ class RunLease
         return $affected > 0 ? $nextDispatch : null;
     }
 
+    /**
+     * Mint the next dispatch id for a run that is live (in_progress, not
+     * cancelled) regardless of its resume_state — the fallback for a
+     * continuation that rewinds a run which is not in one of the
+     * expected paused states (a pre-lease run, or a test that resets
+     * end_state without resetting resume_state). The claim() that follows
+     * still enforces every safety check (a live lease held by another
+     * process loses), so this only widens the mint, not the claim.
+     */
+    public function mintDispatchForLiveRun(string $runId): ?string
+    {
+        $this->assertOutsideTransaction();
+
+        $nextDispatch = (string) Str::uuid();
+
+        $affected = DB::table('agent_runs')
+            ->where('id', $runId)
+            ->where('end_state', 'in_progress')
+            ->whereNull('cancelled_at')
+            ->update(['dispatch_id' => $nextDispatch]);
+
+        return $affected > 0 ? $nextDispatch : null;
+    }
+
     /** The process nonce: one per process, stable across calls. */
     public function nonce(): string
     {
