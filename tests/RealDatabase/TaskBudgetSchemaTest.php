@@ -138,15 +138,15 @@ class TaskBudgetSchemaTest extends RealDatabaseTestCase
     }
 
     #[Test]
-    public function task_budgets_has_its_five_indexes(): void
+    public function task_budgets_has_its_seven_indexes(): void
     {
         $this->assertReady();
         $indexes = $this->indexes('task_budgets');
 
-        foreach (['id', 'root_conversation_id', 'user_id,updated_at', 'state,updated_at', 'managed_task_id', 'prompt_question_id'] as $expected) {
+        foreach (['id', 'root_conversation_id', 'user_id,updated_at', 'state,updated_at', 'managed_task_id', 'prompt_question_id', 'root_run_id', 'paused_run_id'] as $expected) {
             $this->assertContains($expected, $indexes, "an index on ({$expected})");
         }
-        $this->assertCount(6, $indexes, 'the primary key and the five indexes, nothing else');
+        $this->assertCount(8, $indexes, 'the primary key and the seven indexes, nothing else');
     }
 
     #[Test]

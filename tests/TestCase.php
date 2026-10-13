@@ -457,6 +457,8 @@ abstract class TestCase extends BaseTestCase
                 $table->index(['state', 'updated_at']);
                 $table->index('managed_task_id');
                 $table->index('prompt_question_id');
+                $table->index('root_run_id');
+                $table->index('paused_run_id');
             });
         }
 

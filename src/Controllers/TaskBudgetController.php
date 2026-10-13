@@ -4,10 +4,13 @@ namespace ClarionApp\LlmClient\Controllers;
 
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\TaskBudgetEvent;
+use ClarionApp\LlmClient\Services\RunTraceQuery;
 use ClarionApp\LlmClient\Services\TaskBudgetService;
 use ClarionApp\LlmClient\Services\TaskBudgetText;
 use ClarionApp\LlmClient\ValueObjects\StatedCeilings;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Auth;
 
 class TaskBudgetController extends Controller
@@ -25,6 +28,40 @@ class TaskBudgetController extends Controller
         }
 
         return response()->json($tasks->standing($task)->toArray());
+    }
+
+    /**
+     * The standing and event record of the latest task whose root or paused
+     * run is $runId. An absent run and another user's run get the same 404
+     * as the other run endpoints; a run with no task gets a null standing.
+     */
+    public function forRun(string $runId)
+    {
+        $runs = app(RunTraceQuery::class);
+        if ($runs->findRun((string) Auth::id(), $runId) === null) {
+            return response()->json(['error' => 'Run not found', 'code' => 'run_not_found'], 404);
+        }
+        $task = $runs->taskBudgetsForRuns([$runId])[$runId] ?? null;
+        if ($task === null) {
+            return response()->json(['standing' => null, 'events' => []]);
+        }
+        $events = TaskBudgetEvent::where('task_budget_id', $task->id)
+            ->orderBy('created_at')
+            ->get()
+            ->map(fn (TaskBudgetEvent $event) => [
+                'id' => $event->id,
+                'kind' => $event->kind,
+                'payload' => $event->payload,
+                'actor_user_id' => $event->actor_user_id,
+                // The stored value keeps its microseconds; the model's cast would not.
+                'created_at' => Carbon::parse($event->getRawOriginal('created_at'), 'UTC')->toJSON(),
+            ])
+            ->all();
+
+        return response()->json([
+            'standing' => app(TaskBudgetService::class)->standing($task)->toArray(),
+            'events' => $events,
+        ]);
     }
 
     /**

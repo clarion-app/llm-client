@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Commands;
 
+use ClarionApp\LlmClient\Services\TaskBudgetLimits;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -29,6 +30,9 @@ class PurgeExpiredRunTracesCommand extends Command
     /** Runs deleted per pass. Keeps each `whereIn` well inside SQLite's 999-parameter cap. */
     private const CHUNK_SIZE = 500;
 
+    /** Task budget states a task never leaves; only these are purged by age. */
+    private const FINISHED_TASK_STATES = ['concluded', 'completed', 'halted', 'ended'];
+
     /** Documented fallback retention window (FR-013) when the supplied value can't be trusted. */
     private const DEFAULT_RETENTION_DAYS = 90;
 
@@ -44,6 +48,8 @@ class PurgeExpiredRunTracesCommand extends Command
         if ($dryRun) {
             $this->warn('Dry-run mode — no changes will be made');
         }
+
+        $this->purgeFinishedTaskBudgets($dryRun);
 
         $totalExpiredRuns = $this->expiredRunsQuery($cutoffDate)->count();
 
@@ -115,6 +121,38 @@ class PurgeExpiredRunTracesCommand extends Command
         ]);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Finished task budgets last changed before the task budget retention
+     * period, and their events (events first), in chunks. A running or
+     * paused task is never purged by age. Runs before the run purge's early
+     * return, so a finished task ages out even when no run has.
+     */
+    private function purgeFinishedTaskBudgets(bool $dryRun): void
+    {
+        if (!DB::getSchemaBuilder()->hasTable('task_budgets')) {
+            return;
+        }
+        $cutoff = now()->subDays(app(TaskBudgetLimits::class)->retentionDays());
+        $query = fn () => DB::table('task_budgets')
+            ->whereIn('state', self::FINISHED_TASK_STATES)
+            ->where('updated_at', '<', $cutoff);
+        if ($dryRun) {
+            $this->info('Task budgets that would be purged: '.$query()->count());
+
+            return;
+        }
+        $deletedTasks = 0;
+        do {
+            $chunk = $query()->limit(self::CHUNK_SIZE)->pluck('id')->all();
+            if ($chunk === []) {
+                break;
+            }
+            DB::table('task_budget_events')->whereIn('task_budget_id', $chunk)->delete();
+            $deletedTasks += DB::table('task_budgets')->whereIn('id', $chunk)->delete();
+        } while (count($chunk) === self::CHUNK_SIZE);
+        $this->info("Task budgets purged: {$deletedTasks}");
     }
 
     /**

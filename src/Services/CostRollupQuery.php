@@ -30,6 +30,15 @@ use Illuminate\Support\Facades\DB;
  */
 class CostRollupQuery
 {
+    /** The aggregate taskTotal() and taskTotals() select over a task's usage records. */
+    private const TASK_TOTAL_COLUMNS =
+        'COUNT(*) as request_count, '.
+        'COALESCE(SUM(CASE WHEN cost_unpriced = 0 THEN total_cost ELSE 0 END), 0) as priced_cost_total, '.
+        'COALESCE(SUM(CASE WHEN cost_unpriced = 0 AND total_cost = 0 THEN 1 ELSE 0 END), 0) as zero_priced_request_count, '.
+        'COALESCE(SUM(CASE WHEN cost_unpriced = 1 THEN 1 ELSE 0 END), 0) as unpriced_request_count, '.
+        'COALESCE(SUM(CASE WHEN cost_unpriced = 1 THEN total_tokens ELSE 0 END), 0) as unpriced_total_tokens, '.
+        'COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN 1 ELSE 0 END), 0) as estimated_request_count';
+
     public function conversationTotal(string $conversationId, string $from, string $to, ?string $callerId, bool $isOperator): array
     {
         return $this->aggregate(CostSummary::ENTITY_CONVERSATION, $conversationId, $from, $to, $isOperator ? null : $callerId);
@@ -195,16 +204,36 @@ class CostRollupQuery
     {
         $row = DB::table('usage_records')
             ->where('task_budget_id', $taskBudgetId)
-            ->selectRaw(
-                'COUNT(*) as request_count, '.
-                'COALESCE(SUM(CASE WHEN cost_unpriced = 0 THEN total_cost ELSE 0 END), 0) as priced_cost_total, '.
-                'COALESCE(SUM(CASE WHEN cost_unpriced = 0 AND total_cost = 0 THEN 1 ELSE 0 END), 0) as zero_priced_request_count, '.
-                'COALESCE(SUM(CASE WHEN cost_unpriced = 1 THEN 1 ELSE 0 END), 0) as unpriced_request_count, '.
-                'COALESCE(SUM(CASE WHEN cost_unpriced = 1 THEN total_tokens ELSE 0 END), 0) as unpriced_total_tokens, '.
-                'COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN 1 ELSE 0 END), 0) as estimated_request_count'
-            )->first();
+            ->selectRaw(self::TASK_TOTAL_COLUMNS)
+            ->first();
 
         return $this->shapeRow($row);
+    }
+
+    /**
+     * taskTotal() for several tasks in one query, keyed by task id. A task
+     * with no usage gets the empty total.
+     *
+     * @param  list<string>  $taskBudgetIds
+     * @return array<string, array>
+     */
+    public function taskTotals(array $taskBudgetIds): array
+    {
+        if ($taskBudgetIds === []) {
+            return [];
+        }
+        $rows = DB::table('usage_records')
+            ->whereIn('task_budget_id', $taskBudgetIds)
+            ->groupBy('task_budget_id')
+            ->selectRaw('task_budget_id, '.self::TASK_TOTAL_COLUMNS)
+            ->get()
+            ->keyBy('task_budget_id');
+        $totals = [];
+        foreach ($taskBudgetIds as $id) {
+            $totals[$id] = $this->shapeRow($rows[$id] ?? null);
+        }
+
+        return $totals;
     }
 
     private function shapeRow(?object $row): array
