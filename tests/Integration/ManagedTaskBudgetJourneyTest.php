@@ -184,6 +184,34 @@ class ManagedTaskBudgetJourneyTest extends AssembledSystemTestCase
     }
 
     #[Test]
+    public function a_managed_task_its_budget_stopped_before_any_part_was_accepted_says_so_in_its_result(): void
+    {
+        // Found at the post-implementation reconciliation: with no part
+        // accepted, the result read "within the allowed rounds or time" —
+        // a stop by the task's budget reported as a different limit's.
+        $this->scenario = 'task_budget_managed_task_nothing_accepted';
+        config(['llm-client.agent_loop.max_iterations' => 2]);
+        [$managed, $one] = $this->startManagedTask();
+        $budget = $this->onlyTask();
+
+        // Round 1: the manager assigns part one, the helper takes the last
+        // step and is stopped, and the manager's next step is refused.
+        $this->script()->toolRequests([$this->assignCall('call_assign_1', $one)]);
+        $this->scriptNoteSteps(['part one']);
+        $this->assertTrue($this->workNextRound());
+        $this->assertSame('halted', TaskBudget::findOrFail($budget->id)->state->value, 'precondition: the budget halted');
+
+        // Round 2: finalized with a shortfall.
+        $this->assertTrue($this->workNextRound());
+
+        $managed->refresh();
+        $this->assertSame('completed_with_shortfalls', $managed->status);
+        $this->assertNotSame('accepted', $one->fresh()->state);
+        $this->assertSame("No part of this task could be completed before this task's budget ceiling was reached.", $managed->final_response);
+        $this->assertStringNotContainsString('rounds or time', (string) $managed->final_response);
+    }
+
+    #[Test]
     public function within_its_budget_a_managed_task_keeps_its_own_round_bound_and_ends_its_budget_as_completed(): void
     {
         $this->scenario = 'task_budget_managed_task_completes';

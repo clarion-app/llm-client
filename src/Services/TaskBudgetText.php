@@ -96,7 +96,7 @@ class TaskBudgetText
 
     public function decisionGuidance(?string $problem = null, array $params = []): string
     {
-        $base = "This task's budget prompt accepts: 1 or 'continue' (optionally 'steps=N' and/or 'spend=X' for the additional allowance), 2 or 'accept', 3 or 'stop'. To start something new, accept or stop this task first.";
+        $base = "This task's budget prompt accepts: 1 or 'continue' (optionally 'steps=N' and/or 'spend=X' for the additional allowance), 2 or 'accept', 3 or 'stop'. To start something new, accept this task first.";
         if ($problem === null) {
             return $base;
         }
@@ -142,6 +142,12 @@ class TaskBudgetText
         $text = "This task's budget ceiling was reached before this part could be completed.";
 
         return $standing === null ? $text : $text.' '.$this->standing($standing).'.';
+    }
+
+    /** A managed task's result when its budget stopped it before any part was accepted. */
+    public function managedNothingCompleted(): string
+    {
+        return "No part of this task could be completed before this task's budget ceiling was reached.";
     }
 
     public function sequenceStopped(): string

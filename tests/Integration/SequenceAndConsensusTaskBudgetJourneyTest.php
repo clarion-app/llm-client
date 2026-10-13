@@ -299,6 +299,52 @@ class SequenceAndConsensusTaskBudgetJourneyTest extends AssembledSystemTestCase
         $this->assertNotNull($consensusTask->ended_at);
     }
 
+    #[Test]
+    public function a_single_contributor_stopped_by_the_ceiling_is_reported_as_stopped_by_the_task_budget(): void
+    {
+        // Found at the post-implementation reconciliation: the
+        // single-contributor fallback never goes through finalize(), so a
+        // contributor stopped by the consensus task's budget had its partial
+        // answer posted as if it were the whole answer, and the task was
+        // recorded as completed.
+        $this->scenario = 'task_budget_consensus_single';
+        $this->assignHelper($this->coordinator, $this->agent('contributor-only'));
+        $conversation = $this->rootConversation('sync', $this->coordinator);
+
+        // The consensus task gets one step: the contributor takes it and is
+        // stopped before its second.
+        config(['llm-client.agent_loop.max_iterations' => 1]);
+        $this->script()->steps[] = [
+            'choices' => [[
+                'message' => ['role' => 'assistant', 'content' => 'Half of the sources say 42.', 'tool_calls' => [[
+                    'id' => 'call_only_apps', 'type' => 'function',
+                    'function' => ['name' => 'list_applications', 'arguments' => '{}'],
+                ]]],
+                'finish_reason' => 'tool_calls',
+            ]],
+        ];
+
+        $response = $this->actingAs($this->fixture()->user, 'api')->postJson('/api/clarion-app/llm-client/consensus-requests', [
+            'conversation_id' => $conversation->id,
+            'question' => 'What is the answer?',
+        ]);
+        $response->assertStatus(200);
+
+        $request = ConsensusRequest::findOrFail($response->json('consensus_request_id'));
+        $this->assertSame('single_contributor_fallback', $request->status);
+        $delegation = Delegation::firstOrFail();
+        $this->assertSame('task_budget', $delegation->result_reason, 'precondition: the contributor was stopped by the task budget');
+
+        $stopped = (new TaskBudgetText())->consensusStopped();
+        $this->assertSame("Half of the sources say 42. {$stopped}", $request->reconciled_answer, 'the partial answer is kept and marked as stopped by the task budget');
+        $this->assertSame("Half of the sources say 42. {$stopped}", \ClarionApp\LlmClient\Models\Message::findOrFail($request->answer_message_id)->content);
+
+        $task = TaskBudget::where('scope', TaskBudget::SCOPE_CONSENSUS)->firstOrFail();
+        $this->assertSame(1, (int) $task->steps_used);
+        $this->assertSame('ended', $task->state->value, 'a request whose only contributor was stopped did not complete');
+        $this->assertNotNull($task->ended_at);
+    }
+
     public static function contributorCounts(): array
     {
         return [

@@ -302,10 +302,18 @@ class ConsensusService
 
         // 098's solo path -- deliberately NOT delegateBatch() (FR-016).
         $result = $this->delegationService->delegate($conversation, $assignment->helper_agent_id, $question, null, null, null, $taskBudgetId);
-        app(TaskBudgetService::class)->endRequestTask($taskBudgetId, true, null);
 
+        // A contributor stopped by the request's task budget is reported as
+        // such, as finalize() reports one of a batch: its partial answer is
+        // kept and marked, and the request's task did not complete.
+        $stoppedByTaskBudget = ($result['reason'] ?? null) === 'task_budget';
         $answer = (string) ($result['summary'] ?? '');
+        if ($stoppedByTaskBudget) {
+            $answer = trim($answer.' '.app(TaskBudgetText::class)->consensusStopped());
+        }
         $successfulCount = in_array($result['status'] ?? null, ['success', 'partial'], true) ? 1 : 0;
+        $completed = !$stoppedByTaskBudget && $successfulCount === 1;
+        app(TaskBudgetService::class)->endRequestTask($taskBudgetId, $completed, $completed ? null : $request->status);
 
         $message = Message::create([
             'conversation_id' => $conversation->id,

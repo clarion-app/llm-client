@@ -126,6 +126,7 @@ class TaskBudgetTextTest extends TestCase
             ],
             'helperStopped' => [$t->helperStopped()],
             'managedShortfall' => [$t->managedShortfall(), $t->managedShortfall($reachedSteps)],
+            'managedNothingCompleted' => [$t->managedNothingCompleted()],
             'sequenceStopped' => [$t->sequenceStopped()],
             'consensusStopped' => [$t->consensusStopped()],
             'unavailable' => [$t->unavailable()],
@@ -347,6 +348,7 @@ class TaskBudgetTextTest extends TestCase
         );
         $this->assertSame("Stopped by this task's budget before finishing.", $t->helperStopped());
         $this->assertSame("This task's budget ceiling was reached before this part could be completed.", $t->managedShortfall());
+        $this->assertSame("No part of this task could be completed before this task's budget ceiling was reached.", $t->managedNothingCompleted());
         $this->assertSame("This task's budget ceiling was reached, so this sequence stopped before this stage.", $t->sequenceStopped());
         $this->assertSame("Stopped by this task's budget before answering.", $t->consensusStopped());
         $this->assertSame("This task's budget could not be checked, so no further work was started.", $t->unavailable());
@@ -376,9 +378,21 @@ class TaskBudgetTextTest extends TestCase
     }
 
     #[Test]
+    public function decision_guidance_names_only_accept_as_the_way_to_start_something_new(): void
+    {
+        // A stopped prompt keeps the conversation's question slot, so a new
+        // request after "stop" is refused again: telling the user to stop
+        // first would send them round in a circle.
+        $guidance = $this->text->decisionGuidance();
+
+        $this->assertStringContainsString('To start something new, accept this task first.', $guidance);
+        $this->assertStringNotContainsString('or stop this task first', $guidance);
+    }
+
+    #[Test]
     public function decision_guidance_names_the_accepted_replies_and_the_specific_problem(): void
     {
-        $base = "This task's budget prompt accepts: 1 or 'continue' (optionally 'steps=N' and/or 'spend=X' for the additional allowance), 2 or 'accept', 3 or 'stop'. To start something new, accept or stop this task first.";
+        $base = "This task's budget prompt accepts: 1 or 'continue' (optionally 'steps=N' and/or 'spend=X' for the additional allowance), 2 or 'accept', 3 or 'stop'. To start something new, accept this task first.";
         $t = $this->text;
 
         $this->assertSame($base, $t->decisionGuidance());

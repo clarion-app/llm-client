@@ -107,7 +107,9 @@ class MessageController extends Controller
             if ($directive['viewOnly']) {
                 return response()->json($tasks->standing($task)->toArray());
             }
-            $changed = $tasks->changeFromConversation($conversation, $task, $directive['stated'], (string) Auth::id());
+            // A body field sent beside the line wins key by key, as it does
+            // for a request.
+            $changed = $tasks->changeFromConversation($conversation, $task, TaskBudgetController::statedFrom($bodyBudget, $directive['stated']), (string) Auth::id());
             if ($changed === null) {
                 return response()->json(['code' => 'no_active_task', 'message' => $text->noTaskInProgress()], 409);
             }
@@ -152,6 +154,12 @@ class MessageController extends Controller
         // A reply to the conversation's pending question is recorded as its
         // answer (intake stores the message itself) and resumes the paused
         // run; the continuation arrives over the conversation's broadcasts.
+        // Ceilings stated with a reply to a waiting question change the
+        // conversation's task before the reply is taken; they would
+        // otherwise be dropped, since a reply starts no new request.
+        $changedWithReply = app(TaskBudgetService::class)->changeWithReply($conversation, $stated, (string) Auth::id());
+        $replyNotice = $changedWithReply === null ? null : app(TaskBudgetService::class)->reducedLine($stated, $changedWithReply['reduced']);
+
         $intake = app(QuestionAnswerIntake::class)->accept($conversation, (string) Auth::id(), $content);
 
         if ($intake->kind === IntakeResult::ANSWER_REQUIRED) {
@@ -166,7 +174,9 @@ class MessageController extends Controller
         }
 
         if ($intake->kind === IntakeResult::DECISION_RECORDED) {
-            return response()->json($intake->message, 201);
+            return $replyNotice === null
+                ? response()->json($intake->message, 201)
+                : response()->json($intake->message->toArray() + ['task_budget_notice' => $replyNotice], 201);
         }
 
         if ($intake->kind === IntakeResult::ANSWERED) {
@@ -178,7 +188,9 @@ class MessageController extends Controller
             // channel, as it does when no request is waiting at all.
             app(QuestionResumer::class)->resumeAfterAnswer($intake->question);
 
-            return response()->json($intake->message, 201);
+            return $replyNotice === null
+                ? response()->json($intake->message, 201)
+                : response()->json($intake->message->toArray() + ['task_budget_notice' => $replyNotice], 201);
         }
 
         // A message sent while the conversation is busy is queued and picked

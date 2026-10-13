@@ -551,7 +551,7 @@ class ManagerService
      * Never touches rounds_used -- a forced finalize is not itself a
      * round.
      */
-    public function finalizeWithShortfall(ManagedTask $task, string $reason): void
+    public function finalizeWithShortfall(ManagedTask $task, string $reason, ?string $nothingCompleted = null): void
     {
         $parts = ManagedTaskPart::where('managed_task_id', $task->id)->get();
 
@@ -578,7 +578,7 @@ class ManagerService
 
         $task->status = 'completed_with_shortfalls';
         $task->final_response = empty($acceptedSummaries)
-            ? 'No part of this task could be completed within the allowed rounds or time.'
+            ? ($nothingCompleted ?? 'No part of this task could be completed within the allowed rounds or time.')
             : implode(' ', $acceptedSummaries);
         $task->shortfall_note = $this->composeSystemShortfallNote($shortfallParts, $reason);
         $task->completed_at = now();

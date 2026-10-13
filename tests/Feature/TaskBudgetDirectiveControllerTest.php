@@ -511,6 +511,58 @@ class TaskBudgetDirectiveControllerTest extends AssembledSystemTestCase
     }
 
     #[Test]
+    #[DataProvider('promptEntries')]
+    public function ceilings_stated_with_a_reply_to_the_waiting_prompt_change_the_task_and_are_not_dropped(string $controller, bool $implicit): void
+    {
+        // Found at the post-implementation reconciliation: a "/budget" line
+        // followed by a reply was stripped, the reply taken as the decision,
+        // and the stated ceilings silently thrown away.
+        $conversation = $this->begin($controller, 'directive_with_reply'.($implicit ? '_implicit' : ''));
+        $prompt = $this->pausedAtTheCeiling(self::pathOf($controller), $conversation);
+        $task = $this->taskOf($conversation);
+        $requests = $this->modelRequests(self::pathOf($controller));
+
+        $response = $this->postTo($controller, $implicit ? null : $conversation, "/budget steps=40\nstop");
+
+        if ($controller === 'agent') {
+            $response->assertStatus(202)->assertJson(['status' => 'awaiting_user']);
+        } else {
+            $response->assertStatus(201);
+            $this->assertSame('stop', $response->json('content'), 'the reply is stored without the directive line');
+        }
+
+        $row = DB::table('task_budgets')->where('id', $task->id)->first();
+        $this->assertSame(40, (int) $row->max_steps, 'the stated ceiling changed the task');
+        $this->assertSame('user', $row->max_steps_origin);
+        $this->assertSame('paused', $row->state);
+        $prompt->refresh();
+        $this->assertSame(QuestionState::Stopped, $prompt->state, 'and the reply was still taken as the decision');
+        $this->assertSame($requests, $this->modelRequests(self::pathOf($controller)), 'nothing ran');
+
+        $standing = $this->standingOf($task);
+        $content = $this->text->budgetUpdated($standing);
+        $notices = $this->noticesOf($conversation);
+        $this->assertSame([$content], array_map(fn (Message $m) => $m->content, array_values(array_filter($notices, fn (Message $m) => $m->tool_data['notice'] === 'ceiling_changed'))));
+        $this->assertContains($content, $this->deliveredOn($controller, $conversation), 'the change is told on the channel: the reply\'s response is the decision\'s');
+        $this->assertCount(1, $this->events($task->id, 'ceiling_changed'));
+    }
+
+    #[Test]
+    #[DataProvider('controllers')]
+    public function a_directive_alone_with_a_body_field_lets_the_body_win_key_by_key(string $controller): void
+    {
+        $conversation = $this->begin($controller, 'directive_only_with_body');
+        $task = $this->runningTask($conversation);
+
+        $this->postTo($controller, $conversation, '/budget steps=40 spend=2.00', ['max_spend' => '3.00'])->assertStatus(200);
+
+        $row = DB::table('task_budgets')->where('id', $task->id)->first();
+        $this->assertSame(40, (int) $row->max_steps, 'the directive fills the key the body left out');
+        $this->assertSame(0, bccomp('3.00', (string) $row->max_spend, 10), 'the body field\'s spend wins');
+        $this->assertSame('user', $row->max_spend_origin);
+    }
+
+    #[Test]
     #[DataProvider('controllers')]
     public function a_bare_budget_shows_the_standing_and_changes_nothing(string $controller): void
     {

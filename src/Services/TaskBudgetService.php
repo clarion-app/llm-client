@@ -333,16 +333,49 @@ class TaskBudgetService
      *
      * @return ?array{standing: TaskBudgetStanding, reduced: array{steps: bool, spend: bool}, content: string}
      */
-    public function changeFromConversation(Conversation $conversation, TaskBudget $task, StatedCeilings $stated, string $actorUserId): ?array
+    public function changeFromConversation(Conversation $conversation, TaskBudget $task, StatedCeilings $stated, string $actorUserId, bool $deliver = false): ?array
     {
         $changed = $this->changeCeilings($task, $stated, $actorUserId);
         if ($changed === null) {
             return null;
         }
         $content = (new TaskBudgetText())->budgetUpdated($changed['standing'], $this->reducedLine($stated, $changed['reduced']));
-        $this->postNotice($conversation, $task, 'ceiling_changed', $content, false);
+        $this->postNotice($conversation, $task, 'ceiling_changed', $content, $deliver);
 
         return $changed + ['content' => $content];
+    }
+
+    /**
+     * Ceilings stated with a message that is about to be taken as the reply
+     * to the conversation's waiting question (an agent's question or a
+     * ceiling prompt) are not a new request's: they change the
+     * conversation's running or paused task first, exactly as a "/budget"
+     * line sent on its own would, so they are never silently dropped. The
+     * change notice is delivered on the channel, because the response
+     * carries the reply's outcome, not the change. Null — nothing changed —
+     * when nothing is stated, no question of this user waits in the
+     * conversation, or it has no running or paused task.
+     *
+     * @return ?array{standing: TaskBudgetStanding, reduced: array{steps: bool, spend: bool}, content: string}
+     */
+    public function changeWithReply(Conversation $conversation, ?StatedCeilings $stated, string $userId): ?array
+    {
+        if ($stated === null) {
+            return null;
+        }
+        try {
+            $waiting = AgentQuestion::where('pending_conversation_id', $conversation->id)->where('user_id', $userId)->exists();
+            $task = $waiting ? $this->currentFor($conversation) : null;
+            if ($task === null || $task->state->isTerminal()) {
+                return null;
+            }
+
+            return $this->changeFromConversation($conversation, $task, $stated, $userId, true);
+        } catch (\Throwable $e) {
+            Log::warning('Task budget ceilings stated with a reply could not be applied for conversation '.$conversation->id, ['conversation_id' => $conversation->id, 'error' => $e->getMessage()]);
+
+            return null;
+        }
     }
 
     /** The line telling the user a stated ceiling was cut to the installation maximum, or null. */

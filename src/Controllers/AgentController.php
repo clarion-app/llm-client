@@ -49,7 +49,7 @@ class AgentController extends Controller
         // what a user does while it is busy or waiting on a ceiling prompt.
         $directive = (new TaskBudgetDirectiveParser())->parse($message);
         if ($directive['malformed'] || $directive['viewOnly'] || $directive['directiveOnly']) {
-            return $this->handleDirective($directive, $validated['conversation_id'] ?? null, (string) $user->id, $channel);
+            return $this->handleDirective($directive, $bodyBudget, $validated['conversation_id'] ?? null, (string) $user->id, $channel);
         }
         if ($directive['stated'] !== null) {
             $message = $directive['remaining'];
@@ -64,8 +64,12 @@ class AgentController extends Controller
             : null;
 
         $answered = null;
+        // The change made by ceilings stated with a reply to a waiting
+        // question (a reply starts no new request of its own).
+        $changedWithReply = null;
 
         if ($questionConversation !== null) {
+            $changedWithReply = app(TaskBudgetService::class)->changeWithReply($questionConversation, $stated, (string) $user->id);
             [$answered, $refusal] = $this->acceptAnswer($questionConversation, (string) $user->id, $message);
             if ($refusal !== null) {
                 return $refusal;
@@ -117,6 +121,7 @@ class AgentController extends Controller
 
             // Taken as an answer before the processing check: the reply
             // to a pending question is exactly what the run is waiting for.
+            $changedWithReply = app(TaskBudgetService::class)->changeWithReply($conversation, $stated, (string) $user->id);
             [$answered, $refusal] = $this->acceptAnswer($conversation, (string) $user->id, $message);
             if ($refusal !== null) {
                 return $refusal;
@@ -276,7 +281,12 @@ class AgentController extends Controller
             $response['question_id'] = $result['question_id'];
         }
 
-        if (($line = app(TaskBudgetService::class)->reducedLine($stated)) !== null) {
+        // A reply to a waiting question started no request: only a change
+        // its stated ceilings actually made can have been reduced.
+        $line = $answered !== null
+            ? ($changedWithReply === null ? null : app(TaskBudgetService::class)->reducedLine($stated, $changedWithReply['reduced']))
+            : app(TaskBudgetService::class)->reducedLine($stated);
+        if ($line !== null) {
             $response['task_budget_notice'] = $line;
         }
 
@@ -289,7 +299,7 @@ class AgentController extends Controller
      * most recently updated conversation on the channel whose task is
      * running or paused.
      */
-    private function handleDirective(array $directive, ?string $conversationId, string $userId, string $channel)
+    private function handleDirective(array $directive, ?array $bodyBudget, ?string $conversationId, string $userId, string $channel)
     {
         $text = new TaskBudgetText();
         if ($conversationId !== null) {
@@ -322,7 +332,9 @@ class AgentController extends Controller
         if ($directive['viewOnly']) {
             return response()->json(['status' => 'budget_updated', 'content' => $text->standing($tasks->standing($task)), 'conversation_id' => $conversation->id], 200);
         }
-        $changed = $tasks->changeFromConversation($conversation, $task, $directive['stated'], $userId);
+        // A body field sent beside the line wins key by key, as it does for
+        // a request.
+        $changed = $tasks->changeFromConversation($conversation, $task, TaskBudgetController::statedFrom($bodyBudget, $directive['stated']), $userId);
         if ($changed === null) {
             return response()->json(['status' => 'budget_updated', 'content' => $text->noTaskInProgress(), 'conversation_id' => $conversation->id], 200);
         }

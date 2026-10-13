@@ -121,7 +121,13 @@ class RunManagedTaskStepJob implements ShouldQueue
 
         $budgetStop = app(TaskBudgetGate::class)->wouldStop($conversation);
         if ($budgetStop !== null) {
-            app(ManagerService::class)->finalizeWithShortfall($task, app(TaskBudgetText::class)->managedShortfall($budgetStop->standing));
+            // The result names what stopped it: the task's budget, never the
+            // rounds or time a shortfall otherwise means.
+            app(ManagerService::class)->finalizeWithShortfall(
+                $task,
+                app(TaskBudgetText::class)->managedShortfall($budgetStop->standing),
+                app(TaskBudgetText::class)->managedNothingCompleted(),
+            );
 
             return;
         }
