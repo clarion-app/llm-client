@@ -57,6 +57,8 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('conversation/{id}/end', [ConversationController::class, "end"]);
     Route::post('conversation/{id}/confirm-api-call', [ConversationController::class, "confirmApiCall"]);
     Route::get('conversation/{id}/handoffs', [ConversationController::class, "handoffs"]);
+    Route::get('conversation/{id}/task-budget', [\ClarionApp\LlmClient\Controllers\TaskBudgetController::class, "show"]);
+    Route::patch('conversation/{id}/task-budget', [\ClarionApp\LlmClient\Controllers\TaskBudgetController::class, "update"]);
     Route::get('user/{id}/conversation', [ConversationController::class, "userConversations"]);
     Route::post('agent', AgentController::class);
     Route::resource('server', ServerController::class);
@@ -113,6 +115,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::get('agent-runs/{runId}/actions/{actionId}', [RunController::class, "actionDetail"]);
     // Multi-agent arrangement read endpoint (106 US1)
     Route::get('agent-runs/{runId}/arrangement', [RunController::class, "arrangement"]);
+    Route::get('agent-runs/{runId}/task-budget', [\ClarionApp\LlmClient\Controllers\TaskBudgetController::class, "forRun"]);
 
     // Delegation protocol read endpoints (098 US3)
     Route::get('agent-runs/{runId}/delegations', [DelegationController::class, "forRun"]);

@@ -7,6 +7,8 @@ use ClarionApp\LlmClient\Models\ManagedTask;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\ManagerService;
+use ClarionApp\LlmClient\Services\TaskBudgetGate;
+use ClarionApp\LlmClient\Services\TaskBudgetText;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -117,6 +119,19 @@ class RunManagedTaskStepJob implements ShouldQueue
             return;
         }
 
+        $budgetStop = app(TaskBudgetGate::class)->wouldStop($conversation);
+        if ($budgetStop !== null) {
+            // The result names what stopped it: the task's budget, never the
+            // rounds or time a shortfall otherwise means.
+            app(ManagerService::class)->finalizeWithShortfall(
+                $task,
+                app(TaskBudgetText::class)->managedShortfall($budgetStop->standing),
+                app(TaskBudgetText::class)->managedNothingCompleted(),
+            );
+
+            return;
+        }
+
         // First step: seed with the original request itself, so the
         // manager's very first turn has something to decompose. Every
         // later step continues the SAME conversation -- adding another
@@ -137,6 +152,10 @@ class RunManagedTaskStepJob implements ShouldQueue
         $task->refresh();
         $task->last_progress_at = now();
         $task->save();
+
+        if (in_array($task->status, self::TERMINAL_STATUSES, true)) {
+            app(ManagerService::class)->endTaskBudget($task, $task->status !== 'failed', $task->status);
+        }
 
         if (!in_array($task->status, self::TERMINAL_STATUSES, true)) {
             self::dispatch($this->managedTaskId)->onQueue(config('llm-client.manager.queue', 'managed-tasks'));

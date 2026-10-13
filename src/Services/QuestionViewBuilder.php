@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\UnansweredPolicy;
@@ -44,7 +45,7 @@ class QuestionViewBuilder
             : UnansweredPolicy::tryFrom((string) $question->unanswered_policy);
         $assumed = $policy === UnansweredPolicy::ProceedOnAssumption ? $question->assumedAnswer() : null;
 
-        return [
+        $view = [
             'id' => (string) $question->id,
             'question' => (string) $question->question,
             'preamble' => $question->preamble,
@@ -66,7 +67,19 @@ class QuestionViewBuilder
             'outcome_text' => $state === QuestionState::Pending ? null : $this->renderer->renderOutcome($question),
             'stopped_at' => $question->stopped_at?->copy()->utc()->format('Y-m-d\\TH:i:s\\Z'),
             'answered_late' => $state === QuestionState::Answered && $question->stopped_at !== null,
+            'kind' => $question->isCeilingPrompt() ? 'task_budget' : 'agent',
         ];
+
+        if ($question->isCeilingPrompt()) {
+            $task = $question->task_budget_id === null ? null : TaskBudget::find($question->task_budget_id);
+            $standing = $task === null ? null : app(TaskBudgetService::class)->standing($task);
+            $offered = $task === null ? ['steps' => null, 'spend' => null] : app(TaskBudgetService::class)->offeredAllowance($task, $standing);
+            $view['offered_allowance'] = ['steps' => $offered['steps'], 'spend' => $offered['spend']];
+            $view['reached'] = $standing?->reached() ?? [];
+            $view['standing'] = $standing?->toArray();
+        }
+
+        return $view;
     }
 
     /**

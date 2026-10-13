@@ -20,6 +20,10 @@ final readonly class QuestionResolution
 
     public function toToolResult(AgentQuestion $question): string
     {
+        if ($question->isCeilingPrompt()) {
+            throw new \LogicException('A ceiling prompt is never answered with a tool result.');
+        }
+
         $base = ['outcome' => $this->state->value, 'question_id' => $question->id];
 
         $payload = match ($this->state) {

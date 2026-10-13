@@ -247,6 +247,12 @@ class RunTraceContinuityJourneyTest extends AssembledSystemTestCase
                     'duration_ms' => null,
                     'step_count' => 0,
                 ]);
+            // spec 133: Part 1's task ended with the run it rewinds here, so
+            // the continuation would join an ended task and be refused. The
+            // rewound pause predates any task budget: clear the pointer and
+            // the continuation opens a task of its own, lazily.
+            DB::table('conversations')->where('id', $fixture->conversation->id)->update(['active_task_budget_id' => null]);
+            $fixture->conversation->active_task_budget_id = null;
             $this->rebindScript();
             $stream->reset();
 

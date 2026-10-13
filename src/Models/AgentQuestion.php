@@ -32,7 +32,13 @@ class AgentQuestion extends Model
 
     public $incrementing = false;
 
+    // origin is null for a question the agent asked with ask_user, and this
+    // value for a task-budget ceiling prompt.
+    public const ORIGIN_TASK_BUDGET = 'task_budget';
+
     protected $fillable = [
+        'origin',
+        'task_budget_id',
         'conversation_id',
         'user_id',
         'pending_conversation_id',
@@ -272,5 +278,10 @@ class AgentQuestion extends Model
         }
 
         return $value === null || $value === '' ? null : (string) $value;
+    }
+
+    public function isCeilingPrompt(): bool
+    {
+        return $this->origin === self::ORIGIN_TASK_BUDGET;
     }
 }

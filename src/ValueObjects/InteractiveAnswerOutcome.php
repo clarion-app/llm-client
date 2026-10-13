@@ -20,6 +20,7 @@ final readonly class InteractiveAnswerOutcome
         public ?AgentQuestion $question = null,
         public ?Message $message = null,
         public ?string $selectedSummary = null,
+        public ?string $guidance = null,
     ) {
     }
 
@@ -33,9 +34,9 @@ final readonly class InteractiveAnswerOutcome
         return new self(InteractiveAnswerStatus::AnswerRequired, $state);
     }
 
-    public static function invalidAnswer(QuestionState $state): self
+    public static function invalidAnswer(QuestionState $state, ?string $guidance = null): self
     {
-        return new self(InteractiveAnswerStatus::InvalidAnswer, $state);
+        return new self(InteractiveAnswerStatus::InvalidAnswer, $state, guidance: $guidance);
     }
 
     public static function notPending(QuestionState $state, ?AgentQuestion $question = null): self

@@ -37,6 +37,7 @@ class AgentBindingMigrationBackfillTest extends TestCase
         // the same process see the schema they expect.
         Schema::dropIfExists('conversations');
         Schema::create('conversations', function (Blueprint $table) {
+            $table->uuid('active_task_budget_id')->nullable();
             $table->uuid('id')->primary();
             $table->uuid('server_id')->nullable();
             $table->timestamps();
@@ -69,6 +70,7 @@ class AgentBindingMigrationBackfillTest extends TestCase
         // runs, exactly as it would against a real, un-migrated database.
         Schema::dropIfExists('conversations');
         Schema::create('conversations', function (Blueprint $table) {
+            $table->uuid('active_task_budget_id')->nullable();
             $table->uuid('id')->primary();
             $table->uuid('server_id')->nullable();
             $table->timestamps();

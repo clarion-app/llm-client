@@ -169,6 +169,14 @@ class ResolveAbandonedRunsCommand extends Command
                 // failure can never undo the abandonment resolution above.
                 $recorder->enqueueForwarding($runId);
 
+                // The swept run's task ends with it, as closeRun() would
+                // have ended it. Best-effort: never throws.
+                app(\ClarionApp\LlmClient\Services\TaskBudgetService::class)->rootRunClosed(
+                    $runId,
+                    \ClarionApp\LlmClient\ValueObjects\RunEndState::Abandoned,
+                    'resolved by sweep: no activity for ' . $minutes . ' minutes',
+                );
+
                 Log::info('Abandoned run resolved', [
                     'run_id' => $runId,
                     'started_at' => $startedAt,

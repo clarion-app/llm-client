@@ -57,6 +57,7 @@ class RunController extends Controller
 
         $awaitingUser = $this->runTraceQuery->runIdsAwaitingUser($runIds);
         $questionStopped = $this->runTraceQuery->runIdsStoppedOnQuestion($runIds);
+        $taskBudgets = $this->runTraceQuery->taskBudgetSummariesForRuns($runIds, $awaitingUser, $questionStopped);
 
         $data = array_map(
             fn (AgentRun $run) => $this->runSummary(
@@ -64,6 +65,7 @@ class RunController extends Controller
                 (int) ($actionCounts[$run->id] ?? 0),
                 isset($awaitingUser[$run->id]),
                 isset($questionStopped[$run->id]),
+                $taskBudgets,
             ),
             $result['data'],
         );
@@ -247,8 +249,9 @@ class RunController extends Controller
         int $actionCount,
         ?bool $awaitingUser = null,
         ?bool $questionStopped = null,
+        ?array $taskBudgets = null,
     ): array {
-        return $this->runTraceQuery->runSummaryRow($run, $actionCount, $awaitingUser, $questionStopped);
+        return $this->runTraceQuery->runSummaryRow($run, $actionCount, $awaitingUser, $questionStopped, $taskBudgets);
     }
 
     /**

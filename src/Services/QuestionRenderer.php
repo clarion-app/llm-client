@@ -86,6 +86,19 @@ class QuestionRenderer
 
         $stopped = $question->stopped_at !== null;
 
+        if ($question->isCeilingPrompt()) {
+            $text = app(TaskBudgetText::class);
+
+            // A decided or stopped ceiling prompt names this task's budget;
+            // its other states read as any question's.
+            if ($state === QuestionState::Answered) {
+                return str_starts_with((string) $question->answer_raw, 'accept') ? $text->outcomeAccepted() : $text->outcomeContinued();
+            }
+            if ($state === QuestionState::Stopped) {
+                return $text->alreadyStopped();
+            }
+        }
+
         return match ($state) {
             QuestionState::Answered => $this->renderAnswered($question, $stopped),
             QuestionState::Expired => 'This question expired and is no longer awaiting a reply.',
@@ -132,6 +145,10 @@ class QuestionRenderer
         }
 
         $deadline = $this->deadlineText($question);
+
+        if ($question->isCeilingPrompt()) {
+            return app(TaskBudgetText::class)->promptExpiryStatement($deadline);
+        }
 
         if ($policy === UnansweredPolicy::ProceedOnAssumption) {
             return "If there is no answer by {$deadline}, the agent will continue assuming: ".$this->assumptionText($question);
@@ -260,6 +277,10 @@ class QuestionRenderer
     /** The notice shown when a question is resolved without an answer. */
     public function renderNotice(AgentQuestion $question): string
     {
+        if ($question->isCeilingPrompt() && $question->state === QuestionState::Stopped) {
+            return app(TaskBudgetText::class)->expiredStopped();
+        }
+
         $quoted = '"'.$question->question.'"';
 
         return match ($question->state) {

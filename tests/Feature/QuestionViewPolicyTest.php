@@ -39,7 +39,7 @@ class QuestionViewPolicyTest extends TestCase
     private const ASKED_AT = '2026-10-12 09:00:00';
 
     private const VIEW_KEYS = ['allow_multiple', 'answer', 'answerable', 'answered_late', 'assumed_answer', 'choices',
-        'consequential', 'expires_at', 'expiry_statement', 'id', 'if_unanswered', 'outcome_text', 'preamble', 'question',
+        'consequential', 'expires_at', 'expiry_statement', 'id', 'if_unanswered', 'kind', 'outcome_text', 'preamble', 'question',
         'state', 'stopped_at'];
 
     private User $owner;

@@ -5,9 +5,12 @@ namespace ClarionApp\LlmClient\Services;
 use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Models\AgentRunStep;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Models\ToolInvocationRecord;
 use ClarionApp\LlmClient\Models\UsageRecord;
+use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
+use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
 use ClarionApp\LlmClient\ValueObjects\RunRelation;
 use Illuminate\Support\Facades\DB;
 
@@ -792,11 +795,17 @@ class RunTraceQuery
         int $actionCount,
         ?bool $awaitingUser = null,
         ?bool $questionStopped = null,
+        ?array $taskBudgets = null,
     ): array {
-        // Callers projecting many runs pass the flags from one batched
-        // lookup each; a single summary looks them up itself.
+        // Callers projecting many runs pass the flags and the task budgets
+        // from one batched lookup each; a single summary looks them up itself.
         $awaitingUser ??= isset($this->runIdsAwaitingUser([$run->id])[$run->id]);
         $questionStopped ??= isset($this->runIdsStoppedOnQuestion([$run->id])[$run->id]);
+        $taskBudgets ??= $this->taskBudgetSummariesForRuns(
+            [$run->id],
+            $awaitingUser ? [$run->id => true] : [],
+            $questionStopped ? [$run->id => true] : [],
+        );
 
         return [
             'id' => $run->id,
@@ -819,7 +828,82 @@ class RunTraceQuery
             'product_ms' => $run->product_ms,
             'awaiting_user' => $awaitingUser,
             'question_stopped' => $questionStopped,
+            'task_budget' => $taskBudgets[$run->id] ?? null,
         ];
+    }
+
+    /**
+     * The latest task whose root run or paused run is each of $runIds, in
+     * one query.
+     *
+     * @param  list<string>  $runIds
+     * @return array<string, TaskBudget>
+     */
+    public function taskBudgetsForRuns(array $runIds): array
+    {
+        if ($runIds === []) {
+            return [];
+        }
+        $tasks = TaskBudget::query()
+            ->where(fn ($q) => $q->whereIn('root_run_id', $runIds)->orWhereIn('paused_run_id', $runIds))
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+        // Ascending order, so a later task for the same run overwrites an
+        // earlier one and the latest wins.
+        $byRun = [];
+        foreach ($tasks as $task) {
+            foreach (array_unique(array_filter([$task->root_run_id, $task->paused_run_id])) as $runId) {
+                if (in_array($runId, $runIds, true)) {
+                    $byRun[$runId] = $task;
+                }
+            }
+        }
+
+        return $byRun;
+    }
+
+    /**
+     * The task budget each run summary shows, keyed by run id. The prompt's
+     * state comes from the question flags already looked up for the runs,
+     * so no further question query is made.
+     *
+     * @param  list<string>  $runIds
+     * @param  array<string, true>  $awaitingUser
+     * @param  array<string, true>  $questionStopped
+     * @return array<string, array>
+     */
+    public function taskBudgetSummariesForRuns(array $runIds, array $awaitingUser, array $questionStopped): array
+    {
+        $byRun = $this->taskBudgetsForRuns($runIds);
+        if ($byRun === []) {
+            return [];
+        }
+        $taskIds = array_values(array_unique(array_map(fn (TaskBudget $task) => $task->id, $byRun)));
+        $totals = app(CostRollupQuery::class)->taskTotals($taskIds);
+        $currency = (string) config('llm-client.cost.currency', 'USD');
+        $summaries = [];
+        foreach ($byRun as $runId => $task) {
+            $total = $totals[$task->id];
+            $promptRun = $task->paused_run_id ?? $runId;
+            $subState = null;
+            if ($task->state === TaskBudgetState::Paused && $task->prompt_question_id !== null && isset($awaitingUser[$promptRun])) {
+                $subState = isset($questionStopped[$promptRun]) ? 'stopped' : 'awaiting_decision';
+            }
+            $summaries[$runId] = [
+                'state' => $task->state->value,
+                'sub_state' => $subState,
+                'steps_used' => (int) $task->steps_used,
+                'max_steps' => (int) $task->max_steps,
+                'spend_used' => Decimal::round($total['priced_cost_total'], 10),
+                'max_spend' => Decimal::round($task->max_spend, 10),
+                'currency' => $currency,
+                'approximate' => $total['has_estimated_cost'],
+                'incomplete' => $total['unpriced_request_count'] > 0,
+            ];
+        }
+
+        return $summaries;
     }
 
     /**

@@ -3,12 +3,14 @@
 namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Exceptions\ConsensusNoEligibleContributorsException;
+use ClarionApp\LlmClient\Exceptions\ConsensusTaskBudgetUnavailableException;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Models\ConsensusRequest;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\ModelPrice;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
@@ -57,6 +59,9 @@ class ConsensusService
      *   consensus.min_contributor_count (only reachable when an installation
      *   raises that config above its default of 2) -- no ConsensusRequest
      *   row is created for either refusal.
+     * @throws ConsensusTaskBudgetUnavailableException when the request's own
+     *   task budget cannot be opened -- refused before any row is created or
+     *   any contributor is asked, never run on the conversation's own task.
      */
     public function dispatch(Conversation $conversation, string $question): ConsensusRequest
     {
@@ -77,14 +82,42 @@ class ConsensusService
         }
 
         if ($eligibleCount === 1) {
-            return $this->dispatchSingleContributorFallback($conversation, $question, $eligible->first());
+            return $this->onOwnTaskBudget($conversation, fn (string $taskBudgetId) => $this->dispatchSingleContributorFallback($conversation, $question, $eligible->first(), $taskBudgetId));
         }
 
         if ($eligibleCount < $minRequired) {
             throw new ConsensusNoEligibleContributorsException($eligibleCount, $minRequired);
         }
 
-        return $this->dispatchBatch($conversation, $question, $eligible, $ownerUserId);
+        return $this->onOwnTaskBudget($conversation, fn (string $taskBudgetId) => $this->dispatchBatch($conversation, $question, $eligible, $ownerUserId, $taskBudgetId));
+    }
+
+    /**
+     * Runs the request on a task budget of its own, which every contributor
+     * works under; the conversation keeps pointing at its own task. Fails
+     * closed: a request whose task cannot be opened is refused rather than
+     * letting its contributors fall back to the conversation's task. A
+     * request that ends with an error ends its task too (a no-op when
+     * finalize() already ended it).
+     *
+     * @param  \Closure(string): ConsensusRequest  $dispatch
+     * @throws ConsensusTaskBudgetUnavailableException
+     */
+    private function onOwnTaskBudget(Conversation $conversation, \Closure $dispatch): ConsensusRequest
+    {
+        $tasks = app(TaskBudgetService::class);
+        $task = $tasks->openForRequest($conversation, TaskBudget::SCOPE_CONSENSUS, null, null, false);
+        if ($task === null) {
+            throw new ConsensusTaskBudgetUnavailableException();
+        }
+
+        try {
+            return $dispatch($task->id);
+        } catch (\Throwable $e) {
+            $tasks->endRequestTask($task->id, false, 'failed');
+
+            throw $e;
+        }
     }
 
     /**
@@ -148,8 +181,21 @@ class ConsensusService
      *
      * @param  array<string, array<string, mixed>>  $batchResults  the six-field
      *   shape delegateBatch() returns, keyed by tool_call_id.
+     * @param  ?string  $taskBudgetId  the request's task budget, ended here
+     *   (completed when the request completed, else ended with its status).
      */
-    public function finalize(ConsensusRequest $request, array $batchResults): void
+    public function finalize(ConsensusRequest $request, array $batchResults, ?string $taskBudgetId = null): void
+    {
+        try {
+            $this->finalizeRequest($request, $batchResults);
+        } finally {
+            if ($taskBudgetId !== null) {
+                app(TaskBudgetService::class)->endRequestTask($taskBudgetId, $request->status === 'completed', $request->status);
+            }
+        }
+    }
+
+    private function finalizeRequest(ConsensusRequest $request, array $batchResults): void
     {
         try {
             $successful = array_values(array_filter(
@@ -180,7 +226,9 @@ class ConsensusService
             $contributorAnswers = $delegations->map(fn (Delegation $delegation) => [
                 'delegation_id' => $delegation->id,
                 'helper_agent_id' => $delegation->helper_agent_id,
-                'answer' => (string) $delegation->result_summary,
+                'answer' => $delegation->result_reason === 'task_budget'
+                    ? trim((string) $delegation->result_summary.' '.app(TaskBudgetText::class)->consensusStopped())
+                    : (string) $delegation->result_summary,
             ])->all();
 
             $judgeConversation = $this->createJudgeConversation($request);
@@ -238,6 +286,7 @@ class ConsensusService
         Conversation $conversation,
         string $question,
         AgentHelperAssignment $assignment,
+        string $taskBudgetId,
     ): ConsensusRequest {
         $request = ConsensusRequest::create([
             'conversation_id' => $conversation->id,
@@ -252,10 +301,19 @@ class ConsensusService
         ]);
 
         // 098's solo path -- deliberately NOT delegateBatch() (FR-016).
-        $result = $this->delegationService->delegate($conversation, $assignment->helper_agent_id, $question, null);
+        $result = $this->delegationService->delegate($conversation, $assignment->helper_agent_id, $question, null, null, null, $taskBudgetId);
 
+        // A contributor stopped by the request's task budget is reported as
+        // such, as finalize() reports one of a batch: its partial answer is
+        // kept and marked, and the request's task did not complete.
+        $stoppedByTaskBudget = ($result['reason'] ?? null) === 'task_budget';
         $answer = (string) ($result['summary'] ?? '');
+        if ($stoppedByTaskBudget) {
+            $answer = trim($answer.' '.app(TaskBudgetText::class)->consensusStopped());
+        }
         $successfulCount = in_array($result['status'] ?? null, ['success', 'partial'], true) ? 1 : 0;
+        $completed = !$stoppedByTaskBudget && $successfulCount === 1;
+        app(TaskBudgetService::class)->endRequestTask($taskBudgetId, $completed, $completed ? null : $request->status);
 
         $message = Message::create([
             'conversation_id' => $conversation->id,
@@ -279,6 +337,7 @@ class ConsensusService
         string $question,
         \Illuminate\Support\Collection $eligible,
         string $ownerUserId,
+        string $taskBudgetId,
     ): ConsensusRequest {
         $defaultCount = (int) config('llm-client.consensus.default_contributor_count', 3);
         $quorumFraction = (float) config('llm-client.consensus.quorum_fraction', 0.5);
@@ -320,12 +379,12 @@ class ConsensusService
             ];
         }
 
-        $batchResults = $this->delegationService->delegateBatch($conversation, $calls);
+        $batchResults = $this->delegationService->delegateBatch($conversation, $calls, $taskBudgetId);
 
         $request->batch_id = $this->batchIdFromResults($batchResults);
         $request->save();
 
-        $this->finalize($request, $batchResults);
+        $this->finalize($request, $batchResults, $taskBudgetId);
 
         return $request->fresh();
     }

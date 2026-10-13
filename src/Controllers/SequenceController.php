@@ -6,10 +6,13 @@ use App\Http\Controllers\Controller;
 use Auth;
 use ClarionApp\LlmClient\Exceptions\SequenceDefinitionValidationException;
 use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
+use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageSequenceDefinition;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Services\SequenceQuery;
 use ClarionApp\LlmClient\Services\SequenceService;
+use ClarionApp\LlmClient\Services\TaskBudgetService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -235,6 +238,11 @@ class SequenceController extends Controller
         }
 
         $resumingFromPosition = $safety['resume_from']?->stage?->position;
+
+        $sequenceConversation = Conversation::find($run->conversation_id);
+        if ($sequenceConversation !== null) {
+            app(TaskBudgetService::class)->openForRequest($sequenceConversation, TaskBudget::SCOPE_SEQUENCE_RUN, null, null, true);
+        }
 
         $run->status = 'resumed';
         $run->resumed_at = now();

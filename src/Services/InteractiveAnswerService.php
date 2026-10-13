@@ -60,6 +60,10 @@ class InteractiveAnswerService implements InteractiveQuestionAnswers
             return InteractiveAnswerOutcome::answerRequired($state);
         }
 
+        if ($question->isCeilingPrompt()) {
+            return app(CeilingPromptAnswers::class)->interactive($question, $userId, $answer, $method);
+        }
+
         if (!$this->fits($answer, $question)) {
             return InteractiveAnswerOutcome::invalidAnswer($state);
         }
@@ -82,7 +86,7 @@ class InteractiveAnswerService implements InteractiveQuestionAnswers
     {
         $outcome = $this->record($questionId, $userId, $answer, $method);
 
-        if ($outcome->status === InteractiveAnswerStatus::Answered) {
+        if ($outcome->status === InteractiveAnswerStatus::Answered && ($outcome->question === null || $outcome->question->state === QuestionState::Answered)) {
             try {
                 ResumeAfterQuestionJob::dispatch($questionId);
             } catch (\Throwable $e) {

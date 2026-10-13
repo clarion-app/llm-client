@@ -1121,5 +1121,42 @@ return [
         // Rows handled per sweep chunk.
         'sweep_batch_size' => 100,
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Task budgets
+    |--------------------------------------------------------------------------
+    |
+    | Every task — one user request, with all the helper work it causes —
+    | runs under a step ceiling and a spend ceiling. A task with no stated
+    | ceilings gets the defaults below; there is no way to run unlimited.
+    | The default step ceiling is agent_loop.max_iterations (no separate
+    | key). Stated ceilings above the maxima are reduced to them, and so is a
+    | default that exceeds its maximum. Every value is read when it is used,
+    | and an invalid one (zero, negative, non-numeric) resolves to the
+    | shipped value — a zero maximum never means unlimited. Spend is in the
+    | installation currency (cost.currency).
+    |
+    */
+    'task_budget' => [
+        // Spend ceiling of a task that states none.
+        'default_max_spend' => env('LLM_CLIENT_TASK_BUDGET_DEFAULT_MAX_SPEND', '1.00'),
+        // Highest step ceiling a task can have, however it is set. Capped at
+        // 1 000 000.
+        'maximum_steps' => env('LLM_CLIENT_TASK_BUDGET_MAXIMUM_STEPS', 200),
+        // Highest spend ceiling a task can have. Capped at 1 000 000.
+        'maximum_spend' => env('LLM_CLIENT_TASK_BUDGET_MAXIMUM_SPEND', '25.00'),
+        // Proportion of a ceiling at which the user is told it is near.
+        // Null, or a value outside (0, 1), uses
+        // budget.default_approach_threshold.
+        'approach_threshold' => env('LLM_CLIENT_TASK_BUDGET_APPROACH_THRESHOLD'),
+        // Minutes the ceiling prompt waits for a decision. Null uses
+        // agent_questions.expiry_minutes; always brought within the
+        // agent_questions minimum and maximum.
+        'prompt_wait_minutes' => env('LLM_CLIENT_TASK_BUDGET_PROMPT_WAIT_MINUTES'),
+        // Days a finished task's record is kept. Null uses
+        // run_trace.retention_days.
+        'retention_days' => null,
+    ],
 ];
 

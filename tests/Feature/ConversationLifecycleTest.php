@@ -81,6 +81,7 @@ class ConversationLifecycleTest extends TestCase
         });
 
         Schema::create('conversations', function (Blueprint $table) {
+            $table->uuid('active_task_budget_id')->nullable();
             $table->uuid('id')->primary();
             $table->uuid('user_id')->nullable();
             $table->uuid('server_id')->nullable();
@@ -94,6 +95,107 @@ class ConversationLifecycleTest extends TestCase
             $table->timestamps();
             $table->softDeletes();
         });
+
+        // spec 133: every entry path now crosses the task budget gate,
+        // which opens a task and reads its spend from usage_records — so
+        // those three tables are copied here from tests/TestCase.php
+        // (schema parity, not a re-baseline).
+        if (!Schema::hasTable('usage_records')) {
+            Schema::create('usage_records', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('conversation_id');
+                $table->uuid('user_id');
+                $table->uuid('attempt_group_id');
+                $table->string('agent_id', 255)->nullable();
+                $table->uuid('run_id')->nullable();
+                $table->integer('input_tokens')->nullable()->default(0);
+                $table->integer('output_tokens')->nullable()->default(0);
+                $table->integer('total_tokens')->nullable()->default(0);
+                $table->integer('reused_input_tokens')->nullable();
+                $table->boolean('reused_input_estimated')->default(false);
+                $table->boolean('reused_input_adjusted')->default(false);
+                $table->boolean('input_estimated')->default(false);
+                $table->boolean('output_estimated')->default(false);
+                $table->string('model', 128)->nullable();
+                $table->string('provider_type', 32)->nullable();
+                $table->json('co_member_tags')->nullable();
+                $table->uuid('model_price_id')->nullable();
+                $table->decimal('reused_input_cost', 20, 10)->nullable();
+                $table->decimal('fresh_input_cost', 20, 10)->nullable();
+                $table->decimal('output_cost', 20, 10)->nullable();
+                $table->decimal('total_cost', 20, 10)->nullable();
+                $table->boolean('cost_unpriced')->default(false);
+                $table->boolean('cost_estimated')->default(false);
+                $table->timestamp('created_at')->useCurrent();
+                $table->uuid('task_budget_id')->nullable();
+
+                $table->index('conversation_id');
+                $table->index('user_id');
+                $table->index('attempt_group_id');
+                $table->index(['user_id', 'created_at']);
+                $table->index('run_id');
+                $table->index('agent_id');
+                $table->index('task_budget_id');
+            });
+        }
+
+        // task_budgets / task_budget_events, and the task_budget_id /
+        // active_task_budget_id / origin columns above and below — mirror
+        // 2026_10_14_000000_create_task_budgets_tables.php column for column.
+        if (!Schema::hasTable('task_budgets')) {
+            Schema::create('task_budgets', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('user_id')->nullable();
+                $table->uuid('root_conversation_id');
+                $table->uuid('root_run_id')->nullable();
+                $table->uuid('managed_task_id')->nullable();
+                $table->string('scope', 16);
+                $table->boolean('unattended')->default(false);
+                $table->string('state', 16)->default('running');
+                $table->string('end_reason', 256)->nullable();
+                $table->unsignedInteger('max_steps');
+                $table->string('max_steps_origin', 32);
+                $table->unsignedInteger('original_max_steps');
+                $table->decimal('max_spend', 20, 10);
+                $table->string('max_spend_origin', 32);
+                $table->decimal('original_max_spend', 20, 10);
+                $table->unsignedInteger('steps_used')->default(0);
+                $table->decimal('approach_threshold', 5, 4);
+                $table->timestamp('steps_approach_noticed_at', 6)->nullable();
+                $table->timestamp('spend_approach_noticed_at', 6)->nullable();
+                $table->timestamp('paused_at', 6)->nullable();
+                $table->string('pause_reason', 16)->nullable();
+                $table->uuid('paused_run_id')->nullable();
+                $table->unsignedInteger('paused_iteration')->nullable();
+                $table->string('resume_mode', 8)->nullable();
+                $table->unsignedInteger('paused_steps_used')->nullable();
+                $table->decimal('paused_spend', 20, 10)->nullable();
+                $table->uuid('prompt_question_id')->nullable();
+                $table->timestamp('ended_at', 6)->nullable();
+                $table->timestamp('created_at', 6)->nullable();
+                $table->timestamp('updated_at', 6)->nullable();
+
+                $table->index('root_conversation_id');
+                $table->index(['user_id', 'updated_at']);
+                $table->index(['state', 'updated_at']);
+                $table->index('managed_task_id');
+                $table->index('prompt_question_id');
+                $table->index('root_run_id');
+                $table->index('paused_run_id');
+            });
+        }
+
+        if (!Schema::hasTable('task_budget_events')) {
+            Schema::create('task_budget_events', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('task_budget_id');
+                $table->string('kind', 32);
+                $table->json('payload');
+                $table->uuid('actor_user_id')->nullable();
+                $table->timestamp('created_at', 6)->useCurrent();
+                $table->index(['task_budget_id', 'created_at']);
+            });
+        }
 
         Schema::create('messages', function (Blueprint $table) {
             $table->uuid('id')->primary();

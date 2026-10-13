@@ -14,12 +14,26 @@ final readonly class IntakeResult
     public const ANSWERED = 'answered';
     public const ANSWER_REQUIRED = 'answer_required';
     public const NOT_AN_ANSWER = 'not_an_answer';
+    public const DECISION_REQUIRED = 'decision_required';
+    public const DECISION_RECORDED = 'decision_recorded';
 
     public function __construct(
         public string $kind,
         public ?AgentQuestion $question = null,
         public ?Message $message = null,
+        public ?string $guidance = null,
+        public ?string $acknowledgement = null,
     ) {
+    }
+
+    public static function decisionRequired(AgentQuestion $question, string $guidance): self
+    {
+        return new self(self::DECISION_REQUIRED, $question, null, $guidance);
+    }
+
+    public static function decisionRecorded(AgentQuestion $question, Message $message, string $acknowledgement): self
+    {
+        return new self(self::DECISION_RECORDED, $question, $message, null, $acknowledgement);
     }
 
     public static function answered(AgentQuestion $question, Message $message): self

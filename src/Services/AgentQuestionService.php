@@ -7,8 +7,10 @@ use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
+use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\AnswerMethod;
+use ClarionApp\LlmClient\ValueObjects\CeilingPromptRequest;
 use ClarionApp\LlmClient\ValueObjects\DeliveryResult;
 use ClarionApp\LlmClient\ValueObjects\OpenedQuestion;
 use ClarionApp\LlmClient\ValueObjects\OpenQuestionRequest;
@@ -42,8 +44,17 @@ class AgentQuestionService
     /** `tool_data.kind` of the user's message that answered a question. */
     public const KIND_ANSWER = 'agent_question_answer';
 
+    /** `tool_data.kind` of a notice about a task's budget (approaching, changed). */
+    public const KIND_TASK_BUDGET_NOTICE = 'task_budget_notice';
+
+    /** `tool_data.kind` of a task-budget report (halted, accepted, stopped). */
+    public const KIND_TASK_BUDGET_REPORT = 'task_budget_report';
+
     /** Every message kind that exists only for the user, never for the model. */
-    public const CONVERSATION_ONLY_KINDS = [self::KIND_QUESTION, self::KIND_NOTICE, self::KIND_ANSWER];
+    public const CONVERSATION_ONLY_KINDS = [self::KIND_QUESTION, self::KIND_NOTICE, self::KIND_ANSWER, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT];
+
+    /** Assistant-role messages the system writes, which are never the agent replying to anyone. */
+    public const SYSTEM_NOTICE_KINDS = [self::KIND_NOTICE, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT];
 
     /** Length of the `agent_questions.delivery_failure_reason` column. */
     private const MAX_FAILURE_REASON_CHARS = 512;
@@ -197,6 +208,190 @@ class AgentQuestionService
     }
 
     /**
+     * Ask the user what to do with a task paused at its budget ceiling.
+     *
+     * The display message is written first and the question then points at
+     * it as its paused message: there is no paused agent turn behind a
+     * ceiling prompt. Both are written in one transaction, and the question
+     * takes the conversation's single question slot, so if the slot is
+     * already held nothing is written and the prompt is refused. Delivery
+     * happens after the commit.
+     */
+    public function openCeilingPrompt(CeilingPromptRequest $request): OpenedQuestion|QuestionRefusal
+    {
+        $conversation = $request->conversation;
+        $text = app(TaskBudgetText::class);
+        $requested = config('llm-client.task_budget.prompt_wait_minutes');
+        $requested = is_numeric($requested) ? (int) $requested : null;
+
+        try {
+            [$question, $display] = DB::transaction(function () use ($request, $conversation, $text, $requested) {
+                $now = now();
+                $effectiveMinutes = app(TaskBudgetLimits::class)->promptWaitMinutes();
+
+                $display = Message::create([
+                    'conversation_id' => $conversation->id,
+                    'role' => 'assistant',
+                    'user' => $conversation->character,
+                    'content' => '',
+                    'responseTime' => 0,
+                    'tool_data' => [
+                        'kind' => self::KIND_QUESTION,
+                        'question_id' => null,
+                        'state' => QuestionState::Pending->value,
+                        'origin' => AgentQuestion::ORIGIN_TASK_BUDGET,
+                    ],
+                ]);
+
+                $question = AgentQuestion::create([
+                    'origin' => AgentQuestion::ORIGIN_TASK_BUDGET,
+                    'task_budget_id' => $request->task->id,
+                    'conversation_id' => $conversation->id,
+                    'user_id' => $conversation->user_id,
+                    'pending_conversation_id' => $conversation->id,
+                    'run_id' => $request->runId,
+                    'step_id' => null,
+                    'action_id' => null,
+                    'paused_message_id' => $display->id,
+                    'display_message_id' => $display->id,
+                    'tool_call_id' => 'task_budget',
+                    'channel' => (string) ($conversation->channel ?? 'web'),
+                    'resume_mode' => $request->resumeMode,
+                    'question' => $text->promptQuestion($request->standing),
+                    'choices' => $text->choices($request->offeredSteps, $request->offeredSpend, $request->standing->currency),
+                    'allow_multiple' => false,
+                    'preamble' => $request->report,
+                    'state' => QuestionState::Pending,
+                    'asked_at' => $now,
+                    'expires_at' => $now->copy()->addMinutes($effectiveMinutes),
+                    'unanswered_policy' => \ClarionApp\LlmClient\ValueObjects\UnansweredPolicy::Stop,
+                    'consequential' => true,
+                    'requested_wait_minutes' => $requested,
+                    'effective_wait_minutes' => $effectiveMinutes,
+                ]);
+
+                $toolData = $display->tool_data;
+                $toolData['question_id'] = $question->id;
+                $display->tool_data = $toolData;
+                $display->content = app(QuestionRenderer::class)->render($question, $question->preamble);
+                $display->save();
+
+                Conversation::find($conversation->id)?->update(['is_processing' => false]);
+                $conversation->setAttribute('is_processing', false);
+
+                return [$question, $display];
+            });
+        } catch (UniqueConstraintViolationException) {
+            return QuestionRefusal::alreadyPending();
+        }
+
+        app(TaskBudgetService::class)->appendEvent($request->task, 'prompt_raised', [
+            'question_id' => $question->id,
+            'choices' => $question->choices,
+        ]);
+
+        app(RunTraceRecorder::class)->announceRunChanged($question->run_id);
+
+        $delivery = app(QuestionPresenter::class)->deliverQuestion($conversation, $question, (string) $display->content, $question->preamble);
+
+        if ($delivery->delivered) {
+            $deliveredAt = now();
+            DB::table('agent_questions')->where('id', $question->id)->update(['delivered_at' => $deliveredAt]);
+            $question->delivered_at = $deliveredAt;
+        } else {
+            Log::warning('AgentQuestionService: the task budget prompt could not be delivered', [
+                'question_id' => $question->id,
+                'conversation_id' => $conversation->id,
+                'channel' => $question->channel,
+                'reason' => self::recordableReason((string) $delivery->failureReason),
+            ]);
+            $this->stopCeilingPrompt($question, null, null, (string) ($delivery->failureReason ?? 'delivery failed'));
+            $question->refresh();
+        }
+
+        return new OpenedQuestion($question, $display, $delivery);
+    }
+
+    private function answerToolData(AgentQuestion $question): array
+    {
+        $toolData = ['kind' => self::KIND_ANSWER, 'question_id' => $question->id];
+        if ($question->isCeilingPrompt()) {
+            $toolData['origin'] = AgentQuestion::ORIGIN_TASK_BUDGET;
+        }
+
+        return $toolData;
+    }
+
+    /**
+     * Park a pending ceiling prompt at the user's request (or because it
+     * could not be delivered): stopped, keeping the question slot. The
+     * user's reply is kept in the conversation and a notice says so. A
+     * prompt stopped because its channel failed records the failure and
+     * posts no notice (the channel has just failed, and the user chose
+     * nothing); it stays answerable from the web form.
+     * Returns the stored reply, or null when the prompt was not pending.
+     */
+    public function stopCeilingPrompt(AgentQuestion $question, ?string $userId = null, ?string $rawContent = null, ?string $deliveryFailureReason = null): ?Message
+    {
+        $stoppedAt = now()->format('Y-m-d H:i:s.u');
+        $fields = ['stopped_at' => $stoppedAt];
+        if ($deliveryFailureReason !== null) {
+            $fields['delivery_failure_reason'] = self::recordableReason($deliveryFailureReason);
+        }
+
+        $result = DB::transaction(function () use ($question, $fields, $userId, $rawContent, $deliveryFailureReason) {
+            if (!$this->transition($question->id, [QuestionState::Pending], QuestionState::Stopped, $fields, false, false, false)) {
+                return null;
+            }
+            $stopped = AgentQuestion::findOrFail($question->id);
+            $this->markDisplayMessage($stopped);
+            $conversation = Conversation::find($stopped->conversation_id);
+            $reply = null;
+            if ($userId !== null && $rawContent !== null) {
+                $reply = Message::create([
+                    'conversation_id' => $stopped->conversation_id,
+                    'role' => 'user',
+                    'user' => User::find($userId)?->name,
+                    'content' => $rawContent,
+                    'tool_data' => $this->answerToolData($stopped),
+                ]);
+            }
+            $notice = ($conversation === null || $deliveryFailureReason !== null) ? null : Message::create([
+                'conversation_id' => $conversation->id,
+                'role' => 'assistant',
+                'user' => $conversation->character,
+                'content' => app(TaskBudgetText::class)->stoppedByChoice(),
+                'responseTime' => 0,
+                'tool_data' => ['kind' => self::KIND_NOTICE, 'question_id' => $stopped->id, 'state' => QuestionState::Stopped->value],
+            ]);
+
+            return [$stopped, $conversation, $reply, $notice];
+        });
+
+        if ($result === null) {
+            return null;
+        }
+        [$stopped, $conversation, $reply, $notice] = $result;
+
+        if ($stopped->task_budget_id !== null && ($task = TaskBudget::find($stopped->task_budget_id)) !== null) {
+            if ($deliveryFailureReason !== null) {
+                app(TaskBudgetService::class)->appendEvent($task, 'prompt_stopped', ['question_id' => $stopped->id, 'reason' => 'undeliverable']);
+            } else {
+                app(TaskBudgetService::class)->appendEvent($task, 'decision', ['decision' => 'stop', 'question_id' => $stopped->id], $userId);
+            }
+        }
+        if ($conversation !== null && $notice !== null) {
+            $this->deliverNotice($conversation, $notice, 'AgentQuestionService: the stop notice could not be delivered', ['question_id' => $stopped->id, 'conversation_id' => $conversation->id]);
+        }
+        try {
+            app(RunTraceRecorder::class)->announceRunChanged($stopped->run_id);
+        } catch (\Throwable) {
+        }
+
+        return $reply ?? $notice;
+    }
+
+    /**
      * Resume a run whose question could not be delivered, on the path it
      * paused on: inline for the synchronous path (the pause site returns the
      * continuation's result to its caller), through a queued job for the
@@ -284,6 +479,16 @@ class AgentQuestionService
         }
 
         $this->recordStop($question);
+
+        if ($question->isCeilingPrompt()) {
+            try {
+                if ($question->task_budget_id !== null && ($task = TaskBudget::find($question->task_budget_id)) !== null) {
+                    app(TaskBudgetService::class)->appendEvent($task, 'prompt_stopped', ['question_id' => $question->id, 'reason' => 'expired']);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('AgentQuestionService: the expired task budget prompt could not be recorded on its task', ['question_id' => $question->id, 'error' => $e->getMessage()]);
+            }
+        }
 
         return QuestionState::Stopped;
     }
@@ -488,14 +693,15 @@ class AgentQuestionService
         string $userId,
         string $rawContent,
         AnswerMethod $method = AnswerMethod::TypedReply,
+        ?string $recordedRaw = null,
     ): ?Message {
         if ((string) $question->user_id !== $userId) {
             throw new \LogicException('Only the user who was asked may answer a question.');
         }
 
-        return DB::transaction(function () use ($question, $answer, $userId, $rawContent, $method) {
+        return DB::transaction(function () use ($question, $answer, $userId, $rawContent, $method, $recordedRaw) {
             $won = $this->transition($question->id, [QuestionState::Pending, QuestionState::Stopped], QuestionState::Answered, [
-                'answer_raw' => $rawContent,
+                'answer_raw' => $recordedRaw ?? $rawContent,
                 'answer_selected' => json_encode($answer->selected),
                 'answer_method' => $method->value,
                 'answered_by' => $userId,
@@ -510,10 +716,7 @@ class AgentQuestionService
                 'role' => 'user',
                 'user' => User::find($userId)?->name,
                 'content' => $rawContent,
-                'tool_data' => [
-                    'kind' => self::KIND_ANSWER,
-                    'question_id' => $question->id,
-                ],
+                'tool_data' => $this->answerToolData($question),
             ]);
 
             DB::table('agent_questions')->where('id', $question->id)->update(['answer_message_id' => $message->id]);

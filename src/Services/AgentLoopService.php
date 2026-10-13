@@ -58,6 +58,8 @@ use ClarionApp\LlmClient\ValueObjects\RateLimitDecision;
 use Illuminate\Support\Str;
 use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use Illuminate\Support\Facades\Context;
+use ClarionApp\LlmClient\ValueObjects\StatedCeilings;
+use ClarionApp\LlmClient\ValueObjects\TaskBudgetDecision;
 use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
 use GuzzleHttp\Client;
@@ -441,7 +443,29 @@ class AgentLoopService
         int $iteration = 1,
         ?string $runId = null,
         ?string $triggerMessageId = null,
+        ?StatedCeilings $stated = null,
     ): void {
+        $previousTaskBudgetId = Context::get('task_budget_id');
+
+        try {
+            $this->startIteration($conversation, $iteration, $runId, $triggerMessageId, $stated);
+        } finally {
+            $this->restoreTaskBudgetContext($previousTaskBudgetId);
+        }
+    }
+
+    private function startIteration(
+        Conversation $conversation,
+        int $iteration,
+        ?string $runId,
+        ?string $triggerMessageId,
+        ?StatedCeilings $stated,
+    ): void {
+        // A new request begins only here: with tracing disabled every
+        // streamed iteration passes a null run id, so that alone is not the
+        // signal.
+        $newRequest = $iteration === 1 && $runId === null;
+
         // Gated only when this call MINTS a run. The condition is load-bearing
         // in both directions, and both mistakes look reasonable in review:
         //
@@ -498,6 +522,20 @@ class AgentLoopService
                     );
                 }
             }
+        }
+
+        if ($newRequest) {
+            app(TaskBudgetService::class)->forNewRun($conversation, $stated, false, $runId);
+        }
+        $this->enterTaskBudgetContext($conversation);
+
+        // The task budget claims this iteration's model call before it is
+        // dispatched.
+        $budgetDecision = app(TaskBudgetGate::class)->beforeStep($conversation, $runId);
+        if ($budgetDecision->isStop()) {
+            $this->stopAtTaskBudget($conversation, $budgetDecision, $runId, null, $iteration, 'stream');
+
+            return;
         }
 
         // Resolved once per dispatch, before buildToolsPayload()/
@@ -850,12 +888,49 @@ class AgentLoopService
         $this->dispatchResumedStream($conversation, $runId, ($toolData['iteration'] ?? 1) + 1);
     }
 
+    /** The shared resume prologue, for a task resumed after its ceiling prompt. */
+    public function resumeTaskBudgetPrologue(Conversation $conversation, ?string $runId): ?array
+    {
+        return $this->resumePrologue($conversation, $runId, null);
+    }
+
+    /** Continue a streamed task after the user chose to continue at its ceiling. */
+    public function resumeAfterTaskBudget(Conversation $conversation, ?string $runId, int $iteration): void
+    {
+        if ($runId !== null) {
+            Context::add('run_id', $runId);
+        }
+        $this->dispatchResumedStream($conversation, $runId, $iteration);
+    }
+
+    /** Continue a synchronous task after the user chose to continue at its ceiling. */
+    public function resumeAfterTaskBudgetSync(Conversation $conversation, ?string $runId, int $iteration): array
+    {
+        $attemptGroupId = (string) Str::uuid();
+        $stepId = null;
+        if ($runId !== null && $this->runTraceRecorder !== null) {
+            Context::add('run_id', $runId);
+            $stepId = $this->runTraceRecorder->openStep($runId, null, $attemptGroupId);
+        }
+
+        return $this->continueSyncAfterPause($conversation, $runId, $stepId, $attemptGroupId, $iteration);
+    }
+
     /**
      * Rebuild the payload from the stored conversation and dispatch the
      * next streamed request of a resumed run.
      */
     private function dispatchResumedStream(Conversation $conversation, ?string $runId, int $iteration): void
     {
+        // The task budget claims the continuation's model call before it is
+        // dispatched.
+        $budgetDecision = app(TaskBudgetGate::class)->beforeStep($conversation, $runId);
+        if ($budgetDecision->isStop()) {
+            $this->stopAtTaskBudget($conversation, $budgetDecision, $runId, null, $iteration, 'stream');
+
+            return;
+        }
+
         // Resolved once, before buildToolsPayload()/applyContextWindowTrim()
         // — resuming never
         // mints a run of its own, so this reads back whatever the original
@@ -1226,6 +1301,69 @@ class AgentLoopService
      */
     public function run(Conversation $conversation, string $message, array $options = []): array
     {
+        // The task-budget slot is restored, never cleared, on the way out:
+        // a helper's run is nested inside its delegator's, which must keep
+        // stamping its own usage with its own task afterwards.
+        $previousTaskBudgetId = Context::get('task_budget_id');
+
+        try {
+            return $this->runTask($conversation, $message, $options);
+        } finally {
+            $this->restoreTaskBudgetContext($previousTaskBudgetId);
+        }
+    }
+
+    private function restoreTaskBudgetContext(?string $previous): void
+    {
+        if ($previous === null) {
+            Context::forget('task_budget_id');
+        } else {
+            Context::add('task_budget_id', $previous);
+        }
+    }
+
+    /** Puts the conversation's current task in the context that stamps usage records. */
+    private function enterTaskBudgetContext(Conversation $conversation): void
+    {
+        $taskId = $conversation->active_task_budget_id;
+        if ($taskId !== null) {
+            Context::add('task_budget_id', $taskId);
+        }
+    }
+
+    /**
+     * What happens when the task budget refuses the next step: a helper
+     * stops its own run and hands its delegator a budget-stopped result; a
+     * root pauses (or halts) the task.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function stopAtTaskBudget(Conversation $conversation, TaskBudgetDecision $decision, ?string $runId, ?string $openStepId, int $nextIteration, string $resumeMode): ?array
+    {
+        if ((string) $conversation->channel === self::DELEGATION_CHANNEL) {
+            $reason = app(TaskBudgetText::class)->ceilingReachedReason();
+            if ($this->runTraceRecorder !== null) {
+                if ($openStepId !== null) {
+                    $this->runTraceRecorder->closeStep($openStepId, RunEndState::StoppedEarly, $reason);
+                }
+                $this->runTraceRecorder->closeRun($runId, RunEndState::StoppedEarly, $reason);
+            }
+            $conversation->update(['is_processing' => false]);
+
+            return ['status' => 'error', 'code' => 'task_budget_reached', 'content' => $reason, 'message_id' => null];
+        }
+
+        try {
+            $task = app(TaskBudgetService::class)->currentFor($conversation);
+        } catch (\Throwable $e) {
+            $task = null;
+        }
+
+        return app(TaskBudgetPauser::class)->pause($conversation, $task, $decision, $runId, $openStepId, $nextIteration, $resumeMode);
+    }
+
+    private function runTask(Conversation $conversation, string $message, array $options = []): array
+    {
         // Trigger-fired work (a scheduler run with nobody present) carries
         // its own work kind and run kind throughout this method, never a
         // second, separate code path -- every existing caller that passes
@@ -1266,6 +1404,12 @@ class AgentLoopService
                 agentId: $conversation->character ?? $conversation->id,
             );
         }
+
+        // The task this run belongs to: a new one for a new request, the
+        // delegator's for a helper.
+        $stated = $options['task_budget'] ?? null;
+        app(TaskBudgetService::class)->forNewRun($conversation, $stated instanceof StatedCeilings ? $stated : null, $unattended, $runId);
+        $this->enterTaskBudgetContext($conversation);
 
         // Resolved once per dispatch, before buildToolsPayload()/
         // applyContextWindowTrim() are called (085-graceful-degradation,
@@ -1322,7 +1466,9 @@ class AgentLoopService
         $this->attemptInitialRouting($conversation, $message);
         $this->ensureSpecialistAvailable($conversation);
 
-        $maxIterations = $options['max_iterations'] ?? config('llm-client.agent_loop.max_iterations', 20);
+        // Only an explicit bound limits this run's own iterations; otherwise
+        // the task budget is the bound, checked before every model call.
+        $maxIterations = $options['max_iterations'] ?? null;
         $deadlineAt = $options['deadline_at'] ?? null;
         $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
@@ -1369,7 +1515,7 @@ class AgentLoopService
                 );
             }
 
-            for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
+            for ($iteration = 1; $maxIterations === null || $iteration <= $maxIterations; $iteration++) {
                 // Delegation time bound (research.md D3): checked before any
                 // per-iteration work for this iteration begins, mirroring the
                 // max-iterations-exceeded close-out shape below exactly, but
@@ -1397,6 +1543,14 @@ class AgentLoopService
                         'message_id' => null,
                         'code' => 'time_ceiling_reached',
                     ];
+                }
+
+                // The task budget claims this iteration's model call before
+                // anything of it starts.
+                $budgetDecision = app(TaskBudgetGate::class)->beforeStep($conversation, $runId);
+                if ($budgetDecision->isStop()) {
+                    return $this->stopAtTaskBudget($conversation, $budgetDecision, $runId, $currentStepId, $iteration, 'sync')
+                        ?? ['status' => 'stopped', 'code' => 'task_budget_reached', 'content' => '', 'message_id' => null];
                 }
 
                 // Generate attempt group ID for this turn (shared across LLM calls, retries, and tool calls)
@@ -2646,16 +2800,41 @@ class AgentLoopService
         string $attemptGroupId,
         int $iteration,
     ): array {
+        $previousTaskBudgetId = Context::get('task_budget_id');
+        $this->enterTaskBudgetContext($conversation);
+
+        try {
+            return $this->continueSyncLoop($conversation, $runId, $currentStepId, $attemptGroupId, $iteration);
+        } finally {
+            $this->restoreTaskBudgetContext($previousTaskBudgetId);
+        }
+    }
+
+    private function continueSyncLoop(
+        Conversation $conversation,
+        ?string $runId,
+        ?string $currentStepId,
+        string $attemptGroupId,
+        int $iteration,
+    ): array {
         // Resolved once, before buildToolsPayload()/applyContextWindowTrim()
         // are called — never re-evaluated inside this method's own loop, so
         // every iteration of this continuation uses one frozen decision.
         $decision = app(DegradationGate::class)->forRun($runId);
 
-        $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
         $tools = $this->buildToolsPayload($decision->withheldTools, $conversation);
         $formattedTools = $this->formatTools($conversation, $tools);
 
-        for (; $iteration <= $maxIterations; $iteration++) {
+        // Bounded by the task budget alone, checked before every model call.
+        for (;; $iteration++) {
+            $budgetDecision = app(TaskBudgetGate::class)->beforeStep($conversation, $runId);
+            if ($budgetDecision->isStop()) {
+                // The step opened for this iteration never started: the
+                // stop closes it.
+                return $this->stopAtTaskBudget($conversation, $budgetDecision, $runId, $currentStepId, $iteration, 'sync')
+                    ?? ['status' => 'stopped', 'code' => 'task_budget_reached', 'content' => '', 'message_id' => null];
+            }
+
             $rawMessages = $this->buildMessagesPayload($conversation, $runId);
 
             // Site 7: ContextReshape around applyContextWindowTrim in resumeSync().
@@ -3112,28 +3291,6 @@ class AgentLoopService
                 );
             }
         }
-
-        // Close the run on exit — stopped early due to max iterations (FR-010).
-        if ($this->runTraceRecorder !== null && $runId !== null) {
-            if ($currentStepId !== null) {
-                $this->runTraceRecorder->closeStep(
-                    $currentStepId,
-                    RunEndState::StoppedEarly,
-                    'Maximum iterations reached',
-                );
-            }
-            $this->runTraceRecorder->closeRun(
-                $runId,
-                RunEndState::StoppedEarly,
-                'Maximum iterations reached',
-            );
-        }
-
-        $agentId = $conversation->character ?? $conversation->id;
-        $conversation->update(['is_processing' => false]);
-
-
-        return ['status' => 'error', 'content' => 'Maximum iterations reached', 'message_id' => null];
     }
 
     /**
@@ -3992,33 +4149,7 @@ class AgentLoopService
      */
     private function askReachabilityRefusal(Conversation $conversation, bool $unattended): ?QuestionRefusal
     {
-        if ($conversation->user_id === null || $conversation->user_id === '') {
-            return QuestionRefusal::noReachableUser(QuestionRefusal::NO_USER_REASON);
-        }
-
-        if ($unattended) {
-            return QuestionRefusal::noReachableUser(QuestionRefusal::UNATTENDED_REASON);
-        }
-
-        $channel = (string) ($conversation->channel ?? 'web');
-
-        if ($channel === self::DELEGATION_CHANNEL) {
-            $rootId = DelegationService::chainRootConversationId((string) $conversation->id);
-
-            if ($rootId !== (string) $conversation->id
-                && AgentQuestion::where('pending_conversation_id', $rootId)->exists()
-            ) {
-                return QuestionRefusal::alreadyPending();
-            }
-
-            return QuestionRefusal::noReachableUser(QuestionRefusal::HELPER_REASON);
-        }
-
-        if (!app(ConversationChannelRegistry::class)->has($channel)) {
-            return QuestionRefusal::noReachableUser("Questions cannot be delivered on the '{$channel}' channel.");
-        }
-
-        return null;
+        return app(\ClarionApp\LlmClient\Services\UserReachability::class)->refusal($conversation, $unattended);
     }
 
     private function handleMemoryCreate(array $arguments, Conversation $conversation): string
@@ -5982,14 +6113,26 @@ class AgentLoopService
     }
 
     /**
-     * Get the most recent user message in a conversation.
+     * Get the most recent user message in a conversation. A decision typed
+     * at a task's budget ceiling ("continue steps=20") is stored as a user
+     * message but is not a request, so it is skipped: a resumed task keeps
+     * routing and recalling memory on what the user actually asked.
      */
     private function getLastUserMessage(Conversation $conversation): ?Message
     {
-        return Message::where('conversation_id', $conversation->id)
+        $messages = Message::where('conversation_id', $conversation->id)
             ->where('role', 'user')
             ->latest('created_at')
-            ->first();
+            ->cursor();
+
+        foreach ($messages as $message) {
+            $toolData = is_array($message->tool_data) ? $message->tool_data : [];
+            if (($toolData['origin'] ?? null) !== AgentQuestion::ORIGIN_TASK_BUDGET) {
+                return $message;
+            }
+        }
+
+        return null;
     }
 
     /**

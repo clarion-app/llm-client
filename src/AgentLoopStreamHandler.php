@@ -156,6 +156,23 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
     public function finish($data, $seconds)
     {
+        // This iteration's usage is stamped with the conversation's task; the
+        // slot is restored afterwards, never left set for unrelated work.
+        $previousTaskBudgetId = \Illuminate\Support\Facades\Context::get('task_budget_id');
+
+        try {
+            $this->finishIteration($data, $seconds);
+        } finally {
+            if ($previousTaskBudgetId === null) {
+                \Illuminate\Support\Facades\Context::forget('task_budget_id');
+            } else {
+                \Illuminate\Support\Facades\Context::add('task_budget_id', $previousTaskBudgetId);
+            }
+        }
+    }
+
+    private function finishIteration($data, $seconds): void
+    {
         $parsedData = is_string($data) ? json_decode($data, true) : $data;
         $conversationId = $parsedData['conversation_id'] ?? null;
         $iteration = $parsedData['iteration'] ?? 1;
@@ -168,8 +185,6 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
         $conversation = Conversation::find($conversationId);
         if (!$conversation) return;
-
-        $maxIterations = config('llm-client.agent_loop.max_iterations', 20);
 
         // Ensure we have a runTraceRecorder (resolve from container if not injected).
         if ($this->runTraceRecorder === null) {
@@ -221,6 +236,9 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         // is needed here.
         if ($this->runId !== null) {
             \Illuminate\Support\Facades\Context::add('run_id', $this->runId);
+        }
+        if ($conversation->active_task_budget_id !== null) {
+            \Illuminate\Support\Facades\Context::add('task_budget_id', $conversation->active_task_budget_id);
         }
 
         // Record LLM usage metrics for the final chunk (fire-and-forget, never throws)
@@ -275,12 +293,6 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
         // If we have tool calls to execute
         if (!empty($this->toolCalls)) {
-            // Check iteration limit
-            if ($iteration >= $maxIterations) {
-                $this->handleMaxIterationReached($conversation);
-                return;
-            }
-
             // The step is closed inside handleToolCalls(), once it is known whether
             // this round resolved or suspended for a confirmation — a suspended step
             // stays open across the pause so its duration covers the human wait.
@@ -876,48 +888,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         }
     }
 
-    private function handleMaxIterationReached(Conversation $conversation): void
-    {
-        $errorContent = 'I\'ve reached the maximum number of iterations (' .
-            config('llm-client.agent_loop.max_iterations', 20) .
-            ') for this request. Please try breaking your request into smaller steps.';
-
-        if ($this->message === null) {
-            $this->message = Message::create([
-                'conversation_id' => $conversation->id,
-                'responseTime' => 0,
-                'user' => $conversation->character,
-                'role' => 'assistant',
-                'content' => $errorContent,
-            ]);
-            event(new NewConversationMessageEvent($conversation->id, $this->message->id));
-        } else {
-            $this->message->update(['content' => $errorContent]);
-        }
-
-        // Close the step and run as stopped_early.
-        $this->closeCurrentStep(
-            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
-            'Maximum iterations reached',
-        );
-        $this->closeRun(
-            \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
-            null,
-            'Maximum iterations reached',
-        );
-
-        event(new FinishOpenAIConversationResponseEvent($conversation->id, $errorContent));
-        $conversation->update(['is_processing' => false]);
-    }
-
     /**
-     * A conversation work ceiling was reached mid-batch. Mirrors
-     * handleMaxIterationReached()'s exact close-out sequence — the visible
-     * assistant message, the step/run closed stopped_early, the finish
-     * event, is_processing cleared — with two differences: the message's
-     * tool_data carries the mixed real/synthesized tool_results the caller
-     * already built (§3.3), and the reason names the work ceiling rather
-     * than the iteration count.
+     * A conversation work ceiling was reached mid-batch. Closes out the
+     * response — the visible assistant message, the step/run closed
+     * stopped_early, the finish event, is_processing cleared — with the
+     * message's tool_data carrying the mixed real/synthesized tool_results
+     * the caller already built (§3.3), and the reason naming the work
+     * ceiling.
      */
     private function handleWorkCeilingReached(
         Conversation $conversation,
@@ -1029,7 +1006,7 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             ->latest('created_at')
             ->cursor()
             ->first(fn (Message $message) => !(is_array($message->tool_data)
-                && ($message->tool_data['kind'] ?? null) === \ClarionApp\LlmClient\Services\AgentQuestionService::KIND_NOTICE));
+                && in_array($message->tool_data['kind'] ?? null, \ClarionApp\LlmClient\Services\AgentQuestionService::SYSTEM_NOTICE_KINDS, true)));
 
         if ($latestUserMessage && $latestAssistantMessage &&
             $latestUserMessage->created_at > $latestAssistantMessage->created_at) {

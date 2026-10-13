@@ -12,10 +12,14 @@ use ClarionApp\LlmClient\Services\LateReplyNotifier;
 use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
 use ClarionApp\LlmClient\Services\QuestionResumer;
 use ClarionApp\LlmClient\Services\RoleResolver;
+use ClarionApp\LlmClient\Services\TaskBudgetDirectiveParser;
+use ClarionApp\LlmClient\Services\TaskBudgetService;
+use ClarionApp\LlmClient\Services\TaskBudgetText;
 use ClarionApp\LlmClient\ValueObjects\IntakeResult;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
+use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
 use Illuminate\Http\Request;
 use Auth;
 use Illuminate\Support\Facades\Log;
@@ -31,11 +35,26 @@ class AgentController extends Controller
             'message' => 'present|nullable|string',
             'conversation_id' => 'nullable|string|exists:conversations,id',
             'channel' => ['nullable', 'string', 'max:50', 'regex:/^[a-z0-9_-]+$/'],
-        ]);
+            'task_budget' => ['sometimes', 'nullable', 'array'],
+        ] + TaskBudgetController::rules('task_budget.'));
 
         $user = Auth::user();
         $channel = $validated['channel'] ?? 'web';
         $message = (string) ($validated['message'] ?? '');
+        $bodyBudget = $validated['task_budget'] ?? null;
+
+        // A "/budget" line is read first — before the message can be taken
+        // as an answer or refused while the conversation is busy: changing
+        // or viewing the ceilings of a running or paused task is exactly
+        // what a user does while it is busy or waiting on a ceiling prompt.
+        $directive = (new TaskBudgetDirectiveParser())->parse($message);
+        if ($directive['malformed'] || $directive['viewOnly'] || $directive['directiveOnly']) {
+            return $this->handleDirective($directive, $bodyBudget, $validated['conversation_id'] ?? null, (string) $user->id, $channel);
+        }
+        if ($directive['stated'] !== null) {
+            $message = $directive['remaining'];
+        }
+        $stated = TaskBudgetController::statedFrom($bodyBudget, $directive['stated']);
 
         // A reply without a conversation id answers the user's most recently
         // asked pending question on this channel, however long ago it was
@@ -45,8 +64,12 @@ class AgentController extends Controller
             : null;
 
         $answered = null;
+        // The change made by ceilings stated with a reply to a waiting
+        // question (a reply starts no new request of its own).
+        $changedWithReply = null;
 
         if ($questionConversation !== null) {
+            $changedWithReply = app(TaskBudgetService::class)->changeWithReply($questionConversation, $stated, (string) $user->id);
             [$answered, $refusal] = $this->acceptAnswer($questionConversation, (string) $user->id, $message);
             if ($refusal !== null) {
                 return $refusal;
@@ -98,6 +121,7 @@ class AgentController extends Controller
 
             // Taken as an answer before the processing check: the reply
             // to a pending question is exactly what the run is waiting for.
+            $changedWithReply = app(TaskBudgetService::class)->changeWithReply($conversation, $stated, (string) $user->id);
             [$answered, $refusal] = $this->acceptAnswer($conversation, (string) $user->id, $message);
             if ($refusal !== null) {
                 return $refusal;
@@ -189,7 +213,9 @@ class AgentController extends Controller
                     ?? ['status' => 'stopped', 'content' => '', 'message_id' => null];
             } else {
                 $agentLoopService = app(AgentLoopService::class);
-                $result = $agentLoopService->run($conversation, $message);
+                $result = $stated === null
+                    ? $agentLoopService->run($conversation, $message)
+                    : $agentLoopService->run($conversation, $message, ['task_budget' => $stated]);
             }
         } catch (BudgetExceededException $e) {
             // Structural, rather than an instanceof test inside the blanket
@@ -225,6 +251,9 @@ class AgentController extends Controller
             // deserves its own, more precise status than the sibling
             // max_iterations outcome currently, imprecisely, falls into.
             'stopped' => 200,
+            'decision_required' => 200,
+            'budget_updated' => 200,
+            'directive_malformed' => 200,
             default => 500,
         };
 
@@ -252,7 +281,65 @@ class AgentController extends Controller
             $response['question_id'] = $result['question_id'];
         }
 
+        // A reply to a waiting question started no request: only a change
+        // its stated ceilings actually made can have been reduced.
+        $line = $answered !== null
+            ? ($changedWithReply === null ? null : app(TaskBudgetService::class)->reducedLine($stated, $changedWithReply['reduced']))
+            : app(TaskBudgetService::class)->reducedLine($stated);
+        if ($line !== null) {
+            $response['task_budget_notice'] = $line;
+        }
+
         return response()->json($response, $statusCode);
+    }
+
+    /**
+     * Answers a directive-only, bare or malformed "/budget" message without
+     * running anything. Without a conversation id it targets the user's
+     * most recently updated conversation on the channel whose task is
+     * running or paused.
+     */
+    private function handleDirective(array $directive, ?array $bodyBudget, ?string $conversationId, string $userId, string $channel)
+    {
+        $text = new TaskBudgetText();
+        if ($conversationId !== null) {
+            $conversation = Conversation::find($conversationId);
+            if (!$conversation) {
+                return response()->json(['error' => 'Conversation not found', 'code' => 'conversation_not_found'], 404);
+            }
+            if ($conversation->user_id !== $userId) {
+                return response()->json(['error' => 'Forbidden', 'code' => 'forbidden'], 403);
+            }
+        } else {
+            $id = Conversation::query()
+                ->join('task_budgets', 'task_budgets.id', '=', 'conversations.active_task_budget_id')
+                ->where('conversations.user_id', $userId)
+                ->where('conversations.channel', $channel)
+                ->whereNull('conversations.deleted_at')
+                ->whereIn('task_budgets.state', [TaskBudgetState::Running->value, TaskBudgetState::Paused->value])
+                ->orderByDesc('conversations.updated_at')
+                ->value('conversations.id');
+            $conversation = $id === null ? null : Conversation::find($id);
+        }
+        if ($directive['malformed']) {
+            return response()->json(['status' => 'directive_malformed', 'content' => $text->directiveMalformed(), 'conversation_id' => $conversation?->id], 200);
+        }
+        $tasks = app(TaskBudgetService::class);
+        $task = $conversation === null ? null : $tasks->currentFor($conversation);
+        if ($task === null || $task->state->isTerminal()) {
+            return response()->json(['status' => 'budget_updated', 'content' => $text->noTaskInProgress(), 'conversation_id' => $conversation?->id], 200);
+        }
+        if ($directive['viewOnly']) {
+            return response()->json(['status' => 'budget_updated', 'content' => $text->standing($tasks->standing($task)), 'conversation_id' => $conversation->id], 200);
+        }
+        // A body field sent beside the line wins key by key, as it does for
+        // a request.
+        $changed = $tasks->changeFromConversation($conversation, $task, TaskBudgetController::statedFrom($bodyBudget, $directive['stated']), $userId);
+        if ($changed === null) {
+            return response()->json(['status' => 'budget_updated', 'content' => $text->noTaskInProgress(), 'conversation_id' => $conversation->id], 200);
+        }
+
+        return response()->json(['status' => 'budget_updated', 'content' => $changed['content'], 'conversation_id' => $conversation->id], 200);
     }
 
     /**
@@ -319,6 +406,23 @@ class AgentController extends Controller
                 'code' => 'answer_required',
                 'error' => 'An answer is required to reply to the pending question.',
             ], 422)];
+        }
+
+        if ($intake->kind === IntakeResult::DECISION_REQUIRED) {
+            return [null, response()->json([
+                'status' => 'decision_required',
+                'content' => $intake->guidance,
+                'conversation_id' => $conversation->id,
+            ], 200)];
+        }
+
+        if ($intake->kind === IntakeResult::DECISION_RECORDED) {
+            return [null, response()->json([
+                'status' => 'awaiting_user',
+                'content' => '',
+                'question_id' => $intake->question?->id,
+                'conversation_id' => $conversation->id,
+            ], 202)];
         }
 
         if ($intake->kind === IntakeResult::ANSWERED) {

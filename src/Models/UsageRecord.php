@@ -48,6 +48,7 @@ class UsageRecord extends Model
         'total_cost',
         'cost_unpriced',
         'cost_estimated',
+        'task_budget_id',
     ];
 
     protected $casts = [
@@ -85,6 +86,14 @@ class UsageRecord extends Model
         static::creating(function ($model) {
             if ($model->run_id === null) {
                 $model->run_id = Context::get('run_id');
+            }
+        });
+
+        // Attribute the usage to the task in progress, which every loop
+        // entry carries in Context; an explicit value is never overwritten.
+        static::creating(function ($model) {
+            if ($model->task_budget_id === null) {
+                $model->task_budget_id = Context::get('task_budget_id');
             }
         });
     }

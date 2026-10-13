@@ -77,6 +77,7 @@ class ConversationCondensationTest extends TestCase
 
         // conversations table
         Schema::create('conversations', function (Blueprint $table) {
+            $table->uuid('active_task_budget_id')->nullable();
             $table->uuid('id')->primary();
             $table->uuid('user_id');
             $table->uuid('server_id');
