@@ -112,7 +112,11 @@ class TaskBudgetDefaultCeilingJourneyTest extends AssembledSystemTestCase
         $this->assertSame($runId, $prompt->run_id);
         $run = $this->actingAs($this->fixture()->user, 'api')->getJson("/api/clarion-app/llm-client/agent-runs/{$runId}")->assertStatus(200)->json();
         $this->assertSame('in_progress', $run['end_state']);
-        $this->assertSame(0, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count(), 'no step is left open');
+        // The pause sits on the step boundary: the step is left open and
+        // marked paused (the run is resumable until its resumer claims it),
+        // never closed.
+        $this->assertSame(1, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count(), 'the open step is left open');
+        $this->assertSame('paused', DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->value('checkpoint_state'), 'the step is marked paused');
         $this->assertFalse((bool) $conversation->fresh()->is_processing);
 
         // The old per-request bound never fired.

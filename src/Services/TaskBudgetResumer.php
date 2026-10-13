@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Contracts\FaultInjector;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -114,6 +115,22 @@ class TaskBudgetResumer
             'max_steps' => $newSteps, 'max_spend' => $newSpend,
             'steps_reduced' => $grant['steps_reduced'], 'spend_reduced' => $grant['spend_reduced'],
         ], $question->answered_by);
+
+        // The continuation runs under a fresh claim: mint the next dispatch
+        // id while the run is paused, then claim the lease. A lost claim
+        // means another resumer already took the run; return as if the
+        // CAS were already consumed. With run tracing off there is no run
+        // row to claim — the continuation simply runs.
+        if ($runId !== null) {
+            $dispatch = app(RunLease::class)->mintDispatch($runId, ['paused']);
+            if ($dispatch !== null) {
+                if (!app(RunLease::class)->claim($runId, $dispatch)->won) {
+                    return null;
+                }
+
+                app(FaultInjector::class)->reach('during_pause_resume');
+            }
+        }
 
         Conversation::find($conversation->id)?->update(['is_processing' => true]);
         $conversation->setAttribute('is_processing', true);

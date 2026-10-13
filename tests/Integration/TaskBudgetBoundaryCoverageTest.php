@@ -255,10 +255,14 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
     // B2 — a synchronous continuation
     // ---------------------------------------------------------------
 
-    private function assertNoStepLeftOpen(?string $runId): void
+    private function assertPausedStepLeftOpen(?string $runId): void
     {
         $this->assertNotNull($runId);
-        $this->assertSame(0, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count(), 'no step is left open');
+        // The pause sits on the step boundary: the step is left open and
+        // marked paused (the run is resumable until its resumer claims it),
+        // never closed.
+        $this->assertSame(1, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count(), 'the open step is left open');
+        $this->assertSame('paused', DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->value('checkpoint_state'), 'the step is marked paused');
     }
 
     private function row8(): void
@@ -281,7 +285,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(2, $this->modelRequests('sync'));
         $this->assertSame(2, (int) $task->steps_used, 'the continuation\'s request was claimed');
         $this->assertSame('paused', $task->state, 'and at the ceiling it made no further request');
-        $this->assertNoStepLeftOpen($this->latestRunIdOf($conversation));
+        $this->assertPausedStepLeftOpen($this->latestRunIdOf($conversation));
     }
 
     private function row9(): void
@@ -302,7 +306,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(2, (int) $task->steps_used);
         $this->assertSame('paused', $task->state);
         $this->assertNotNull($this->promptOf($conversation), 'the ceiling prompt is what the answer\'s reply waits on');
-        $this->assertNoStepLeftOpen($question->run_id);
+        $this->assertPausedStepLeftOpen($question->run_id);
     }
 
     private function row10(): void
@@ -328,7 +332,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertNotSame($first->id, $second->id);
         $this->assertSame(QuestionState::Pending, $second->state);
         $this->assertSame($runId, $second->run_id, 'still the same run');
-        $this->assertNoStepLeftOpen($runId);
+        $this->assertPausedStepLeftOpen($runId);
     }
 
     // ---------------------------------------------------------------
@@ -418,7 +422,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(1, $this->modelRequests('stream'), 'the continuation was refused at the ceiling, not dispatched');
         $this->assertSame(1, (int) $task->steps_used);
         $this->assertSame('paused', $task->state);
-        $this->assertNoStepLeftOpen($this->latestRunIdOf($conversation));
+        $this->assertPausedStepLeftOpen($this->latestRunIdOf($conversation));
     }
 
     private function row15(): void
@@ -438,7 +442,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(1, (int) $task->steps_used);
         $this->assertSame('paused', $task->state);
         $this->assertNotNull($this->promptOf($conversation));
-        $this->assertNoStepLeftOpen($question->run_id);
+        $this->assertPausedStepLeftOpen($question->run_id);
     }
 
     private function row16(): void
@@ -467,7 +471,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $second = $this->promptOf($conversation);
         $this->assertNotSame($first->id, $second->id);
         $this->assertSame($runId, $second->run_id, 'still the same run');
-        $this->assertNoStepLeftOpen($runId);
+        $this->assertPausedStepLeftOpen($runId);
     }
 
     // ---------------------------------------------------------------

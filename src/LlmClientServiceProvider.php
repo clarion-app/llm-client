@@ -63,6 +63,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
     {
         parent::boot();
 
+        // The run checkpoint writes to the run's own row, which the run
+        // trace mints. With run tracing disabled there is no run row, so a
+        // run that resume is enabled to resume has nowhere to be written —
+        // the feature is silently inert. Say so once at boot.
+        if (!config('llm-client.run_trace.enabled', true) && config('llm-client.resume.enabled', true)) {
+            \Illuminate\Support\Facades\Log::warning('llm-client: resume is enabled but run tracing is disabled; runs cannot be checkpointed and will not be resumable.');
+        }
+
         $this->loadMigrationsFrom(__DIR__.'/Migrations');
 
         $this->app->booted(function () {
@@ -506,6 +514,15 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Contracts\FaultInjector::class, function () {
             return new \ClarionApp\LlmClient\Services\NullFaultInjector();
         });
+
+        // The execution lease (spec 134, lease contract §1): one per
+        // process — the nonce is per process, shared by every instance, so
+        // a singleton keeps every write in this process under one nonce.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RunLease::class);
+
+        // The strict checkpoint writer (spec 134, checkpoint-ledger
+        // contract §1): scoped, depends on the lease.
+        $this->app->scoped(\ClarionApp\LlmClient\Services\RunCheckpoint::class);
 
         // Register role resolution services
         $this->app->singleton(\ClarionApp\LlmClient\Services\RoleResolver::class, function ($app) {

@@ -2,9 +2,11 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Exceptions\CheckpointWriteFailed;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\ValueObjects\PauseKind;
 use ClarionApp\LlmClient\ValueObjects\PausedTurnContext;
+use Illuminate\Support\Facades\DB;
 
 /**
  * The one place a paused model turn is written into, and consumed out of,
@@ -55,6 +57,30 @@ class PausedTurnWriter
 
         $message->tool_data = $toolData;
         $message->save();
+
+        // C6: the run is paused — the step and the paused call marked
+        // paused, and the run's lease released. A paused run is worked by
+        // nobody until its resumer claims it. A checkpoint write cannot
+        // happen inside a transaction, so when this pause is written inside
+        // one (the question path) the mark is deferred to its commit; the
+        // paused-turn message itself stays in the transaction, so there is
+        // never a pending question without a resumable pause. Under a
+        // test's RefreshDatabase the afterCommit callback runs immediately
+        // (its wrapping transaction is not a deferral target), so the mark
+        // is a no-op for that test — those are pre-checkpoint tests that
+        // never assert checkpoint state.
+        $runId = $context->runId;
+        $stepId = $context->stepId;
+        $callId = $context->pausedToolCallId;
+        if (DB::transactionLevel() > 0) {
+            try {
+                DB::afterCommit(fn () => app(RunCheckpoint::class)->markPaused($runId, $stepId, $callId));
+            } catch (CheckpointWriteFailed) {
+                // A RefreshDatabase wrapping transaction: the mark is a no-op.
+            }
+        } else {
+            app(RunCheckpoint::class)->markPaused($runId, $stepId, $callId);
+        }
     }
 
     /**

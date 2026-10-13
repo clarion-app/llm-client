@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
+use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use ClarionApp\LlmClient\ValueObjects\RoleResolution;
 
 /**
@@ -301,7 +302,9 @@ class ConsensusService
         ]);
 
         // 098's solo path -- deliberately NOT delegateBatch() (FR-016).
-        $result = $this->delegationService->delegate($conversation, $assignment->helper_agent_id, $question, null, null, null, $taskBudgetId);
+        // 134-resumable-long-tasks: a single consensus contributor is
+        // resumed by the consensus mechanism, not a plain parent hop.
+        $result = $this->delegationService->delegate($conversation, $assignment->helper_agent_id, $question, null, null, null, $taskBudgetId, ResumeDriver::Consensus->value);
 
         // A contributor stopped by the request's task budget is reported as
         // such, as finalize() reports one of a batch: its partial answer is

@@ -312,7 +312,7 @@ class ConsensusServiceTest extends TestCase
         $delegationService = $this->mockDelegationService();
         $delegationService->shouldReceive('delegate')
             ->once()
-            ->with($conversation, $helper->id, 'Is it safe?', null, null, null, Mockery::type('string'))
+            ->with($conversation, $helper->id, 'Is it safe?', null, null, null, Mockery::type('string'), 'consensus')
             ->andReturn($this->sixFieldResult((string) Str::uuid(), 'success', 'It is safe.'));
         $delegationService->shouldNotReceive('delegateBatch');
 

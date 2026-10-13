@@ -13,6 +13,7 @@ use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
+use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
 use Illuminate\Support\Facades\Context;
@@ -79,7 +80,7 @@ class DelegationService
      *   completed-delegation result shape (contracts/
      *   delegation-protocol-meta-tool.md).
      */
-    public function delegate(Conversation $parentConversation, string $helperAgentId, string $task, ?string $context, ?string $managedTaskId = null, ?string $partId = null, ?string $taskBudgetId = null): array
+    public function delegate(Conversation $parentConversation, string $helperAgentId, string $task, ?string $context, ?string $managedTaskId = null, ?string $partId = null, ?string $taskBudgetId = null, ?string $resumeDriver = null): array
     {
         $resolved = $this->resolveAndValidate($parentConversation, $helperAgentId);
         if (isset($resolved['error'])) {
@@ -111,7 +112,7 @@ class DelegationService
 
         $helperConversation = Conversation::find($delegation->helper_conversation_id);
 
-        return $this->runDelegatedTask($delegation, $resolved['helperAgent'], $helperConversation);
+        return $this->runDelegatedTask($delegation, $resolved['helperAgent'], $helperConversation, null, $resumeDriver);
     }
 
     /**
@@ -1059,7 +1060,7 @@ class DelegationService
      *
      * @return array<string, mixed>
      */
-    private function runDelegatedTask(Delegation $delegation, Agent $helperAgent, Conversation $helperConversation, ?array $boundOptions = null): array
+    private function runDelegatedTask(Delegation $delegation, Agent $helperAgent, Conversation $helperConversation, ?array $boundOptions = null, ?string $resumeDriver = null): array
     {
         $actionId = $delegation->parent_action_id;
 
@@ -1081,6 +1082,14 @@ class DelegationService
         // capability_agent.* rather than delegation.* -- through the exact
         // same override mechanism, so the two entry points' bounds can
         // differ without either mutating the other's config reads.
+        // 134-resumable-long-tasks: the helper's own run is driven by its
+        // delegator. The row tells the common two (a batch member has a
+        // batch_id; everything else is a plain solo hop resumed by its
+        // parent); a sequence stage or a consensus contributor goes
+        // through the same solo write path, so those two pass their own
+        // driver explicitly.
+        $driver = $resumeDriver ?? ($delegation->batch_id !== null ? ResumeDriver::BatchMember->value : ResumeDriver::Parent->value);
+
         $delegationOptions = array_merge([
             'max_iterations' => config('llm-client.delegation.max_iterations', 10),
             'deadline_at' => now()->addSeconds(config('llm-client.delegation.max_seconds', 120)),
@@ -1091,6 +1100,7 @@ class DelegationService
             'preset' => 'delegation_result',
             'retry_on_validation_failure' => true,
             'max_schema_retries' => config('llm-client.delegation.max_result_schema_retries', 2),
+            '_resume_driver' => $driver,
         ], $boundOptions ?? []);
 
         try {

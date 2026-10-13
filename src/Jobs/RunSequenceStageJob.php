@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\Services\SequenceService;
 use ClarionApp\LlmClient\Services\TaskBudgetGate;
 use ClarionApp\LlmClient\Services\TaskBudgetService;
 use ClarionApp\LlmClient\Services\TaskBudgetText;
+use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -160,7 +161,7 @@ class RunSequenceStageJob implements ShouldQueue
         $conversation = Conversation::find($run->conversation_id);
 
         $taskDescription = "Execute stage \"{$stage->name}\" of an automated sequence pipeline, using the input provided below.";
-        $result = $delegationService->delegate($conversation, $stage->helper_agent_id, $taskDescription, (string) $inputPayload);
+        $result = $delegationService->delegate($conversation, $stage->helper_agent_id, $taskDescription, (string) $inputPayload, null, null, null, ResumeDriver::SequenceStage->value);
 
         // Phase 5 (US3, T046, FR-008): a refusal ({"error": ...}) never
         // carries a 'status' key -- checked first, before ever reading

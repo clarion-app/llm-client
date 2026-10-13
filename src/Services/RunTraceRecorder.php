@@ -682,6 +682,11 @@ class RunTraceRecorder
                         'tool_exec_ms' => $breakdown['tool_exec_ms'],
                         'confirm_wait_ms' => $breakdown['confirm_wait_ms'],
                         'product_ms' => $breakdown['product_ms'],
+                        // A terminal run is over: nothing may still claim it
+                        // (data-model §1 invariant).
+                        'resume_state' => null,
+                        'dispatch_id' => null,
+                        'lease_holder' => null,
                     ]);
             } catch (\Throwable $e) {
                 Log::warning('RunTraceRecorder: failed to update run terminal state', [

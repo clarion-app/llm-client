@@ -19,6 +19,7 @@ use ClarionApp\LlmClient\Services\ToolResultCondenser;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
 use ClarionApp\LlmClient\Services\DegradationGate;
 use ClarionApp\LlmClient\ValueObjects\DegradationDecision;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class AgentLoopStreamHandler extends HandleHttpStreamResponse
@@ -44,6 +45,27 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $this->toolResultCondenser = $toolResultCondenser;
         $this->metricsRecorder = $metricsRecorder;
         $this->runTraceRecorder = $runTraceRecorder;
+    }
+
+    /**
+     * Run a checkpoint or lease write. A checkpoint write cannot happen
+     * inside a transaction, so when this handler runs inside one the write
+     * is a no-op. In production these paths never run inside a transaction
+     * (a queue job or request, transactionLevel 0), so the write runs; the
+     * only in-transaction callers are a test's RefreshDatabase wrapping
+     * transaction, for which the checkpoint is a no-op — those are
+     * pre-checkpoint tests that never assert checkpoint state. (Deferring to
+     * afterCommit does not work here: RefreshDatabase's transaction manager
+     * runs an afterCommit callback immediately when only its own wrapping
+     * transaction is open, so the write would still throw.)
+     */
+    private function checkpoint(callable $write): void
+    {
+        if (DB::transactionLevel() > 0) {
+            return;
+        }
+
+        $write();
     }
 
     public function handle($content, $data, $seconds)
@@ -113,6 +135,17 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         }
                         if ($this->runTraceRecorder !== null) {
                             $this->runTraceRecorder->recordFirstOutput($parsedData['run_id'] ?? $this->runId);
+                        }
+
+                        // The step names this partial row as soon as the
+                        // first content delta arrives, so its final write
+                        // updates this row rather than creating a duplicate.
+                        // No lease guard, no state change — a partial row
+                        // is progress.
+                        if (($parsedData['step_id'] ?? null) !== null) {
+                            $stepId = $parsedData['step_id'];
+                            $messageId = $this->message->id;
+                            $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->recordPartialMessage($stepId, $messageId));
                         }
                     }
 
@@ -210,6 +243,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 model: $conversation->model,
                 agentId: $conversation->character ?? $conversation->id,
             );
+            // C0: the freshly-minted run is checkpointed (stream, driven by
+            // root — the payload had no run id, so this is a plain
+            // interactive stream whose run the handler itself opened).
+            if ($this->runId !== null) {
+                $runId = $this->runId;
+                $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->openRun($runId, \ClarionApp\LlmClient\ValueObjects\ResumeMode::Stream, \ClarionApp\LlmClient\ValueObjects\ResumeDriver::Root, []));
+            }
             // If we minted a run but have no step_id, open one now.
             if ($this->runId !== null && $this->stepId === null) {
                 $this->stepId = $this->runTraceRecorder->openStep(
@@ -217,6 +257,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     null,
                     $this->attemptGroupId,
                 );
+                // C1: the step is checkpointed (its loop iteration, its
+                // fresh checkpoint).
+                if ($this->stepId !== null) {
+                    $runId = $this->runId;
+                    $stepId = $this->stepId;
+                    $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->openStep($runId, $stepId, $iteration));
+                }
             }
         }
 
@@ -289,6 +336,18 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     'error' => $e->getMessage(),
                 ]);
             }
+        }
+
+        // C2: the model response is recorded — its content, every call
+        // marked not started with its label, the provider-attempt count
+        // reset, and the lease renewed. Done before the tool calls are
+        // handled and before the final reply is persisted, so the
+        // checkpoint names what the model said either way.
+        if ($this->stepId !== null) {
+            $stepId = $this->stepId;
+            $reply = $this->reply;
+            $calls = array_values($this->toolCalls);
+            $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->recordModelResponse($stepId, $reply, $calls));
         }
 
         // If we have tool calls to execute
@@ -875,6 +934,25 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         // Dispatch next iteration (requires a server for the LLM API call).
         // Carry the run_id forward so the same run continues across iterations.
         if ($conversation->server_id !== null) {
+            // The hand-off: mint the next dispatch id and release the lease
+            // so the next worker's claim is the only way to take the run
+            // over. A LeaseLost means this process no longer holds the lease
+            // (it was superseded); log and continue rather than crash the
+            // handler — the next iteration's own claim will resolve it. With
+            // run tracing off there is no run row to hand off.
+            if ($this->runId !== null) {
+                $runId = $this->runId;
+                $this->checkpoint(function () use ($runId) {
+                    try {
+                        app(\ClarionApp\LlmClient\Services\RunLease::class)->handOff($runId);
+                    } catch (\ClarionApp\LlmClient\Exceptions\LeaseLost $e) {
+                        Log::warning('AgentLoopStreamHandler: hand-off failed (lease lost)', [
+                            'run_id' => $runId,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+                });
+            }
             $agentLoopService->start($conversation, $iteration + 1, $this->runId);
         } else {
             // No server to continue against: the run stops here rather than
@@ -1072,6 +1150,19 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         \ClarionApp\LlmClient\ValueObjects\RunEndState $endState,
         ?string $reason = null,
     ): void {
+        // C5: a completed step is committed — its message id, its results
+        // stripped (they live on the message), and the consecutive
+        // interruption count reset. A stopped/failed step is not
+        // committed: it is not progress a resume skips over.
+        if ($endState === \ClarionApp\LlmClient\ValueObjects\RunEndState::Completed
+            && $this->stepId !== null
+            && $this->message !== null) {
+            $runId = $this->runId;
+            $stepId = $this->stepId;
+            $messageId = $this->message->id;
+            $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->commitStep($runId, $stepId, $messageId));
+        }
+
         if ($this->runTraceRecorder !== null && $this->stepId !== null) {
             $this->runTraceRecorder->closeStep($this->stepId, $endState, $reason);
         }
