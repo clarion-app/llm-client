@@ -1158,5 +1158,38 @@ return [
         // run_trace.retention_days.
         'retention_days' => null,
     ],
+
+    // Resumable long tasks (spec 134, data-model.md §7). Master switch and
+    // the lease/retry timing of the checkpoint-and-lease machinery.
+    'resume' => [
+        // Master switch; false writes no checkpoints and produces
+        // legacy-shaped records (the tests' off switch).
+        'enabled' => env('LLM_CLIENT_RESUME_ENABLED', true),
+        // FR-004 detection window, which is also the base lease.
+        'detection_window_seconds' => (int) env('LLM_CLIENT_RESUME_DETECTION_WINDOW_SECONDS', 300),
+        // Base lease for helper runs (research D9).
+        'helper_lease_seconds' => 30,
+        // Added to an action's bound when extending the lease.
+        'lease_grace_seconds' => 60,
+        // FR-019: stop unresumable when this many consecutive
+        // interruptions occur without a step completing.
+        'max_consecutive_interruptions' => 3,
+        'provider_retry' => [
+            // FR-022: delays between the five provider attempts.
+            'delays_seconds' => [10, 30, 90, 180],
+            // FR-022: cap on the retry window from the first failure.
+            'max_window_seconds' => 600,
+        ],
+        // AgentStreamStepJob::$timeout.
+        'stream_job_timeout_seconds' => (int) env('LLM_CLIENT_RESUME_STREAM_JOB_TIMEOUT_SECONDS', 600),
+        // Queue for ResumeInterruptedRunJob / ResumeConsensusRequestJob.
+        'queue' => 'default',
+        // Queue for AgentStreamStepJob (today's http queue).
+        'stream_queue' => 'http',
+        // Operator-declared effect-free tool names (research D3).
+        'effect_free_tools' => [],
+        // D11: resume_options is bounded to this many bytes.
+        'max_options_bytes' => 65536,
+    ],
 ];
 

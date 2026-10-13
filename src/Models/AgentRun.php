@@ -35,6 +35,22 @@ class AgentRun extends Model
         'tool_exec_ms',
         'confirm_wait_ms',
         'product_ms',
+        'checkpoint_version',
+        'resume_mode',
+        'resume_driver',
+        'resume_options',
+        'resume_state',
+        'dispatch_id',
+        'lease_holder',
+        'lease_expires_at',
+        'last_progress_at',
+        'interrupted_at',
+        'consecutive_interruptions',
+        'resume_count',
+        'provider_attempts',
+        'provider_first_failure_at',
+        'next_attempt_at',
+        'cancelled_at',
     ];
 
     protected $casts = [
@@ -51,6 +67,16 @@ class AgentRun extends Model
         'tool_exec_ms' => 'integer',
         'confirm_wait_ms' => 'integer',
         'product_ms' => 'integer',
+        'resume_options' => 'array',
+        'lease_expires_at' => 'datetime',
+        'last_progress_at' => 'datetime',
+        'interrupted_at' => 'datetime',
+        'provider_first_failure_at' => 'datetime',
+        'next_attempt_at' => 'datetime',
+        'cancelled_at' => 'datetime',
+        'consecutive_interruptions' => 'integer',
+        'resume_count' => 'integer',
+        'provider_attempts' => 'integer',
     ];
 
     protected static function booted(): void

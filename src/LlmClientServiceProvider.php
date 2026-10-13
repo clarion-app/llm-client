@@ -500,6 +500,13 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             return new \ClarionApp\LlmClient\Services\RunTraceQuery();
         });
 
+        // Fault-injection seam (spec 134, research D21): production binds
+        // the no-op (one method call per named point); tests swap in
+        // SnapshotFaultInjector to stage a dead worker.
+        $this->app->singleton(\ClarionApp\LlmClient\Contracts\FaultInjector::class, function () {
+            return new \ClarionApp\LlmClient\Services\NullFaultInjector();
+        });
+
         // Register role resolution services
         $this->app->singleton(\ClarionApp\LlmClient\Services\RoleResolver::class, function ($app) {
             return new \ClarionApp\LlmClient\Services\RoleResolver(

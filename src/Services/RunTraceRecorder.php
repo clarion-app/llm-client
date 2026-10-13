@@ -65,6 +65,16 @@ class RunTraceRecorder
     }
 
     /**
+     * Cut an end_reason to the 256 characters its varchar(256) column holds,
+     * multibyte-safe (research F7). Null stays null: a state that carries no
+     * reason must not gain one.
+     */
+    private static function cutReason(?string $reason): ?string
+    {
+        return $reason === null ? null : mb_substr($reason, 0, 256);
+    }
+
+    /**
      * Enqueue this run for external forwarding (Phase 4, US2), in its own
      * inner try/catch mirroring broadcast()'s isolation pattern immediately
      * above: a failure here must never undo or mask the caller's own write,
@@ -399,6 +409,10 @@ class RunTraceRecorder
                 ]);
             }
 
+            // end_reason is varchar(256); cut multibyte-safely before the terminal
+            // UPDATE so strict MySQL/MariaDB cannot refuse the write (research F7).
+            $reason = self::cutReason($reason);
+
             // Compute duration from started_at, clamped to >= 0 (contract C5)
             $endedAt = now();
             $startedAt = DB::table('agent_run_steps')
@@ -610,6 +624,10 @@ class RunTraceRecorder
                     'end_state' => $endState->value,
                 ]);
             }
+
+            // end_reason is varchar(256); cut multibyte-safely before the terminal
+            // UPDATE so strict MySQL/MariaDB cannot refuse the write (research F7).
+            $reason = self::cutReason($reason);
 
             // Compute step_count from current steps
             $stepCount = (int) DB::table('agent_run_steps')

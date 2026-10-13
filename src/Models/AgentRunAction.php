@@ -30,6 +30,7 @@ class AgentRunAction extends Model
         'duration_ms',
         'content',
         'created_at',
+        'tool_call_id',
     ];
 
     protected $casts = [
