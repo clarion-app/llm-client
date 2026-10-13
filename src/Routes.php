@@ -58,6 +58,7 @@ Route::group(['middleware'=>'auth:api', 'prefix'=>$this->routePrefix ], function
     Route::post('conversation/{id}/confirm-api-call', [ConversationController::class, "confirmApiCall"]);
     Route::get('conversation/{id}/handoffs', [ConversationController::class, "handoffs"]);
     Route::get('conversation/{id}/task-budget', [\ClarionApp\LlmClient\Controllers\TaskBudgetController::class, "show"]);
+    Route::patch('conversation/{id}/task-budget', [\ClarionApp\LlmClient\Controllers\TaskBudgetController::class, "update"]);
     Route::get('user/{id}/conversation', [ConversationController::class, "userConversations"]);
     Route::post('agent', AgentController::class);
     Route::resource('server', ServerController::class);

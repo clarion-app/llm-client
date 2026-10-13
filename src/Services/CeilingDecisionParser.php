@@ -36,12 +36,9 @@ class CeilingDecisionParser
         if ($kind === null) {
             return $this->invalid(TaskBudgetText::PROBLEM_UNRECOGNISED, ['reply' => $trimmed]);
         }
-        $pairs = [];
-        foreach (array_slice($tokens, 1) as $token) {
-            if (preg_match('/^(steps|spend)=(.*)$/i', $token, $m) !== 1) {
-                return $this->invalid(TaskBudgetText::PROBLEM_UNRECOGNISED, ['reply' => $trimmed]);
-            }
-            $pairs[] = [strtolower($m[1]), $m[2]];
+        $pairs = self::keyValuePairs(array_slice($tokens, 1));
+        if ($pairs === null) {
+            return $this->invalid(TaskBudgetText::PROBLEM_UNRECOGNISED, ['reply' => $trimmed]);
         }
         if ($kind !== CeilingDecision::CONTINUE) {
             if ($pairs !== []) {
@@ -50,30 +47,14 @@ class CeilingDecisionParser
 
             return $kind === CeilingDecision::ACCEPT ? CeilingDecision::accept() : CeilingDecision::stop();
         }
-        $steps = null;
-        $spend = null;
-        $givenSteps = null;
-        $givenSpend = null;
-        $seen = [];
-        foreach ($pairs as [$key, $value]) {
-            if (isset($seen[$key])) {
-                return $this->invalid(TaskBudgetText::PROBLEM_REPEATED_KEY, ['key' => $key]);
-            }
-            $seen[$key] = true;
-            if ($key === 'steps') {
-                if (preg_match('/^\d+$/', $value) !== 1 || (int) $value < 1) {
-                    return $this->invalid(TaskBudgetText::PROBLEM_INVALID_STEPS, ['value' => $value]);
-                }
-                $steps = (int) $value;
-                $givenSteps = $value;
-            } else {
-                if (preg_match('/^\d+(\.\d+)?$/', $value) !== 1 || bccomp($value, '0', 10) <= 0) {
-                    return $this->invalid(TaskBudgetText::PROBLEM_INVALID_SPEND, ['value' => $value]);
-                }
-                $spend = Decimal::round($value, 10);
-                $givenSpend = $value;
-            }
+        $allowance = self::allowance($pairs);
+        if ($allowance['problem'] !== null) {
+            return $this->invalid($allowance['problem'], $allowance['params']);
         }
+        $givenSteps = $allowance['steps'];
+        $givenSpend = $allowance['spend'];
+        $steps = $givenSteps === null ? null : (int) $givenSteps;
+        $spend = $givenSpend === null ? null : Decimal::round($givenSpend, 10);
         if ($against === null) {
             return CeilingDecision::continue($steps, $spend);
         }
@@ -111,6 +92,54 @@ class CeilingDecisionParser
         }
 
         return CeilingDecision::continue($addSteps, $addSpend, $stepsReduced, $spendReduced);
+    }
+
+    /**
+     * Splits "steps=…"/"spend=…" tokens (keys in any case) into [key, value]
+     * pairs, keys lower-cased. Null when any token is not one of them.
+     *
+     * @param list<string> $tokens
+     * @return ?list<array{0: string, 1: string}>
+     */
+    public static function keyValuePairs(array $tokens): ?array
+    {
+        $pairs = [];
+        foreach ($tokens as $token) {
+            if (preg_match('/^(steps|spend)=(.*)$/i', $token, $m) !== 1) {
+                return null;
+            }
+            $pairs[] = [strtolower($m[1]), $m[2]];
+        }
+
+        return $pairs;
+    }
+
+    /**
+     * Checks [key, value] pairs: each key at most once, steps a whole number
+     * of at least 1, spend a plain amount above 0. Values are returned as
+     * given; on the first problem, its TaskBudgetText problem code and
+     * parameters.
+     *
+     * @param list<array{0: string, 1: string}> $pairs
+     * @return array{steps: ?string, spend: ?string, problem: ?string, params: array<string, string>}
+     */
+    public static function allowance(array $pairs): array
+    {
+        $found = ['steps' => null, 'spend' => null];
+        foreach ($pairs as [$key, $value]) {
+            $problem = match (true) {
+                $found[$key] !== null => [TaskBudgetText::PROBLEM_REPEATED_KEY, ['key' => $key]],
+                $key === 'steps' && (preg_match('/^\d+$/', $value) !== 1 || (int) $value < 1) => [TaskBudgetText::PROBLEM_INVALID_STEPS, ['value' => $value]],
+                $key === 'spend' && (preg_match('/^\d+(\.\d+)?$/', $value) !== 1 || bccomp($value, '0', 10) <= 0) => [TaskBudgetText::PROBLEM_INVALID_SPEND, ['value' => $value]],
+                default => null,
+            };
+            if ($problem !== null) {
+                return ['steps' => null, 'spend' => null, 'problem' => $problem[0], 'params' => $problem[1]];
+            }
+            $found[$key] = $value;
+        }
+
+        return ['steps' => $found['steps'], 'spend' => $found['spend'], 'problem' => null, 'params' => []];
     }
 
     private function invalid(string $problem, array $params = []): CeilingDecision

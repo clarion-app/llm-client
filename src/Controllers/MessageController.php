@@ -23,6 +23,9 @@ use ClarionApp\LlmClient\Services\QuestionResumer;
 use ClarionApp\LlmClient\Services\QuestionViewBuilder;
 use ClarionApp\LlmClient\ValueObjects\IntakeResult;
 use ClarionApp\LlmClient\ValueObjects\BudgetWorkKind;
+use ClarionApp\LlmClient\Services\TaskBudgetDirectiveParser;
+use ClarionApp\LlmClient\Services\TaskBudgetService;
+use ClarionApp\LlmClient\Services\TaskBudgetText;
 
 class MessageController extends Controller
 {
@@ -63,9 +66,12 @@ class MessageController extends Controller
         // blank message is the same validation error it always was.
         $validatedData = $request->validate([
             'content' => 'present|nullable|string',
-            'conversation_id' => 'required|exists:conversations,id'
-        ]);
+            'conversation_id' => 'required|exists:conversations,id',
+            'task_budget' => ['sometimes', 'nullable', 'array'],
+        ] + TaskBudgetController::rules('task_budget.'));
         $content = (string) ($validatedData['content'] ?? '');
+        $bodyBudget = $validatedData['task_budget'] ?? null;
+        unset($validatedData['task_budget']);
 
         // Only the requester's own pending question lets a blank message
         // through, so a blank message can never reveal whether someone
@@ -83,6 +89,37 @@ class MessageController extends Controller
         {
             return response()->json([], 403);
         }
+
+        // A "/budget" line is read before the request is admitted or taken as
+        // an answer: changing or viewing the ceilings is not a request, and
+        // a ceiling changed while a ceiling prompt waits leaves it waiting.
+        $directive = (new TaskBudgetDirectiveParser())->parse($content);
+        $text = new TaskBudgetText();
+        if ($directive['malformed']) {
+            return response()->json(['code' => 'directive_malformed', 'message' => $text->directiveMalformed()], 422);
+        }
+        if ($directive['viewOnly'] || $directive['directiveOnly']) {
+            $tasks = app(TaskBudgetService::class);
+            $task = $tasks->currentFor($conversation);
+            if ($task === null || $task->state->isTerminal()) {
+                return response()->json(['code' => 'no_active_task', 'message' => $text->noTaskInProgress()], 409);
+            }
+            if ($directive['viewOnly']) {
+                return response()->json($tasks->standing($task)->toArray());
+            }
+            $changed = $tasks->changeFromConversation($conversation, $task, $directive['stated'], (string) Auth::id());
+            if ($changed === null) {
+                return response()->json(['code' => 'no_active_task', 'message' => $text->noTaskInProgress()], 409);
+            }
+
+            return response()->json($changed['standing']->toArray() + ['reduced' => $changed['reduced']]);
+        }
+        // A "/budget" line ahead of a request states the ceilings for it and
+        // is not part of the request; a body field wins key by key.
+        if ($directive['stated'] !== null) {
+            $content = $directive['remaining'];
+        }
+        $stated = TaskBudgetController::statedFrom($bodyBudget, $directive['stated']);
 
         // Before Message::create(), not after. A refused request must leave the
         // stored history byte-identical, and the user's own turn is the half
@@ -160,7 +197,12 @@ class MessageController extends Controller
         // this message must not start a second, concurrent one.
         if (!Conversation::whereKey($conversation->id)->value('is_processing')) {
             $agentLoopService = app(AgentLoopService::class);
-            $agentLoopService->start($conversation, 1, null, $message->id);
+            $agentLoopService->start($conversation, 1, null, $message->id, $stated);
+        }
+
+        $line = app(TaskBudgetService::class)->reducedLine($stated);
+        if ($line !== null) {
+            return response()->json($message->toArray() + ['task_budget_notice' => $line], 201);
         }
 
         return response()->json($message, 201);

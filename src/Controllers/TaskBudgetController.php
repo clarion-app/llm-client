@@ -5,6 +5,9 @@ namespace ClarionApp\LlmClient\Controllers;
 use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Services\TaskBudgetService;
+use ClarionApp\LlmClient\Services\TaskBudgetText;
+use ClarionApp\LlmClient\ValueObjects\StatedCeilings;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 
 class TaskBudgetController extends Controller
@@ -22,5 +25,56 @@ class TaskBudgetController extends Controller
         }
 
         return response()->json($tasks->standing($task)->toArray());
+    }
+
+    /**
+     * Changes the ceilings of the conversation's running or paused task. A
+     * paused task stays paused; the change governs its next step boundary.
+     */
+    public function update(Request $request, string $id)
+    {
+        $conversation = Conversation::where('id', $id)->where('user_id', Auth::id())->first();
+        if ($conversation === null) {
+            return response()->json(['message' => 'Not found.'], 404);
+        }
+        $validated = $request->validate(self::rules(''));
+        if (($validated['max_steps'] ?? null) === null && ($validated['max_spend'] ?? null) === null) {
+            return response()->json(['message' => 'Give max_steps, max_spend or both.', 'errors' => ['max_steps' => ['Give max_steps, max_spend or both.']]], 422);
+        }
+        $tasks = app(TaskBudgetService::class);
+        $task = $tasks->currentFor($conversation);
+        $changed = ($task === null || $task->state->isTerminal()) ? null
+            : $tasks->changeCeilings($task, new StatedCeilings($validated['max_steps'] ?? null, $validated['max_spend'] ?? null), (string) Auth::id());
+        if ($changed === null) {
+            return response()->json(['code' => 'no_active_task', 'message' => (new TaskBudgetText())->noTaskInProgress()], 409);
+        }
+
+        return response()->json($changed['standing']->toArray() + ['reduced' => $changed['reduced']]);
+    }
+
+    /**
+     * The ceilings a request states: a body field wins key by key, a
+     * "/budget" line fills only the keys the body leaves out. Null when
+     * nothing is stated.
+     */
+    public static function statedFrom(?array $body, ?StatedCeilings $directive): ?StatedCeilings
+    {
+        $steps = $body['max_steps'] ?? $directive?->maxSteps;
+        $stated = new StatedCeilings($steps === null ? null : (int) $steps, $body['max_spend'] ?? $directive?->maxSpend);
+
+        return $stated->isEmpty() ? null : $stated;
+    }
+
+    /** Validation rules for stated ceilings, under $prefix ('' or 'task_budget.'). */
+    public static function rules(string $prefix): array
+    {
+        return [
+            $prefix.'max_steps' => ['sometimes', 'nullable', 'integer', 'min:1'],
+            $prefix.'max_spend' => ['sometimes', 'nullable', 'regex:/^\d+(\.\d+)?$/', function ($attribute, $value, $fail) {
+                if (!is_string($value) && !is_int($value) && !is_float($value) || preg_match('/^\d+(\.\d+)?$/', (string) $value) !== 1 || bccomp((string) $value, '0', 10) <= 0) {
+                    $fail('The '.$attribute.' must be an amount greater than 0.');
+                }
+            }],
+        ];
     }
 }

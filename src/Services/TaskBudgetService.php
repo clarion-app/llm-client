@@ -4,13 +4,16 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Models\TaskBudgetEvent;
+use ClarionApp\LlmClient\ValueObjects\CeilingOrigin;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\StatedCeilings;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetStanding;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
+use ClarionApp\LlmClient\Support\Decimal;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -254,6 +257,124 @@ class TaskBudgetService
         ];
     }
 
+    /**
+     * Changes the stated ceilings of a running or paused task. Never resumes
+     * a paused task. Returns null when the task is no longer running or
+     * paused.
+     *
+     * @return ?array{standing: TaskBudgetStanding, reduced: array{steps: bool, spend: bool}}
+     */
+    public function changeCeilings(TaskBudget $task, StatedCeilings $stated, string $actorUserId): ?array
+    {
+        $c = $this->limits->clamp($stated);
+        $stepsStated = $stated->maxSteps !== null && $c['steps_origin'] !== CeilingOrigin::Default;
+        $spendStated = $stated->maxSpend !== null && $c['spend_origin'] !== CeilingOrigin::Default;
+        $before = TaskBudget::find($task->id);
+        if ($before === null || !in_array($before->state, [TaskBudgetState::Running, TaskBudgetState::Paused], true)) {
+            return null;
+        }
+        $threshold = Decimal::toPlainNotation((string) $before->approach_threshold);
+        $updates = ['updated_at' => now()->format('Y-m-d H:i:s.u')];
+        if ($stepsStated) {
+            $updates['max_steps'] = $c['steps'];
+            $updates['max_steps_origin'] = $c['steps_origin']->value;
+            if (bccomp(bcdiv((string) (int) $before->steps_used, (string) $c['steps'], 10), $threshold, 10) < 0) {
+                $updates['steps_approach_noticed_at'] = null;
+            }
+        }
+        if ($spendStated) {
+            $updates['max_spend'] = $c['spend'];
+            $updates['max_spend_origin'] = $c['spend_origin']->value;
+            $spent = $this->costs->taskTotal($before->id)['priced_cost_total'];
+            if (bccomp(bcdiv(Decimal::toPlainNotation((string) $spent), $c['spend'], 10), $threshold, 10) < 0) {
+                $updates['spend_approach_noticed_at'] = null;
+            }
+        }
+        $won = DB::table('task_budgets')->where('id', $before->id)
+            ->whereIn('state', [TaskBudgetState::Running->value, TaskBudgetState::Paused->value])
+            ->update($updates);
+        if ($won !== 1) {
+            return null;
+        }
+        $after = TaskBudget::findOrFail($before->id);
+        $reduced = ['steps' => $stepsStated && $c['steps_reduced'], 'spend' => $spendStated && $c['spend_reduced']];
+        $this->appendEvent($after, 'ceiling_changed', [
+            'before' => ['max_steps' => (int) $before->max_steps, 'max_steps_origin' => $before->max_steps_origin->value, 'max_spend' => (string) $before->max_spend, 'max_spend_origin' => $before->max_spend_origin->value],
+            'after' => ['max_steps' => (int) $after->max_steps, 'max_steps_origin' => $after->max_steps_origin->value, 'max_spend' => (string) $after->max_spend, 'max_spend_origin' => $after->max_spend_origin->value],
+            'reduced' => $reduced,
+        ], $actorUserId);
+
+        return ['standing' => $this->standing($after), 'reduced' => $reduced];
+    }
+
+    /**
+     * Changes the ceilings from a "/budget" line sent in the conversation and
+     * records the change there, undelivered: the reply carries it. Null when
+     * the task is no longer running or paused.
+     *
+     * @return ?array{standing: TaskBudgetStanding, reduced: array{steps: bool, spend: bool}, content: string}
+     */
+    public function changeFromConversation(Conversation $conversation, TaskBudget $task, StatedCeilings $stated, string $actorUserId): ?array
+    {
+        $changed = $this->changeCeilings($task, $stated, $actorUserId);
+        if ($changed === null) {
+            return null;
+        }
+        $content = (new TaskBudgetText())->budgetUpdated($changed['standing'], $this->reducedLine($stated, $changed['reduced']));
+        $this->postNotice($conversation, $task, 'ceiling_changed', $content, false);
+
+        return $changed + ['content' => $content];
+    }
+
+    /** The line telling the user a stated ceiling was cut to the installation maximum, or null. */
+    public function reducedLine(?StatedCeilings $stated, ?array $reduced = null): ?string
+    {
+        if ($stated === null) {
+            return null;
+        }
+        $c = $this->limits->clamp($stated);
+        $steps = $reduced['steps'] ?? $c['steps_reduced'];
+        $spend = $reduced['spend'] ?? $c['spend_reduced'];
+        if (!$steps && !$spend) {
+            return null;
+        }
+
+        return (new TaskBudgetText())->reducedToMaximum(
+            $steps ? $stated->maxSteps : null,
+            $steps ? $this->limits->maximumSteps() : null,
+            $spend ? $stated->maxSpend : null,
+            $spend ? $this->limits->maximumSpend() : null,
+            (string) config('llm-client.cost.currency', 'USD'),
+        );
+    }
+
+    /** Writes a task-budget notice into the conversation; delivers it on its channel when asked and reachable. */
+    public function postNotice(Conversation $conversation, TaskBudget $task, string $notice, string $text, bool $deliver): ?Message
+    {
+        try {
+            $message = Message::create([
+                'conversation_id' => $conversation->id,
+                'role' => 'assistant',
+                'user' => $conversation->character,
+                'content' => $text,
+                'responseTime' => 0,
+                'tool_data' => ['kind' => AgentQuestionService::KIND_TASK_BUDGET_NOTICE, 'task_budget_id' => $task->id, 'notice' => $notice],
+            ]);
+            if ($deliver && app(UserReachability::class)->refusal($conversation, (bool) $task->unattended) === null) {
+                $delivery = app(AgentQuestionService::class)->deliver($conversation, $text);
+                if (!$delivery->delivered) {
+                    Log::warning('Task budget notice could not be delivered for task '.$task->id, ['task_budget_id' => $task->id, 'reason' => $delivery->failureReason]);
+                }
+            }
+
+            return $message;
+        } catch (\Throwable $e) {
+            Log::warning('Task budget notice could not be posted for task '.$task->id, ['task_budget_id' => $task->id, 'error' => $e->getMessage()]);
+
+            return null;
+        }
+    }
+
     /** Best-effort: a failed write is logged and never thrown. */
     public function appendEvent(TaskBudget $task, string $kind, array $payload, ?string $actorUserId = null): void
     {
@@ -303,6 +424,10 @@ class TaskBudgetService
             'max_spend' => $c['spend'],
             'max_spend_origin' => $c['spend_origin']->value,
         ], null);
+
+        if (($line = $this->reducedLine($stated)) !== null) {
+            $this->postNotice($conversation, $task, 'reduced_to_maximum', $line, true);
+        }
 
         return $task;
     }
