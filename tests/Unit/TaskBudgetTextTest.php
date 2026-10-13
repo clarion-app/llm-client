@@ -130,6 +130,7 @@ class TaskBudgetTextTest extends TestCase
             'consensusStopped' => [$t->consensusStopped()],
             'unavailable' => [$t->unavailable()],
             'noTaskInProgress' => [$t->noTaskInProgress()],
+            'limitsWhileProcessing' => [$t->limitsWhileProcessing()],
             'budgetUpdated' => [
                 $t->budgetUpdated($s),
                 $t->budgetUpdated($s, $t->reducedToMaximum(1000, 200, null, null, 'USD')),

@@ -461,19 +461,22 @@ class TaskBudgetServiceForNewRunTest extends TestCase
                 'created_at' => now(),
             ]);
         }
-        foreach ([$run, $run, $run, $otherRun] as $position => $runId) {
+        // Three finished steps of the run, one of another run, and the run's
+        // step still open — the one about to claim, which claims for itself.
+        foreach ([[$run, 'completed'], [$run, 'completed'], [$run, 'failed'], [$otherRun, 'completed'], [$run, 'in_progress']] as $position => [$runId, $endState]) {
             DB::table('agent_run_steps')->insert([
                 'id' => (string) Str::uuid(),
                 'run_id' => $runId,
                 'position' => $position,
                 'started_at' => now(),
+                'end_state' => $endState,
             ]);
         }
 
         $task = $this->service()->openLazily($conversation, $run);
 
         $task = TaskBudget::find($task->id);
-        $this->assertSame(3, (int) $task->steps_used, "seeded from the run's recorded steps");
+        $this->assertSame(3, (int) $task->steps_used, "seeded from the run's finished steps");
         $this->assertSame(20, (int) $task->max_steps);
         $this->assertSame(CeilingOrigin::Default, $task->max_steps_origin);
         $this->assertSame($run, $task->root_run_id);
@@ -617,5 +620,20 @@ class TaskBudgetServiceForNewRunTest extends TestCase
         $decision = app(TaskBudgetGate::class)->beforeStep($conversation, null);
         $this->assertTrue($decision->isStop(), 'the first boundary fails closed');
         $this->assertSame('unavailable', $decision->reason);
+    }
+    #[Test]
+    public function a_request_ending_with_a_long_reason_still_ends_its_task_with_the_reason_cut_to_fit(): void
+    {
+        $task = $this->service()->openForRequest($this->conversation(['channel' => 'sequence-run']), TaskBudget::SCOPE_SEQUENCE_RUN, null, null, true);
+        // A failed sequence run's reason names the stage and its failure in full.
+        $reason = "Stage 'Draft the report' failed: ".str_repeat('é', 400);
+
+        $this->service()->endRequestTask($task->id, false, $reason);
+
+        $row = DB::table('task_budgets')->where('id', $task->id)->first();
+        $this->assertSame('ended', $row->state);
+        $this->assertSame(256, mb_strlen((string) $row->end_reason), 'the reason fits its column (256 characters)');
+        $this->assertSame(mb_substr($reason, 0, 256), $row->end_reason);
+        $this->assertSame($reason, $this->events($task->id)[1]['payload']['request_end_reason'] ?? null, 'the event keeps it whole');
     }
 }

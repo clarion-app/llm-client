@@ -326,4 +326,34 @@ class TaskBudgetSchemaTest extends RealDatabaseTestCase
         ]);
         $this->assertNull(DB::table('agent_questions')->where('id', $legacy)->value('origin'), 'an agent question has no origin');
     }
+    #[Test]
+    public function a_request_ending_with_a_reason_longer_than_its_column_still_ends_its_task(): void
+    {
+        $this->assertReady();
+        $id = (string) Str::uuid();
+        DB::table('task_budgets')->insert([
+            'id' => $id,
+            'root_conversation_id' => (string) Str::uuid(),
+            'scope' => 'sequence_run',
+            'unattended' => true,
+            'state' => 'running',
+            'max_steps' => 20,
+            'max_steps_origin' => 'default',
+            'original_max_steps' => 20,
+            'max_spend' => '1.0000000000',
+            'max_spend_origin' => 'default',
+            'original_max_spend' => '1.0000000000',
+            'steps_used' => 3,
+            'approach_threshold' => '0.8000',
+            'created_at' => '2026-10-14 09:00:00.000001',
+            'updated_at' => '2026-10-14 09:00:00.000001',
+        ]);
+        $reason = "Stage 'Draft the report' failed: ".str_repeat('é', 400);
+
+        app(\ClarionApp\LlmClient\Services\TaskBudgetService::class)->endRequestTask($id, false, $reason);
+
+        $row = DB::table('task_budgets')->where('id', $id)->first();
+        $this->assertSame('ended', $row->state, 'the task ended; strict mode did not refuse the write');
+        $this->assertSame(mb_substr($reason, 0, 256), $row->end_reason);
+    }
 }

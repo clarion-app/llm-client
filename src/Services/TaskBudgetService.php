@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Services;
 
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\ManagedTask;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Models\TaskBudgetEvent;
@@ -29,6 +30,9 @@ class TaskBudgetService
 {
     private const DELEGATION_CHANNEL = 'agent-delegation';
     private const MANAGED_TASK_CHANNEL = 'managed-task';
+
+    /** The length of task_budgets.end_reason. */
+    private const END_REASON_LENGTH = 256;
 
     public function __construct(
         private TaskBudgetLimits $limits,
@@ -71,6 +75,15 @@ class TaskBudgetService
                 return $current;
             }
 
+            // A managed task started before task budgets has none: it gets
+            // its managed task's budget now, never one tied to this round's
+            // run (which would end with the round and stop every later one).
+            if ($channel === self::MANAGED_TASK_CHANNEL) {
+                $managedTaskId = ManagedTask::where('conversation_id', $conversation->id)->value('id');
+
+                return $this->open($conversation, TaskBudget::SCOPE_MANAGED_TASK, $stated, true, null, $managedTaskId, true);
+            }
+
             if ($current !== null && $current->state === TaskBudgetState::Running) {
                 $this->supersede($current);
             }
@@ -110,7 +123,10 @@ class TaskBudgetService
 
         if ($runId !== null) {
             DB::table('usage_records')->where('run_id', $runId)->whereNull('task_budget_id')->update(['task_budget_id' => $task->id]);
-            $steps = DB::table('agent_run_steps')->where('run_id', $runId)->count();
+            // Only finished steps count: a step still open here is the one
+            // about to claim (a synchronous continuation opens its step
+            // before the boundary), and it claims for itself.
+            $steps = DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', '!=', 'in_progress')->count();
             if ($steps > 0) {
                 DB::table('task_budgets')->where('id', $task->id)->update(['steps_used' => $steps]);
                 $task->steps_used = $steps;
@@ -167,7 +183,10 @@ class TaskBudgetService
             $now = now()->format('Y-m-d H:i:s.u');
             $won = DB::table('task_budgets')->where('id', $task->id)->where('state', TaskBudgetState::Running->value)->update([
                 'state' => $completed ? TaskBudgetState::Completed->value : TaskBudgetState::Ended->value,
-                'end_reason' => $completed ? null : $reason,
+                // The request's own reason can be long (a failed sequence run
+                // names its stage and the failure in full); the column holds
+                // its start, the event below keeps it whole.
+                'end_reason' => $completed || $reason === null ? null : mb_substr($reason, 0, self::END_REASON_LENGTH),
                 'ended_at' => $now,
                 'updated_at' => $now,
             ]);

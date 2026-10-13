@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\ValueObjects\DeliveryResult;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetDecision;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -62,13 +63,17 @@ class TaskBudgetGate
     {
         try {
             $task = $conversation->active_task_budget_id === null ? null : TaskBudget::find($conversation->active_task_budget_id);
-            // A helper created before its conversation carried a pointer
-            // joins its chain root's task rather than opening its own.
-            if ($task === null && $conversation->channel === 'agent-delegation') {
-                $task = $this->tasks->forNewRun($conversation, null, false, $runId);
-            }
             if ($task === null) {
-                $task = $this->tasks->openLazily($conversation, $runId);
+                // A helper created before its conversation carried a pointer
+                // joins its chain root's task rather than opening its own.
+                $task = $conversation->channel === 'agent-delegation'
+                    ? $this->tasks->forNewRun($conversation, null, false, $runId)
+                    : null;
+                $task ??= $this->tasks->openLazily($conversation, $runId);
+                // Work that predates task budgets gets its task here; the
+                // usage of the step it is claiming is stamped with it, as
+                // any other step's is.
+                Context::add('task_budget_id', $task->id);
             }
 
             if ($task->state !== TaskBudgetState::Running) {

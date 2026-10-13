@@ -159,6 +159,11 @@ class TaskBudgetText
         return "This task's budget could not be checked, so no further work was started.";
     }
 
+    public function limitsWhileProcessing(): string
+    {
+        return "This task's budget can only be stated when a request starts, and this conversation is still working on the previous one, so your message was not sent. Send it again once the reply has finished.";
+    }
+
     public function noTaskInProgress(): string
     {
         return "No task is running or paused in this conversation, so this task's budget cannot be shown or changed. To set it for your next request, start that request with '/budget steps=50 spend=2.00' on its first line.";

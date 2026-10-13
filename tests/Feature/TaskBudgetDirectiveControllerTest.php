@@ -361,6 +361,46 @@ class TaskBudgetDirectiveControllerTest extends AssembledSystemTestCase
     // A directive on its own changes the current task
     // ---------------------------------------------------------------
 
+    /** @return array<string, array{0: string, 1: ?array}> */
+    public static function statedWhileBusy(): array
+    {
+        return [
+            'a body field' => ["Store the notes.", ['max_steps' => 5]],
+            'a directive line' => ["/budget steps=5\nStore the notes.", null],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('statedWhileBusy')]
+    public function a_request_stating_its_ceilings_while_the_conversation_is_busy_is_refused_never_queued_without_them(string $content, ?array $taskBudget): void
+    {
+        $conversation = $this->begin('message', 'stated_while_busy');
+        $running = $this->runningTask($conversation);
+
+        $response = $this->postTo('message', $conversation, $content, $taskBudget);
+
+        // A queued message is picked up later as a new request with the
+        // defaults: the ceiling the user stated would be silently lost.
+        $response->assertStatus(409);
+        $this->assertSame(['code' => 'processing', 'message' => $this->text->limitsWhileProcessing()], $response->json());
+        $this->assertSame([], $this->messagesOf($conversation, 'user'), 'nothing is stored to be picked up later');
+        $this->assertSame('running', DB::table('task_budgets')->where('id', $running->id)->value('state'), 'the running task is untouched');
+        $this->assertSame(1, TaskBudget::count());
+        $this->assertSame(0, $this->modelRequests('stream'));
+    }
+
+    #[Test]
+    public function a_request_stating_nothing_while_the_conversation_is_busy_is_still_queued_as_before(): void
+    {
+        $conversation = $this->begin('message', 'nothing_stated_while_busy');
+        $this->runningTask($conversation);
+
+        $this->postTo('message', $conversation, 'Store the notes.')->assertStatus(201);
+
+        $this->assertCount(1, $this->messagesOf($conversation, 'user'), 'stored, to be picked up when the reply finishes');
+        $this->assertSame(0, $this->modelRequests('stream'));
+    }
+
     #[Test]
     #[DataProvider('controllers')]
     public function a_directive_alone_changes_the_running_tasks_ceiling_even_while_the_conversation_is_busy(string $controller): void

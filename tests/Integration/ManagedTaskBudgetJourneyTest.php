@@ -226,4 +226,44 @@ class ManagedTaskBudgetJourneyTest extends AssembledSystemTestCase
         $this->assertNotNull($budget->ended_at);
         $this->assertFalse($this->workNextRound());
     }
+    #[Test]
+    public function a_managed_task_already_in_progress_before_task_budgets_keeps_one_budget_across_its_rounds(): void
+    {
+        $this->scenario = 'task_budget_managed_task_legacy';
+        config(['llm-client.manager.step_max_iterations' => 4]);
+        [$managed, $one, $two] = $this->startManagedTask();
+        // Started before task budgets existed: no budget, and its manager's
+        // conversation points at none.
+        DB::table('task_budget_events')->delete();
+        DB::table('task_budgets')->delete();
+        DB::table('conversations')->where('id', $managed->conversation_id)->update(['active_task_budget_id' => null]);
+
+        // Round 1 ends at the manager's own bound of 4 steps.
+        $this->script()->toolRequests([$this->assignCall('call_assign_1', $one)]);
+        $this->scriptNoteSteps(['part one']);
+        $this->scriptHelperAnswer('Part one is written.');
+        $this->script()->toolRequests([$this->acceptCall('call_accept_1', $one)]);
+        $this->script()->toolRequests([$this->assignCall('call_assign_2', $two)]);
+        $this->scriptNoteSteps(['part two']);
+        $this->scriptHelperAnswer('Part two is written.');
+        $this->script()->toolRequests([$this->acceptCall('call_accept_2', $two)]);
+        $this->assertTrue($this->workNextRound());
+
+        $budget = $this->onlyTask();
+        $this->assertSame('managed_task', $budget->scope, 'the managed task gets a budget of its own, not one tied to a round');
+        $this->assertSame($managed->id, $budget->managed_task_id);
+        $this->assertTrue((bool) $budget->unattended);
+        $this->assertSame('running', $budget->state->value, 'a round ending leaves the managed task\'s budget running');
+        $this->assertSame(8, (int) $budget->steps_used);
+
+        // Round 2 finalizes the managed task, with no shortfall.
+        $this->script()->toolRequests([['id' => 'call_finalize', 'name' => 'finalize_task', 'arguments' => ['final_response' => 'Both parts are written.']]]);
+        $this->script()->finalAnswer('Task finalized.');
+        $this->assertTrue($this->workNextRound());
+
+        $managed->refresh();
+        $this->assertSame('completed', $managed->status, 'never finalized with a shortfall the budget did not cause');
+        $this->assertSame(1, TaskBudget::count(), 'one budget across every round');
+        $this->assertSame('completed', TaskBudget::firstOrFail()->state->value);
+    }
 }

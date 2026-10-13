@@ -181,6 +181,13 @@ class MessageController extends Controller
             return response()->json($intake->message, 201);
         }
 
+        // A message sent while the conversation is busy is queued and picked
+        // up later as a new request, with no way to carry ceilings stated
+        // for it: refuse it rather than run it later without them.
+        if ($stated !== null && Conversation::whereKey($conversation->id)->value('is_processing')) {
+            return response()->json(['code' => 'processing', 'message' => $text->limitsWhileProcessing()], 409);
+        }
+
         $validatedData['content'] = $content;
         $validatedData['role'] = "user";
         $validatedData['user'] = Auth::user()->name;
