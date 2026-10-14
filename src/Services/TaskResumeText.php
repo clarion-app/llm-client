@@ -87,6 +87,24 @@ class TaskResumeText
     }
 
     /**
+     * end_reason: the model provider refused the request itself, which
+     * waiting cannot change.
+     */
+    public function providerRejectedReason(): string
+    {
+        return 'The model provider refused the request, so this task stopped and will not be retried.';
+    }
+
+    /**
+     * Channel report: the provider refused the request, nothing is retried,
+     * and N steps were completed and are kept.
+     */
+    public function providerRejectedReport(int $completedSteps): string
+    {
+        return $this->providerRejectedReason()." {$completedSteps} steps were completed and are kept.";
+    }
+
+    /**
      * end_reason (one sentence per reason code). Every one names "this task"
      * and fits the 256-character end_reason column.
      */

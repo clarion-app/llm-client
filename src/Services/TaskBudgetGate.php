@@ -59,6 +59,41 @@ class TaskBudgetGate
         }
     }
 
+    /**
+     * The check for a model call that repeats a step already claimed (a
+     * resumed lost call, a provider retry): the step was claimed when it was
+     * first opened, so nothing is claimed again and nothing is refunded.
+     * The task must still be running and its spend below the ceiling, read
+     * fresh from the usage records. A task that does not exist yet (work
+     * that predates task budgets) has nothing to enforce. Any failure is
+     * STOP(unavailable): never thrown.
+     */
+    public function beforeReclaimedStep(Conversation $conversation, ?string $runId): TaskBudgetDecision
+    {
+        try {
+            $task = $conversation->active_task_budget_id === null ? null : TaskBudget::find($conversation->active_task_budget_id);
+            if ($task === null) {
+                return TaskBudgetDecision::allow();
+            }
+            if ($task->state !== TaskBudgetState::Running) {
+                return TaskBudgetDecision::stop(TaskBudgetDecision::REASON_NOT_RUNNING, $this->tasks->standing($task));
+            }
+
+            $spend = $this->costs->taskTotal($task->id)['priced_cost_total'];
+            if (bccomp($spend, $task->max_spend, 10) >= 0) {
+                $reason = ((int) $task->steps_used >= (int) $task->max_steps) ? TaskBudgetDecision::REASON_BOTH : TaskBudgetDecision::REASON_SPEND;
+
+                return TaskBudgetDecision::stop($reason, $this->tasks->standing($task));
+            }
+
+            return TaskBudgetDecision::allow();
+        } catch (\Throwable $e) {
+            Log::error('Task budget could not be checked for conversation '.$conversation->id, ['conversation_id' => $conversation->id, 'error' => $e->getMessage()]);
+
+            return TaskBudgetDecision::unavailable();
+        }
+    }
+
     public function beforeStep(Conversation $conversation, ?string $runId): TaskBudgetDecision
     {
         try {

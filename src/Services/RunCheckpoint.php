@@ -122,6 +122,8 @@ class RunCheckpoint
         $this->guardLease($runId, [
             'last_progress_at' => $this->timestamp(now()),
             'provider_attempts' => 0,
+            'provider_first_failure_at' => null,
+            'next_attempt_at' => null,
         ]);
 
         $checkpoint = $this->checkpointOf($stepId);

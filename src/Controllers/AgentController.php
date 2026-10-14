@@ -246,6 +246,10 @@ class AgentController extends Controller
             // The agent asked the user a question, already delivered through
             // the conversation's channel; the caller sends nothing.
             'awaiting_user' => 202,
+            // The model provider is unavailable for the moment: the task is
+            // still working, its retry is scheduled, and its reply will
+            // arrive on the conversation's channel.
+            'continuing' => 202,
             // A conversation work ceiling correctly stopping a response is
             // not a server failure — it is a policy-correct outcome that
             // deserves its own, more precise status than the sibling

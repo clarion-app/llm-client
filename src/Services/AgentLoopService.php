@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Contracts\FaultInjector;
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\LeaseLost;
+use Illuminate\Support\Sleep;
 use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Exceptions\PresetNotFoundException;
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
@@ -607,6 +608,17 @@ class AgentLoopService
                 // iteration carries the run forward and does not re-open it.
                 if ($runId !== null) {
                     $this->checkpoint(fn () => app(RunCheckpoint::class)->openRun($runId, ResumeMode::Stream, ResumeDriver::Root, []));
+                    // The model call is the stream job's, and the job's claim
+                    // needs the lease this request just took when it opened
+                    // the run: hand it off now. The hand-off mints the
+                    // dispatch id the job will carry.
+                    if ($this->checkpointNow()) {
+                        try {
+                            app(RunLease::class)->handOff($runId);
+                        } catch (LeaseLost) {
+                            // Run tracing wrote no lease for this run.
+                        }
+                    }
                 }
             }
         }
@@ -1628,6 +1640,124 @@ class AgentLoopService
         $message->update(['tool_data' => $toolData]);
     }
 
+    /** The delegation's time bound was reached: the open step and the run stop early. */
+    private function stopAtTimeBound(Conversation $conversation, ?string $runId, ?string $currentStepId): array
+    {
+        $conversation->update(['is_processing' => false]);
+
+        if ($this->runTraceRecorder !== null && $runId !== null) {
+            if ($currentStepId !== null) {
+                $this->runTraceRecorder->closeStep(
+                    $currentStepId,
+                    RunEndState::StoppedEarly,
+                    'Delegation time bound reached',
+                );
+            }
+            $this->runTraceRecorder->closeRun(
+                $runId,
+                RunEndState::StoppedEarly,
+                'Delegation time bound reached',
+            );
+        }
+
+        return [
+            'status' => 'error',
+            'content' => 'Delegation time bound reached',
+            'message_id' => null,
+            'code' => 'time_ceiling_reached',
+        ];
+    }
+
+    /**
+     * One model call of the synchronous loop, ridden through transient
+     * provider failures. A failure the retry scheduler does not take (a
+     * rejected request, an untraced or pre-lease run) is rethrown for the
+     * caller's own failure path. A root run's failure defers the task
+     * (`continuing`: no worker is held and the conversation stays
+     * processing); a nested run's failure retries here, after a sleep, with
+     * its lease extended past the sleep; an exhausted allowance has already
+     * been closed and reported by the scheduler.
+     *
+     * @param callable(): array $call
+     * @param callable(): ?string $openAction opens a fresh model-request action
+     * @return array{response: ?array, stop: ?array}
+     */
+    private function callLlmSyncWithProviderRetry(
+        Conversation $conversation,
+        ?string $runId,
+        ?string $stepId,
+        ?string &$actionId,
+        mixed $deadlineAt,
+        callable $call,
+        callable $openAction,
+    ): array {
+        while (true) {
+            try {
+                return ['response' => $call(), 'stop' => null];
+            } catch (LeaseLost $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                if ($runId === null || $stepId === null || $this->runTraceRecorder === null || !$this->checkpointNow()
+                    || (int) DB::table('agent_runs')->where('id', $runId)->value('checkpoint_version') !== 1) {
+                    throw $e;
+                }
+                $run = AgentRun::find($runId);
+                if ($run === null) {
+                    throw $e;
+                }
+
+                $decision = app(ProviderRetryScheduler::class)->onFailure($run, $stepId, $actionId, $e);
+
+                if ($decision->isLost()) {
+                    throw new LeaseLost();
+                }
+                if ($decision->isExhausted()) {
+                    $actionId = null;
+
+                    return ['response' => null, 'stop' => [
+                        'status' => 'error',
+                        'code' => 'provider_unavailable',
+                        'content' => app(TaskResumeText::class)->providerUnavailableReason(),
+                        'message_id' => null,
+                    ]];
+                }
+                if ($decision->deferredUntil() !== null) {
+                    $actionId = null;
+
+                    return ['response' => null, 'stop' => [
+                        'status' => 'continuing',
+                        'code' => 'provider_retry',
+                        'content' => app(TaskResumeText::class)->continuingText($decision->deferredUntil()),
+                        'message_id' => null,
+                    ]];
+                }
+                if ($decision->inlineDelaySeconds() === null) {
+                    throw $e;
+                }
+
+                // Retry in place. The lease covers the sleep and a base
+                // lease after it, so a delegator polling for a dead helper
+                // does not take this one over while it waits.
+                $seconds = $decision->inlineDelaySeconds();
+                $actionId = null;
+                app(RunLease::class)->renew($runId, $seconds + (int) config('llm-client.resume.helper_lease_seconds', 30));
+                Sleep::sleep($seconds);
+
+                if ($deadlineAt !== null && now()->greaterThanOrEqualTo($deadlineAt)) {
+                    return ['response' => null, 'stop' => $this->stopAtTimeBound($conversation, $runId, $stepId)];
+                }
+                $this->recordStepAttempt($stepId);
+                $actionId = $openAction();
+                $this->extendLeaseBeforeModelCall($runId);
+            }
+        }
+    }
+
+    private function recordStepAttempt(?string $stepId): void
+    {
+        $this->runTraceRecorder?->recordStepAttempt($stepId);
+    }
+
     /**
      * The cause that cancelled the run named by $runId, or null when the
      * run may continue. A run whose id is absent, or that no longer
@@ -1959,29 +2089,7 @@ class AgentLoopService
                 // max-iterations-exceeded close-out shape below exactly, but
                 // with its own distinct end_reason/code.
                 if ($deadlineAt !== null && now()->greaterThanOrEqualTo($deadlineAt)) {
-                    $conversation->update(['is_processing' => false]);
-
-                    if ($this->runTraceRecorder !== null && $runId !== null) {
-                        if ($currentStepId !== null) {
-                            $this->runTraceRecorder->closeStep(
-                                $currentStepId,
-                                RunEndState::StoppedEarly,
-                                'Delegation time bound reached',
-                            );
-                        }
-                        $this->runTraceRecorder->closeRun(
-                            $runId,
-                            RunEndState::StoppedEarly,
-                            'Delegation time bound reached',
-                        );
-                    }
-
-                    return [
-                        'status' => 'error',
-                        'content' => 'Delegation time bound reached',
-                        'message_id' => null,
-                        'code' => 'time_ceiling_reached',
-                    ];
+                    return $this->stopAtTimeBound($conversation, $runId, $currentStepId);
                 }
 
                 // Cancellation: a cancelled
@@ -1998,6 +2106,16 @@ class AgentLoopService
                 // already).
                 if (!$reclaimedStep) {
                     $budgetDecision = app(TaskBudgetGate::class)->beforeStep($conversation, $runId);
+                    if ($budgetDecision->isStop()) {
+                        return $this->stopAtTaskBudget($conversation, $budgetDecision, $runId, $currentStepId, $iteration, 'sync')
+                            ?? ['status' => 'stopped', 'code' => 'task_budget_reached', 'content' => '', 'message_id' => null];
+                    }
+                }
+                // A repeated model call of an already-claimed step claims
+                // nothing, but the task must still be running and under its
+                // spend ceiling.
+                if ($reclaimedStep && !$isResumedIteration) {
+                    $budgetDecision = app(TaskBudgetGate::class)->beforeReclaimedStep($conversation, $runId);
                     if ($budgetDecision->isStop()) {
                         return $this->stopAtTaskBudget($conversation, $budgetDecision, $runId, $currentStepId, $iteration, 'sync')
                             ?? ['status' => 'stopped', 'code' => 'task_budget_reached', 'content' => '', 'message_id' => null];
@@ -2082,14 +2200,26 @@ class AgentLoopService
                 // so a live-but-slow run is not mistaken for dead.
                 $this->extendLeaseBeforeModelCall($runId);
 
-                $response = $this->callLlmSync(
+                $attempt = $this->callLlmSyncWithProviderRetry(
                     $conversation,
-                    $formatted['messages'],
-                    $formattedTools,
-                    $systemPrompt,
-                    modelOverride: $decision->effectiveModel,
-                    serverIdOverride: $decision->effectiveServerId,
+                    $runId,
+                    $currentStepId,
+                    $activeActionId,
+                    $deadlineAt,
+                    fn () => $this->callLlmSync(
+                        $conversation,
+                        $formatted['messages'],
+                        $formattedTools,
+                        $systemPrompt,
+                        modelOverride: $decision->effectiveModel,
+                        serverIdOverride: $decision->effectiveServerId,
+                    ),
+                    fn () => $this->runTraceRecorder->openAction($currentStepId, ActionType::LlmRequest, $modelName, $attemptGroupId),
                 );
+                if ($attempt['stop'] !== null) {
+                    return $attempt['stop'];
+                }
+                $response = $attempt['response'];
                 if ($this->runTraceRecorder !== null && $activeActionId !== null) {
                     $this->runTraceRecorder->closeAction($activeActionId, ActionOutcome::Success);
                     $activeActionId = null;
@@ -3624,14 +3754,26 @@ class AgentLoopService
             // Extend the run's lease over the model call that follows.
             $this->extendLeaseBeforeModelCall($runId);
 
-            $response = $this->callLlmSync(
+            $attempt = $this->callLlmSyncWithProviderRetry(
                 $conversation,
-                $formatted['messages'],
-                $formattedTools,
-                $formatted['system'],
-                modelOverride: $decision->effectiveModel,
-                serverIdOverride: $decision->effectiveServerId,
+                $runId,
+                $currentStepId,
+                $llmActionId,
+                null,
+                fn () => $this->callLlmSync(
+                    $conversation,
+                    $formatted['messages'],
+                    $formattedTools,
+                    $formatted['system'],
+                    modelOverride: $decision->effectiveModel,
+                    serverIdOverride: $decision->effectiveServerId,
+                ),
+                fn () => $this->runTraceRecorder->openAction($currentStepId, ActionType::LlmRequest, $modelName, $attemptGroupId),
             );
+            if ($attempt['stop'] !== null) {
+                return $attempt['stop'];
+            }
+            $response = $attempt['response'];
             if ($this->runTraceRecorder !== null && $llmActionId !== null) {
                 $this->runTraceRecorder->closeAction($llmActionId, ActionOutcome::Success);
             }
@@ -4808,6 +4950,39 @@ class AgentLoopService
             ],
             'required' => ['operationId'],
         ];
+    }
+
+    /**
+     * Count a model call that was made and never answered (its worker died
+     * mid-call): the provider reports nothing for it, so its input, the
+     * payload the call would have carried, is recorded once as an estimate
+     * (output estimated as empty). Fire-and-forget: never throws.
+     */
+    public function recordLostModelCall(Conversation $conversation, string $runId): void
+    {
+        if ($this->metricsRecorder === null) {
+            return;
+        }
+
+        try {
+            $formatted = $this->formatMessages($conversation, $this->buildMessagesPayload($conversation, $runId));
+            $this->metricsRecorder->recordUsage(
+                conversationId: $conversation->id,
+                userId: (string) $conversation->user_id,
+                attemptGroupId: (string) Str::uuid(),
+                providerUsage: [],
+                inputText: $this->concatMessageText($formatted['messages']),
+                outputText: '',
+                model: $conversation->model,
+                providerType: $conversation->effectiveProviderType?->value,
+                agentId: $conversation->character ?: null,
+            );
+        } catch (\Throwable $e) {
+            Log::warning('AgentLoopService: a lost model call could not be counted', [
+                'run_id' => $runId,
+                'error' => get_class($e),
+            ]);
+        }
     }
 
     /**
@@ -7130,6 +7305,16 @@ class AgentLoopService
 
             if ($this->cancelCauseFor($runId) !== null) {
                 $this->closeCancelledRun($conversation, $runId, $stepId);
+
+                return;
+            }
+
+            // The step was claimed when it was first opened, so the repeat
+            // claims nothing; the task must still be running and under its
+            // spend ceiling.
+            $budgetDecision = app(TaskBudgetGate::class)->beforeReclaimedStep($conversation, $runId);
+            if ($budgetDecision->isStop()) {
+                $this->stopAtTaskBudget($conversation, $budgetDecision, $runId, $stepId, $iteration, 'stream');
 
                 return;
             }

@@ -4,6 +4,13 @@ namespace Tests\Feature\Resume;
 
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
+use ClarionApp\LlmClient\Jobs\ResumeInterruptedRunJob;
+use ClarionApp\LlmClient\Services\TaskResumeText;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Promise\RejectedPromise;
+use GuzzleHttp\Psr7\Request;
+use PHPUnit\Framework\Attributes\DataProvider;
 use ClarionApp\LlmClient\Models\Conversation;
 use GuzzleHttp\Promise\FulfilledPromise;
 use GuzzleHttp\Psr7\Response;
@@ -439,5 +446,152 @@ class AgentStreamStepJobTest extends TestCase
         $this->assertSame('takeover', $payload['detected_by'] ?? null, 'the detection is a takeover');
 
         $this->assertSame(1, DB::table('agent_run_resume_events')->where('run_id', 'run-1')->where('kind', 'takeover')->count(), 'one takeover event');
+    }
+
+    // ---------------------------------------------------------------
+    // A failed request is reported to the retry scheduler, never finished
+    // (quickstart M18, research F3)
+    // ---------------------------------------------------------------
+
+    /** A run, its open step and its in-flight model-request action, on a real conversation. */
+    private function makeRunOnConversation(): string
+    {
+        $conversationId = $this->makeConversation();
+        $this->makeRun('run-1', ['conversation_id' => $conversationId]);
+        $this->makeStep('step-1', 'run-1', 1);
+        DB::table('agent_run_actions')->insert([
+            'id' => 'action-1',
+            'run_id' => 'run-1',
+            'step_id' => 'step-1',
+            'action_type' => 'llm_request',
+            'target' => 'gpt-test',
+            'outcome' => 'in_progress',
+            'started_at' => now()->format('Y-m-d H:i:s.u'),
+        ]);
+
+        return $conversationId;
+    }
+
+    /** The model request itself is refused: Guzzle rejects the promise, as its own stack does for a 5xx or a refused connection. */
+    private function bindRejectingHandler(\Throwable $failure): void
+    {
+        $this->requestCount = 0;
+        $this->app->instance('llm-client.http_handler', function () use ($failure) {
+            $this->requestCount++;
+
+            return new RejectedPromise($failure);
+        });
+    }
+
+    private function statusFailure(int $status): RequestException
+    {
+        return new RequestException(
+            'provider said no: sk-test-LEAK-CHECK',
+            new Request('POST', 'https://provider.example/v1/chat/completions'),
+            new Response($status, [], json_encode(['error' => ['message' => 'provider said no: sk-test-LEAK-CHECK']])),
+        );
+    }
+
+    /** @return array<string, array{0: \Throwable, 1: string}> */
+    public static function transientRejections(): array
+    {
+        return [
+            '503 response' => [new RequestException('x', new Request('POST', 'https://provider.example/v1/chat/completions'), new Response(503)), 'unavailable'],
+            '429 response' => [new RequestException('x', new Request('POST', 'https://provider.example/v1/chat/completions'), new Response(429)), 'rate_limited'],
+            'connection refused' => [new ConnectException('Connection refused', new Request('POST', 'https://provider.example/v1/chat/completions')), 'connection'],
+        ];
+    }
+
+    #[Test]
+    #[DataProvider('transientRejections')]
+    public function rejected_request_schedules_retry(\Throwable $failure, string $reason): void
+    {
+        $conversationId = $this->makeRunOnConversation();
+        $this->bindRejectingHandler($failure);
+
+        (new AgentStreamStepJob($this->request(), $this->data('run-1', 'step-1', $conversationId, '10000000-0000-0000-0000-000000000001')))->handle();
+
+        $this->assertSame(1, $this->requestCount, 'the request was sent and refused');
+
+        // The run waits: it is not finished, not failed, not left holding a lease.
+        $run = $this->runRow('run-1');
+        $this->assertSame('in_progress', $run->end_state, 'the run is not over');
+        $this->assertSame('waiting_provider_retry', $run->resume_state, 'the failure was handed to the retry scheduler');
+        $this->assertNotNull($run->next_attempt_at, 'a retry is due');
+        $this->assertNull($run->lease_holder, 'no worker is held for the wait');
+        $this->assertNotSame('10000000-0000-0000-0000-000000000001', $run->dispatch_id, 'a new dispatch id carries the retry');
+        $this->assertSame(1, (int) $run->provider_attempts);
+
+        $jobs = Queue::pushed(ResumeInterruptedRunJob::class);
+        $this->assertCount(1, $jobs, 'a delayed resume job carries the retry');
+        $this->assertSame($run->dispatch_id, $jobs->first()->dispatchId);
+        $this->assertNotNull($jobs->first()->delay, 'and it is delayed');
+
+        $events = DB::table('agent_run_resume_events')->where('run_id', 'run-1')->where('kind', 'provider_retry_scheduled')->get();
+        $this->assertCount(1, $events);
+        $this->assertSame($reason, json_decode((string) $events[0]->payload, true)['reason']);
+
+        // finish() was not called: the step is still the open step, no reply
+        // was written, and the conversation is still processing (F3: it used
+        // to hang for an hour instead).
+        $step = $this->stepRow('run-1', 'step-1');
+        $this->assertSame('in_progress', $step->end_state, 'the step is not closed');
+        $this->assertSame('open', $step->checkpoint_state, 'no model response was recorded');
+        $this->assertSame(0, DB::table('messages')->where('conversation_id', $conversationId)->where('role', 'assistant')->count(), 'no reply was written for a response that never came');
+        $this->assertTrue((bool) DB::table('conversations')->where('id', $conversationId)->value('is_processing'), 'the task is still running');
+        $this->assertSame('failure', DB::table('agent_run_actions')->where('id', 'action-1')->value('outcome'), 'the model-request action records the failed attempt');
+        Queue::assertNotPushed(AgentStreamStepJob::class, 'the job never re-dispatches itself');
+    }
+
+    #[Test]
+    public function incomplete_stream_is_transient(): void
+    {
+        // Headers arrive, the body ends without a finish reason or [DONE]:
+        // the provider cut the stream. That is a failed attempt, never a
+        // finished reply.
+        $conversationId = $this->makeRunOnConversation();
+        $this->bindStreamingHandler([
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+        ]);
+
+        (new AgentStreamStepJob($this->request(), $this->data('run-1', 'step-1', $conversationId, '10000000-0000-0000-0000-000000000001')))->handle();
+
+        $run = $this->runRow('run-1');
+        $this->assertSame('waiting_provider_retry', $run->resume_state, 'a cut stream is retried');
+        $this->assertSame('in_progress', $run->end_state);
+        $events = DB::table('agent_run_resume_events')->where('run_id', 'run-1')->where('kind', 'provider_retry_scheduled')->get();
+        $this->assertCount(1, $events);
+        $this->assertSame('incomplete_stream', json_decode((string) $events[0]->payload, true)['reason']);
+        $this->assertSame('open', $this->stepRow('run-1', 'step-1')->checkpoint_state, 'the half reply was not recorded as the model\'s response');
+        $this->assertSame('in_progress', $this->stepRow('run-1', 'step-1')->end_state);
+        $this->assertCount(1, Queue::pushed(ResumeInterruptedRunJob::class), 'the retry is carried by one delayed job');
+        $this->assertTrue((bool) DB::table('conversations')->where('id', $conversationId)->value('is_processing'));
+    }
+
+    #[Test]
+    public function rejected_400_fails_run_with_report(): void
+    {
+        // A request the provider will not accept is not retried: the run
+        // fails, the conversation is released, and the user is not left
+        // waiting for an hour (F3).
+        $conversationId = $this->makeRunOnConversation();
+        $this->bindRejectingHandler($this->statusFailure(400));
+
+        (new AgentStreamStepJob($this->request(), $this->data('run-1', 'step-1', $conversationId, '10000000-0000-0000-0000-000000000001')))->handle();
+
+        $run = $this->runRow('run-1');
+        $this->assertSame('failed', $run->end_state, 'the run is closed failed');
+        $this->assertNotEmpty($run->end_reason, 'with a reason');
+        $this->assertStringNotContainsString('LEAK-CHECK', (string) $run->end_reason, 'the provider\'s own text is not the reason');
+        $this->assertSame('failed', $this->stepRow('run-1', 'step-1')->end_state, 'the open step is closed failed');
+        $this->assertFalse((bool) DB::table('conversations')->where('id', $conversationId)->value('is_processing'), 'the conversation is released');
+        Queue::assertNotPushed(ResumeInterruptedRunJob::class, 'a rejected request is not retried');
+        $this->assertSame(0, DB::table('agent_run_resume_events')->where('run_id', 'run-1')->where('kind', 'provider_retry_scheduled')->count());
+        $this->assertNull($run->next_attempt_at);
+        $this->assertNotEmpty(
+            DB::table('messages')->where('conversation_id', $conversationId)->where('role', 'assistant')->pluck('content')->filter(fn ($c) => $c !== '' && $c !== null)->all(),
+            'the user is told, in the conversation, that the task could not continue',
+        );
     }
 }

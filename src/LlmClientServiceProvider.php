@@ -546,6 +546,8 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->bind(\ClarionApp\LlmClient\Services\ResumePlanner::class);
         $this->app->bind(\ClarionApp\LlmClient\Services\RunResumer::class);
         $this->app->bind(\ClarionApp\LlmClient\Services\RunCancellation::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\ProviderRetryScheduler::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\TaskNoticePoster::class);
         $this->app->bind(\ClarionApp\LlmClient\Services\ResumeEventLog::class);
         $this->app->bind(\ClarionApp\LlmClient\Services\TaskResumeText::class);
         $this->app->bind(\ClarionApp\LlmClient\Services\PausedRunQuery::class);

@@ -5,7 +5,18 @@ namespace ClarionApp\LlmClient\Jobs;
 use ClarionApp\HttpQueue\HttpRequest;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Contracts\FaultInjector;
+use ClarionApp\LlmClient\Exceptions\IncompleteStream;
+use ClarionApp\LlmClient\Exceptions\LeaseLost;
+use ClarionApp\LlmClient\Models\AgentRun;
+use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Services\ProviderRetryScheduler;
+use ClarionApp\LlmClient\Services\QueuedMessagePickup;
 use ClarionApp\LlmClient\Services\RunLease;
+use ClarionApp\LlmClient\Services\RunTraceRecorder;
+use ClarionApp\LlmClient\Services\TaskNoticePoster;
+use ClarionApp\LlmClient\Services\TaskResumeText;
+use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
+use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\Services\RunResumer;
 use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
 use GuzzleHttp\Client;
@@ -145,7 +156,7 @@ class AgentStreamStepJob implements ShouldQueue
 
         // 4. A stream that ended without its end marker is incomplete.
         if (!$handler->streamCompleted()) {
-            $this->onStreamFailure($runId, $stepId, new \RuntimeException('incomplete stream'));
+            $this->onStreamFailure($runId, $stepId, new IncompleteStream());
 
             return;
         }
@@ -180,18 +191,64 @@ class AgentStreamStepJob implements ShouldQueue
     }
 
     /**
-     * A rejected request, an incomplete stream or a mid-stream exception:
-     * logged only. The run is never finished on a response it did not fully
-     * receive and never re-dispatched blindly; its lease expires and the
-     * detection sweep resumes it by repeating the model call.
+     * A rejected request, an incomplete stream or a mid-stream exception.
+     * The run is never finished on a response it did not fully receive and
+     * the job never re-dispatches itself: the failure goes to the retry
+     * scheduler, which waits for a transient one (a delayed job carries the
+     * retry) and, for a request the provider rejects, closes the run failed
+     * with a report, instead of leaving the conversation processing for an
+     * hour.
      */
     private function onStreamFailure(string $runId, string $stepId, \Throwable $e): void
     {
-        Log::warning('AgentStreamStepJob: the stream failed; it is not re-dispatched', [
+        Log::info('AgentStreamStepJob: the stream failed; it is not re-dispatched', [
             'run_id' => $runId,
             'step_id' => $stepId,
             'error_class' => get_class($e),
         ]);
+
+        // A run with no trace record has nothing to schedule or close; a
+        // process that lost its lease is superseded and writes nothing.
+        if ($runId === '' || $e instanceof LeaseLost) {
+            return;
+        }
+
+        $run = AgentRun::find($runId);
+        if ($run === null || $run->end_state !== RunEndState::InProgress) {
+            return;
+        }
+
+        $actionId = isset($this->data['action_id']) ? (string) $this->data['action_id'] : null;
+        $decision = app(ProviderRetryScheduler::class)->onFailure($run, $stepId, $actionId, $e);
+        if ($decision->deferredUntil() !== null || $decision->isExhausted() || $decision->isLost()) {
+            return;
+        }
+
+        $this->failRun($run, $stepId, $actionId);
+    }
+
+    /** A rejected request: the run fails, the user is told, and a message queued behind it is picked up. */
+    private function failRun(AgentRun $run, string $stepId, ?string $actionId): void
+    {
+        $text = app(TaskResumeText::class);
+        $recorder = app(RunTraceRecorder::class);
+        $completedSteps = (int) DB::table('agent_run_steps')
+            ->where('run_id', $run->id)
+            ->where('end_state', RunEndState::Completed->value)
+            ->count();
+
+        $recorder->closeAction($actionId, ActionOutcome::Failure, 'provider rejected the request');
+        $recorder->closeStep($stepId, RunEndState::Failed, $text->providerRejectedReason());
+        $recorder->closeRun((string) $run->id, RunEndState::Failed, $text->providerRejectedReason());
+
+        $conversation = Conversation::find($run->conversation_id);
+        if ($conversation === null) {
+            return;
+        }
+        $conversation->update(['is_processing' => false]);
+        app(TaskNoticePoster::class)->post($conversation, $run, 'provider_rejected', $text->providerRejectedReport($completedSteps));
+
+        app(QueuedMessagePickup::class)->startIfAny($conversation, $run);
     }
 
     /**

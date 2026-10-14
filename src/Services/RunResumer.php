@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
+use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\CallDispositionKind;
 use ClarionApp\LlmClient\ValueObjects\ClaimResult;
 use ClarionApp\LlmClient\ValueObjects\PlanKind;
@@ -154,13 +155,19 @@ class RunResumer
                 return $this->continueDecidedConfirmation($run, $conversation, $plan, $decided, $caller);
             }
 
-            $this->applyOutcomeUnknown($run, $conversation, $plan);
-            $this->recordResumeStarted($run, $plan);
-            $this->maybeResumedNotice($run, $conversation, $plan);
+            // A delayed provider retry claiming the run on time is not a
+            // recovery from an interruption: it says nothing of "resuming"
+            // and counts no resume. Its own events already tell the story.
+            $providerRetry = !$won->takeover && (int) $run->provider_attempts > 0 && $run->next_attempt_at !== null;
+            if (!$providerRetry) {
+                $this->applyOutcomeUnknown($run, $conversation, $plan);
+                $this->recordResumeStarted($run, $plan);
+                $this->maybeResumedNotice($run, $conversation, $plan);
+            }
 
             return $plan->mode === ResumeMode::Sync
                 ? $this->continueSync($run, $conversation, $plan, $caller)
-                : $this->continueStream($conversation, $plan);
+                : $this->continueStream($run, $conversation, $plan);
         } finally {
             if ($previousRunId === null) {
                 Context::forget('run_id');
@@ -373,7 +380,7 @@ class RunResumer
             $state = $loop->buildResumeLoopState($plan, $conversation, $plan->iteration, null, false);
         } else {
             if ($plan->kind === PlanKind::RepeatModelCall) {
-                $this->closeLostModelCall((string) $plan->openStepId);
+                $this->closeLostModelCall($conversation, $run, (string) $plan->openStepId);
             }
             // A step paused at the ceiling never claimed its step (the gate
             // stopped it), so its model call claims one now.
@@ -382,7 +389,7 @@ class RunResumer
 
         $result = $loop->runLoop($state);
 
-        if ($caller === ResumeCaller::Background && ($result['status'] ?? null) !== 'superseded') {
+        if ($caller === ResumeCaller::Background && $this->resultNeedsDelivery($result)) {
             $content = (string) ($result['content'] ?? '');
             if (trim($content) !== '') {
                 $this->deliver($conversation->fresh() ?? $conversation, $run, $content, $result['message_id'] ?? null);
@@ -390,6 +397,21 @@ class RunResumer
         }
 
         return $result;
+    }
+
+    /**
+     * Whether a sync continuation's result is a message for the user. A
+     * superseded worker says nothing; a task waiting on a provider retry is
+     * not over (its waiting notice was posted by the scheduler); an
+     * exhausted retry was reported by the scheduler already.
+     *
+     * @param array<string, mixed> $result
+     */
+    private function resultNeedsDelivery(array $result): bool
+    {
+        return ($result['status'] ?? null) !== 'superseded'
+            && ($result['status'] ?? null) !== 'continuing'
+            && ($result['code'] ?? null) !== 'provider_unavailable';
     }
 
     /**
@@ -438,7 +460,7 @@ class RunResumer
         }
 
         $result = $loop->resumeSync($conversation, $paused, $approved, decisionRecorded: true);
-        if ($caller === ResumeCaller::Background && ($result['status'] ?? null) !== 'superseded') {
+        if ($caller === ResumeCaller::Background && $this->resultNeedsDelivery($result)) {
             $content = (string) ($result['content'] ?? '');
             if (trim($content) !== '') {
                 $this->deliver($conversation->fresh() ?? $conversation, $run, $content, $result['message_id'] ?? null);
@@ -454,7 +476,7 @@ class RunResumer
      * `AgentStreamStepJob` with a handed-off dispatch id, exactly as a
      * normal stream iteration is.
      */
-    private function continueStream(Conversation $conversation, ResumePlan $plan): ?array
+    private function continueStream(AgentRun $run, Conversation $conversation, ResumePlan $plan): ?array
     {
         $lease = app(RunLease::class);
         $loop = app(AgentLoopService::class);
@@ -475,7 +497,7 @@ class RunResumer
                     $loop->start($conversation, $plan->iteration, $plan->runId, resumed: true);
                     break;
                 }
-                $this->closeLostModelCall((string) $plan->openStepId);
+                $this->closeLostModelCall($conversation, $run, (string) $plan->openStepId);
                 $lease->handOff($plan->runId);
                 $loop->redispatchOpenStep($conversation, $plan->runId, (string) $plan->openStepId, $plan->iteration, $plan->partialMessageId);
                 break;
@@ -517,17 +539,33 @@ class RunResumer
             && DB::table('agent_run_steps')->where('id', $plan->openStepId)->value('checkpoint_state') === 'paused';
     }
 
-    /** The lost model call's in-flight actions are closed unfinished. */
-    private function closeLostModelCall(string $stepId): void
+    /**
+     * The lost model call's in-flight actions are closed unfinished. A call
+     * that was made and never answered (its worker died) still cost
+     * something the provider will never report: its input is counted once as
+     * an estimate, stamped with the run and the task like any other usage.
+     * A call the provider answered with a failure was closed already and
+     * counts nothing here.
+     */
+    private function closeLostModelCall(Conversation $conversation, AgentRun $run, string $stepId): void
     {
         $actionIds = DB::table('agent_run_actions')
             ->where('step_id', $stepId)
             ->where('outcome', ActionOutcome::InProgress->value)
             ->pluck('id');
 
+        $lostCall = $actionIds->isNotEmpty() && DB::table('agent_run_actions')
+            ->whereIn('id', $actionIds)
+            ->where('action_type', ActionType::LlmRequest->value)
+            ->exists();
+        if ($lostCall) {
+            app(AgentLoopService::class)->recordLostModelCall($conversation, (string) $run->id);
+        }
+
         foreach ($actionIds as $actionId) {
             app(RunTraceRecorder::class)->closeAction((string) $actionId, ActionOutcome::Unfinished, 'interrupted');
         }
+        app(RunTraceRecorder::class)->recordStepAttempt($stepId);
     }
 
     /**
@@ -536,58 +574,12 @@ class RunResumer
      */
     private function postNotice(Conversation $conversation, AgentRun $run, string $notice, string $text): ?Message
     {
-        try {
-            $message = Message::create([
-                'conversation_id' => $conversation->id,
-                'role' => 'assistant',
-                'user' => $conversation->character,
-                'content' => $text,
-                'responseTime' => 0,
-                'tool_data' => ['kind' => AgentQuestionService::KIND_TASK_RESUME_NOTICE, 'notice' => $notice, 'run_id' => (string) $run->id],
-            ]);
-
-            $this->deliver($conversation, $run, $text, (string) $message->id);
-
-            return $message;
-        } catch (\Throwable $e) {
-            Log::warning('RunResumer: a resume notice could not be posted', [
-                'run_id' => $run->id,
-                'error' => get_class($e),
-            ]);
-
-            return null;
-        }
+        return app(TaskNoticePoster::class)->post($conversation, $run, $notice, $text);
     }
 
-    /**
-     * Put a message the resume wrote in front of the user: broadcast on the
-     * web, delivered through the conversation's channel adapter elsewhere
-     * when the user can be reached (an unattended run keeps it in the
-     * history only). A delivery failure never stops the resume.
-     */
     private function deliver(Conversation $conversation, AgentRun $run, string $text, ?string $messageId): void
     {
-        if ((string) ($conversation->channel ?? 'web') === 'web') {
-            if ($messageId !== null) {
-                event(new NewConversationMessageEvent($conversation->id, $messageId));
-            }
-
-            return;
-        }
-
-        $options = is_array($run->resume_options) ? $run->resume_options : json_decode((string) $run->resume_options, true);
-        $unattended = is_array($options) && !empty($options['unattended']);
-        if (app(UserReachability::class)->refusal($conversation, $unattended) !== null) {
-            return;
-        }
-
-        $delivery = app(AgentQuestionService::class)->deliver($conversation, $text);
-        if (!$delivery->delivered) {
-            Log::warning('RunResumer: a message could not be delivered on the conversation\'s channel', [
-                'run_id' => $run->id,
-                'reason' => $delivery->failureReason,
-            ]);
-        }
+        app(TaskNoticePoster::class)->deliver($conversation, $run, $text, $messageId);
     }
 
     /** The run's open step (if any) is closed with $state. */
