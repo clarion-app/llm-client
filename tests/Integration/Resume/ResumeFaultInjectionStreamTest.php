@@ -2,14 +2,20 @@
 
 namespace Tests\Integration\Resume;
 
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
+use ClarionApp\LlmClient\Jobs\ResumeInterruptedRunJob;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
+use ClarionApp\LlmClient\Services\RunResumer;
 use Dedoc\Scramble\Generator;
 use Dedoc\Scramble\GeneratorConfig;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Integration\AssembledSystemTestCase;
 use Tests\Integration\Harness\OperationCatalogue;
@@ -18,6 +24,7 @@ use Tests\Support\EffectLedger;
 use Tests\Support\InjectedFault;
 use Tests\Support\ScriptedProvider;
 use Tests\Support\SnapshotFaultInjector;
+use Tests\Support\TravelsPastLease;
 
 /**
  * The streamed path, killed at a fault point, leaves the checkpoint in a
@@ -44,6 +51,7 @@ use Tests\Support\SnapshotFaultInjector;
 class ResumeFaultInjectionStreamTest extends AssembledSystemTestCase
 {
     use TaskBudgetJourneys;
+    use TravelsPastLease;
 
     private const USAGE = [10, 10];
 
@@ -133,6 +141,57 @@ class ResumeFaultInjectionStreamTest extends AssembledSystemTestCase
             $this->fail("the run failed before the fault point ({$point}): {$e->getMessage()}");
         }
         $this->assertNotNull($thrown, "the fault at {$point} (occurrence {$occurrence}) was never reached — the funnel is not in place");
+    }
+
+    /**
+     * The resume half: expire the run's lease (travel window + 1 s), run the
+     * interruption sweep, and run the job the sweep pushed. The resumer
+     * re-drives the step from the checkpoint, so the disposition executes
+     * and the ledger count is observable.
+     */
+    private function resumeRun(Conversation $conversation): object
+    {
+        $this->travelPastLease($conversation);
+
+        Queue::fake([AgentStreamStepJob::class, ResumeInterruptedRunJob::class]);
+        $this->assertSame(0, Artisan::call('llm-client:resume-interrupted-runs'), 'the sweep ran');
+
+        $captured = null;
+        Queue::assertPushed(ResumeInterruptedRunJob::class, function ($job) use (&$captured) {
+            $captured = $job;
+            return true;
+        });
+        $this->assertNotNull($captured, 'the sweep pushed a resume job');
+
+        $captured->handle(app(RunResumer::class));
+
+        return $this->runRowOf($conversation);
+    }
+
+    /** @return Message|null the task_resume_notice of $noticeType for the conversation */
+    private function resumeNotice(Conversation $conversation, string $noticeType): ?Message
+    {
+        return Message::where('conversation_id', $conversation->id)->get()->first(
+            fn (Message $m) => ($m->tool_data['kind'] ?? null) === 'task_resume_notice'
+                && ($m->tool_data['notice'] ?? null) === $noticeType
+        );
+    }
+
+    /** The tool result for $callId in the conversation's step messages. */
+    private function toolResult(Conversation $conversation, string $callId): ?array
+    {
+        $message = Message::where('conversation_id', $conversation->id)->get()->first(
+            function (Message $m) use ($callId) {
+                $results = $m->tool_data['tool_results'] ?? [];
+                return is_array($results) && collect($results)->contains(fn ($r) => ($r['tool_call_id'] ?? null) === $callId);
+            }
+        );
+        if ($message === null) {
+            return null;
+        }
+        $results = $message->tool_data['tool_results'] ?? [];
+
+        return collect($results)->first(fn ($r) => ($r['tool_call_id'] ?? null) === $callId);
     }
 
     // ---------------------------------------------------------------
@@ -292,5 +351,143 @@ class ResumeFaultInjectionStreamTest extends AssembledSystemTestCase
         $run = $this->runRowOf($conversation);
         $call = $this->latestCallAt($run, 'call_memory');
         $this->assertSame('not_started', $call['state'] ?? null, 'killed in the approved declarative-memory resume before the start marker: the call is not_started');
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4: resume half
+    // ---------------------------------------------------------------
+    // The kill half above pins the checkpoint state at each stream site. The
+    // resume half drives the run across the kill boundary — expire the
+    // lease, run the sweep, run the pushed job — and asserts the
+    // exactly-once ledger count and the disposition (reuse / execute /
+    // rerun / outcome-unknown) the resume applies.
+
+    #[Test]
+    public function killed_before_tool_started_resumes_and_executes_once(): void
+    {
+        $this->scenario = 'resume_stream_before_started';
+        $this->setupJourney();
+        $conversation = $this->conversationFor('stream');
+
+        $this->send('stream', $conversation, 'Write to the ledger.')->assertStatus(201);
+        $this->killAt('before_tool_started', 1, fn () => $this->playTurn(0, '', [
+            ['id' => 'call_write', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.write']],
+        ], self::USAGE));
+
+        $run = $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the not_started call executes exactly once on resume');
+        $this->assertSame('completed', $run->end_state, 'the resumed run completes');
+    }
+
+    #[Test]
+    public function killed_after_effect_on_effectful_is_outcome_unknown_not_rerun(): void
+    {
+        $this->scenario = 'resume_stream_after_effect_effectful';
+        $this->setupJourney();
+        $conversation = $this->conversationFor('stream');
+
+        $this->send('stream', $conversation, 'Write to the ledger.')->assertStatus(201);
+        $this->killAt('after_tool_effect', 1, fn () => $this->playTurn(0, '', [
+            ['id' => 'call_write', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.write']],
+        ], self::USAGE));
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the effectful call is not re-run (the effect fired once, before the kill)');
+
+        $result = $this->toolResult($conversation, 'call_write');
+        $this->assertNotNull($result, 'the step message holds the call result');
+        $this->assertTrue((bool) ($result['outcome_unknown'] ?? false), 'the result is marked outcome_unknown');
+
+        $notice = $this->resumeNotice($conversation, 'outcome_unknown');
+        $this->assertNotNull($notice, 'a task_resume_notice (outcome_unknown) is posted');
+    }
+
+    #[Test]
+    public function killed_after_recorded_is_reused(): void
+    {
+        $this->scenario = 'resume_stream_after_recorded';
+        $this->setupJourney();
+        $conversation = $this->conversationFor('stream');
+
+        $this->send('stream', $conversation, 'Write to the ledger.')->assertStatus(201);
+        $this->killAt('after_tool_recorded', 1, fn () => $this->playTurn(0, '', [
+            ['id' => 'call_write', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.write']],
+        ], self::USAGE));
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the completed call is reused, not re-run');
+    }
+
+    #[Test]
+    public function killed_meta_tool_before_started_resumes_and_runs(): void
+    {
+        $this->scenario = 'resume_stream_t8_meta';
+        $this->setupJourney();
+        $conversation = $this->conversationFor('stream');
+
+        $this->send('stream', $conversation, 'Search the operations.')->assertStatus(201);
+        $this->killAt('before_tool_started', 1, fn () => $this->playTurn(0, '', [
+            ['id' => 'call_search', 'name' => 'search_operations', 'arguments' => ['query' => 'notes']],
+        ], self::USAGE));
+
+        $this->resumeRun($conversation);
+
+        // The batch finished in the resume job; the next model call is a
+        // stream step job, played here.
+        $this->playTurn(0, 'Here are the note operations.', [], self::USAGE);
+
+        $this->assertSame('completed', $this->runRowOf($conversation)->end_state, 'the resumed run completes with the meta tool re-run');
+        $this->assertNotNull($this->toolResult($conversation, 'call_search'), 'the meta tool ran and its result is in the step message');
+    }
+
+    #[Test]
+    public function killed_approved_call_after_effect_is_outcome_unknown_not_rerun(): void
+    {
+        $this->scenario = 'resume_stream_t5_approved_after_effect';
+        $this->setupJourney();
+
+        // The host API offers a deletion, which needs the user's
+        // confirmation; its effect goes through the host API — record it.
+        $document = self::taskBudgetHostApiDocument();
+        $document['paths']['/notes/stale'] = [
+            'delete' => ['operationId' => 'clearStaleNotes', 'summary' => 'Delete every stale note', 'parameters' => [], 'responses' => ['200' => ['description' => 'Deleted']]],
+        ];
+        (new OperationCatalogue())->seed($document);
+        (new OperationCatalogue())->fakeHostApi([
+            '/notes/stale' => function () {
+                $this->effectLedger->record('clearStaleNotes');
+
+                return \Illuminate\Support\Facades\Http::response(['ok' => true], 200, ['Content-Type' => 'application/json']);
+            },
+            '*' => \Illuminate\Support\Facades\Http::response(['ok' => true], 200, ['Content-Type' => 'application/json']),
+        ]);
+
+        $conversation = $this->conversationFor('stream');
+        $clear = ['id' => 'call_clear', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'clearStaleNotes', 'parameters' => []]];
+
+        $this->send('stream', $conversation, 'Clear the stale notes.')->assertStatus(201);
+        $this->playTurn(0, '', [$clear], self::USAGE);
+
+        $paused = Message::where('conversation_id', $conversation->id)->get()->first(
+            fn (Message $m) => is_array($m->tool_data['pending_confirmation'] ?? null)
+        );
+        $this->assertNotNull($paused, 'precondition: paused for the user\'s confirmation');
+
+        // Approve: the continuation (resume) executes the approved call —
+        // where the kill lands, after the effect has fired.
+        $this->killAt('after_tool_effect', 1, function () use ($conversation, $paused) {
+            app(AgentLoopService::class)->resume(Conversation::findOrFail($conversation->id), $paused, true);
+        });
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('clearStaleNotes'), 'the approved call is not re-run despite the approval (FR-011)');
+
+        $result = $this->toolResult($conversation, 'call_clear');
+        $this->assertNotNull($result, 'the step message holds the call result');
+        $this->assertTrue((bool) ($result['outcome_unknown'] ?? false), 'the approved call is outcome_unknown, not re-executed');
     }
 }

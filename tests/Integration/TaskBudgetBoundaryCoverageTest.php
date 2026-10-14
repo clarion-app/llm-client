@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Jobs\RunEvalCaseJob;
 use ClarionApp\LlmClient\Jobs\RunManagedTaskStepJob;
@@ -384,7 +384,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->travel(1)->seconds();
         $this->send('stream', $conversation, 'Second request.')->assertStatus(201);
         // Counted without re-reading the stream harness, which would discard the handler mid-reply.
-        $this->assertSame(1, Queue::pushed(SendHttpStreamRequest::class)->count(), 'precondition: the second message waits while the first is processing');
+        $this->assertSame(1, Queue::pushed(AgentStreamStepJob::class)->count(), 'precondition: the second message waits while the first is processing');
         $stream->finish();
 
         // Picked up as a new request: a new task, claimed before it was dispatched.
@@ -573,7 +573,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
     private function row6(): void
     {
         config(['llm-client.agent_loop.max_iterations' => 3]);
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
         [, $manager, $helpers] = $this->delegatingRoot(['part-helper']);
         $response = $this->actingAs($this->fixture()->user, 'api')->postJson('/api/clarion-app/llm-client/managed-tasks', [
             'agent_id' => $manager->id,

@@ -3,7 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -205,7 +205,7 @@ class MessageControllerLateReplyTest extends TestCase
 
         $this->assertStoredThenNoticed($response, $conversation, $question, '2');
         $this->assertSame($decided, $this->decided($question), 'the reply changes nothing about what was decided');
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         Queue::assertNotPushed(ResumeAfterQuestionJob::class);
         $this->assertSame(1, DB::table('agent_runs')->where('conversation_id', $conversation->id)->count(), 'no second run beside the one continuing');
     }
@@ -216,13 +216,13 @@ class MessageControllerLateReplyTest extends TestCase
         [$conversation, $question] = $this->proceeded();
         $this->continuedAndFinished($question);
         $decided = $this->decided($question);
-        $streamsBefore = Queue::pushed(SendHttpStreamRequest::class)->count();
+        $streamsBefore = Queue::pushed(AgentStreamStepJob::class)->count();
 
         $response = $this->reply($conversation, '2');
 
         $this->assertStoredThenNoticed($response, $conversation, $question, '2');
         $this->assertSame($decided, $this->decided($question), 'the paused turn is not consumed again and the decision stands');
-        $this->assertSame($streamsBefore + 1, Queue::pushed(SendHttpStreamRequest::class)->count(), 'the reply is handled as a new message: one new run');
+        $this->assertSame($streamsBefore + 1, Queue::pushed(AgentStreamStepJob::class)->count(), 'the reply is handled as a new message: one new run');
         Queue::assertNotPushed(ResumeAfterQuestionJob::class);
     }
 
@@ -254,6 +254,6 @@ class MessageControllerLateReplyTest extends TestCase
         $this->assertSame([], $this->lateReplyNotices($conversation));
         $this->assertSame([], $this->web->textsFor($conversation->id), 'nothing is delivered');
         $this->assertNull(DB::table('agent_questions')->where('id', $question->id)->value('late_reply_noticed_at'));
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 }

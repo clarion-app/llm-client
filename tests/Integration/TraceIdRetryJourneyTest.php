@@ -2,8 +2,8 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Services\AgentLoopService;
@@ -17,46 +17,29 @@ use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 
 /**
- * FR-009/SC-006 (US4 scenario 3): a retried deferred continuation — whether
- * SendHttpStreamRequest self-redispatches on a transient failure, or the
- * queue connection's own `--tries` mechanism re-releases the identical job
- * payload — carries the ORIGINAL run's run_id forward, never minting a
- * fresh one (research.md D2).
+ * FR-009/SC-006 (US4 scenario 3): a redelivered stream step — the queue
+ * connection's own `--tries` mechanism re-releasing the identical
+ * `AgentStreamStepJob` payload — carries the ORIGINAL run's run_id forward,
+ * never minting a fresh one (research.md D2).
  *
- * How the two sub-cases are driven, and why:
+ * The stream step deliberately does not self-redispatch: `AgentStreamStepJob`
+ * has `$tries = 1` and, on a rejected request, an incomplete stream, or a
+ * mid-stream exception, neither re-dispatches nor records a model response it
+ * did not receive (lease contract §5). A failed stream is instead detected by
+ * lease expiry and resumed by `RepeatModelCall` (Phase 5) — a fresh dispatch
+ * that reads the run's durable state, not a retry of the same job. So the
+ * only redelivery of the identical serialized payload this test can exercise
+ * is the queue's own native retry: the same payload, popped, released back
+ * onto the queue, and popped again — no new dispatch, no serialization of
+ * anything this suite cannot serialize.
  *
- * Sub-case A (self-redispatch) needs SendHttpStreamRequest::handle() to hit
- * a transient \RuntimeException while reading the stream and call
- * `SendHttpStreamRequest::dispatch($this->request, $this->callback_name, $this->data)`
- * from its own catch block (http-queue/src/Jobs/SendHttpStreamRequest.php:76).
- * That method hard-codes `new Client(['timeout' => ...])` with no test
- * seam, so actually running it here would require a real, unmocked network
- * call — not available to this suite (see TraceIdDeferredWorkJourneyTest's
- * docblock for the full reasoning, and http-queue/tests/Unit/
- * SendHttpStreamRequestTest.php for how http-queue's own suite handles this:
- * an anonymous subclass swapping the Client, which cannot itself be
- * dispatched through a real queue, because PHP forbids serializing
- * `class@anonymous` instances — and dispatch-and-serialize is exactly the
- * mechanism under test here).
- *
- * http-queue's own test suite (T015 there) already proves that exact
- * `SendHttpStreamRequest::dispatch(...)` line fires when a genuine
- * \RuntimeException is thrown mid-stream — that is http-queue's contract,
- * not 069's. What 069 owns is narrower and is what this test actually
- * proves: that when a job's own already-hydrated Context is active and
- * something inside it — whether http-queue's real retry branch or this
- * test standing in for it — issues that identical dispatch call, the
- * result carries the SAME run_id forward via Queue::createPayloadUsing,
- * automatically, with no code in this feature doing anything to make that
- * happen. This test therefore issues that literal production line itself,
- * from within a job whose Context was rehydrated by a REAL, genuine
- * JobProcessing crossing (not a value the test set), and inspects the
- * SECOND job that results.
- *
- * Sub-case B (the queue's own --tries) needs no such substitution: it is
- * the same payload, popped, released back onto the queue, and popped again
- * — no new dispatch, no serialization of anything this suite cannot
- * serialize.
+ * The test undoes the suite's fake queue and dispatches for real, against
+ * the `database` connection (the `sync` connection executes the job inline
+ * during dispatch, in the same process with the same Context, so there is no
+ * real queue-payload boundary for D2's rehydration to cross). The deferred
+ * job is popped off a real, non-executing queue backend, its `JobProcessing`
+ * event fired (D2's rehydration hook), and its `AgentLoopStreamHandler`
+ * callback driven directly with scripted content.
  */
 class TraceIdRetryJourneyTest extends AssembledSystemTestCase
 {
@@ -89,42 +72,29 @@ class TraceIdRetryJourneyTest extends AssembledSystemTestCase
     }
 
     /**
-     * Pop the next SendHttpStreamRequest genuinely queued on the real
+     * Pop the next AgentStreamStepJob genuinely queued on the real
      * `database` connection's `http` queue, fire the real JobProcessing
      * event (D2's rehydration hook), and hand back both the job (so the
-     * caller can release() or delete() it) and its constructor arguments
-     * recovered via reflection off the unserialized command.
+     * caller can release() or delete() it) and its public constructor
+     * arguments recovered off the unserialized command.
      *
-     * @return array{job: QueueJobContract, request: \ClarionApp\HttpQueue\HttpRequest, callback_name: string, data: array}
+     * @return array{job: QueueJobContract, request: \ClarionApp\HttpQueue\HttpRequest, data: array}
      */
     private function popAndRehydrateStreamJob(): array
     {
         $job = Queue::connection('database')->pop('http');
-        $this->assertNotNull($job, 'Expected a genuinely queued SendHttpStreamRequest job on the database connection\'s "http" queue');
+        $this->assertNotNull($job, 'Expected a genuinely queued AgentStreamStepJob job on the database connection\'s "http" queue');
 
         $payload = $job->payload();
         $command = unserialize($payload['data']['command']);
-        $this->assertInstanceOf(SendHttpStreamRequest::class, $command);
+        $this->assertInstanceOf(AgentStreamStepJob::class, $command);
 
         event(new JobProcessing('database', $job));
 
-        $reflector = new \ReflectionClass($command);
-
-        $requestProperty = $reflector->getProperty('request');
-        $requestProperty->setAccessible(true);
-
-        $callbackProperty = $reflector->getProperty('callback_name');
-        $callbackProperty->setAccessible(true);
-
-        $dataProperty = $reflector->getProperty('data');
-        $dataProperty->setAccessible(true);
-        $rawData = $dataProperty->getValue($command);
-
         return [
             'job' => $job,
-            'request' => $requestProperty->getValue($command),
-            'callback_name' => $callbackProperty->getValue($command),
-            'data' => is_string($rawData) ? json_decode($rawData, true) : (array) $rawData,
+            'request' => $command->request,
+            'data' => $command->data,
         ];
     }
 
@@ -142,85 +112,6 @@ class TraceIdRetryJourneyTest extends AssembledSystemTestCase
             $handler->handle($chunk, $data, $elapsed);
         }
         $handler->finish($data, $elapsed);
-    }
-
-    /**
-     * FR-009/SC-006, US4 scenario 3, self-redispatch sub-case: the retry
-     * dispatch SendHttpStreamRequest issues from inside its own handle() on
-     * a transient failure carries the ORIGINAL run_id, never a fresh one —
-     * because it fires while that job's own (genuinely rehydrated) Context
-     * is still active.
-     */
-    public function test_self_redispatch_retry_preserves_the_original_run_id(): void
-    {
-        $this->scenario = 'self_redispatch_retry_preserves_original_run_id';
-        $this->entryPath = 'stream';
-
-        $fixture = $this->fixture()->build();
-        Message::create([
-            'id' => (string) \Illuminate\Support\Str::uuid(),
-            'conversation_id' => $fixture->conversation->id,
-            'role' => 'user',
-            'content' => 'A question whose first stream attempt will fail transiently',
-        ]);
-
-        $this->app->make(AgentLoopService::class)->start($fixture->conversation);
-
-        $run = DB::table('agent_runs')->where('conversation_id', $fixture->conversation->id)->first();
-        $this->assertNotNull($run);
-        $originalRunId = $run->id;
-
-        // --- Attempt 1: pops, rehydrates, then (standing in for a real
-        // transient \RuntimeException inside handle()'s stream read —
-        // see class docblock) issues the exact retry-dispatch line
-        // production code runs from its catch block, while attempt 1's
-        // rehydrated Context is still the active one. ---
-        Context::flush();
-        $attempt1 = $this->popAndRehydrateStreamJob();
-        $this->assertSame($originalRunId, Context::get('run_id'), 'Attempt 1 must rehydrate the originating run_id');
-
-        SendHttpStreamRequest::dispatch($attempt1['request'], $attempt1['callback_name'], $attempt1['data']);
-        $attempt1['job']->delete();
-
-        // --- Attempt 2 (the retry): pop the job the line above produced.
-        // It must carry the SAME run_id — proving Queue::createPayloadUsing
-        // dehydrated it from attempt 1's still-active, rehydrated Context,
-        // not from a fresh mint. ---
-        Context::flush();
-        $this->assertNull(Context::get('run_id'), 'Precondition: Context must be empty before the retry is processed');
-
-        $attempt2 = $this->popAndRehydrateStreamJob();
-        $this->assertSame(
-            $originalRunId,
-            Context::get('run_id'),
-            'FR-009: the self-redispatched retry must rehydrate to the SAME run_id as the original attempt, not a fresh one'
-        );
-        $this->assertSame(
-            $originalRunId,
-            $attempt2['data']['run_id'] ?? null,
-            'The pre-069 manual run_id channel in the retried job\'s data must also carry the original id'
-        );
-
-        $this->driveStreamHandlerToFinalAnswer($attempt2['data'], 'The answer, after one transient retry.');
-
-        $replyMessage = Message::where('conversation_id', $fixture->conversation->id)
-            ->where('role', 'assistant')
-            ->first();
-        $this->assertNotNull($replyMessage, 'The retried attempt must have eventually written the reply');
-        $this->assertSame(
-            $originalRunId,
-            $replyMessage->run_id,
-            'SC-006: the record written after a successful retry must carry the ORIGINAL run_id, never a new one'
-        );
-
-        $usageRecord = UsageRecord::where('conversation_id', $fixture->conversation->id)->first();
-        $this->assertNotNull($usageRecord);
-        $this->assertSame($originalRunId, $usageRecord->run_id, 'SC-006: usage recorded after the retry must carry the original run_id');
-
-        // There must be exactly one run for this conversation throughout —
-        // the retry never opened a second one.
-        $runCount = DB::table('agent_runs')->where('conversation_id', $fixture->conversation->id)->count();
-        $this->assertSame(1, $runCount, 'FR-009: a retry must never mint a second run for the same continuation');
     }
 
     /**

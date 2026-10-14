@@ -245,7 +245,7 @@ class ResponseBoundaryOnlyJourneyTest extends TestCase
     #[Test]
     public function a_streaming_continuation_carrying_a_run_id_never_relinks_the_degradation_event(): void
     {
-        \Illuminate\Support\Facades\Queue::fake([\ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest::class]);
+        \Illuminate\Support\Facades\Queue::fake([\ClarionApp\LlmClient\Jobs\AgentStreamStepJob::class]);
         \Illuminate\Support\Facades\Http::fake();
 
         // Standing already past the 0.75 rung from setUp(), so the decision

@@ -89,7 +89,14 @@ class QuestionResumer
         if ($question->run_id !== null) {
             $dispatch = app(RunLease::class)->mintDispatch($question->run_id, ['paused']);
             if ($dispatch !== null) {
-                if (!app(RunLease::class)->claim($question->run_id, $dispatch)->won) {
+                $claim = app(RunLease::class)->claim($question->run_id, $dispatch);
+                if (!$claim->won) {
+                    // Cancellation wins: a run the user cancelled meanwhile
+                    // is closed, never left waiting on a continuation.
+                    if ($claim->reason === 'cancelled') {
+                        app(RunResumer::class)->refuseIfCancelled($question->run_id);
+                    }
+
                     return null;
                 }
 

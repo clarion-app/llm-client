@@ -3,7 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
@@ -339,7 +339,7 @@ class EntryPathCoverageJourneyTest extends TestCase
             'conversation_id' => $this->conversation->id,
         ])->assertStatus(402);
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     #[Test]
@@ -352,7 +352,7 @@ class EntryPathCoverageJourneyTest extends TestCase
             ])->assertStatus(201);
         });
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
         $this->assertSame([], $reads);
     }
 

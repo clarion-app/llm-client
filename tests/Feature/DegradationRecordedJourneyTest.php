@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use Tests\TestCase;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\CostSummary;
@@ -71,7 +71,7 @@ class DegradationRecordedJourneyTest extends TestCase
         config(['llm-client.budget.on_unpriced_model' => 'admit_untracked']);
 
         \Illuminate\Support\Facades\Http::fake();
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
     }
 
     protected function tearDown(): void

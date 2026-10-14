@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
@@ -234,12 +234,12 @@ class ConversationBindingSurvivesAgentEditJourneyTest extends TestCase
         $conversation = Conversation::find($conversationId);
         app(AgentLoopService::class)->start($conversation);
 
-        // Capture the dispatched SendHttpStreamRequest job's HttpRequest via
+        // Capture the dispatched AgentStreamStepJob job's HttpRequest via
         // reflection on its protected 'request' property — mirrors
         // tests/Integration/Harness/ScriptedStream.php:56-73's own
         // established technique.
         $capturedRequests = [];
-        Queue::pushed(SendHttpStreamRequest::class, function (SendHttpStreamRequest $job) use (&$capturedRequests) {
+        Queue::pushed(AgentStreamStepJob::class, function (AgentStreamStepJob $job) use (&$capturedRequests) {
             $reflector = new \ReflectionClass($job);
             $requestProperty = $reflector->getProperty('request');
             $requestProperty->setAccessible(true);
@@ -248,7 +248,7 @@ class ConversationBindingSurvivesAgentEditJourneyTest extends TestCase
             return true;
         });
 
-        $this->assertNotEmpty($capturedRequests, 'start() must dispatch a SendHttpStreamRequest job');
+        $this->assertNotEmpty($capturedRequests, 'start() must dispatch an AgentStreamStepJob job');
 
         $body = $capturedRequests[0]->body;
         $messages = is_array($body->messages ?? null) ? $body->messages : [];

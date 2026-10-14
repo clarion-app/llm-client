@@ -124,7 +124,14 @@ class TaskBudgetResumer
         if ($runId !== null) {
             $dispatch = app(RunLease::class)->mintDispatch($runId, ['paused']);
             if ($dispatch !== null) {
-                if (!app(RunLease::class)->claim($runId, $dispatch)->won) {
+                $claim = app(RunLease::class)->claim($runId, $dispatch);
+                if (!$claim->won) {
+                    // Cancellation wins: a run the user cancelled meanwhile
+                    // is closed, never left waiting on a continuation.
+                    if ($claim->reason === 'cancelled') {
+                        app(RunResumer::class)->refuseIfCancelled($runId);
+                    }
+
                     return null;
                 }
 

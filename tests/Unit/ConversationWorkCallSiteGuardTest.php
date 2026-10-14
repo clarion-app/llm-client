@@ -51,7 +51,9 @@ class ConversationWorkCallSiteGuardTest extends TestCase
      */
     private const EXPECTED_OCCURRENCES = [
         'Services/AgentLoopService.php' => 3,
-        'AgentLoopStreamHandler.php' => 1,
+        // handleToolCalls() and resumeToolCalls() (a resumed step's batch):
+        // two tool-call loops, one check each.
+        'AgentLoopStreamHandler.php' => 2,
     ];
 
     private string $srcDir;

@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
@@ -79,7 +79,7 @@ class QuestionAnswerEquivalenceJourneyTest extends AssembledSystemTestCase
         ]);
         // A tap's resume is queued; the harness adapter works it after
         // submit() returns, as a queue worker would.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         $this->telegram = new RecordingRichChannelDelivery('telegram');
         $this->app->make(ConversationChannelRegistry::class)->register($this->telegram);

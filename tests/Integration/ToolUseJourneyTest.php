@@ -124,7 +124,7 @@ class ToolUseJourneyTest extends AssembledSystemTestCase
             AgentTurnCompleted::class,
         ]);
 
-        // Drive start() — this dispatches a SendHttpStreamRequest
+        // Drive start() — this dispatches an AgentStreamStepJob
         $this->app->make(AgentLoopService::class)->start($fixture->conversation);
 
         // Capture the dispatched stream request via ScriptedStream
@@ -144,7 +144,7 @@ class ToolUseJourneyTest extends AssembledSystemTestCase
         // Finish the stream — this triggers tool execution and the next iteration
         $stream->finish();
 
-        // handleToolCalls() dispatches a new SendHttpStreamRequest — re-extract it
+        // handleToolCalls() dispatches a new AgentStreamStepJob — re-extract it
         $stream->extractDispatchedJobs();
 
         // Move to next slot for the final answer response

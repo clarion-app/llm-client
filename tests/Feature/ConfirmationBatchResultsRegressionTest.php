@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
@@ -447,12 +447,12 @@ class ConfirmationBatchResultsRegressionTest extends TestCase
 
         $this->assertNotNull($pausedMessage->tool_data['pending_confirmation'] ?? null, 'the DELETE call must pause the turn');
         $this->assertSame(['notes.store'], $executedRegistryTools, 'only the call before the pause runs before approval');
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
 
         $service = new AgentLoopService(app(McpToolRegistry::class), $executor, new OperationCache(), app(ProviderRegistry::class));
         $service->resume($conversation->fresh(), $pausedMessage, true);
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
         $this->assertBatchResults($pausedMessage, 'call_a', 'call_confirm', 'call_b', 'notes.store', 'deleted');
         $this->assertSame(['notes.store'], $executedRegistryTools, 'A runs exactly once and B never runs');
     }
@@ -499,11 +499,11 @@ class ConfirmationBatchResultsRegressionTest extends TestCase
             'the external execute_operation call must pause the turn',
         );
         $this->assertSame(['notes.store'], $executedRegistryTools, 'only the call before the pause runs before approval');
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
 
         $realService->resume($conversation->fresh(), $pausedMessage, true);
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
         $this->assertBatchResults($pausedMessage, 'call_a', 'call_confirm', 'call_b', 'notes.store', 'file deleted');
         $this->assertSame(['notes.store'], $executedRegistryTools, 'A runs exactly once and B never runs');
         $this->assertSame(1, $approvedRuns);

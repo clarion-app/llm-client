@@ -2,16 +2,24 @@
 
 namespace Tests\Integration\Resume;
 
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
+use ClarionApp\LlmClient\Jobs\ResumeInterruptedRunJob;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\McpClientTool;
+use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\McpToolExecutor;
 use ClarionApp\LlmClient\Services\McpToolRegistry;
 use ClarionApp\LlmClient\Services\QuestionAnswerIntake;
 use ClarionApp\LlmClient\Services\QuestionResumer;
+use ClarionApp\LlmClient\Services\RunResumer;
 use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
 use Dedoc\Scramble\Generator;
 use Dedoc\Scramble\GeneratorConfig;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Integration\AssembledSystemTestCase;
 use Tests\Integration\Harness\OperationCatalogue;
@@ -20,6 +28,7 @@ use Tests\Support\EffectLedger;
 use Tests\Support\InjectedFault;
 use Tests\Support\ScriptedProvider;
 use Tests\Support\SnapshotFaultInjector;
+use Tests\Support\TravelsPastLease;
 
 /**
  * The synchronous path, killed at a fault point, leaves the checkpoint in a
@@ -48,6 +57,7 @@ use Tests\Support\SnapshotFaultInjector;
 class ResumeFaultInjectionSyncTest extends AssembledSystemTestCase
 {
     use TaskBudgetHelperJourneys;
+    use TravelsPastLease;
 
     private const USAGE = [10, 10];
 
@@ -139,6 +149,57 @@ class ResumeFaultInjectionSyncTest extends AssembledSystemTestCase
             $this->fail("the run failed before the fault point ({$point}): {$e->getMessage()}");
         }
         $this->assertNotNull($thrown, "the fault at {$point} (occurrence {$occurrence}) was never reached — the funnel is not in place");
+    }
+
+    /**
+     * The resume half: expire the run's lease (travel window + 1 s), run the
+     * interruption sweep, and run the job the sweep pushed. The resumer
+     * re-drives the loop through the bound handler, so the disposition
+     * executes and the ledger count is observable.
+     */
+    private function resumeRun(Conversation $conversation): object
+    {
+        $this->travelPastLease($conversation);
+
+        Queue::fake([AgentStreamStepJob::class, ResumeInterruptedRunJob::class]);
+        $this->assertSame(0, Artisan::call('llm-client:resume-interrupted-runs'), 'the sweep ran');
+
+        $captured = null;
+        Queue::assertPushed(ResumeInterruptedRunJob::class, function ($job) use (&$captured) {
+            $captured = $job;
+            return true;
+        });
+        $this->assertNotNull($captured, 'the sweep pushed a resume job');
+
+        $captured->handle(app(RunResumer::class));
+
+        return $this->runRowOf($conversation);
+    }
+
+    /** @return Message|null the task_resume_notice of $noticeType for the conversation */
+    private function resumeNotice(Conversation $conversation, string $noticeType): ?Message
+    {
+        return Message::where('conversation_id', $conversation->id)->get()->first(
+            fn (Message $m) => ($m->tool_data['kind'] ?? null) === 'task_resume_notice'
+                && ($m->tool_data['notice'] ?? null) === $noticeType
+        );
+    }
+
+    /** The tool result for $callId in the conversation's step messages. */
+    private function toolResult(Conversation $conversation, string $callId): ?array
+    {
+        $message = Message::where('conversation_id', $conversation->id)->get()->first(
+            function (Message $m) use ($callId) {
+                $results = $m->tool_data['tool_results'] ?? [];
+                return is_array($results) && collect($results)->contains(fn ($r) => ($r['tool_call_id'] ?? null) === $callId);
+            }
+        );
+        if ($message === null) {
+            return null;
+        }
+        $results = $message->tool_data['tool_results'] ?? [];
+
+        return collect($results)->first(fn ($r) => ($r['tool_call_id'] ?? null) === $callId);
     }
 
     // ---------------------------------------------------------------
@@ -436,8 +497,403 @@ class ResumeFaultInjectionSyncTest extends AssembledSystemTestCase
     // ---------------------------------------------------------------
     // Phase 4: resume half
     // ---------------------------------------------------------------
-    // The resume planner's own fault points (after_claim, during_join_wait,
-    // the takeover and the provider-retry re-drive) are exercised in Phase 4,
-    // where the resume path is implemented. The checkpoint-state half pinned
-    // above (T1–T6) is what this file owns.
+    // The kill half above pins the checkpoint state at each fault point. The
+    // resume half drives the run across the kill boundary — expire the lease,
+    // run the sweep, run the pushed job — and asserts the exactly-once ledger
+    // count and the disposition (reuse / execute / rerun / outcome-unknown)
+    // the resume applies.
+
+    /** A single effect-free (ledger.read) call, then the final answer. */
+    private function scriptReadThenReply(): void
+    {
+        $this->script()
+            ->toolRequests([['id' => 'call_read', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.read']]])
+            ->usage(...self::USAGE);
+        $this->script()->finalAnswer('Done.')->usage(...self::USAGE);
+    }
+
+    /** Two calls (an effectful write and an effect-free read), then the answer. */
+    private function scriptTwoCallsThenReply(): void
+    {
+        $this->script()
+            ->toolRequests([
+                ['id' => 'call_write', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.write']],
+                ['id' => 'call_read', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.read']],
+            ])
+            ->usage(...self::USAGE);
+        $this->script()->finalAnswer('Done.')->usage(...self::USAGE);
+    }
+
+    /** Three effectful calls with distinct arguments, then the answer. */
+    private function scriptThreeWritesThenReply(): void
+    {
+        $this->script()
+            ->toolRequests([
+                ['id' => 'call_w1', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.write', 'parameters' => ['note' => 'one']]],
+                ['id' => 'call_w2', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.write', 'parameters' => ['note' => 'two']]],
+                ['id' => 'call_w3', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.write', 'parameters' => ['note' => 'three']]],
+            ])
+            ->usage(...self::USAGE);
+        $this->script()->finalAnswer('Done.')->usage(...self::USAGE);
+    }
+
+    #[Test]
+    public function killed_before_tool_started_resumes_and_executes_once(): void
+    {
+        $this->scenario = 'resume_sync_before_started';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptWriteThenReply();
+
+        $this->killAt('before_tool_started', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Write to the ledger.'));
+
+        $run = $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the not_started call executes exactly once on resume');
+        $this->assertSame('completed', $run->end_state, 'the resumed run completes');
+    }
+
+    #[Test]
+    public function killed_after_effect_on_effectful_is_outcome_unknown_not_rerun(): void
+    {
+        $this->scenario = 'resume_sync_after_effect_effectful';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptWriteThenReply();
+
+        $this->killAt('after_tool_effect', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Write to the ledger.'));
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the effectful call is not re-run (the effect fired once, before the kill)');
+
+        $result = $this->toolResult($conversation, 'call_write');
+        $this->assertNotNull($result, 'the step message holds the call result');
+        $this->assertTrue((bool) ($result['outcome_unknown'] ?? false), 'the result is marked outcome_unknown');
+        $this->assertStringContainsStringIgnoringCase('interrupted', (string) ($result['content'] ?? ''), 'the result says the action was interrupted');
+
+        $notice = $this->resumeNotice($conversation, 'outcome_unknown');
+        $this->assertNotNull($notice, 'a task_resume_notice (outcome_unknown) is posted');
+        $this->assertStringContainsString('Write to the ledger (effectful)', (string) $notice->content, 'the notice names the action label');
+    }
+
+    #[Test]
+    public function killed_after_effect_on_effect_free_is_rerun(): void
+    {
+        $this->scenario = 'resume_sync_after_effect_free';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptReadThenReply();
+
+        $this->killAt('after_tool_effect', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Read from the ledger.'));
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(2, $this->effectLedger->count('ledger.read'), 'the effect-free call is re-run on resume');
+    }
+
+    #[Test]
+    public function killed_after_recorded_is_reused(): void
+    {
+        $this->scenario = 'resume_sync_after_recorded';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptWriteThenReply();
+
+        $this->killAt('after_tool_recorded', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Write to the ledger.'));
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the completed call is reused, not re-run');
+    }
+
+    #[Test]
+    public function killed_after_model_recorded_executes_every_call_once(): void
+    {
+        $this->scenario = 'resume_sync_after_model_recorded';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptTwoCallsThenReply();
+
+        $this->killAt('after_model_recorded', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Write and read the ledger.'));
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the write call executes once');
+        $this->assertSame(1, $this->effectLedger->count('ledger.read'), 'the read call executes once');
+    }
+
+    #[Test]
+    public function killed_before_step_message_writes_the_message_once(): void
+    {
+        $this->scenario = 'resume_sync_before_step_message';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptWriteThenReply();
+
+        $this->killAt('before_step_message', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Write to the ledger.'));
+
+        $this->resumeRun($conversation);
+
+        // The committed step's message (the one that holds tool_results) is
+        // written exactly once: no duplicate. The task_resume_notice and the
+        // final answer are separate assistant rows and do not count.
+        $stepMessages = Message::where('conversation_id', $conversation->id)
+            ->where('role', 'assistant')
+            ->get()
+            ->filter(fn (Message $m) => !empty($m->tool_data['tool_results']));
+        $this->assertCount(1, $stepMessages, 'the step message is written once, with no duplicate');
+    }
+
+    #[Test]
+    public function killed_after_step_message_closes_the_step_and_continues(): void
+    {
+        $this->scenario = 'resume_sync_after_step_message';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptWriteThenReply();
+
+        $this->killAt('after_step_message', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Write to the ledger.'));
+
+        $run = $this->resumeRun($conversation);
+
+        $step = DB::table('agent_run_steps')->where('run_id', $run->id)->orderByDesc('position')->first();
+        $this->assertSame('completed', $step->end_state, 'the step is closed');
+        $this->assertSame('completed', $run->end_state, 'the run continues to completion');
+        $this->assertCount(
+            1,
+            Message::where('conversation_id', $conversation->id)->where('role', 'assistant')->get()
+                ->filter(fn (Message $m) => !empty($m->tool_data['tool_results'])),
+            'the step message already written is not written again',
+        );
+        $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the step\'s write is not repeated');
+    }
+
+    // T2 — a killed delegate batch: the resume half is covered in Phase 7
+    // (the batch's helper runs are driven by their parent's resume), so this
+    // file leaves the checkpoint-state half (above) and defers the batch
+    // resume to Phase 7.
+
+    #[Test]
+    public function killed_approved_call_after_effect_is_outcome_unknown_not_rerun(): void
+    {
+        $this->scenario = 'resume_sync_t6_approved_after_effect';
+        $this->setupJourney();
+        config(['llm-client.agent_loop.max_iterations' => 4]);
+        $conversation = $this->syncConversation();
+
+        // A confirmation pause: the deletion needs the user's approval.
+        $document = self::taskBudgetHostApiDocument();
+        $document['paths']['/notes/stale'] = [
+            'delete' => ['operationId' => 'clearStaleNotes', 'summary' => 'Delete every stale note', 'parameters' => [], 'responses' => ['200' => ['description' => 'Deleted']]],
+        ];
+        (new OperationCatalogue())->seed($document);
+
+        // The deletion's effect goes through the host API; record it.
+        (new OperationCatalogue())->fakeHostApi([
+            '/notes/stale' => function () {
+                $this->effectLedger->record('clearStaleNotes');
+
+                return \Illuminate\Support\Facades\Http::response(['ok' => true], 200, ['Content-Type' => 'application/json']);
+            },
+            '*' => \Illuminate\Support\Facades\Http::response(['ok' => true], 200, ['Content-Type' => 'application/json']),
+        ]);
+
+        $clear = ['id' => 'call_clear', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'clearStaleNotes', 'parameters' => []]];
+        $this->script()->toolRequests([$clear])->usage(...self::USAGE);
+        $this->script()->finalAnswer('Done.')->usage(...self::USAGE);
+
+        $this->send('sync', $conversation, 'Clear the stale notes.')->assertStatus(202);
+        $paused = Message::where('conversation_id', $conversation->id)->get()->first(
+            fn (Message $m) => is_array($m->tool_data['pending_confirmation'] ?? null)
+        );
+        $this->assertNotNull($paused, "precondition: paused for the user's confirmation");
+
+        // Approve (the continuation executes the approved call — where the
+        // kill lands, after the effect has fired).
+        $this->killAt('after_tool_effect', 1, function () use ($conversation, $paused) {
+            app(AgentLoopService::class)->resume(Conversation::findOrFail($conversation->id), $paused, true);
+        });
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('clearStaleNotes'), 'the approved call is not re-run despite the approval (FR-011)');
+
+        $result = $this->toolResult($conversation, 'call_clear');
+        $this->assertNotNull($result, 'the step message holds the call result');
+        $this->assertTrue((bool) ($result['outcome_unknown'] ?? false), 'the approved call is outcome_unknown, not re-executed');
+    }
+
+    #[Test]
+    public function a_step_with_two_completed_calls_executes_only_the_third(): void
+    {
+        $this->scenario = 'resume_sync_us2_ac1';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+        $this->scriptThreeWritesThenReply();
+
+        // Kill after the second call is recorded: calls one and two are
+        // completed, the third is not_started.
+        $this->killAt('after_tool_recorded', 2, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Write three notes.'));
+
+        $this->resumeRun($conversation);
+
+        // One and two are reused (their effects fired pre-kill); only the
+        // third executes on resume. Three distinct argument hashes, one each.
+        $this->assertSame(3, $this->effectLedger->count('ledger.write'), 'only the third call executes on resume (one and two are reused)');
+    }
+
+    #[Test]
+    public function an_external_mcp_tool_killed_after_effect_is_outcome_unknown_not_rerun(): void
+    {
+        $this->scenario = 'resume_sync_m3_external_tool';
+        $this->setupJourney();
+        config(['llm-client.agent_loop.max_iterations' => 4]);
+        $conversation = $this->syncConversation();
+
+        // An external mcp: tool whose cached readOnlyHint says true — the
+        // classifier does not trust the hint (quickstart M3). The tool's
+        // server_id must name the server's own id (its belongsTo lookup),
+        // so the server is created first and its id read back.
+        $server = \ClarionApp\LlmClient\Models\McpClientServer::create([
+            'name' => 'external',
+            'transport' => 'http',
+            'url' => 'https://mcp.example',
+            'user_id' => $this->fixture()->user->id,
+        ]);
+        $serverId = (string) $server->id;
+        McpClientTool::create([
+            'server_id' => $serverId,
+            'synthetic_operation_id' => "mcp:{$serverId}:read_thing",
+            'name' => 'read_thing',
+            'description' => 'An external read.',
+            'input_schema' => ['type' => 'object'],
+            'annotations' => ['readOnlyHint' => true],
+            'last_seen_at' => now(),
+        ]);
+
+        // The external tool's effect goes through the host API; record it.
+        (new OperationCatalogue())->fakeHostApi([
+            '/mcp-client/' => function () {
+                $this->effectLedger->record('mcp:read_thing');
+
+                return \Illuminate\Support\Facades\Http::response(['ok' => true], 200, ['Content-Type' => 'application/json']);
+            },
+            '*' => \Illuminate\Support\Facades\Http::response(['ok' => true], 200, ['Content-Type' => 'application/json']),
+        ]);
+
+        $mcp = ['id' => 'call_mcp', 'name' => 'execute_operation', 'arguments' => ['operationId' => "mcp:{$serverId}:read_thing"]];
+        $this->script()->toolRequests([$mcp])->usage(...self::USAGE);
+        $this->script()->finalAnswer('Done.')->usage(...self::USAGE);
+
+        // The external tool's own confirmation would pause the run before
+        // its effect fires; allow it so the effect runs and the kill can
+        // land after it (the test is about the effect class, not the
+        // confirmation).
+        $this->app->instance(\ClarionApp\LlmClient\Services\McpClientCallValidator::class, new class
+        {
+            public function validate(string $operationId, string $method, string $path): array
+            {
+                return ['status' => \ClarionApp\LlmClient\Services\ApiCallValidator::STATUS_ALLOW, 'reason' => 'test-allowed'];
+            }
+        });
+
+        $this->killAt('after_tool_effect', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Use the external read tool.'));
+
+        $this->resumeRun($conversation);
+
+        $this->assertSame(1, $this->effectLedger->count('mcp:read_thing'), 'the external tool is not re-run (its readOnlyHint is untrusted, so it is effectful)');
+
+        $result = $this->toolResult($conversation, 'call_mcp');
+        $this->assertNotNull($result, 'the step message holds the call result');
+        $this->assertTrue((bool) ($result['outcome_unknown'] ?? false), 'the external tool is outcome_unknown, not re-executed');
+    }
+
+    #[Test]
+    public function a_not_started_confirmation_call_pauses_again_on_resume(): void
+    {
+        $this->scenario = 'resume_sync_fr012_confirmation';
+        $this->setupJourney();
+        config(['llm-client.agent_loop.max_iterations' => 4]);
+        $conversation = $this->syncConversation();
+
+        $document = self::taskBudgetHostApiDocument();
+        $document['paths']['/notes/stale'] = [
+            'delete' => ['operationId' => 'clearStaleNotes', 'summary' => 'Delete every stale note', 'parameters' => [], 'responses' => ['200' => ['description' => 'Deleted']]],
+        ];
+        (new OperationCatalogue())->seed($document);
+
+        $clear = ['id' => 'call_clear', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'clearStaleNotes', 'parameters' => []]];
+        $this->script()->toolRequests([$clear])->usage(...self::USAGE);
+        $this->script()->finalAnswer('Done.')->usage(...self::USAGE);
+
+        $this->send('sync', $conversation, 'Clear the stale notes.')->assertStatus(202);
+        $paused = Message::where('conversation_id', $conversation->id)->get()->first(
+            fn (Message $m) => is_array($m->tool_data['pending_confirmation'] ?? null)
+        );
+        $this->assertNotNull($paused, "precondition: paused for the user's confirmation");
+
+        // Kill before the start marker: the confirmation-requiring call is
+        // not_started. On resume it must pause for confirmation again, not
+        // execute.
+        $this->killAt('before_tool_started', 1, function () use ($conversation, $paused) {
+            app(AgentLoopService::class)->resume(Conversation::findOrFail($conversation->id), $paused, true);
+        });
+
+        $run = $this->resumeRun($conversation);
+
+        $this->assertSame('paused', $run->resume_state, 'the not_started confirmation call pauses for confirmation again on resume');
+    }
+
+    #[Test]
+    public function a_not_started_policy_refused_call_is_refused_again(): void
+    {
+        $this->scenario = 'resume_sync_fr012_policy_refused';
+        $this->setupJourney();
+        config(['llm-client.agent_loop.max_iterations' => 4]);
+        $conversation = $this->syncConversation();
+
+        // The journey's Generator mock returns an empty paths list, which
+        // hides the ledger operations from the definition parser. Re-bind it
+        // to a doc that resolves both, so the definition (allowing
+        // ledger.write) resolves and the agent can call ledger.read.
+        $this->app->instance(\Dedoc\Scramble\Generator::class, new class extends \Dedoc\Scramble\Generator
+        {
+            public function __construct()
+            {
+            }
+
+            public function __invoke(?\Dedoc\Scramble\GeneratorConfig $config = null): array
+            {
+                return [
+                    'paths' => [
+                        '/ledger/write' => ['post' => ['operationId' => 'ledger.write', 'summary' => 'Write to the ledger (effectful)']],
+                        '/ledger/read' => ['get' => ['operationId' => 'ledger.read', 'summary' => 'Read from the ledger (effect-free)']],
+                    ],
+                ];
+            }
+        });
+
+        // A command-policy refusal: the agent definition denies the operation.
+        $agent = app(\ClarionApp\LlmClient\Services\AgentService::class)->create(
+            $this->fixture()->user->id,
+            "name: root\ninstructions: I am root.\ntools:\n  allow:\n    - ledger.write\nsafety:\n  confirmation_required: []\n  unattended_authorized: []\n",
+        );
+        $conversation->update(['agent_id' => $agent->id, 'agent_version_id' => $agent->current_version_id]);
+        $conversation = $conversation->fresh();
+
+        // A call to an operation the definition does not allow: refused by
+        // policy. Kill before the start marker (the call is not_started).
+        $denied = ['id' => 'call_denied', 'name' => 'execute_operation', 'arguments' => ['operationId' => 'ledger.read']];
+        $this->script()->toolRequests([$denied])->usage(...self::USAGE);
+        $this->script()->finalAnswer('Done.')->usage(...self::USAGE);
+
+        $this->killAt('before_tool_started', 1, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Read the ledger.'));
+
+        $run = $this->resumeRun($conversation);
+
+        // The refused call is refused again: no execution, the run does not
+        // complete on the refused call.
+        $this->assertSame(0, $this->effectLedger->count('ledger.read'), 'the policy-refused call is not executed on resume');
+    }
 }

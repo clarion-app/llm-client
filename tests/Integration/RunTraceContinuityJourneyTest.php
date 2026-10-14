@@ -587,6 +587,13 @@ class RunTraceContinuityJourneyTest extends AssembledSystemTestCase
             ->where('id', $run->id)
             ->update(['started_at' => $agedStartedAt]);
 
+        // A dropped job never renews the run's lease or makes progress, so
+        // both are as old as the step (the sweep never abandons a run whose
+        // lease is still live).
+        DB::table('agent_runs')
+            ->where('id', $run->id)
+            ->update(['lease_expires_at' => $agedStartedAt->format('Y-m-d H:i:s.u'), 'last_progress_at' => $agedStartedAt->format('Y-m-d H:i:s.u')]);
+
         // ---- Run the sweep command with a 2-minute threshold ----
         $exitCode = \Illuminate\Support\Facades\Artisan::call(
             'llm-client:resolve-abandoned-runs',

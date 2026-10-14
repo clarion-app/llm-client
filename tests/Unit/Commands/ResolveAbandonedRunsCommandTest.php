@@ -644,6 +644,71 @@ class ResolveAbandonedRunsCommandTest extends TestCase
         $this->assertGreaterThanOrEqual(0, (int) $run->product_ms);
     }
 
+    // ========================================================================
+    // The abandoned sweep must never preempt a live resume (quickstart M27) —
+    // a run whose lease is still valid (a future `lease_expires_at`) is not
+    // abandoned, and abandoning a run clears the resume machinery's columns
+    // (`resume_state`, `dispatch_id`, `lease_holder`).
+    // ========================================================================
+
+    #[Test]
+    public function never_preempts_live_resume(): void
+    {
+        $userId = (string) Str::uuid();
+        $runId = (string) Str::uuid();
+        $stepId = (string) Str::uuid();
+        $staleTime = CarbonImmutable::now()->subMinutes(120);
+
+        $this->insertRun($runId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        $this->insertStep($stepId, $runId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+
+        // The resume machinery holds a lease on the run (a future
+        // `lease_expires_at`): the abandoned sweep must not preempt it.
+        DB::table('agent_runs')->where('id', $runId)->update([
+            'lease_expires_at' => CarbonImmutable::now()->addMinutes(10)->format('Y-m-d H:i:s.u'),
+            'lease_holder' => (string) Str::uuid(),
+            'resume_state' => 'resuming',
+            'dispatch_id' => (string) Str::uuid(),
+        ]);
+
+        $exitCode = Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $this->assertSame(0, $exitCode);
+
+        $run = DB::table('agent_runs')->where('id', $runId)->first();
+        $this->assertNotNull($run);
+        $this->assertEquals(
+            RunEndState::InProgress->value,
+            $run->end_state,
+            'a run with a live lease (a future lease_expires_at) is not abandoned by the sweep (M27)',
+        );
+
+        // Abandoning a run (a different run, no lease) clears the resume
+        // machinery's columns.
+        $otherRunId = (string) Str::uuid();
+        $otherStepId = (string) Str::uuid();
+        $this->insertRun($otherRunId, $userId, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        $this->insertStep($otherStepId, $otherRunId, 1, RunEndState::InProgress->value,
+            $staleTime->format('Y-m-d H:i:s.u'));
+        DB::table('agent_runs')->where('id', $otherRunId)->update([
+            'resume_state' => 'resuming',
+            'dispatch_id' => (string) Str::uuid(),
+            'lease_holder' => (string) Str::uuid(),
+        ]);
+
+        Artisan::call('llm-client:resolve-abandoned-runs');
+
+        $otherRun = DB::table('agent_runs')->where('id', $otherRunId)->first();
+        $this->assertNotNull($otherRun);
+        $this->assertEquals(RunEndState::Abandoned->value, $otherRun->end_state);
+        $this->assertNull($otherRun->resume_state, 'abandoning a run clears resume_state');
+        $this->assertNull($otherRun->dispatch_id, 'abandoning a run clears dispatch_id');
+        $this->assertNull($otherRun->lease_holder, 'abandoning a run clears lease_holder');
+    }
+
     #[Test]
     public function swept_runs_breakdown_reconciles_with_duration(): void
     {

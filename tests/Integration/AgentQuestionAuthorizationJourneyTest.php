@@ -3,7 +3,7 @@
 namespace Tests\Integration;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -323,7 +323,7 @@ class AgentQuestionAuthorizationJourneyTest extends AssembledSystemTestCase
         $this->script()
             ->toolRequest('ask_user', ['question' => AgentQuestionWebJourneyTest::QUESTION, 'choices' => AgentQuestionWebJourneyTest::CHOICES]);
         // Anything that did resume A's run would be queued here, not run unseen.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         $question = $this->userAIsAsked();
         $userA = $this->fixture()->user;

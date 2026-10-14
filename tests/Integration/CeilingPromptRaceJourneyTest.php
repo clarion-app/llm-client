@@ -306,6 +306,19 @@ class CeilingPromptRaceJourneyTest extends AssembledSystemTestCase
 
         switch ($outcome) {
             case 'continued':
+                if ($run->cancelled_at !== null && $continuations === []) {
+                    // The losing end still cancelled the run before the
+                    // continuation started; cancellation wins: the
+                    // decision stands, but the run is closed, not continued.
+                    $this->assertSame(QuestionState::Answered, $fresh->state, "{$label}: the prompt is answered");
+                    $this->assertCount(1, $this->events($taskId, 'allowance_granted'), "{$label}: one allowance granted");
+                    $this->assertSame('continue', $this->events($taskId, 'decision')[0]['decision'] ?? null);
+                    $this->assertSame('stopped_early', $run->end_state, "{$label}: the cancelled run is closed");
+                    $this->assertSame(app(\ClarionApp\LlmClient\Services\TaskResumeText::class)->cancelledReason(), $run->end_reason);
+                    $this->assertSame(1, (int) $task->steps_used, "{$label}: no step is taken after the cancellation");
+                    $this->assertFalse((bool) $conversation->fresh()?->is_processing, "{$label}: the conversation is released");
+                    break;
+                }
                 $this->assertSame(QuestionState::Answered, $fresh->state, "{$label}: the prompt is answered");
                 $this->assertNotNull($fresh->resumed_at, "{$label}: and resumed");
                 $this->assertNull($fresh->pending_conversation_id);

@@ -3,7 +3,6 @@
 namespace Tests\RealDatabase;
 
 use ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand;
-use ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand;
 use ClarionApp\LlmClient\Contracts\ConversationChannelDelivery;
 use ClarionApp\LlmClient\Controllers\AgentController;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -11,6 +10,7 @@ use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentQuestionService;
 use ClarionApp\LlmClient\Services\ConversationChannelRegistry;
+use ClarionApp\LlmClient\Services\PausedRunQuery;
 use ClarionApp\LlmClient\Services\RunTraceQuery;
 use ClarionApp\LlmClient\ValueObjects\DeliveryResult;
 use ClarionApp\LlmClient\ValueObjects\QuestionState;
@@ -203,7 +203,7 @@ class AgentQuestionExpiryPolicyQueriesTest extends RealDatabaseTestCase
         // The abandoned-run exemption: a stopped question always, a pending
         // one until ten minutes past its deadline, a resolved one whose run
         // has not resumed yet while within the abandonment threshold.
-        $exempt = $this->callPrivate(app(ResolveAbandonedRunsCommand::class), 'getPendingQuestionRunIds', [now()->subMinutes(60)]);
+        $exempt = $this->callPrivate(app(PausedRunQuery::class), 'getPendingQuestionRunIds', [now()->subMinutes(60)]);
         $this->assertEqualsCanonicalizing($only('pending, deadline ahead', 'pending, deadline 5 minutes ago', 'stopped a year ago', 'answered, resume queued'), $exempt);
 
         // The purge keeps every run a waiting question names, however old,

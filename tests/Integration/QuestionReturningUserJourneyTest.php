@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
@@ -82,7 +82,7 @@ class QuestionReturningUserJourneyTest extends AssembledSystemTestCase
 
         // A tap's or an expiry's resume is queued; the test works it as a
         // queue worker would, after the request that queued it.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         Event::fake([
             NewConversationMessageEvent::class,

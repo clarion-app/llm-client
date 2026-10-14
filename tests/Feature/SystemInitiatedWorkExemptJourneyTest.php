@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use Tests\TestCase;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Contracts\ProviderType;
 use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
@@ -90,7 +90,7 @@ class SystemInitiatedWorkExemptJourneyTest extends TestCase
         Carbon::setTestNow(Carbon::parse('2026-08-12 10:00:00', 'UTC'));
 
         \Illuminate\Support\Facades\Http::fake();
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
 
         $this->user = User::factory()->create();
 

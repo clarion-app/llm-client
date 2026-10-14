@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
@@ -73,7 +73,7 @@ class AgentQuestionExpiryJourneyTest extends AssembledSystemTestCase
 
         // Resume jobs are held on the fake queue, as a real queue holds them
         // until a worker picks them up.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         Event::fake([
             NewConversationMessageEvent::class,

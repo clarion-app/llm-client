@@ -283,8 +283,11 @@ class ConversationController extends Controller
         }
 
         // Deleting stops the conversation's work: a question waiting on the
-        // user is withdrawn (and told) before the conversation goes.
+        // user is withdrawn (and told) before the conversation goes, and the
+        // conversation's in-progress runs (and their helper runs) are
+        // cancelled so they close stopped_early rather than being resumed.
         app(AgentQuestionService::class)->withdrawForConversation($conversation);
+        app(\ClarionApp\LlmClient\Services\RunCancellation::class)->cancelForConversation($conversation, 'conversation_deleted');
 
         $conversation->delete();
 
@@ -307,8 +310,11 @@ class ConversationController extends Controller
         }
 
         // Before end(), whose already-ended early return must not keep a
-        // waiting question alive.
+        // waiting question alive. The conversation's in-progress runs (and
+        // their helper runs) are cancelled so they close stopped_early
+        // rather than being resumed.
         app(AgentQuestionService::class)->withdrawForConversation($conversation);
+        app(\ClarionApp\LlmClient\Services\RunCancellation::class)->cancelForConversation($conversation, 'conversation_ended');
 
         $ended = $lifecycle->end($conversation);
 

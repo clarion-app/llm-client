@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -64,7 +64,7 @@ class ChannelNativeQuestionMessagingJourneyTest extends AssembledSystemTestCase
 
         // The resume is queued, as a queue worker would run it: tap() (or
         // the test) works the job after submit() has returned.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         $this->telegram = new RecordingRichChannelDelivery('telegram');
         $this->app->make(ConversationChannelRegistry::class)->register($this->telegram);

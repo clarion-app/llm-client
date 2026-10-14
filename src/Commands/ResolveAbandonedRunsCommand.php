@@ -2,8 +2,8 @@
 
 namespace ClarionApp\LlmClient\Commands;
 
+use ClarionApp\LlmClient\Services\PausedRunQuery;
 use ClarionApp\LlmClient\Services\RunTraceRecorder;
-use ClarionApp\LlmClient\ValueObjects\QuestionState;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -26,13 +26,6 @@ use Illuminate\Support\Facades\Log;
  */
 class ResolveAbandonedRunsCommand extends Command
 {
-    /**
-     * How long after its deadline a still-pending question keeps its run
-     * exempt, covering the expiry sweep that runs after this one in the
-     * same scheduler tick.
-     */
-    private const PENDING_QUESTION_GRACE_MINUTES = 10;
-
     protected $signature = 'llm-client:resolve-abandoned-runs
                             {--minutes= : Abandonment threshold in minutes (default: from config)}
                             {--dry-run : Show what would be resolved without actually resolving}';
@@ -52,14 +45,10 @@ class ResolveAbandonedRunsCommand extends Command
             $this->warn('Dry-run mode — no changes will be made');
         }
 
-        // Collect run ids that have a pending confirmation still within the
-        // confirmation_timeout window. These runs are exempt from the sweep.
-        // Runs waiting on a pending, still-answerable question are exempt
-        // for the same reason.
-        $exemptRunIds = array_values(array_unique(array_merge(
-            $this->getPendingConfirmationRunIds(),
-            $this->getPendingQuestionRunIds($cutoff),
-        )));
+        // Runs waiting on a pending, still-answerable human confirmation, or
+        // a pending question the user can still answer, are exempt from the
+        // sweep (shared with the resume-detection sweep).
+        $exemptRunIds = app(PausedRunQuery::class)->exemptRunIds($cutoff);
 
         // Find eligible abandoned runs: in_progress, latest activity older than cutoff,
         // and not exempt (pending confirmation).
@@ -119,6 +108,9 @@ class ResolveAbandonedRunsCommand extends Command
                         'tool_exec_ms' => $breakdown['tool_exec_ms'],
                         'confirm_wait_ms' => $breakdown['confirm_wait_ms'],
                         'product_ms' => $breakdown['product_ms'],
+                        'resume_state' => null,
+                        'dispatch_id' => null,
+                        'lease_holder' => null,
                     ]);
 
                 // Close any still-open steps in the same pass.
@@ -199,124 +191,6 @@ class ResolveAbandonedRunsCommand extends Command
     }
 
     /**
-     * Get run ids that have a pending confirmation still within the timeout window.
-     *
-     * These runs are exempt from the sweep because the step is legitimately
-     * waiting on a human response (FR-018, SC-008's second clause).
-     *
-     * The shape read here is the one the agent loop actually writes at a pause
-     * (contracts §3.2): `pending_confirmation` is a nested array carrying
-     * `expires_at`, and `run_id` sits beside it. A resumed pause sets
-     * `pending_confirmation` to null, which is why the array check matters.
-     *
-     * @return array<string>
-     */
-    private function getPendingConfirmationRunIds(): array
-    {
-        if (!DB::getSchemaBuilder()->hasTable('messages')) {
-            return [];
-        }
-
-        // A confirmation that has not yet expired was written less than
-        // confirmation_timeout seconds ago, so only that slice of the message
-        // table can hold one. Without this bound the sweep would load and JSON-decode
-        // every message ever written, every five minutes. The window is doubled to
-        // stay clear of the streamed path, where the message is created earlier in
-        // the round than the pause that updates it.
-        $timeout = (int) config('llm-client.agent_loop.confirmation_timeout', 300);
-        $window = now()->subSeconds(max($timeout * 2, 600));
-
-        $candidates = DB::table('messages')
-            ->whereNotNull('tool_data')
-            ->where('created_at', '>=', $window)
-            ->select('tool_data')
-            ->get();
-
-        $exemptRunIds = [];
-        foreach ($candidates as $msg) {
-            $toolData = is_string($msg->tool_data)
-                ? json_decode($msg->tool_data, true)
-                : $msg->tool_data;
-
-            if (!is_array($toolData)) {
-                continue;
-            }
-
-            $pending = $toolData['pending_confirmation'] ?? null;
-            $runId = $toolData['run_id'] ?? null;
-
-            if (!is_array($pending) || $runId === null) {
-                continue;
-            }
-
-            $expiresAt = $pending['expires_at'] ?? null;
-            if ($expiresAt === null) {
-                continue;
-            }
-
-            try {
-                if (\Carbon\Carbon::parse($expiresAt)->isFuture()) {
-                    $exemptRunIds[] = (string) $runId;
-                }
-            } catch (\Throwable $e) {
-                // An unparseable expiry is not a reason to sweep a run that may
-                // still be waiting; treat it as exempt and let the operator see it.
-                $exemptRunIds[] = (string) $runId;
-            }
-        }
-
-        return array_values(array_unique($exemptRunIds));
-    }
-
-    /**
-     * Get run ids paused on a question that can still be answered.
-     *
-     * The paused step stays open for as long as the user takes to answer,
-     * which is exactly what this sweep looks for. A stopped question waits
-     * for a late answer or a discard with no time bound, so its run is
-     * always exempt.
-     *
-     * A pending question's exemption lasts until a short grace after its
-     * `expires_at`: this sweep runs before the expiry sweep when both are
-     * due in the same scheduler tick, so a question whose deadline has just
-     * passed may not have been stopped yet. The bound still ends the
-     * exemption when the expiry sweep has stalled, so a stalled sweep can
-     * never pin a run open forever.
-     *
-     * A question resolved since $cutoff whose run has not resumed yet (its
-     * resume is queued — an expiry, an answer tapped after the work stopped)
-     * is the run's latest activity: the run is about to continue, not
-     * abandoned. Once the threshold has passed with no resume, it is swept
-     * like any other.
-     *
-     * @return array<string>
-     */
-    private function getPendingQuestionRunIds(\DateTimeInterface $cutoff): array
-    {
-        if (!DB::getSchemaBuilder()->hasTable('agent_questions')) {
-            return [];
-        }
-
-        return DB::table('agent_questions')
-            ->where(function ($query) use ($cutoff) {
-                $query->where(function ($pending) {
-                    $pending->where('state', QuestionState::Pending->value)
-                        ->where('expires_at', '>', now()->subMinutes(self::PENDING_QUESTION_GRACE_MINUTES));
-                })->orWhere('state', QuestionState::Stopped->value)
-                    ->orWhere(function ($resolved) use ($cutoff) {
-                        $resolved->whereNotIn('state', [QuestionState::Pending->value, QuestionState::Stopped->value])
-                            ->whereNull('resumed_at')
-                            ->where('resolved_at', '>', $cutoff);
-                    });
-            })
-            ->whereNotNull('run_id')
-            ->distinct()
-            ->pluck('run_id')
-            ->map(fn ($runId) => (string) $runId)
-            ->all();
-    }
-
-    /**
      * Find eligible abandoned runs.
      *
      * A run is eligible when:
@@ -334,17 +208,32 @@ class ResolveAbandonedRunsCommand extends Command
         // One grouped query rather than a MAX() per in-progress run. The cutoff is
         // formatted at the same precision the endpoints are stored at, so a run is
         // not held back by a sub-second comparison artifact.
+        //
+        // The run's latest activity is the newest of four signals: its steps'
+        // last observed activity, its last progress, its lease expiry, and its
+        // next provider-retry attempt. A run still inside its lease window or
+        // mid-retry (its next attempt still in the future) is not abandoned.
+        // GREATEST is not portable (SQLite lacks it; MySQL's multi-argument
+        // MAX is an aggregate), so it is built as nested CASE.
         $latestActivity = DB::table('agent_run_steps')
-            ->select('run_id', DB::raw('MAX(COALESCE(ended_at, started_at)) as latest_activity'))
+            ->select('run_id', DB::raw('MAX(COALESCE(ended_at, started_at)) as step_activity'))
             ->groupBy('run_id');
+
+        $stepActivity = 'COALESCE(activity.step_activity, agent_runs.started_at)';
+        $lastProgress = 'COALESCE(agent_runs.last_progress_at, agent_runs.started_at)';
+        $leaseExpires = 'COALESCE(agent_runs.lease_expires_at, agent_runs.started_at)';
+        $nextAttempt = 'COALESCE(agent_runs.next_attempt_at, agent_runs.started_at)';
+
+        $greatest2 = fn (string $a, string $b) => "CASE WHEN {$a} >= {$b} THEN {$a} ELSE {$b} END";
+        $latest = $greatest2(
+            $greatest2($greatest2($stepActivity, $lastProgress), $leaseExpires),
+            $nextAttempt,
+        );
 
         $query = DB::table('agent_runs')
             ->leftJoinSub($latestActivity, 'activity', 'activity.run_id', '=', 'agent_runs.id')
             ->where('agent_runs.end_state', 'in_progress')
-            ->whereRaw(
-                'COALESCE(activity.latest_activity, agent_runs.started_at) < ?',
-                [$cutoff->format('Y-m-d H:i:s.u')]
-            );
+            ->whereRaw("{$latest} < ?", [$cutoff->format('Y-m-d H:i:s.u')]);
 
         if (!empty($exemptRunIds)) {
             $query->whereNotIn('agent_runs.id', $exemptRunIds);

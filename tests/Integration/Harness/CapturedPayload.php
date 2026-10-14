@@ -62,7 +62,7 @@ class CapturedPayload
     /**
      * Extract from an http-queue HttpRequest.
      *
-     * These are only produced by dispatched SendHttpStreamRequest jobs, so the
+     * These are only produced by dispatched AgentStreamStepJob jobs, so the
      * source is always the streaming entry path.
      *
      * @param HttpRequest $request The outgoing HTTP request.

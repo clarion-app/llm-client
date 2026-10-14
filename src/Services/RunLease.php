@@ -40,6 +40,15 @@ class RunLease
         $window = (int) config('llm-client.resume.detection_window_seconds', 300);
         $expires = now()->addSeconds($window)->format('Y-m-d H:i:s.u');
 
+        // Whether a live holder's expired lease is about to be replaced: read
+        // under this dispatch id, so only a row this claim can win is read (a
+        // sweep that marks the run interrupted also mints a new dispatch id,
+        // which this claim then loses).
+        $heldBefore = DB::table('agent_runs')
+            ->where('id', $runId)
+            ->where('dispatch_id', $dispatchId)
+            ->value('lease_holder') !== null;
+
         // One placeholder per occurrence: the real engine (native prepares)
         // rejects a named parameter used twice.
         $affected = DB::connection()->update(
@@ -71,17 +80,17 @@ class RunLease
             return ClaimResult::lost($this->lostReason($runId, $dispatchId));
         }
 
-        // The claim is done; the row it left says what kind of claim it was.
-        // `interrupted_at` equal to this claim's own :now means the claim
-        // itself detected the interruption (it replaced an expired,
-        // still-held lease the sweep had not processed); a sweep-marked row
-        // keeps the sweep's earlier stamp.
+        // The claim is done; the row it left says whether it was a takeover.
+        // It detected the interruption itself only when it replaced an
+        // expired, still-held lease (the statement counted it); a claim of a
+        // sweep-marked row (lease already released) counts nothing more.
         $row = DB::table('agent_runs')->where('id', $runId)->first();
+        $takeover = $row !== null && $row->resume_state === 'resuming';
 
         return ClaimResult::won(
             $this->nonce(),
-            $row !== null && $row->resume_state === 'resuming',
-            $row !== null && $row->interrupted_at === $now,
+            $takeover,
+            $takeover && $heldBefore,
         );
     }
 

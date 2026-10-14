@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers;
 use ClarionApp\LlmClient\Controllers\AgentController;
 use ClarionApp\LlmClient\Controllers\ConversationController;
@@ -122,7 +122,7 @@ class InteractiveAnswerRaceJourneyTest extends AssembledSystemTestCase
 
         // A tap's resume and an expiry's resume are queued; the test works
         // them as a queue worker would, after the request that queued them.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         // Ending a conversation also captures its episodic memory through a
         // model call of its own, which is not what these races are about.
@@ -403,9 +403,15 @@ class InteractiveAnswerRaceJourneyTest extends AssembledSystemTestCase
         $this->assertSame($fresh->id, $stored['question_id'] ?? null);
 
         $continuations = $this->continuationsOf($fresh);
+        $run = DB::table('agent_runs')->where('id', $fresh->run_id)->first();
         if ($state === 'withdrawn') {
             $this->assertSame([], $continuations, "{$label}: a withdrawn run is never continued");
-            $this->assertSame('stopped_early', DB::table('agent_runs')->where('id', $fresh->run_id)->value('end_state'));
+            $this->assertSame('stopped_early', $run->end_state);
+        } elseif ($run->cancelled_at !== null && $continuations === []) {
+            // The losing end still cancelled the run before its continuation
+            // started; cancellation wins over resuming.
+            $this->assertSame('stopped_early', $run->end_state, "{$label}: the cancelled run is closed, not continued");
+            $this->assertSame(app(\ClarionApp\LlmClient\Services\TaskResumeText::class)->cancelledReason(), $run->end_reason);
         } else {
             $this->assertCount(1, $continuations, "{$label}: the run is resumed exactly once");
             $this->assertSame($stored, $continuations[0], "{$label}: the continuation carries the stored outcome");
@@ -452,9 +458,9 @@ class InteractiveAnswerRaceJourneyTest extends AssembledSystemTestCase
             "{$label}: the user's messages are the prompt and the winning answer only",
         );
         $this->assertSame(
-            $state === 'withdrawn' ? 0 : 1,
+            $state === 'withdrawn' || ($run->cancelled_at !== null && $continuations === []) ? 0 : 1,
             $messages->filter(fn (Message $m) => $m->role !== 'user' && $m->content === self::CONTINUED)->count(),
-            "{$label}: the agent carried on exactly once",
+            "{$label}: the agent carried on exactly once (never after a cancellation)",
         );
     }
 
@@ -630,6 +636,13 @@ class InteractiveAnswerRaceJourneyTest extends AssembledSystemTestCase
             $label = "trial {$trial}: {$second} arriving before the {$first}'s compare-and-set";
             $this->told = [];
 
+            // A losing end still cancels the run, so the previous trial's
+            // scripted continuation may never have been asked for.
+            if (in_array('withdraw', [$first, $second], true)) {
+                $this->expectInterruptedRun = true;
+                $this->script->steps = [];
+                $this->script->cursor = 0;
+            }
             $this->scriptAsk(continues: $state !== 'withdrawn');
             $conversation = $this->telegramConversation();
             $question = $this->ask($conversation);

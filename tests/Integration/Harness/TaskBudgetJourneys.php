@@ -2,7 +2,7 @@
 
 namespace Tests\Integration\Harness;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
@@ -57,7 +57,7 @@ trait TaskBudgetJourneys
 
         config(['llm-client.run_trace.enabled' => true, 'llm-client.cost.currency' => 'USD']);
 
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         $this->app->singleton(
             McpToolExecutor::class,

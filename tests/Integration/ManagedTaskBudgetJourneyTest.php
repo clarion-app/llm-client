@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Jobs\RunManagedTaskStepJob;
 use ClarionApp\LlmClient\Models\Agent;
@@ -54,7 +54,7 @@ class ManagedTaskBudgetJourneyTest extends AssembledSystemTestCase
         parent::setUp();
         $this->setUpHelperJourney();
         $this->entryPath = 'sync';
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
 
         $this->fixtureWithModel();
         $this->manager = $this->agent('manager-agent');

@@ -29,15 +29,22 @@ class SnapshotFaultInjector implements FaultInjector
     private array $snapshot = [];
 
     /**
-     * Arm one (point, occurrence) pair over the listed tables.
+     * Arm one (point, occurrence) pair over the listed tables. `task_budgets`
+     * is always snapshotted and restored too: the run's own catch closes the
+     * run (ending its task budget via rootRunClosed()), but a real SIGKILL
+     * would not run that catch, so the budget must be left as it was at the
+     * kill — otherwise a resumed run would see a terminal budget and stop.
      */
+    private bool $fired = false;
+
     public function arm(string $point, int $occurrence, array $tables): void
     {
         $this->armedPoint = $point;
         $this->armedOccurrence = $occurrence;
-        $this->armedTables = $tables;
+        $this->armedTables = array_values(array_unique(array_merge($tables, ['task_budgets'])));
         $this->reachCounts = [];
         $this->snapshot = [];
+        $this->fired = false;
     }
 
     public function reach(string $point): void
@@ -59,7 +66,19 @@ class SnapshotFaultInjector implements FaultInjector
                 ->all();
         }
 
+        $this->fired = true;
+
         throw new InjectedFault("Injected fault at {$point} (occurrence {$this->armedOccurrence}).");
+    }
+
+    /**
+     * Whether the armed fault fired — for a kill inside a path whose caller
+     * turns every exception into an error response, so it never reaches
+     * the test as a thrown InjectedFault.
+     */
+    public function fired(): bool
+    {
+        return $this->fired;
     }
 
     /**
@@ -77,5 +96,6 @@ class SnapshotFaultInjector implements FaultInjector
 
         $this->snapshot = [];
         $this->armedPoint = null;
+        $this->fired = false;
     }
 }

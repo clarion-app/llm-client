@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
@@ -329,7 +329,7 @@ class AskUserPauseSitesTest extends TestCase
 
         $paused = $this->streamTurn($conversation, [$this->askCall()]);
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
 
         $question = AgentQuestion::where('conversation_id', $conversation->id)->first();
         $this->assertNotNull($question, 'a valid ask opens a question');
@@ -373,7 +373,7 @@ class AskUserPauseSitesTest extends TestCase
             $this->toolCall('call_b', 'record_note_b', []),
         ]);
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         $this->assertSame(['record_note_a'], $this->service->executedTools, 'the call before the ask runs; the call after it never does');
 
         $pending = $paused->tool_data['pending_tool_results'] ?? null;
@@ -429,7 +429,7 @@ class AskUserPauseSitesTest extends TestCase
             'the refusal is the call\'s result',
         );
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
     }
 
     // ---------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
@@ -134,7 +134,7 @@ class ExpiryStopJourneyTest extends AssembledSystemTestCase
 
         // Resume jobs are held on the queue until a worker picks them up, so
         // the test sees exactly what each step queued.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         // The host application's catalogue holds one state-changing
         // operation, and its API is scripted so each call to it is counted.

@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\ConversationHandoff;
@@ -384,7 +384,7 @@ class AgentHandoffJourneyTest extends TestCase
         app(AgentLoopService::class)->start($conversation);
 
         $capturedRequests = [];
-        Queue::pushed(SendHttpStreamRequest::class, function (SendHttpStreamRequest $job) use (&$capturedRequests) {
+        Queue::pushed(AgentStreamStepJob::class, function (AgentStreamStepJob $job) use (&$capturedRequests) {
             $reflector = new \ReflectionClass($job);
             $requestProperty = $reflector->getProperty('request');
             $requestProperty->setAccessible(true);
@@ -393,7 +393,7 @@ class AgentHandoffJourneyTest extends TestCase
             return true;
         });
 
-        $this->assertNotEmpty($capturedRequests, 'start() must dispatch a SendHttpStreamRequest job');
+        $this->assertNotEmpty($capturedRequests, 'start() must dispatch an AgentStreamStepJob job');
 
         $body = $capturedRequests[0]->body;
         $messages = is_array($body->messages ?? null) ? $body->messages : [];

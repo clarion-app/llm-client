@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Database\Schema\Blueprint;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use Tests\Integration\Harness\ResponseScript;
 use Tests\Integration\Harness\ScriptedTransport;
 use Tests\Integration\Harness\ScriptedStream;
@@ -66,7 +66,7 @@ abstract class AssembledSystemTestCase extends TestCase
         $this->app->bind('llm-client.http_handler', fn () => $this->transport->handlerStack());
 
         // Fake queue for stream jobs
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
 
         $this->stream = new ScriptedStream();
     }

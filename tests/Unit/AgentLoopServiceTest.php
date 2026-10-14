@@ -21,7 +21,7 @@ use ClarionApp\LlmClient\Services\AgentService;
 use ClarionApp\LlmClient\Services\GitDefinitionFileReader;
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use Dedoc\Scramble\Generator;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
@@ -219,7 +219,7 @@ class AgentLoopServiceTest extends TestCase
         $conversation->refresh();
         $this->assertTrue($conversation->is_processing);
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
     }
 
     #[Test]
@@ -292,7 +292,7 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
         $service->resume($conversation, $message, true);
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
 
         $message->refresh();
         $this->assertNull($message->tool_data['pending_confirmation']);
@@ -595,7 +595,7 @@ class AgentLoopServiceTest extends TestCase
         $service = new AgentLoopService($registryMock, $executorMock, new OperationCache(), app(ProviderRegistry::class));
         $service->resume($conversation, $message, false);
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
 
         $message->refresh();
         $this->assertNotNull($message->tool_data['tool_results']);
@@ -673,7 +673,7 @@ class AgentLoopServiceTest extends TestCase
 
         $conversation->refresh();
         $this->assertTrue($conversation->is_processing);
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
     }
 
     #[Test]

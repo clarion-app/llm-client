@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -292,7 +292,7 @@ class QuestionResumerStoppedTest extends TestCase
 
         $this->assertFalse((bool) Conversation::findOrFail($question->conversation_id)->is_processing, 'nothing is processing');
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         $this->assertSame([], $this->web->deliveries, 'nothing reached the user');
     }
 
@@ -367,7 +367,7 @@ class QuestionResumerStoppedTest extends TestCase
         $this->assertNull($question->resumed_at, 'the state, not resolved_at, refuses the claim');
         $paused = Message::findOrFail($question->paused_message_id)->tool_data;
         $this->assertNull($paused['tool_results'], 'the paused turn is not consumed');
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     // ---------------------------------------------------------------
@@ -475,7 +475,7 @@ class QuestionResumerStoppedTest extends TestCase
         $resumer = app(QuestionResumer::class);
         $this->assertNull($resumer->resume($question->id, ResumeCaller::HttpRequest), 'a streamed continuation returns nothing');
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         $this->assertNotNull($question->fresh()->resumed_at, 'the resume claim is taken');
 
         $expected = json_encode([
@@ -517,7 +517,7 @@ class QuestionResumerStoppedTest extends TestCase
         $this->assertNull($resumer->resume($question->id, ResumeCaller::Background), 'a second resume finds nothing to do');
         $this->runJob(new ResumeAfterQuestionJob($question->id));
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         $this->assertSame($results, $this->toolResults($question), 'the paused turn is answered exactly once');
     }
 
@@ -542,7 +542,7 @@ class QuestionResumerStoppedTest extends TestCase
         ), 'precondition: the late answer is accepted');
 
         app(QuestionResumer::class)->resume($question->id, ResumeCaller::HttpRequest);
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
 
         $step = DB::table('agent_run_steps')->where('id', $question->step_id)->first();
         $this->assertNotNull($step->ended_at, 'the step that spanned the wait is closed');
@@ -585,7 +585,7 @@ class QuestionResumerStoppedTest extends TestCase
             ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
         ]], $this->toolResults($question), 'the paused call is answered with the withdrawn outcome');
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         $this->assertFalse((bool) Conversation::findOrFail($question->conversation_id)->is_processing, 'nothing continues');
     }
 

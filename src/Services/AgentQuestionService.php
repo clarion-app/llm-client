@@ -50,11 +50,14 @@ class AgentQuestionService
     /** `tool_data.kind` of a task-budget report (halted, accepted, stopped). */
     public const KIND_TASK_BUDGET_REPORT = 'task_budget_report';
 
+    /** `tool_data.kind` of a resume notice (an outcome-unknown action, a resumed step). */
+    public const KIND_TASK_RESUME_NOTICE = 'task_resume_notice';
+
     /** Every message kind that exists only for the user, never for the model. */
-    public const CONVERSATION_ONLY_KINDS = [self::KIND_QUESTION, self::KIND_NOTICE, self::KIND_ANSWER, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT];
+    public const CONVERSATION_ONLY_KINDS = [self::KIND_QUESTION, self::KIND_NOTICE, self::KIND_ANSWER, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT, self::KIND_TASK_RESUME_NOTICE];
 
     /** Assistant-role messages the system writes, which are never the agent replying to anyone. */
-    public const SYSTEM_NOTICE_KINDS = [self::KIND_NOTICE, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT];
+    public const SYSTEM_NOTICE_KINDS = [self::KIND_NOTICE, self::KIND_TASK_BUDGET_NOTICE, self::KIND_TASK_BUDGET_REPORT, self::KIND_TASK_RESUME_NOTICE];
 
     /** Length of the `agent_questions.delivery_failure_reason` column. */
     private const MAX_FAILURE_REASON_CHARS = 512;

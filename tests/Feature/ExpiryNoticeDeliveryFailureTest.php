@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -373,7 +373,7 @@ class ExpiryNoticeDeliveryFailureTest extends TestCase
 
         $this->workResumes();
         $this->assertNotNull($question->fresh()->resumed_at, 'the run resumes on the assumption');
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
     }
 
     #[Test]
@@ -450,7 +450,7 @@ class ExpiryNoticeDeliveryFailureTest extends TestCase
 
         $this->workResumes();
         $this->assertNotNull($question->fresh()->resumed_at, 'the run resumes without the answer');
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
     }
 
     #[Test]

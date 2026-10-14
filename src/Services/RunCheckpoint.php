@@ -125,15 +125,24 @@ class RunCheckpoint
         ]);
 
         $checkpoint = $this->checkpointOf($stepId);
-        $checkpoint['model'] = ['content' => $content];
-        foreach ($calls as $call) {
+        // The model response exactly as received: a resume that finishes
+        // this step's tool batch re-reads the calls (with their arguments)
+        // from here, never from the per-call entries below.
+        $checkpoint['model'] = [
+            'recorded_at' => $this->timestamp(now()),
+            'content' => $content,
+            'tool_calls' => array_values($calls),
+        ];
+        foreach (array_values($calls) as $index => $call) {
             $id = $call['id'] ?? null;
             if ($id === null) {
                 continue;
             }
             $checkpoint['calls'][$id] = [
-                'state' => 'not_started',
+                'index' => $index,
+                'tool' => mb_substr((string) ($call['function']['name'] ?? ''), 0, 256),
                 'label' => $this->labelForCall($call),
+                'state' => 'not_started',
             ];
         }
 
@@ -441,17 +450,18 @@ class RunCheckpoint
     }
 
     /**
-     * The label of a tool call, until TaskResumeText can resolve one
-     * (Phase 4): the operation id the call names, else the tool name.
+     * The label of a tool call, resolved through TaskResumeText: the
+     * operation's summary (the registry's title annotation) → the operation
+     * id → the tool name. Never argument values.
      */
     private function labelForCall(array $call): string
     {
         $arguments = json_decode((string) ($call['function']['arguments'] ?? ''), true);
-        if (is_array($arguments) && isset($arguments['operationId'])) {
-            return (string) $arguments['operationId'];
-        }
 
-        return (string) ($call['function']['name'] ?? '');
+        return app(TaskResumeText::class)->actionLabel(
+            (string) ($call['function']['name'] ?? ''),
+            is_array($arguments) ? $arguments : [],
+        );
     }
 
     /** The step's run, or null when the step is gone (a no-op, not an error). */

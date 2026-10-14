@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use Tests\TestCase;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\CostSummary;
@@ -86,7 +86,7 @@ class LadderConfigurationJourneyTest extends TestCase
         ]);
 
         \Illuminate\Support\Facades\Http::fake();
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
     }
 
     protected function tearDown(): void

@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
@@ -65,7 +65,7 @@ class ExpiryPolicyLegacyJourneyTest extends AssembledSystemTestCase
         config(['llm-client.run_trace.enabled' => true]);
         config(['llm-client.conversation.inactivity_threshold_hours' => 4]);
 
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         Event::fake([
             NewConversationMessageEvent::class,

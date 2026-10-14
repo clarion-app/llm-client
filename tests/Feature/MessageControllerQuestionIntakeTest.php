@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Conversation;
@@ -231,7 +231,7 @@ class MessageControllerQuestionIntakeTest extends TestCase
     public function the_owners_reply_answers_the_pending_question_and_resumes_the_run(): void
     {
         $question = $this->pendingQuestion();
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
 
         $response = $this->actingAs($this->user, 'api')->postJson(self::ENDPOINT, [
             'conversation_id' => $this->conversation->id,
@@ -266,7 +266,7 @@ class MessageControllerQuestionIntakeTest extends TestCase
 
         $this->assertSame('answered', Message::findOrFail($question->display_message_id)->tool_data['state'] ?? null);
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
     }
 
     #[Test]
@@ -291,7 +291,7 @@ class MessageControllerQuestionIntakeTest extends TestCase
         $this->assertSame($this->conversation->id, $question->pending_conversation_id);
         $this->assertNull($question->answer_raw);
         $this->assertSame(0, $this->userMessageCount(), 'a blank reply is not stored');
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     #[Test]
@@ -306,7 +306,7 @@ class MessageControllerQuestionIntakeTest extends TestCase
         $response->assertStatus(422);
         $response->assertJsonValidationErrors('content');
         $this->assertSame(0, $this->userMessageCount());
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     // ---------------------------------------------------------------
@@ -327,7 +327,7 @@ class MessageControllerQuestionIntakeTest extends TestCase
         $this->assertSame('user', strtolower((string) $message->role));
         $this->assertNull($message->tool_data, 'an ordinary message carries no question marker');
         $this->assertSame(0, AgentQuestion::count());
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
     }
 
     #[Test]
@@ -344,7 +344,7 @@ class MessageControllerQuestionIntakeTest extends TestCase
         $response->assertStatus(403);
         $this->assertSame($before, (array) DB::table('agent_questions')->where('id', $question->id)->first());
         $this->assertSame(0, $this->userMessageCount());
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     #[Test]
@@ -386,6 +386,6 @@ class MessageControllerQuestionIntakeTest extends TestCase
         $this->assertSame(QuestionState::Expired, $question->state, 'the earlier resolution stands');
         $this->assertNull($question->answer_raw);
         $this->assertNull($question->answer_message_id);
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 }
