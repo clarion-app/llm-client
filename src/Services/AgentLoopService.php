@@ -324,11 +324,19 @@ class AgentLoopService
      * the continuation's own approved-call step (finished by the
      * boundary) is not counted as earlier work. Keyed by run id and
      * consumed one-shot by the seed; a no-op when tracing is off (no
-     * step row, nothing to cap).
+     * step row, nothing to cap). Only a conversation with no task has a
+     * seed to cap: a cap set for a run whose task already exists would
+     * never be consumed, and the ambient Context would carry it into
+     * every later log line and queued job.
      */
-    private function capBudgetSeedAtPausedStep(?string $pausedStepId, ?string $runId): void
+    private function capBudgetSeedAtPausedStep(Conversation $conversation, ?string $pausedStepId, ?string $runId): void
     {
         if ($pausedStepId === null || $runId === null) {
+            return;
+        }
+
+        $taskId = $conversation->fresh()?->active_task_budget_id;
+        if ($taskId !== null && \ClarionApp\LlmClient\Models\TaskBudget::whereKey($taskId)->exists()) {
             return;
         }
 
@@ -765,7 +773,7 @@ class AgentLoopService
         // read back once the call is approved and executed.
         $inboundActionId = $toolData['action_id'] ?? null;
 
-        $this->capBudgetSeedAtPausedStep($toolData['step_id'] ?? null, $runId);
+        $this->capBudgetSeedAtPausedStep($conversation, $toolData['step_id'] ?? null, $runId);
         $this->closePausedStreamStep($toolData, $message);
 
         // The approved call runs in its own step: open it (C1), record the
@@ -3286,7 +3294,7 @@ class AgentLoopService
         // Recover run_id and step_id from tool_data.
         // If step_id is present, close it with wait_ms (T059) — the step spans
         // the confirmation pause. If run_id is null (pre-feature), mint a fresh run.
-        $this->capBudgetSeedAtPausedStep($pendingStepId, $runId);
+        $this->capBudgetSeedAtPausedStep($conversation, $pendingStepId, $runId);
         [$runId, $currentStepId] = $this->openResumedSyncStep($conversation, $message, $toolData, $runId, $attemptGroupId);
 
         // 112-coding-agent (US1, data-model.md §6): tracks whether

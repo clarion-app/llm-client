@@ -164,4 +164,29 @@ class ResumeInterruptedRunJobTest extends TestCase
             'the run is never left resuming',
         );
     }
+
+    /**
+     * The resume was superseded: another worker took the run over while
+     * this one was slow, and this one's next write met that worker's lease.
+     * The run belongs to the other worker now; this job closes nothing.
+     */
+    #[Test]
+    public function a_resume_superseded_by_another_worker_leaves_the_run_to_that_worker(): void
+    {
+        $this->makeRun('run-1', [
+            'resume_state' => 'working',
+            'lease_holder' => '88888888-8888-8888-8888-888888888888',
+            'lease_expires_at' => now()->addMinutes(5)->format('Y-m-d H:i:s.u'),
+        ]);
+
+        $resumer = Mockery::mock(RunResumer::class);
+        $resumer->shouldReceive('resume')->once()->andThrow(new \ClarionApp\LlmClient\Exceptions\LeaseLost());
+
+        (new ResumeInterruptedRunJob('run-1', '10000000-0000-0000-0000-000000000001'))->handle($resumer);
+
+        $row = $this->runRow('run-1');
+        $this->assertSame('in_progress', $row->end_state, 'the run the other worker holds is not closed');
+        $this->assertSame('88888888-8888-8888-8888-888888888888', $row->lease_holder, 'and its lease is untouched');
+        $this->assertSame('working', $row->resume_state);
+    }
 }

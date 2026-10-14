@@ -257,6 +257,57 @@ class AgentStreamStepJobTest extends TestCase
         $this->assertSame(0, $this->requestCount, 'a lost claim sends no request');
     }
 
+    /**
+     * The user ended the conversation while the next model call was waiting
+     * in the queue (the lease handed off, nobody holding it). The job's
+     * claim loses because the run is cancelled; the run is closed as
+     * cancelled there and then, not left in progress for the abandonment
+     * sweep an hour later.
+     */
+    #[Test]
+    public function a_queued_step_of_a_cancelled_run_closes_the_run_as_cancelled(): void
+    {
+        $conversationId = $this->makeConversation();
+        Conversation::whereKey($conversationId)->update(['is_processing' => false]);
+        $this->makeRun('run-1', [
+            'conversation_id' => $conversationId,
+            'lease_holder' => null,
+            'lease_expires_at' => now()->addMinutes(5)->format('Y-m-d H:i:s.u'),
+            'cancelled_at' => now()->format('Y-m-d H:i:s.u'),
+        ]);
+        $this->makeStep('step-1', 'run-1', 1);
+        $this->bindStreamingHandler($this->contentChunks());
+
+        (new AgentStreamStepJob($this->request(), $this->data('run-1', 'step-1', $conversationId, '10000000-0000-0000-0000-000000000001')))->handle();
+
+        $this->assertSame(0, $this->requestCount, 'a cancelled run sends no request');
+        $run = $this->runRow('run-1');
+        $this->assertSame('stopped_early', $run->end_state, 'the cancelled run is closed, not left in progress');
+        $this->assertSame(app(TaskResumeText::class)->cancelledReason(), $run->end_reason);
+        $this->assertSame('stopped_early', DB::table('agent_run_steps')->where('id', 'step-1')->value('end_state'), 'its open step is closed too');
+        $this->assertFalse((bool) Conversation::whereKey($conversationId)->value('is_processing'));
+    }
+
+    /** A cancelled run another worker still holds is left to that worker's next step boundary. */
+    #[Test]
+    public function a_cancelled_run_held_by_a_live_worker_is_left_to_that_worker(): void
+    {
+        $conversationId = $this->makeConversation();
+        $this->makeRun('run-1', [
+            'conversation_id' => $conversationId,
+            'lease_holder' => '99999999-9999-9999-9999-999999999999',
+            'lease_expires_at' => now()->addMinutes(5)->format('Y-m-d H:i:s.u'),
+            'cancelled_at' => now()->format('Y-m-d H:i:s.u'),
+        ]);
+        $this->makeStep('step-1', 'run-1', 1);
+        $this->bindStreamingHandler($this->contentChunks());
+
+        (new AgentStreamStepJob($this->request(), $this->data('run-1', 'step-1', $conversationId, '10000000-0000-0000-0000-000000000001')))->handle();
+
+        $this->assertSame(0, $this->requestCount);
+        $this->assertSame('in_progress', $this->runRow('run-1')->end_state, 'the live worker closes it at its next boundary');
+    }
+
     // ---------------------------------------------------------------
     // The step guard
     // ---------------------------------------------------------------

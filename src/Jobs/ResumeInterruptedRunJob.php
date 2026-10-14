@@ -44,6 +44,13 @@ class ResumeInterruptedRunJob implements ShouldQueue
     {
         try {
             $resumer->resume($this->runId, $this->dispatchId, ResumeCaller::Background);
+        } catch (\ClarionApp\LlmClient\Exceptions\LeaseLost) {
+            // Superseded: another worker took the run over while this one
+            // was slow. The run is that worker's now; this job closes and
+            // records nothing.
+            Log::info('ResumeInterruptedRunJob: the resume was superseded by another worker', [
+                'run_id' => $this->runId,
+            ]);
         } catch (\Throwable $e) {
             // The resumer itself threw (its own catch path did not run, or
             // could not close the run). The run must still be left terminal,

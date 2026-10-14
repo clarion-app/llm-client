@@ -251,6 +251,13 @@ class RunTraceSafetyJourneyTest extends AssembledSystemTestCase
         $fixture = $this->fixture()->build();
         $iterations = 5;
 
+        // This bound is for the run record's own writes. Checkpointing rides
+        // on the run record (it needs its run id), so with it on the
+        // recording arm would also pay for the checkpoint writes, whose cost
+        // has its own bound (the real-database overhead benchmark, at most
+        // 5 % of a step). Both arms run with checkpointing off.
+        $this->app['config']->set('llm-client.resume.enabled', false);
+
         // ---- Control timings: tracing disabled ----
         $this->app['config']->set('llm-client.run_trace.enabled', false);
         $controlTimes = [];
@@ -297,15 +304,11 @@ class RunTraceSafetyJourneyTest extends AssembledSystemTestCase
         // ---- Compute overhead ----
         $overheadMs = ($recordingMedian - $controlMedian) * 1000;
 
-        // SC-007: added per-step time ≤ 10 ms (single step in this test).
-        // The budget was 5 ms for run tracing alone; the checkpoint writes
-        // (spec 134) announce the run on every write point, which adds to
-        // the recording run. The dedicated checkpoint-overhead bound is
-        // SC-008 (the real-db ResumeOverheadBenchmark, ≤ 5 %).
+        // SC-007: added per-step time ≤ 5 ms (single step in this test)
         $this->assertLessThanOrEqual(
-            10.0,
+            5.0,
             $overheadMs,
-            "SC-007 sync: added per-step time {$overheadMs}ms exceeds 10ms budget "
+            "SC-007 sync: added per-step time {$overheadMs}ms exceeds 5ms budget "
                 . "(control median: " . round($controlMedian * 1000, 2) . "ms, "
                 . "recording median: " . round($recordingMedian * 1000, 2) . 'ms)'
         );
@@ -329,6 +332,13 @@ class RunTraceSafetyJourneyTest extends AssembledSystemTestCase
         $fixture = $this->fixture()->build();
         $iterations = 5;
 
+        // This bound is for the run record's own writes. Checkpointing rides
+        // on the run record (it needs its run id), so with it on the
+        // recording arm would also pay for the checkpoint writes, whose cost
+        // has its own bound (the real-database overhead benchmark, at most
+        // 5 % of a step). Both arms run with checkpointing off.
+        $this->app['config']->set('llm-client.resume.enabled', false);
+
         // ---- Control timings: tracing disabled ----
         $this->app['config']->set('llm-client.run_trace.enabled', false);
         $controlTimes = [];
@@ -389,15 +399,11 @@ class RunTraceSafetyJourneyTest extends AssembledSystemTestCase
         // ---- Compute overhead ----
         $overheadMs = ($recordingMedian - $controlMedian) * 1000;
 
-        // SC-007: added per-step time ≤ 10 ms (single step in this test).
-        // The budget was 5 ms for run tracing alone; the checkpoint writes
-        // (spec 134) announce the run on every write point, which adds to
-        // the recording run. The dedicated checkpoint-overhead bound is
-        // SC-008 (the real-db ResumeOverheadBenchmark, ≤ 5 %).
+        // SC-007: added per-step time ≤ 5 ms (single step in this test)
         $this->assertLessThanOrEqual(
-            10.0,
+            5.0,
             $overheadMs,
-            "SC-007 stream: added per-step time {$overheadMs}ms exceeds 10ms budget "
+            "SC-007 stream: added per-step time {$overheadMs}ms exceeds 5ms budget "
                 . "(control median: " . round($controlMedian * 1000, 2) . "ms, "
                 . "recording median: " . round($recordingMedian * 1000, 2) . 'ms)'
         );

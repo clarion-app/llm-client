@@ -1603,6 +1603,13 @@ class DelegationService
     {
         $actionId = $delegation->parent_action_id;
 
+        // The helper's run was taken over by another worker while this one
+        // was slow (a waiting parent re-drove the member): the delegation
+        // is that worker's to conclude. This one writes nothing and stops.
+        if (($rawResult['status'] ?? null) === 'superseded') {
+            return ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name, 'status' => 'superseded'];
+        }
+
         // 110-delegation-deadlock-timeout (FR-013): the same late-result
         // check the catch branch above applies, covering every one of the
         // terminal writes below (completed / bound-exceeded / confirmation

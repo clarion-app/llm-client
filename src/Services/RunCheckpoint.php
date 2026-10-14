@@ -261,7 +261,7 @@ class RunCheckpoint
 
         $affected = DB::table('agent_runs')
             ->where('id', $runId)
-            ->where(fn ($q) => $q->where('lease_holder', $this->lease->nonce())->orWhere('lease_holder', null))
+            ->where(fn ($q) => $this->heldOrReleased($q))
             ->update(['resume_state' => 'paused', 'lease_holder' => null]);
 
         if ($affected === 0 && DB::table('agent_runs')->where('id', $runId)->exists()) {
@@ -418,7 +418,7 @@ class RunCheckpoint
 
         $affected = DB::table('agent_runs')
             ->where('id', $runId)
-            ->where(fn ($q) => $q->where('lease_holder', $this->lease->nonce())->orWhere('lease_holder', null))
+            ->where(fn ($q) => $this->heldOrReleased($q))
             ->update($set);
 
         if ($affected === 0 && DB::table('agent_runs')->where('id', $runId)->exists()) {
@@ -443,12 +443,27 @@ class RunCheckpoint
 
         $affected = DB::table('agent_runs')
             ->where('id', $runId)
-            ->where(fn ($q) => $q->where('lease_holder', $this->lease->nonce())->orWhere('lease_holder', null))
+            ->where(fn ($q) => $this->heldOrReleased($q))
             ->update($set);
 
         if ($affected === 0 && DB::table('agent_runs')->where('id', $runId)->exists()) {
             throw new LeaseLost();
         }
+    }
+
+    /**
+     * The rows this process may write: the lease it holds, or a released
+     * lease (a stream hand-off, whose next worker's first write is the
+     * claim). A lease the detection sweep released is not free: the sweep
+     * declared the run interrupted and minted the dispatch its resume job
+     * claims with, so the process it gave up on gets LeaseLost instead of
+     * quietly taking the run back.
+     */
+    private function heldOrReleased($query)
+    {
+        return $query->where('lease_holder', $this->lease->nonce())
+            ->orWhere(fn ($released) => $released->whereNull('lease_holder')
+                ->where(fn ($state) => $state->whereNull('resume_state')->orWhere('resume_state', '!=', 'interrupted')));
     }
 
     /**

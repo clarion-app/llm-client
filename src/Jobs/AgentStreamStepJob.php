@@ -78,6 +78,14 @@ class AgentStreamStepJob implements ShouldQueue
             // claim sends no request.
             $claim = app(RunLease::class)->claim($runId, $dispatchId);
             if (!$claim->won) {
+                // Cancellation wins: the user ended the conversation while
+                // this step waited in the queue. Nobody else is working the
+                // run, so it is closed as cancelled here rather than left in
+                // progress until the abandonment sweep.
+                if ($claim->reason === 'cancelled') {
+                    app(RunResumer::class)->refuseIfCancelled($runId, $dispatchId);
+                }
+
                 Log::debug('AgentStreamStepJob: the claim was lost, so no request is sent', [
                     'run_id' => $runId,
                     'reason' => $claim->reason,

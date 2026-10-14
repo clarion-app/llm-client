@@ -381,4 +381,67 @@ class ResumePauseInteractionTest extends AssembledSystemTestCase
         $this->assertSame(0, $this->sweepOnce(), 'a later sweep resumes nothing more');
         $this->assertSame('completed', $this->runRowOf($conversation)->end_state);
     }
+
+    // ---------------------------------------------------------------
+    // A resume that meets its run's own open question defers to it
+    // ---------------------------------------------------------------
+
+    /**
+     * The worker died between the question's commit and the pause marker
+     * that follows it: the question is open, but the run still reads as
+     * working on a started `ask_user` call. A resume of that run must not
+     * report the question's outcome unknown, ask again or call the model:
+     * it leaves the run paused, and the user's answer continues it once.
+     */
+    #[Test]
+    public function a_resume_that_meets_its_runs_open_question_leaves_the_run_paused_for_the_answer(): void
+    {
+        $this->scenario = 'pause_resume_defers_to_open_question';
+        $this->setupJourney();
+        $conversation = $this->syncConversation();
+
+        $this->script()->toolRequests([
+            ['id' => 'call_ask', 'name' => 'ask_user', 'arguments' => ['question' => 'Which notes?', 'choices' => ['New', 'Old']]],
+        ])->usage(...self::USAGE);
+        $this->script()->finalAnswer('Using the new notes.')->usage(...self::USAGE);
+        $this->expectInterruptedRun = true;
+        $this->app->make(AgentLoopService::class)->run($conversation, 'Which notes should I use?');
+        $run = $this->runRowOf($conversation);
+        $questionId = DB::table('agent_questions')->where('conversation_id', $conversation->id)->value('id');
+        $this->assertNotNull($questionId, 'precondition: the question is open');
+
+        // What the death leaves: the call started (durable), no pause marker,
+        // and the sweep's hand-off to a resume job.
+        $stepId = DB::table('agent_run_steps')->where('run_id', $run->id)->where('end_state', 'in_progress')->value('id');
+        $checkpoint = json_decode((string) DB::table('agent_run_steps')->where('id', $stepId)->value('checkpoint'), true);
+        $checkpoint['calls']['call_ask']['state'] = 'started';
+        $checkpoint['calls']['call_ask']['effect'] = 'durable';
+        DB::table('agent_run_steps')->where('id', $stepId)->update(['checkpoint_state' => 'model_recorded', 'checkpoint' => json_encode($checkpoint)]);
+        DB::table('agent_runs')->where('id', $run->id)->update([
+            'resume_state' => 'interrupted',
+            'interrupted_at' => now()->format('Y-m-d H:i:s.u'),
+            'dispatch_id' => 'dddddddd-dddd-dddd-dddd-dddddddddddd',
+            'lease_holder' => null,
+            'consecutive_interruptions' => 1,
+        ]);
+        Conversation::whereKey($conversation->id)->update(['is_processing' => true]);
+
+        (new ResumeInterruptedRunJob((string) $run->id, 'dddddddd-dddd-dddd-dddd-dddddddddddd'))->handle(app(RunResumer::class));
+
+        $row = $this->runRowOf($conversation);
+        $this->assertSame('in_progress', $row->end_state, 'the run is not stopped');
+        $this->assertSame('paused', $row->resume_state, 'it is left paused on its question');
+        $this->assertNull($row->lease_holder, 'and held by nobody');
+        $this->assertFalse((bool) Conversation::whereKey($conversation->id)->value('is_processing'), 'the conversation waits for the answer');
+        $this->assertSame(1, $this->modelRequests('sync'), 'no model call');
+        $this->assertSame(1, DB::table('agent_questions')->where('conversation_id', $conversation->id)->count(), 'the question is not asked again');
+        $this->assertSame('pending', DB::table('agent_questions')->where('id', $questionId)->value('state'));
+        $this->assertSame(0, Message::where('conversation_id', $conversation->id)->get()->filter(fn (Message $m) => ($m->tool_data['notice'] ?? null) === 'outcome_unknown')->count(), 'the open question is not reported outcome-unknown');
+        $this->assertSame(0, $this->sweepOnce(), 'the sweep leaves the paused run alone');
+
+        // The user answers: the run continues once and finishes.
+        $this->actingAs($this->fixture()->user, 'api')->postJson('/api/clarion-app/llm-client/question/'.$questionId.'/answer', ['text' => 'New']);
+        $this->assertSame('completed', $this->runRowOf($conversation)->end_state, 'the answer continues the run');
+        $this->assertSame(2, $this->modelRequests('sync'), 'one model call after the answer');
+    }
 }

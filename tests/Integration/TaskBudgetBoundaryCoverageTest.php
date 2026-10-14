@@ -286,6 +286,10 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(2, (int) $task->steps_used, 'the continuation\'s request was claimed');
         $this->assertSame('paused', $task->state, 'and at the ceiling it made no further request');
         $this->assertPausedStepLeftOpen($this->latestRunIdOf($conversation));
+        // The cap on a lazily opened task's seed is for a run with no task;
+        // this run has one, so nothing is left in the ambient Context (where
+        // it would ride into every log line and queued job after it).
+        $this->assertSame([], array_values(array_filter(array_keys(\Illuminate\Support\Facades\Context::all()), fn ($key) => str_starts_with((string) $key, 'resume_seed_step_cap:'))), 'no seed cap is left in the Context');
     }
 
     private function row9(): void

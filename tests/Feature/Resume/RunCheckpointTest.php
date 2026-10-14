@@ -552,6 +552,52 @@ class RunCheckpointTest extends TestCase
         $this->assertSame('open', $this->step('step-1')->checkpoint_state, 'and nothing was written');
     }
 
+    /**
+     * The detection sweep declared the run interrupted: it released the
+     * lease and minted a new dispatch id for the resume job. The slow
+     * original process, coming back to its next write, must not take the
+     * released lease back — the resume job's claim is the only way in.
+     */
+    #[Test]
+    public function a_run_the_sweep_marked_interrupted_is_not_reclaimed_by_the_original_process(): void
+    {
+        $this->makeRun('run-1');
+        $this->makeStep('step-1', 'run-1', 1);
+        $checkpoint = $this->checkpoint();
+        $checkpoint->openRun('run-1', ResumeMode::Sync, ResumeDriver::Root, []);
+        $checkpoint->openStep('run-1', 'step-1', 1);
+        $checkpoint->recordModelResponse('step-1', 'one write', [$this->twoCalls()[0]]);
+        $checkpoint->markStarted('step-1', 'call_a', ToolEffect::Effectful, '', 60);
+
+        // The sweep's compare-and-set, exactly as it leaves the row.
+        DB::table('agent_runs')->where('id', 'run-1')->update([
+            'resume_state' => 'interrupted',
+            'interrupted_at' => now()->format('Y-m-d H:i:s.u'),
+            'dispatch_id' => 'dddddddd-dddd-dddd-dddd-dddddddddddd',
+            'lease_holder' => null,
+            'consecutive_interruptions' => 1,
+        ]);
+
+        foreach ([
+            'C4' => fn () => $checkpoint->markCompleted('step-1', 'call_a', ['tool_call_id' => 'call_a', 'content' => 'late']),
+            'C5' => fn () => $checkpoint->commitStep('run-1', 'step-1', 'msg-1'),
+            'C1' => fn () => $checkpoint->openStep('run-1', 'step-1', 2),
+        ] as $point => $write) {
+            $thrown = false;
+            try {
+                $write();
+            } catch (LeaseLost) {
+                $thrown = true;
+            }
+            $this->assertTrue($thrown, "{$point}: the original process gets LeaseLost on an interrupted run");
+        }
+
+        $row = $this->runRow('run-1');
+        $this->assertNull($row->lease_holder, 'the released lease stays released for the resume job');
+        $this->assertSame('interrupted', $row->resume_state);
+        $this->assertSame('started', json_decode((string) $this->step('step-1')->checkpoint, true)['calls']['call_a']['state'], 'the call is not recorded completed by the superseded process');
+    }
+
     // ---------------------------------------------------------------
     // A tolerant timestamp comparison.
     // ---------------------------------------------------------------

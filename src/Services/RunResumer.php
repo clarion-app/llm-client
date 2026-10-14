@@ -211,13 +211,15 @@ class RunResumer
     }
 
     /**
-     * A continuation (a pause's resume) lost its claim because the user
-     * cancelled the run: close the run as cancelled instead of leaving it
-     * in progress with nothing to continue it. Returns whether it did.
+     * A continuation (a pause's resume, a queued stream step) lost its
+     * claim because the user cancelled the run: close the run as cancelled
+     * instead of leaving it in progress with nothing to continue it. With a
+     * dispatch id, only while that unit of work is still the one entitled
+     * to the run. Returns whether it did.
      */
-    public function refuseIfCancelled(string $runId): bool
+    public function refuseIfCancelled(string $runId, ?string $dispatchId = null): bool
     {
-        $run = $this->idleCancelledRun($runId, null);
+        $run = $this->idleCancelledRun($runId, $dispatchId);
         if ($run === null) {
             return false;
         }

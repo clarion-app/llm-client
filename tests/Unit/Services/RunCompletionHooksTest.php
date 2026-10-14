@@ -67,6 +67,35 @@ class RunCompletionHooksTest extends TestCase
         $this->assertCount(1, $logged);
     }
 
+    /**
+     * Two processes end the same run at once (a resumed run's end and a
+     * stop with a report): both read the hook as not yet run. Only the one
+     * whose compare-and-set lands runs it.
+     */
+    #[Test]
+    public function a_hook_another_process_claimed_after_this_one_read_it_is_not_run_again(): void
+    {
+        $id = $this->makeRun('completed');
+
+        // The other process claims the hook right after this one has read
+        // the run row (between the read and this process's own claim).
+        $claimedByOther = false;
+        DB::listen(function ($query) use ($id, &$claimedByOther) {
+            if ($claimedByOther || !str_starts_with(strtolower($query->sql), 'select') || !str_contains($query->sql, 'resume_options')) {
+                return;
+            }
+            $claimedByOther = true;
+            DB::table('agent_runs')->where('id', $id)->update([
+                'resume_options' => json_encode(['on_complete' => ['hook' => 'no_such_hook', 'ran_at' => now()->toIso8601String()]]),
+            ]);
+        });
+
+        $logged = $this->hookLogsDuring(fn () => app(RunCompletionHooks::class)->run($id));
+
+        $this->assertTrue($claimedByOther, 'precondition: the other process claimed between the read and the claim');
+        $this->assertSame([], $logged, 'the hook the other process claimed is not run a second time');
+    }
+
     #[Test]
     public function a_run_that_is_still_going_runs_no_hook(): void
     {
