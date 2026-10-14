@@ -54,7 +54,7 @@ class TaskResumeText
      */
     public function providerWaitingNotice(CarbonInterface $next): string
     {
-        return "Waiting to retry the model provider. Next attempt at {$this->formatTime($next)}.";
+        return "This task is waiting to retry the model provider. Next attempt at {$this->formatTime($next)}.";
     }
 
     /**
@@ -74,7 +74,7 @@ class TaskResumeText
      */
     public function providerUnavailableReason(): string
     {
-        return 'The model provider stayed unavailable, so there are no further automatic attempts.';
+        return 'This task stopped because the model provider stayed unavailable, so there are no further automatic attempts.';
     }
 
     /**
