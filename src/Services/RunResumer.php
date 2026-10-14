@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\Backend\ApiManager;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Models\AgentRun;
@@ -112,7 +113,7 @@ class RunResumer
         // The interruption bound.
         $max = (int) config('llm-client.resume.max_consecutive_interruptions', 3);
         if ((int) $run->consecutive_interruptions >= $max) {
-            return $this->stopUnresumable($run, $conversation, 'repeated_interruption');
+            return $this->stopUnresumable($run, 'repeated_interruption', null, $conversation);
         }
 
         // A newer task in the same conversation supersedes this one (the
@@ -125,15 +126,32 @@ class RunResumer
             ->where('started_at', '>', $this->stamp($run->started_at))
             ->exists();
         if ($newer) {
-            return $this->stopUnresumable($run, $conversation, 'superseded');
+            return $this->stopUnresumable($run, 'superseded', null, $conversation);
+        }
+
+        // Whatever gave up on the task already released the conversation:
+        // there is no outcome to continue towards.
+        if (!$conversation->is_processing) {
+            return $this->stopUnresumable($run, 'ended_without_outcome', null, $conversation);
         }
 
         // Viability: the planner's verdict, read from the durable records.
         $planned = app(ResumePlanner::class)->plan($run);
         if ($planned instanceof Unresumable) {
-            return $this->stopUnresumable($run, $conversation, $planned->reasonCode);
+            return $this->stopUnresumable($run, $planned->reasonCode, null, $conversation);
         }
         $plan = $planned;
+
+        // The model the run was talking to is still configured.
+        if ($conversation->server === null) {
+            return $this->stopUnresumable($run, 'model_unavailable', null, $conversation);
+        }
+
+        // Every call the resume itself must execute can still be resolved.
+        $missing = $this->unavailableTool($plan);
+        if ($missing !== null) {
+            return $this->stopUnresumable($run, 'tool_unavailable', $missing, $conversation);
+        }
 
         $previousRunId = Context::get('run_id');
         $previousBudgetId = Context::get('task_budget_id');
@@ -230,7 +248,7 @@ class RunResumer
     {
         $reason = app(TaskResumeText::class)->cancelledReason();
 
-        Conversation::whereKey($run->conversation_id)->update(['is_processing' => false]);
+        Conversation::withTrashed()->whereKey($run->conversation_id)->update(['is_processing' => false]);
 
         $this->closeOpenStep((string) $run->id, RunEndState::StoppedEarly, $reason);
         app(RunTraceRecorder::class)->closeRun((string) $run->id, RunEndState::StoppedEarly, $reason);
@@ -241,31 +259,98 @@ class RunResumer
     /**
      * Stop an unresumable run: close it failed with the reason, the
      * open step closed failed, the conversation released, the report posted
-     * and delivered on the channel, and the stopped_unresumable event.
+     * and delivered on the channel, a message the user queued meanwhile
+     * picked up, and the stopped_unresumable event recorded.
      *
+     * @param string|null $label the action the task needed, when the reason names one
      * @return array<string, mixed>
      */
-    private function stopUnresumable(AgentRun $run, Conversation $conversation, string $code): array
+    public function stopUnresumable(AgentRun $run, string $code, ?string $label = null, ?Conversation $conversation = null): array
     {
         $text = app(TaskResumeText::class);
+        $runId = (string) $run->id;
+        $conversation ??= Conversation::find($run->conversation_id);
+
         $completedSteps = (int) DB::table('agent_run_steps')
-            ->where('run_id', $run->id)
+            ->where('run_id', $runId)
             ->where('end_state', RunEndState::Completed->value)
             ->count();
 
-        $conversation->update(['is_processing' => false]);
-        $this->closeOpenStep((string) $run->id, RunEndState::Failed, $text->couldNotResumeReason($code));
-        app(RunTraceRecorder::class)->closeRun((string) $run->id, RunEndState::Failed, $text->couldNotResumeReason($code));
+        $openPosition = DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', RunEndState::InProgress->value)->min('position');
+        $stoppedAt = (int) ($openPosition ?? (DB::table('agent_run_steps')->where('run_id', $runId)->max('position') + 1));
+        $stoppedDuring = "step {$stoppedAt}".($label !== null && $label !== '' ? ", which needed {$label}" : '');
 
-        $report = $text->couldNotResumeReport($code, $completedSteps, null);
-        $message = $this->postNotice($conversation, $run, 'could_not_resume', $report);
+        $reason = $text->couldNotResumeReason($code);
+        $conversation?->update(['is_processing' => false]);
+        $this->closeOpenStep($runId, RunEndState::Failed, $reason);
+        app(RunTraceRecorder::class)->closeRun($runId, RunEndState::Failed, $reason);
 
-        app(ResumeEventLog::class)->record((string) $run->id, 'stopped_unresumable', null, (int) $run->consecutive_interruptions, [
+        $report = $text->couldNotResumeReport($code, $completedSteps, $stoppedDuring);
+
+        // A helper's stop travels to the task that delegated to it; the user
+        // hears about it from there.
+        $helper = app(LegacyRunAssessment::class)->isHelperRun($run);
+        $message = $conversation !== null && !$helper ? $this->postNotice($conversation, $run, 'could_not_resume', $report) : null;
+
+        app(ResumeEventLog::class)->record($runId, 'stopped_unresumable', $openPosition !== null ? (int) $openPosition : null, (int) $run->consecutive_interruptions, [
             'reason_code' => $code,
             'completed_steps' => $completedSteps,
         ]);
 
+        if ($conversation !== null && !$helper && ($run->resume_mode ?? ($run->is_streamed ? 'stream' : 'sync')) === ResumeMode::Stream->value) {
+            app(QueuedMessagePickup::class)->startIfAny($conversation, $run);
+        }
+
         return ['status' => 'stopped', 'code' => 'unresumable', 'content' => $report, 'message_id' => $message?->id];
+    }
+
+    /**
+     * The label of the first call the resume must execute whose tool can no
+     * longer be resolved (an operation removed from the catalogue since the
+     * interruption), or null when every one still can. A lookup that fails
+     * is not taken as the tool being gone.
+     */
+    private function unavailableTool(ResumePlan $plan): ?string
+    {
+        $checkpoint = $plan->openStepId !== null
+            ? json_decode((string) DB::table('agent_run_steps')->where('id', $plan->openStepId)->value('checkpoint'), true)
+            : null;
+
+        foreach ($plan->dispositions as $callId => $disposition) {
+            if ($disposition->kind !== CallDispositionKind::Execute && $disposition->kind !== CallDispositionKind::Rerun) {
+                continue;
+            }
+
+            $call = $this->callFor($plan, (string) $callId);
+            if (($call['function']['name'] ?? null) !== 'execute_operation') {
+                continue;
+            }
+            $arguments = json_decode((string) ($call['function']['arguments'] ?? ''), true);
+            $operationId = is_array($arguments) ? (string) ($arguments['operationId'] ?? '') : '';
+            if ($operationId === '' || str_starts_with($operationId, 'mcp:')) {
+                continue;
+            }
+
+            try {
+                if (\ClarionApp\LlmClient\Models\CapabilityOffering::where('id', $operationId)->exists()) {
+                    continue;
+                }
+                $details = ApiManager::getOperationDetails($operationId);
+            } catch (\Throwable) {
+                continue;
+            }
+            if (is_array($details) && isset($details['method'])) {
+                continue;
+            }
+
+            $label = $checkpoint['calls'][$callId]['label'] ?? null;
+
+            return is_string($label) && $label !== ''
+                ? $label
+                : app(TaskResumeText::class)->actionLabel('execute_operation', is_array($arguments) ? $arguments : []);
+        }
+
+        return null;
     }
 
     /**

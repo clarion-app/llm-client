@@ -29,7 +29,9 @@ class SnapshotFaultInjector implements FaultInjector
     private array $snapshot = [];
 
     /**
-     * Arm one (point, occurrence) pair over the listed tables. `task_budgets`
+     * Arm one (point, occurrence) pair over the listed tables. `conversations`
+     * is always snapshotted too (a SIGKILL leaves `is_processing` as it was at
+     * the kill; the unwinding exception would clear it), and `task_budgets`
      * is always snapshotted and restored too: the run's own catch closes the
      * run (ending its task budget via rootRunClosed()), but a real SIGKILL
      * would not run that catch, so the budget must be left as it was at the
@@ -41,7 +43,7 @@ class SnapshotFaultInjector implements FaultInjector
     {
         $this->armedPoint = $point;
         $this->armedOccurrence = $occurrence;
-        $this->armedTables = array_values(array_unique(array_merge($tables, ['task_budgets'])));
+        $this->armedTables = array_values(array_unique(array_merge($tables, ['task_budgets', 'conversations'])));
         $this->reachCounts = [];
         $this->snapshot = [];
         $this->fired = false;

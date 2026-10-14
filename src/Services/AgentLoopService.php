@@ -578,6 +578,18 @@ class AgentLoopService
             $this->ensureSpecialistAvailable($conversation);
         }
 
+        // A run that began before this version was deployed reaches a
+        // later step with no checkpoint: it is adopted at this boundary and
+        // its lease handed on, as a run checkpointed from its start would be.
+        if ($runId !== null && $iteration > 1 && $this->checkpointNow()
+            && app(LegacyRunAssessment::class)->adoptAtBoundary($runId)) {
+            try {
+                app(RunLease::class)->handOff($runId);
+            } catch (LeaseLost) {
+                // Another process took the adopted run over.
+            }
+        }
+
         // The user is engaging again, so this session is live: clear any end
         // marker set by the idle sweep, making the session eligible to end
         // (and be captured) again once it next goes quiet. A resumed run's

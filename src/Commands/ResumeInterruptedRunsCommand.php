@@ -3,8 +3,12 @@
 namespace ClarionApp\LlmClient\Commands;
 
 use ClarionApp\LlmClient\Jobs\ResumeInterruptedRunJob;
+use ClarionApp\LlmClient\Models\AgentRun;
+use ClarionApp\LlmClient\Services\LegacyRunAssessment;
 use ClarionApp\LlmClient\Services\PausedRunQuery;
 use ClarionApp\LlmClient\Services\ResumeEventLog;
+use ClarionApp\LlmClient\Services\RunResumer;
+use ClarionApp\LlmClient\ValueObjects\Unresumable;
 use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -46,8 +50,9 @@ class ResumeInterruptedRunsCommand extends Command
         $exemptRunIds = app(PausedRunQuery::class)->exemptRunIds($cutoff);
 
         $eligible = $this->findEligibleRuns($now, $cutoff, $exemptRunIds);
+        $legacy = $this->findLegacyRuns($cutoff, $exemptRunIds);
 
-        if (empty($eligible)) {
+        if (empty($eligible) && empty($legacy)) {
             $this->info('No interrupted runs to resume');
             if ($dryRun) {
                 $this->comment('Dry-run complete — no changes were made');
@@ -85,6 +90,10 @@ class ResumeInterruptedRunsCommand extends Command
                     $skipped++;
                     break;
             }
+        }
+
+        foreach ($legacy as $legacyRun) {
+            $resumed += $this->assessLegacy((string) $legacyRun->id, $dryRun);
         }
 
         $verb = $dryRun ? 'would be resumed' : 'resumed';
@@ -182,6 +191,45 @@ class ResumeInterruptedRunsCommand extends Command
     }
 
     /**
+     * A task that was running when this version was deployed: adopted and
+     * resumed when its record suffices, otherwise stopped with the report
+     * (instead of being swept as abandoned). Returns 1 when it is resumed.
+     */
+    private function assessLegacy(string $runId, bool $dryRun): int
+    {
+        $run = AgentRun::find($runId);
+        if ($run === null) {
+            return 0;
+        }
+
+        $assessment = app(LegacyRunAssessment::class)->assess($run);
+
+        if ($assessment instanceof Unresumable) {
+            $this->line(($dryRun ? '  would stop ' : '  stopping ')."{$runId} (started before this version)");
+            if (!$dryRun) {
+                app(RunResumer::class)->stopUnresumable($run, 'legacy_insufficient');
+            }
+
+            return 0;
+        }
+
+        if ($dryRun) {
+            $this->line("  would adopt and resume {$runId}");
+
+            return 1;
+        }
+
+        $dispatch = app(LegacyRunAssessment::class)->adoptInterrupted($run, $assessment);
+        if ($dispatch === null) {
+            return 0;
+        }
+
+        ResumeInterruptedRunJob::dispatch($runId, $dispatch);
+
+        return 1;
+    }
+
+    /**
      * The parent / batch_member driver: the helper is resumed by its parent
      * (a live parent's own resume re-joins it). When the parent run is
      * terminal, the helper is closed `stopped_early` ("its parent task
@@ -250,5 +298,42 @@ class ResumeInterruptedRunsCommand extends Command
             ->select('id', 'resume_state', 'dispatch_id', 'resume_driver', 'last_progress_at', 'lease_expires_at')
             ->get()
             ->all();
+    }
+
+    /**
+     * Runs that began before this version: in progress, never checkpointed,
+     * not cancelled, with no activity for a whole detection window (the
+     * abandonment sweep's own notion of latest activity), and not exempt.
+     *
+     * @return array<int, object>
+     */
+    private function findLegacyRuns($cutoff, array $exemptRunIds): array
+    {
+        if (!(bool) config('llm-client.resume.enabled', true)) {
+            return [];
+        }
+
+        $latestActivity = DB::table('agent_run_steps')
+            ->select('run_id', DB::raw('MAX(COALESCE(ended_at, started_at)) as step_activity'))
+            ->groupBy('run_id');
+
+        $greatest2 = fn (string $a, string $b) => "CASE WHEN {$a} >= {$b} THEN {$a} ELSE {$b} END";
+        $latest = $greatest2(
+            $greatest2('COALESCE(activity.step_activity, agent_runs.started_at)', 'COALESCE(agent_runs.last_progress_at, agent_runs.started_at)'),
+            'COALESCE(agent_runs.lease_expires_at, agent_runs.started_at)',
+        );
+
+        $query = DB::table('agent_runs')
+            ->leftJoinSub($latestActivity, 'activity', 'activity.run_id', '=', 'agent_runs.id')
+            ->where('agent_runs.end_state', 'in_progress')
+            ->whereNull('agent_runs.cancelled_at')
+            ->whereNull('agent_runs.checkpoint_version')
+            ->whereRaw("{$latest} < ?", [$cutoff->format('Y-m-d H:i:s.u')]);
+
+        if (!empty($exemptRunIds)) {
+            $query->whereNotIn('agent_runs.id', $exemptRunIds);
+        }
+
+        return $query->select('agent_runs.id')->get()->all();
     }
 }
