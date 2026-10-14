@@ -5,6 +5,7 @@ namespace Tests\Integration\Resume;
 use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Jobs\ResumeInterruptedRunJob;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\McpClientTool;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Services\AgentLoopService;
@@ -23,6 +24,7 @@ use Illuminate\Support\Facades\Queue;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Integration\AssembledSystemTestCase;
 use Tests\Integration\Harness\OperationCatalogue;
+use Tests\Integration\Harness\ServesHelpers;
 use Tests\Integration\Harness\TaskBudgetHelperJourneys;
 use Tests\Support\EffectLedger;
 use Tests\Support\InjectedFault;
@@ -56,6 +58,7 @@ use Tests\Support\TravelsPastLease;
  */
 class ResumeFaultInjectionSyncTest extends AssembledSystemTestCase
 {
+    use ServesHelpers;
     use TaskBudgetHelperJourneys;
     use TravelsPastLease;
 
@@ -669,10 +672,61 @@ class ResumeFaultInjectionSyncTest extends AssembledSystemTestCase
         $this->assertSame(1, $this->effectLedger->count('ledger.write'), 'the step\'s write is not repeated');
     }
 
-    // T2 — a killed delegate batch: the resume half is covered in Phase 7
-    // (the batch's helper runs are driven by their parent's resume), so this
-    // file leaves the checkpoint-state half (above) and defers the batch
-    // resume to Phase 7.
+    // T2 — a killed delegate batch: the checkpoint-state half is above; the
+    // resume half is here. The batch's members are driven by their parent's
+    // resume, which rejoins them.
+
+    #[Test]
+    public function a_killed_delegate_batch_is_rejoined_by_the_resume_without_new_delegations(): void
+    {
+        $this->scenario = 'resume_sync_t2_batch_rejoin';
+        $this->setUpHelperJourney();
+        $this->bindInjector();
+        $this->priceModel();
+        $this->fixtureWithModel();
+        $root = $this->agent('root');
+        $members = [];
+        foreach (['a' => 'Part one.', 'b' => 'Part two.', 'c' => 'Part three.'] as $key => $task) {
+            $agent = $this->agent($key);
+            $this->assignHelper($root, $agent);
+            $this->serveHelperTask($task, strtoupper($key).' note', strtoupper($key).' done.');
+            $members[$key] = ['agent' => $agent, 'task' => $task, 'call' => "call_to_{$key}"];
+        }
+        $conversation = $this->rootConversation('sync', $root);
+        $this->script()->toolRequests(array_map(
+            fn (array $m) => $this->delegateCall($m['call'], $m['agent'], $m['task']),
+            array_values($members),
+        ))->usage(...self::USAGE);
+
+        // The parent dies with all three delegation rows made and no member
+        // started (the rows are created before any job is dispatched).
+        $this->killAt('after_delegation_row', 3, fn () => $this->app->make(AgentLoopService::class)->run($conversation, 'Do all three parts.'));
+
+        $before = $this->delegationsOf($conversation);
+        $this->assertCount(3, $before, 'precondition: every row was made');
+        foreach ($before as $row) {
+            $this->assertSame('queued', $row->status, 'precondition: no member started');
+        }
+        $this->assertSame([], $this->storedNotes());
+        $this->discardUnconsumedScript();
+        $this->script()->finalAnswer('All three parts are done.')->usage(...self::USAGE);
+
+        $this->resumeRun($conversation);
+
+        $after = $this->delegationsOf($conversation);
+        $this->assertSame(array_map(fn ($d) => $d->id, $before), array_map(fn ($d) => $d->id, $after), 'the resume made no new delegation: it rejoined the three it found');
+        foreach ($members as $key => $member) {
+            $row = Delegation::where('parent_conversation_id', $conversation->id)->where('helper_agent_id', $member['agent']->id)->firstOrFail();
+            $this->assertSame('completed', $row->status, "member {$key} ran");
+            $this->assertSame(strtoupper($key).' done.', $row->result_summary);
+            $this->assertSame(1, $this->resultCountFor($conversation, $member['call']), "member {$key}'s result reached the parent once");
+        }
+        $notes = $this->storedNotes();
+        sort($notes);
+        $this->assertSame(['A note', 'B note', 'C note'], $notes, 'each member ran once');
+        $this->assertSame('completed', $this->runRowOf($conversation)->end_state);
+        $this->tearDownTaskBudgetJourney();
+    }
 
     #[Test]
     public function killed_approved_call_after_effect_is_outcome_unknown_not_rerun(): void

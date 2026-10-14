@@ -2,9 +2,16 @@
 
 namespace Tests\RealDatabase;
 
+use ClarionApp\LlmClient\Models\Agent;
+use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Server;
+use ClarionApp\LlmClient\Services\DelegationService;
+use ClarionApp\LlmClient\Services\RoleAssignmentService;
+use ClarionApp\LlmClient\ValueObjects\ModelRole;
 use ClarionApp\LlmClient\Services\RunTraceRecorder;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\Group;
@@ -32,7 +39,7 @@ use PHPUnit\Framework\Attributes\Test;
 #[Group('real-db')]
 class ResumeSchemaTest extends RealDatabaseTestCase
 {
-    protected array $seedTables = ['agent_runs', 'agent_run_steps', 'agent_run_actions', 'agent_delegations', 'agent_run_resume_events'];
+    protected array $seedTables = ['agent_runs', 'agent_run_steps', 'agent_run_actions', 'agent_delegations', 'agent_run_resume_events', 'conversations', 'servers', 'role_assignments'];
 
     /** MariaDB reports a display width; MySQL 8 does not. */
     private const UNSIGNED_INT = 'unsigned int';
@@ -337,5 +344,45 @@ class ResumeSchemaTest extends RealDatabaseTestCase
         $stored = DB::table('agent_run_actions')->where('id', $actionId)->value('tool_call_id');
         $this->assertSame(255, strlen((string) $stored), 'the 300-character call id is cut to 255');
         $this->assertSame(str_repeat('x', 255), (string) $stored, 'the stored value is the first 255 characters');
+    }
+
+    // ---------------------------------------------------------------
+    // A 300-character provider call id on a delegation is cut to 255 on
+    // the real engine (the column's width), by the one write path every
+    // delegation row goes through.
+    // ---------------------------------------------------------------
+
+    #[Test]
+    public function a_300_character_parent_tool_call_id_is_cut_to_255_on_the_real_engine(): void
+    {
+        $this->assertReady();
+        $userId = (string) Str::uuid();
+        $server = Server::create([
+            'name' => 'Real engine server',
+            'provider_type' => 'openai',
+            'server_url' => 'https://api.openai.com/v1/chat/completions',
+            'token' => 'sk-test-token',
+        ]);
+        // The delegation's helper conversation takes the owner's inference model.
+        app(RoleAssignmentService::class)->set(ModelRole::Inference, $userId, $server->id, 'gpt-4');
+        $parent = Conversation::create(['user_id' => $userId, 'server_id' => $server->id, 'model' => 'gpt-4', 'character' => 'Clarion', 'channel' => 'web']);
+        $helper = new Agent(['user_id' => $userId, 'name' => 'long-call-id-helper']);
+        $helper->id = (string) Str::uuid();
+
+        // A 300-character provider call id, stamped the way the tool
+        // funnel stamps one: through the ambient Context.
+        $longId = str_repeat('c', 300);
+        Context::add('tool_call_id', $longId);
+        try {
+            $method = new \ReflectionMethod(DelegationService::class, 'createDelegationRow');
+            $method->setAccessible(true);
+            $delegation = $method->invoke(app(DelegationService::class), $parent, $helper, 1, 'Do the part.', null, 'in_progress', null);
+        } finally {
+            Context::forget('tool_call_id');
+        }
+
+        $stored = DB::table('agent_delegations')->where('id', $delegation->id)->value('parent_tool_call_id');
+        $this->assertSame(255, strlen((string) $stored), 'the 300-character call id is cut to 255, not refused by strict mode');
+        $this->assertSame(str_repeat('c', 255), (string) $stored, 'the stored value is the first 255 characters');
     }
 }

@@ -249,7 +249,7 @@ class ResumePlanner
 
             $state = (string) ($call['state'] ?? 'not_started');
             if ($state === 'completed' && is_array($call['result'] ?? null)) {
-                $dispositions[$id] = new CallDisposition(CallDispositionKind::Reuse, $call['result']);
+                $dispositions[$id] = new CallDisposition(CallDispositionKind::Reuse, $this->resultEntry($id, $call['result']));
                 continue;
             }
 
@@ -299,6 +299,24 @@ class ResumePlanner
         }
 
         return null;
+    }
+
+    /**
+     * The `tool_results` entry for a call completed in the checkpoint. The
+     * ledger holds the call's decoded result, not the entry the agent is
+     * given, so it is wrapped as the tool's own result text; an entry that
+     * is already one is left as it is.
+     *
+     * @param array<string, mixed> $result
+     * @return array<string, mixed>
+     */
+    private function resultEntry(string $id, array $result): array
+    {
+        if (isset($result['tool_call_id']) && array_key_exists('content', $result)) {
+            return $result;
+        }
+
+        return ['tool_call_id' => $id, 'content' => json_encode($result)];
     }
 
     /** A started, result-less call is dispositioned by its effect class. */

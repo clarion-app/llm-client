@@ -5,6 +5,7 @@ namespace ClarionApp\LlmClient\Commands;
 use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Services\DelegationService;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 
 /**
  * 101-parallel-subagent-execution (US3, contracts §6, research.md D4 layer
@@ -87,7 +88,8 @@ class ResolveStalledDelegationsCommand extends Command
         $staleRows = Delegation::whereNotNull('batch_id')
             ->whereIn('status', ['queued', 'in_progress'])
             ->where('started_at', '<', $cutoff)
-            ->get();
+            ->get()
+            ->reject(fn (Delegation $delegation) => $this->helperIsBeingResumed($delegation));
 
         if ($staleRows->isEmpty()) {
             $this->info('No stalled delegation batch members to resolve');
@@ -145,7 +147,9 @@ class ResolveStalledDelegationsCommand extends Command
             ->where('started_at', '<', $cutoff)
             ->get();
 
-        $idleRows = $staleRows->filter(fn (Delegation $delegation) => $delegationService->isIdle($delegation));
+        $idleRows = $staleRows
+            ->reject(fn (Delegation $delegation) => $this->helperIsBeingResumed($delegation))
+            ->filter(fn (Delegation $delegation) => $delegationService->isIdle($delegation));
 
         if ($idleRows->isEmpty()) {
             $this->info('No stalled solo delegations to resolve');
@@ -160,5 +164,20 @@ class ResolveStalledDelegationsCommand extends Command
                 $delegationService->finalizeStalledChain($delegation);
             }
         }
+    }
+
+    /**
+     * A helper whose run is being resumed, or is working under a live lease,
+     * is not a dead one: its awaiting owner drives it, and it ends through
+     * its own result. A run whose lease has run out is not protected.
+     */
+    private function helperIsBeingResumed(Delegation $delegation): bool
+    {
+        return DB::table('agent_runs')
+            ->where('conversation_id', $delegation->helper_conversation_id)
+            ->where('end_state', 'in_progress')
+            ->whereIn('resume_state', ['resuming', 'working'])
+            ->where('lease_expires_at', '>', now()->format('Y-m-d H:i:s.u'))
+            ->exists();
     }
 }

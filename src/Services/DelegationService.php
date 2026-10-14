@@ -13,6 +13,7 @@ use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\ValueObjects\ActionOutcome;
 use ClarionApp\LlmClient\ValueObjects\ActionType;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
+use ClarionApp\LlmClient\ValueObjects\ResumeCaller;
 use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use ClarionApp\LlmClient\ValueObjects\RunEndState;
 use ClarionApp\LlmClient\ValueObjects\RunKind;
@@ -285,6 +286,18 @@ class DelegationService
     }
 
     /**
+     * The result an agent called as a capability gives its caller, from the
+     * delegation's six-field result.
+     *
+     * @param array<string, mixed> $sixFieldResult
+     * @return array<string, mixed>
+     */
+    public function capabilityResultFor(array $sixFieldResult): array
+    {
+        return $this->translateCapabilityResult($sixFieldResult);
+    }
+
+    /**
      * 101-parallel-subagent-execution (US1, contracts §1, research.md
      * D1/D3, tasks.md T019). $calls is the ordered list of one turn
      * iteration's delegate_to_helper tool calls, each
@@ -392,11 +405,359 @@ class DelegationService
      */
     public function runBatchMember(Delegation $delegation): void
     {
-        $helperAgent = $this->agentQuery->findAgent($delegation->owner_user_id, $delegation->helper_agent_id)
-            ?? Agent::withTrashed()->find($delegation->helper_agent_id);
+        $helperAgent = $this->helperAgentOf($delegation);
         $helperConversation = Conversation::find($delegation->helper_conversation_id);
 
         $this->runDelegatedTask($delegation, $helperAgent, $helperConversation);
+    }
+
+    // -----------------------------------------------------------------
+    // Resuming helpers after an interruption
+    // -----------------------------------------------------------------
+
+    /** The statuses a delegation never leaves. */
+    private const TERMINAL_STATUSES = ['completed', 'exhausted', 'failed'];
+
+    private function helperAgentOf(Delegation $delegation): ?Agent
+    {
+        return $this->agentQuery->findAgent($delegation->owner_user_id, $delegation->helper_agent_id)
+            ?? Agent::withTrashed()->find($delegation->helper_agent_id);
+    }
+
+    /**
+     * The bounds a delegation that is started from the top runs under: an
+     * agent called as a capability has its own, every other hop the
+     * delegation defaults.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function boundOptionsFor(Delegation $delegation): ?array
+    {
+        if ($delegation->origin !== 'capability_offering') {
+            return null;
+        }
+
+        return [
+            'max_iterations' => config('llm-client.capability_agent.max_iterations', 15),
+            'deadline_at' => now()->addSeconds(config('llm-client.capability_agent.max_seconds', 180)),
+        ];
+    }
+
+    /**
+     * The result of a delegation whose helper (or its worker) was interrupted,
+     * for the task that is waiting on it (FR-017). A finished delegation
+     * answers from its own row; otherwise the helper's run is resumed in
+     * place, inline, with its deadline shifted by the time it sat, and the
+     * delegation ends exactly as one that was never interrupted does. A
+     * helper that never opened a run is started from the top: nothing it did
+     * needs protecting. A helper still held by a live worker is waited for.
+     *
+     * @return array<string, mixed> the six-field result plus delegation_id/helper
+     */
+    public function resumeDelegation(Delegation $delegation, ?string $resumeDriver = null): array
+    {
+        $delegation = Delegation::find($delegation->id) ?? $delegation;
+        if (in_array($delegation->status, self::TERMINAL_STATUSES, true)) {
+            return $this->sixFieldResultFromRow($delegation);
+        }
+
+        $helperAgent = $this->helperAgentOf($delegation);
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+        $runId = $this->helperRunIdFor($delegation->helper_conversation_id);
+
+        if ($runId === null) {
+            return $this->runDelegatedTask($delegation, $helperAgent, $helperConversation, $this->boundOptionsFor($delegation), $resumeDriver);
+        }
+
+        try {
+            $rawResult = $this->resumeHelperRun($runId, null);
+        } catch (\Throwable $e) {
+            return $this->concludeFailedDelegation($delegation, $helperAgent, $helperConversation, $e);
+        }
+
+        if ($rawResult === null) {
+            // A live worker holds the helper: it will conclude its own
+            // delegation, and this task waits for that like any member.
+            $this->joinWait([$delegation->id => $delegation]);
+
+            return $this->sixFieldResultFromRow(Delegation::find($delegation->id));
+        }
+
+        return $this->concludeDelegation($delegation, $helperAgent, $helperConversation, $rawResult);
+    }
+
+    /**
+     * A batch member whose worker died, resumed by the job its awaiting
+     * owner dispatched for it: the helper's run is claimed on the job's
+     * dispatch id and resumed in place, and the member's terminal row is
+     * written as an uninterrupted member's is. A job whose claim is lost (the
+     * member is being worked elsewhere) does nothing.
+     */
+    public function resumeBatchMember(Delegation $delegation, string $dispatchId): void
+    {
+        $helperAgent = $this->helperAgentOf($delegation);
+        $helperConversation = Conversation::find($delegation->helper_conversation_id);
+        $runId = $this->helperRunIdFor($delegation->helper_conversation_id);
+
+        if ($runId === null) {
+            $this->runDelegatedTask($delegation, $helperAgent, $helperConversation);
+
+            return;
+        }
+
+        try {
+            $rawResult = $this->resumeHelperRun($runId, $dispatchId);
+        } catch (\Throwable $e) {
+            $this->concludeFailedDelegation($delegation, $helperAgent, $helperConversation, $e);
+
+            return;
+        }
+
+        if ($rawResult === null) {
+            return;
+        }
+
+        $this->concludeDelegation($delegation, $helperAgent, $helperConversation, $rawResult);
+    }
+
+    /**
+     * Resume one helper run through the resumer and hand back what the
+     * helper's loop returned, as `run()` would have. A run already ended
+     * (the worker died after the run closed and before the delegation was
+     * written) answers from the run itself. Null when the run is held by a
+     * live worker, or the claim was lost.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function resumeHelperRun(string $runId, ?string $dispatchId): ?array
+    {
+        $row = DB::table('agent_runs')->where('id', $runId)->first();
+        if ($row === null) {
+            return null;
+        }
+        if ($row->end_state !== RunEndState::InProgress->value) {
+            return $this->rawResultOfEndedRun($row);
+        }
+
+        if ($dispatchId === null) {
+            // Only a run nobody is working may be taken: a sweep-marked one,
+            // or one whose lease has run out.
+            $idle = $row->resume_state === 'interrupted'
+                || $row->lease_holder === null
+                || ($row->lease_expires_at !== null && \Carbon\Carbon::parse($row->lease_expires_at)->lt(now()));
+            if (!$idle) {
+                return null;
+            }
+
+            $dispatchId = app(RunLease::class)->mintDispatch($runId, ['interrupted', 'working', 'resuming']);
+            if ($dispatchId === null) {
+                return null;
+            }
+        }
+
+        $enclosingRunId = Context::get('run_id');
+        $enclosingTaskBudgetId = Context::get('task_budget_id');
+        try {
+            $rawResult = app(RunResumer::class)->resume($runId, $dispatchId, ResumeCaller::Background);
+        } finally {
+            if ($enclosingRunId !== null) {
+                Context::add('run_id', $enclosingRunId);
+            }
+            if ($enclosingTaskBudgetId !== null) {
+                Context::add('task_budget_id', $enclosingTaskBudgetId);
+            }
+        }
+
+        if ($rawResult !== null) {
+            return $rawResult;
+        }
+
+        // The resumer may have closed the run itself (a cancelled helper).
+        $after = DB::table('agent_runs')->where('id', $runId)->first();
+
+        return $after !== null && $after->end_state !== RunEndState::InProgress->value
+            ? $this->rawResultOfEndedRun($after)
+            : null;
+    }
+
+    /**
+     * What a helper's loop would have returned, rebuilt from its ended run
+     * and the last thing it said.
+     *
+     * @return array<string, mixed>
+     */
+    private function rawResultOfEndedRun(object $run): array
+    {
+        $content = (string) (Conversation::find($run->conversation_id)?->messages()
+            ->where('role', 'assistant')
+            ->orderByDesc('created_at')
+            ->value('content') ?? '');
+        $reason = strtolower((string) ($run->end_reason ?? ''));
+
+        if ($run->end_state === RunEndState::Completed->value) {
+            $validated = json_decode($content, true);
+            if (is_array($validated) && isset($validated['status'])) {
+                return ['status' => 'completed', 'content' => $content, 'validated' => $validated];
+            }
+
+            return ['status' => 'error', 'content' => $content];
+        }
+        if (str_contains($reason, 'time bound')) {
+            return ['status' => 'error', 'code' => 'time_ceiling_reached', 'content' => $content];
+        }
+        if (str_contains($reason, 'budget')) {
+            return ['status' => 'error', 'code' => 'task_budget_reached', 'content' => $content];
+        }
+
+        return ['status' => 'stopped', 'code' => 'unresumable', 'content' => $content];
+    }
+
+    /**
+     * A helper stopped by the resumer (its progress could not be continued
+     * safely): the delegation it belongs to ends with a failure of its own
+     * kind, so the task that delegated to it hears of the stop instead of
+     * waiting for a result that will never come. Idempotent: a delegation
+     * already ended is left alone.
+     */
+    public function recordHelperStopped(string $helperConversationId): void
+    {
+        $delegation = Delegation::where('helper_conversation_id', $helperConversationId)
+            ->whereIn('status', ['queued', 'in_progress'])
+            ->first();
+        if ($delegation === null) {
+            return;
+        }
+
+        $this->concludeDelegation(
+            $delegation,
+            $this->helperAgentOf($delegation),
+            Conversation::find($helperConversationId),
+            ['status' => 'stopped', 'code' => 'unresumable', 'content' => ''],
+        );
+    }
+
+    /**
+     * The resumed parent's batch path: its members' results by the call that
+     * made each. Finished members are reused, queued ones started, a member
+     * whose helper was interrupted resumed, and the rest waited for exactly
+     * as the original join waits, with fresh deadlines.
+     *
+     * @param  iterable<Delegation>  $delegations
+     * @return array<string, array<string, mixed>> keyed by `parent_tool_call_id`
+     */
+    public function rejoin(iterable $delegations): array
+    {
+        $pending = [];
+        $all = [];
+        foreach ($delegations as $delegation) {
+            $delegation = Delegation::find($delegation->id) ?? $delegation;
+            $all[] = $delegation;
+
+            if (in_array($delegation->status, self::TERMINAL_STATUSES, true)) {
+                continue;
+            }
+
+            if ($delegation->status === 'queued') {
+                RunDelegationBatchMemberJob::dispatch($delegation->id)->onQueue(config('llm-client.delegation.concurrency.queue', 'delegation-batches'));
+            } else {
+                $this->resumeMemberIfInterrupted($delegation, true);
+            }
+            $pending[$delegation->id] = $delegation;
+        }
+
+        if (!empty($pending)) {
+            $this->joinWait($pending);
+        }
+
+        $results = [];
+        foreach ($all as $delegation) {
+            $results[(string) $delegation->parent_tool_call_id] = $this->sixFieldResultFromRow(Delegation::find($delegation->id));
+        }
+
+        return $results;
+    }
+
+    /**
+     * An `in_progress` batch member whose helper run lost its worker is
+     * handed to a member job in resume mode; one that never opened a run
+     * (its worker died right after admission) goes back to the queue. Both
+     * are decided by one compare-and-set, so a poll that comes round again
+     * does not dispatch twice. Returns whether it dispatched.
+     *
+     * @param bool $adoptMarked a member already marked interrupted (by the
+     *   sweep, which counted that interruption) is taken at once: the caller
+     *   is the one the sweep handed the member's recovery to
+     */
+    private function resumeMemberIfInterrupted(Delegation $delegation, bool $adoptMarked = false): bool
+    {
+        if ($delegation->batch_id === null || $delegation->status !== 'in_progress') {
+            return false;
+        }
+
+        $queue = config('llm-client.delegation.concurrency.queue', 'delegation-batches');
+        $run = DB::table('agent_runs')
+            ->where('conversation_id', $delegation->helper_conversation_id)
+            ->where('kind', RunKind::Interactive->value)
+            ->orderBy('created_at')
+            ->first(['id', 'end_state', 'resume_state', 'dispatch_id', 'lease_holder', 'lease_expires_at', 'interrupted_at', 'last_progress_at', 'consecutive_interruptions']);
+
+        if ($run === null) {
+            // Admitted but never started: only after the worker's own start-up
+            // time has passed, back to the queue it came from.
+            $grace = (int) config('llm-client.resume.helper_lease_seconds', 30) + (int) config('llm-client.resume.lease_grace_seconds', 30);
+            if ($delegation->started_at === null || $delegation->started_at->gt(now()->subSeconds($grace))) {
+                return false;
+            }
+            $requeued = Delegation::where('id', $delegation->id)->where('status', 'in_progress')->update(['status' => 'queued']);
+            if ($requeued === 0) {
+                return false;
+            }
+            RunDelegationBatchMemberJob::dispatch($delegation->id)->onQueue($queue);
+
+            return true;
+        }
+
+        if ($run->end_state !== RunEndState::InProgress->value) {
+            return false;
+        }
+
+        $window = (int) config('llm-client.resume.detection_window_seconds', 300);
+        $state = (string) $run->resume_state;
+
+        if ($adoptMarked && $state === 'interrupted') {
+            $dispatch = app(RunLease::class)->mintDispatch((string) $run->id, ['interrupted']);
+            if ($dispatch === null) {
+                return false;
+            }
+            dispatch(RunDelegationBatchMemberJob::forResume($delegation->id, $dispatch))->onQueue($queue);
+
+            return true;
+        }
+
+        $expired = match ($state) {
+            'working', 'resuming' => $run->lease_expires_at !== null && \Carbon\Carbon::parse($run->lease_expires_at)->lt(now()),
+            'interrupted' => $run->interrupted_at !== null && \Carbon\Carbon::parse($run->interrupted_at)->lt(now()->subSeconds($window)),
+            default => false,
+        };
+        if (!$expired) {
+            return false;
+        }
+
+        $dispatch = app(RunLease::class)->interruptExpired((string) $run->id, $run->dispatch_id !== null ? (string) $run->dispatch_id : null, $state);
+        if ($dispatch === null) {
+            return false;
+        }
+
+        app(ResumeEventLog::class)->record((string) $run->id, 'interruption_detected', null, (int) $run->consecutive_interruptions + 1, [
+            'last_progress_at' => $run->last_progress_at !== null ? (string) $run->last_progress_at : null,
+            'lease_expired_at' => $run->lease_expires_at !== null ? (string) $run->lease_expires_at : null,
+            'resume_state_before' => $state,
+            'detected_by' => 'join_wait',
+        ]);
+
+        dispatch(RunDelegationBatchMemberJob::forResume($delegation->id, $dispatch))->onQueue($queue);
+
+        return true;
     }
 
     /**
@@ -1130,77 +1491,7 @@ class DelegationService
         try {
             $rawResult = $this->agentLoopService->run($helperConversation, $composedMessage, $delegationOptions);
         } catch (\Throwable $e) {
-            // 110-delegation-deadlock-timeout (FR-013): if the chain was
-            // stopped while this hop was still running, the outcome this
-            // hop is about to report is a LATE result and must be
-            // discarded rather than written over the already-resolved row.
-            $lateResult = $this->discardedLateResult($delegation);
-            if ($lateResult !== null) {
-                return $lateResult;
-            }
-
-            // D5: a thrown exception from the nested run() call must never
-            // propagate to the parent's own loop -- caught here and mapped
-            // to a terminal 'failed' Delegation, matching the ordinary
-            // ceiling/completion outcomes' own shape (FR-008/FR-012).
-            $failureReason = Str::limit($e->getMessage(), 500);
-
-            $delegation->status = 'failed';
-            $delegation->completed_at = now();
-            $delegation->outcome_summary = $failureReason;
-            // A helper run that opened and then threw still has its own,
-            // fully-traced (Failed-closed) run row -- linking it here keeps
-            // FR-012 recoverability true of a failed delegation too, not
-            // just a completed one (data-model.md §1: helper_run_id is
-            // "null only if run tracing is disabled").
-            $delegation->helper_run_id = $this->helperRunIdFor($helperConversation->id);
-
-            // 099-result-aggregation (research.md D2, checked FIRST, before
-            // the generic \Throwable handling below): a SchemaValidationError
-            // means the helper's own final answer either never conformed to
-            // the mandatory delegation_result schema, or was empty --
-            // getRawContent() is the only field that distinguishes the two
-            // (User Story 5 AC1 vs AC2).
-            if ($e instanceof SchemaValidationError) {
-                $resultReason = trim($e->getRawContent()) === '' ? 'no_output' : 'malformed_output';
-                $resultSummary = $resultReason === 'no_output'
-                    ? 'The helper produced no output at all.'
-                    : "The helper's output did not conform to the required result schema.";
-            } else {
-                $resultReason = 'exception';
-                $resultSummary = 'The delegation failed due to an unexpected error.';
-            }
-
-            // FR-007: a failure never carries content that could be mistaken
-            // for genuine output -- no content was ever produced on either
-            // of these paths, so result_output stays null.
-            $resultUndone = 'Everything -- the task could not be completed.';
-
-            $delegation->result_status = 'failure';
-            $delegation->result_reason = $resultReason;
-            $delegation->result_summary = $resultSummary;
-            $delegation->result_output = null;
-            $delegation->result_undone = $resultUndone;
-            $delegation->result_truncated = false;
-            $delegation->save();
-
-            $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
-
-            $sixFieldResult = [
-                'status' => 'failure',
-                'summary' => $resultSummary,
-                'output' => null,
-                'undone' => $resultUndone,
-                'truncated' => false,
-                'reason' => $resultReason,
-            ];
-
-            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason, json_encode($sixFieldResult));
-
-            return array_merge(
-                ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
-                $sixFieldResult,
-            );
+            return $this->concludeFailedDelegation($delegation, $helperAgent, $helperConversation, $e);
         } finally {
             if ($enclosingRunId !== null) {
                 Context::add('run_id', $enclosingRunId);
@@ -1209,6 +1500,108 @@ class DelegationService
                 Context::add('task_budget_id', $enclosingTaskBudgetId);
             }
         }
+
+        return $this->concludeDelegation($delegation, $helperAgent, $helperConversation, $rawResult);
+    }
+
+    /**
+     * The terminal write for a delegation whose helper run threw (or whose
+     * resumed run threw): a late result is discarded, otherwise the row is
+     * mapped to a terminal `failed` outcome, exactly as an uninterrupted
+     * delegation maps it.
+     *
+     * @return array<string, mixed>
+     */
+    private function concludeFailedDelegation(Delegation $delegation, Agent $helperAgent, Conversation $helperConversation, \Throwable $e): array
+    {
+        $actionId = $delegation->parent_action_id;
+
+        // 110-delegation-deadlock-timeout (FR-013): if the chain was
+        // stopped while this hop was still running, the outcome this
+        // hop is about to report is a LATE result and must be
+        // discarded rather than written over the already-resolved row.
+        $lateResult = $this->discardedLateResult($delegation);
+        if ($lateResult !== null) {
+            return $lateResult;
+        }
+
+        // D5: a thrown exception from the nested run() call must never
+        // propagate to the parent's own loop -- caught here and mapped
+        // to a terminal 'failed' Delegation, matching the ordinary
+        // ceiling/completion outcomes' own shape (FR-008/FR-012).
+        $failureReason = Str::limit($e->getMessage(), 500);
+
+        $delegation->status = 'failed';
+        $delegation->completed_at = now();
+        $delegation->outcome_summary = $failureReason;
+        // A helper run that opened and then threw still has its own,
+        // fully-traced (Failed-closed) run row -- linking it here keeps
+        // FR-012 recoverability true of a failed delegation too, not
+        // just a completed one (data-model.md §1: helper_run_id is
+        // "null only if run tracing is disabled").
+        $delegation->helper_run_id = $this->helperRunIdFor($helperConversation->id);
+
+        // 099-result-aggregation (research.md D2, checked FIRST, before
+        // the generic \Throwable handling below): a SchemaValidationError
+        // means the helper's own final answer either never conformed to
+        // the mandatory delegation_result schema, or was empty --
+        // getRawContent() is the only field that distinguishes the two
+        // (User Story 5 AC1 vs AC2).
+        if ($e instanceof SchemaValidationError) {
+            $resultReason = trim($e->getRawContent()) === '' ? 'no_output' : 'malformed_output';
+            $resultSummary = $resultReason === 'no_output'
+                ? 'The helper produced no output at all.'
+                : "The helper's output did not conform to the required result schema.";
+        } else {
+            $resultReason = 'exception';
+            $resultSummary = 'The delegation failed due to an unexpected error.';
+        }
+
+        // FR-007: a failure never carries content that could be mistaken
+        // for genuine output -- no content was ever produced on either
+        // of these paths, so result_output stays null.
+        $resultUndone = 'Everything -- the task could not be completed.';
+
+        $delegation->result_status = 'failure';
+        $delegation->result_reason = $resultReason;
+        $delegation->result_summary = $resultSummary;
+        $delegation->result_output = null;
+        $delegation->result_undone = $resultUndone;
+        $delegation->result_truncated = false;
+        $delegation->save();
+
+        $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
+
+        $sixFieldResult = [
+            'status' => 'failure',
+            'summary' => $resultSummary,
+            'output' => null,
+            'undone' => $resultUndone,
+            'truncated' => false,
+            'reason' => $resultReason,
+        ];
+
+        $this->closeDelegationAction($actionId, ActionOutcome::Failure, $failureReason, json_encode($sixFieldResult));
+
+        return array_merge(
+            ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
+            $sixFieldResult,
+        );
+    }
+
+    /**
+     * Everything a delegation does once its helper run has returned: the late-
+     * result guard, then the terminal write that maps the run's outcome to the
+     * delegation row, the parent's trace action and the six-field result. Shared
+     * by a delegation that ran straight through and one whose helper run was
+     * resumed after an interruption, so both end exactly the same way.
+     *
+     * @param array<string, mixed> $rawResult what the helper's loop returned
+     * @return array<string, mixed>
+     */
+    private function concludeDelegation(Delegation $delegation, Agent $helperAgent, Conversation $helperConversation, array $rawResult): array
+    {
+        $actionId = $delegation->parent_action_id;
 
         // 110-delegation-deadlock-timeout (FR-013): the same late-result
         // check the catch branch above applies, covering every one of the
@@ -1302,7 +1695,7 @@ class DelegationService
                 'reason' => $resultReason,
             ];
 
-            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Success, null, json_encode($sixFieldResult));
+            $this->closeDelegationAction($actionId, ActionOutcome::Success, null, json_encode($sixFieldResult));
 
             return array_merge(
                 ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
@@ -1358,7 +1751,7 @@ class DelegationService
                 $sixFieldResult['stopped_by'] = 'task_budget';
             }
 
-            $this->runTraceRecorder->closeAction(
+            $this->closeDelegationAction(
                 $actionId,
                 ActionOutcome::Unfinished,
                 null,
@@ -1407,7 +1800,45 @@ class DelegationService
                 'reason' => 'confirmation_required',
             ];
 
-            $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $resultSummary, json_encode($sixFieldResult));
+            $this->closeDelegationAction($actionId, ActionOutcome::Failure, $resultSummary, json_encode($sixFieldResult));
+
+            return array_merge(
+                ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
+                $sixFieldResult,
+            );
+        }
+
+        // 134-resumable-long-tasks: the helper's run was interrupted and could
+        // not be continued (the resumer stopped it with a report). The task
+        // that delegated to it is told so, as a failure of its own kind
+        // rather than "no output".
+        if ($code === 'unresumable') {
+            $resultSummary = app(TaskResumeText::class)->helperCouldNotResume();
+            $resultUndone = 'Everything -- the task could not be completed.';
+
+            $delegation->status = 'failed';
+            $delegation->completed_at = now();
+            $delegation->outcome_summary = $resultSummary;
+            $delegation->result_status = 'failure';
+            $delegation->result_reason = 'interrupted';
+            $delegation->result_output = null;
+            $delegation->result_summary = $resultSummary;
+            $delegation->result_undone = $resultUndone;
+            $delegation->result_truncated = false;
+            $delegation->save();
+
+            $this->broadcast(fn () => event(new DelegationUpdated($delegation->id)));
+
+            $sixFieldResult = [
+                'status' => 'failure',
+                'summary' => $resultSummary,
+                'output' => null,
+                'undone' => $resultUndone,
+                'truncated' => false,
+                'reason' => 'interrupted',
+            ];
+
+            $this->closeDelegationAction($actionId, ActionOutcome::Failure, $resultSummary, json_encode($sixFieldResult));
 
             return array_merge(
                 ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
@@ -1459,12 +1890,34 @@ class DelegationService
             'reason' => 'no_output',
         ];
 
-        $this->runTraceRecorder->closeAction($actionId, ActionOutcome::Failure, $failureReason, json_encode($sixFieldResult));
+        $this->closeDelegationAction($actionId, ActionOutcome::Failure, $failureReason, json_encode($sixFieldResult));
 
         return array_merge(
             ['delegation_id' => $delegation->id, 'helper' => $helperAgent->name],
             $sixFieldResult,
         );
+    }
+
+    /**
+     * The delegation's action on its delegator's step, closed with the
+     * delegation's result: unless an earlier stop of that step (the
+     * delegator's own, after an interruption) already closed it.
+     */
+    private function closeDelegationAction(?string $actionId, ActionOutcome $outcome, ?string $failureReason = null, ?string $content = null): void
+    {
+        if ($actionId === null) {
+            return;
+        }
+
+        try {
+            if (DB::table('agent_run_actions')->where('id', $actionId)->where('outcome', '!=', ActionOutcome::InProgress->value)->exists()) {
+                return;
+            }
+        } catch (\Throwable) {
+            // no trace tables to consult: close it as always
+        }
+
+        $this->runTraceRecorder->closeAction($actionId, $outcome, $failureReason, $content);
     }
 
     /**
@@ -1554,8 +2007,14 @@ class DelegationService
         $pollIntervalMs = max(1, (int) config('llm-client.delegation.concurrency.join_poll_interval_ms', 200));
 
         $deadlines = [];
+        $byId = [];
+        foreach ($validRows as $member) {
+            $byId[$member->id] = $member;
+        }
 
         while (true) {
+            app(\ClarionApp\LlmClient\Contracts\FaultInjector::class)->reach('during_join_wait');
+
             $rows = Delegation::whereIn('id', $ids)->get(['id', 'status']);
             $now = now();
             $anyStillWaiting = false;
@@ -1572,6 +2031,16 @@ class DelegationService
                 if (!isset($deadlines[$row->id])) {
                     $deadlines[$row->id] = $now->copy()->addSeconds($maxSeconds + $graceSeconds);
                 }
+
+                // A member whose helper lost its worker is resumed, not
+                // waited out: it is handed to a member job in resume mode and
+                // given one more full allowance, once per interruption.
+                if ($row->status === 'in_progress' && isset($byId[$row->id]) && $this->resumeMemberIfInterrupted($byId[$row->id]->fresh() ?? $byId[$row->id])) {
+                    $base = $deadlines[$row->id]->gt($now) ? $deadlines[$row->id] : $now;
+                    $deadlines[$row->id] = $base->copy()->addSeconds($maxSeconds + $graceSeconds);
+                    $this->renewWaitingLease($maxSeconds + $graceSeconds);
+                }
+
                 if ($now->lt($deadlines[$row->id])) {
                     $anyStillWaiting = true;
                 }
@@ -1595,6 +2064,25 @@ class DelegationService
 
         foreach ($stillPending as $delegation) {
             $this->forceFinalizeBatchJoinTimeout($delegation);
+        }
+    }
+
+    /**
+     * The task waiting on its members keeps its own lease over the extra
+     * allowance a resumed member is given, so the wait is not mistaken for a
+     * dead worker. A lease this process no longer holds is not its to renew.
+     */
+    private function renewWaitingLease(int $seconds): void
+    {
+        $runId = Context::get('run_id');
+        if ($runId === null) {
+            return;
+        }
+
+        try {
+            app(RunCheckpoint::class)->renewLease((string) $runId, $seconds + (int) config('llm-client.resume.lease_grace_seconds', 30));
+        } catch (\Throwable) {
+            // not held here (a delegation made outside a checkpointed run)
         }
     }
 

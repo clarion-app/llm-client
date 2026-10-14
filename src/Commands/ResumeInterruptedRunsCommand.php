@@ -2,11 +2,15 @@
 
 namespace ClarionApp\LlmClient\Commands;
 
+use ClarionApp\LlmClient\Jobs\ResumeConsensusRequestJob;
 use ClarionApp\LlmClient\Jobs\ResumeInterruptedRunJob;
+use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
 use ClarionApp\LlmClient\Models\AgentRun;
+use ClarionApp\LlmClient\Services\ConsensusService;
 use ClarionApp\LlmClient\Services\LegacyRunAssessment;
 use ClarionApp\LlmClient\Services\PausedRunQuery;
 use ClarionApp\LlmClient\Services\ResumeEventLog;
+use ClarionApp\LlmClient\Services\RunLease;
 use ClarionApp\LlmClient\Services\RunResumer;
 use ClarionApp\LlmClient\ValueObjects\Unresumable;
 use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
@@ -63,6 +67,7 @@ class ResumeInterruptedRunsCommand extends Command
 
         $resumed = 0;
         $skipped = 0;
+        $consensusDispatched = [];
 
         foreach ($eligible as $run) {
             $runId = (string) $run->id;
@@ -70,19 +75,29 @@ class ResumeInterruptedRunsCommand extends Command
 
             switch ($driver) {
                 case ResumeDriver::Root:
-                    $resumed += $this->resumeRoot($run, $now, $cutoff, $window, $dryRun);
+                    $resumed += $this->resumeRoot($run, $dryRun);
                     break;
                 case ResumeDriver::Parent:
-                case ResumeDriver::BatchMember:
                     $this->closeOrphanedHelper($run, $dryRun);
                     $skipped++;
                     break;
+                case ResumeDriver::BatchMember:
+                    // A live parent's wait drives its member; a dead parent's
+                    // own resume re-joins it. A multi-opinion request has no
+                    // parent run at all: its contributors lead back to the
+                    // request, which one job finishes.
+                    if ($this->isParentless($runId)) {
+                        $resumed += $this->resumeConsensusContributor($run, $dryRun, $consensusDispatched);
+                    } else {
+                        $this->closeOrphanedHelper($run, $dryRun);
+                        $skipped++;
+                    }
+                    break;
                 case ResumeDriver::SequenceStage:
+                    $resumed += $this->resumeSequenceStage($run, $dryRun);
+                    break;
                 case ResumeDriver::Consensus:
-                    // the sequence-stage and consensus drivers resume
-                    // their own work; this sweep leaves them to their own
-                    // re-drive.
-                    $skipped++;
+                    $resumed += $this->resumeConsensusContributor($run, $dryRun, $consensusDispatched);
                     break;
                 case ResumeDriver::None:
                 default:
@@ -113,10 +128,9 @@ class ResumeInterruptedRunsCommand extends Command
      * interruption bound is reached the job is still dispatched: the resumer
      * stops the run with its report and records `stopped_unresumable`.
      */
-    private function resumeRoot(object $run, $now, $cutoff, int $window, bool $dryRun): int
+    private function resumeRoot(object $run, bool $dryRun): int
     {
         $runId = (string) $run->id;
-        $max = (int) config('llm-client.resume.max_consecutive_interruptions', 3);
 
         if ($dryRun) {
             $this->line("  would resume {$runId}");
@@ -124,52 +138,36 @@ class ResumeInterruptedRunsCommand extends Command
             return 1;
         }
 
-        $newDispatch = (string) Str::uuid();
-        $oldDispatch = $run->dispatch_id !== null ? (string) $run->dispatch_id : null;
+        $newDispatch = $this->interrupt($run);
+        if ($newDispatch === null) {
+            return 0;
+        }
+
+        ResumeInterruptedRunJob::dispatch($runId, $newDispatch);
+
+        return 1;
+    }
+
+    /**
+     * The compare-and-set that hands an expired run to exactly one unit of
+     * work: it mints the dispatch id, counts the interruption, marks the run
+     * `interrupted` and releases the lease. The eligibility predicate is
+     * re-evaluated in the WHERE so a run that recovered in the gap is not
+     * swept. Returns the new dispatch id, or null when another process won.
+     */
+    private function interrupt(object $run): ?string
+    {
+        $runId = (string) $run->id;
+        $max = (int) config('llm-client.resume.max_consecutive_interruptions', 3);
         $seenState = (string) $run->resume_state;
 
-        // The compare-and-set: mint the dispatch id, count the interruption,
-        // mark `interrupted`, release the lease. The dispatch_id comparison is
-        // written portably for SQLite (a null-safe equality). The eligibility
-        // predicate is re-evaluated in the WHERE so a run that recovered in the
-        // gap is not swept.
-        // One placeholder per occurrence: the real engine (native prepares)
-        // rejects a named parameter used twice.
-        $nowStamp = $now->format('Y-m-d H:i:s.u');
-        $cutoffStamp = $cutoff->format('Y-m-d H:i:s.u');
-        $affected = DB::connection()->update(
-            "UPDATE agent_runs
-                SET resume_state = 'interrupted',
-                    interrupted_at = ?,
-                    dispatch_id = ?,
-                    lease_holder = NULL,
-                    consecutive_interruptions = consecutive_interruptions + 1
-              WHERE id = ?
-                AND (dispatch_id = ? OR (dispatch_id IS NULL AND ? = 1))
-                AND resume_state = ?
-                AND end_state = 'in_progress'
-                AND cancelled_at IS NULL
-                AND checkpoint_version = 1
-                AND (
-                      (resume_state IN ('working','resuming') AND lease_expires_at < ?)
-                   OR (resume_state = 'waiting_provider_retry' AND next_attempt_at < ?)
-                   OR (resume_state = 'interrupted' AND interrupted_at < ?)
-                )",
-            [
-                $nowStamp,
-                $newDispatch,
-                $runId,
-                $oldDispatch ?? '',
-                $oldDispatch === null ? 1 : 0,
-                $seenState,
-                $nowStamp,
-                $cutoffStamp,
-                $cutoffStamp,
-            ],
+        $newDispatch = app(RunLease::class)->interruptExpired(
+            $runId,
+            $run->dispatch_id !== null ? (string) $run->dispatch_id : null,
+            $seenState,
         );
-
-        if ($affected === 0) {
-            return 0;
+        if ($newDispatch === null) {
+            return null;
         }
 
         // The CAS just counted this interruption. At the bound the
@@ -185,9 +183,119 @@ class ResumeInterruptedRunsCommand extends Command
             ]);
         }
 
-        ResumeInterruptedRunJob::dispatch($runId, $newDispatch);
+        return $newDispatch;
+    }
+
+    /**
+     * A sequence stage's helper run: the same compare-and-set as a root
+     * (so the next sweep minute does not dispatch again while the stage job
+     * is queued, and a lost stage job is re-driven once the window passes),
+     * then one stage job for the sequence run.
+     */
+    private function resumeSequenceStage(object $run, bool $dryRun): int
+    {
+        $runId = (string) $run->id;
+        $sequenceRunId = $this->sequenceRunIdOf($runId);
+        if ($sequenceRunId === null) {
+            return 0;
+        }
+
+        if ($dryRun) {
+            $this->line("  would resume the stage of sequence run {$sequenceRunId} ({$runId})");
+
+            return 1;
+        }
+
+        if ($this->interrupt($run) === null) {
+            return 0;
+        }
+
+        RunSequenceStageJob::dispatch($sequenceRunId)->onQueue(config('llm-client.pipeline.queue', 'sequence-runs'));
 
         return 1;
+    }
+
+    /**
+     * The sequence run whose stage this helper run works: the stage's
+     * delegation lives in the sequence run's conversation, with the stage's
+     * helper agent, and the stage is still marked running.
+     */
+    private function sequenceRunIdOf(string $helperRunId): ?string
+    {
+        $delegation = DB::table('agent_delegations')
+            ->where('helper_conversation_id', DB::table('agent_runs')->where('id', $helperRunId)->value('conversation_id'))
+            ->first(['parent_conversation_id', 'helper_agent_id']);
+        if ($delegation === null) {
+            return null;
+        }
+
+        $candidates = DB::table('sequence_runs')
+            ->where('conversation_id', $delegation->parent_conversation_id)
+            ->whereIn('status', ['in_progress', 'resumed'])
+            ->orderByDesc('started_at')
+            ->pluck('id');
+
+        foreach ($candidates as $sequenceRunId) {
+            $isThatStage = DB::table('stage_results')
+                ->join('stages', 'stages.id', '=', 'stage_results.stage_id')
+                ->where('stage_results.sequence_run_id', $sequenceRunId)
+                ->where('stage_results.status', 'running')
+                ->where('stages.helper_agent_id', $delegation->helper_agent_id)
+                ->exists();
+            if ($isThatStage) {
+                return (string) $sequenceRunId;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * A multi-opinion request's contributors, orphaned with the request's
+     * own process: their runs are batch members with no parent run. One
+     * resume job is dispatched per request, found from the contributors; the
+     * compare-and-set on each contributor run lets exactly one sweep pass
+     * dispatch it, and the next only once the detection window has passed.
+     *
+     * @param array<string, string> $dispatched request ids dispatched in this pass
+     */
+    private function resumeConsensusContributor(object $run, bool $dryRun, array &$dispatched): int
+    {
+        $runId = (string) $run->id;
+        $requestId = app(ConsensusService::class)->requestOfContributorRun($runId);
+        if ($requestId === null) {
+            return 0;
+        }
+
+        if ($dryRun) {
+            $this->line("  would resume multi-opinion request {$requestId} ({$runId})");
+
+            return 1;
+        }
+
+        if ($this->interrupt($run) === null) {
+            return 0;
+        }
+
+        if (isset($dispatched[$requestId])) {
+            return 0;
+        }
+        $dispatched[$requestId] = $runId;
+
+        ResumeConsensusRequestJob::dispatch($requestId)->onQueue(config('llm-client.resume.queue', 'default'));
+
+        return 1;
+    }
+
+    /** Whether the run's delegation was made outside any run (a multi-opinion request's batch). */
+    private function isParentless(string $runId): bool
+    {
+        $conversationId = DB::table('agent_runs')->where('id', $runId)->value('conversation_id');
+
+        return DB::table('agent_delegations')
+            ->where('helper_conversation_id', $conversationId)
+            ->whereNull('parent_run_id')
+            ->exists();
     }
 
     /**

@@ -44,6 +44,7 @@ class ResolveStalledDelegationsCommandTest extends TestCase
     protected function tearDown(): void
     {
         DB::table('agent_delegations')->delete();
+        DB::table('agent_runs')->delete();
 
         parent::tearDown();
     }
@@ -164,6 +165,76 @@ class ResolveStalledDelegationsCommandTest extends TestCase
     // not duplicated here -- this file stays scoped to the batch-member
     // branch alone, per its own header doc.
     // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // 134-resumable-long-tasks: a helper run that is being resumed is not
+    // a dead one. The sweep exempts a delegation whose helper run holds a
+    // live lease (resuming or working), and still resolves one whose
+    // lease has run out.
+    // -----------------------------------------------------------------
+
+    private function makeHelperRun(Delegation $delegation, string $resumeState, \DateTimeInterface $leaseExpiresAt): void
+    {
+        DB::table('agent_runs')->insert([
+            'id' => (string) Str::uuid(),
+            'kind' => 'interactive',
+            'user_id' => $delegation->owner_user_id,
+            'conversation_id' => $delegation->helper_conversation_id,
+            'end_state' => 'in_progress',
+            'started_at' => now()->subMinutes(30),
+            'checkpoint_version' => 1,
+            'resume_driver' => 'batch_member',
+            'resume_state' => $resumeState,
+            'lease_holder' => (string) Str::uuid(),
+            'lease_expires_at' => $leaseExpiresAt,
+        ]);
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function liveResumeStates(): array
+    {
+        return ['resuming' => ['resuming'], 'working' => ['working']];
+    }
+
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('liveResumeStates')]
+    public function a_member_whose_helper_run_holds_a_live_lease_is_exempt(string $resumeState): void
+    {
+        $delegation = $this->makeDelegation('in_progress', (string) Str::uuid(), $this->staleTimestamp());
+        $this->makeHelperRun($delegation, $resumeState, now()->addSeconds(30));
+
+        Artisan::call('llm-client:resolve-stalled-delegations');
+
+        $row = $this->fresh($delegation);
+        $this->assertSame('in_progress', $row->status, 'a member whose helper is being resumed is left to its resume');
+        $this->assertNull($row->completed_at);
+        $this->assertNull($row->result_reason);
+    }
+
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('liveResumeStates')]
+    public function a_member_whose_helper_lease_has_expired_is_still_resolved_as_today(string $resumeState): void
+    {
+        $delegation = $this->makeDelegation('in_progress', (string) Str::uuid(), $this->staleTimestamp());
+        $this->makeHelperRun($delegation, $resumeState, now()->subSeconds(30));
+
+        Artisan::call('llm-client:resolve-stalled-delegations');
+
+        $row = $this->fresh($delegation);
+        $this->assertSame('exhausted', $row->status, 'an expired lease is not protection');
+        $this->assertSame('batch_join_timeout', $row->result_reason);
+    }
+
+    #[Test]
+    public function a_member_whose_helper_run_is_interrupted_with_no_lease_left_is_still_resolved_as_today(): void
+    {
+        $delegation = $this->makeDelegation('in_progress', (string) Str::uuid(), $this->staleTimestamp());
+        $this->makeHelperRun($delegation, 'interrupted', now()->subMinutes(5));
+
+        Artisan::call('llm-client:resolve-stalled-delegations');
+
+        $this->assertSame('exhausted', $this->fresh($delegation)->status);
+    }
 
     // -----------------------------------------------------------------
     // --dry-run reports without writing

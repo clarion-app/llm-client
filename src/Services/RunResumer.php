@@ -165,6 +165,16 @@ class RunResumer
             // session end marker is left exactly as it is.
             $conversation->update(['is_processing' => true]);
 
+            // Calls whose work is recorded in a row of their own (a helper's
+            // delegation, a capability agent's call, a question) are resolved
+            // from that record rather than reported outcome-unknown: a
+            // finished helper's result is reused, an interrupted one resumed.
+            $resolved = app(DurableCallResolver::class)->resolve($run, $conversation, $plan);
+            if ($resolved === null) {
+                return null;
+            }
+            $plan = $resolved;
+
             // A confirmation the user decided before the interruption is
             // carried out now, exactly once, by the continuation that would
             // have carried it out.
@@ -254,6 +264,8 @@ class RunResumer
         app(RunTraceRecorder::class)->closeRun((string) $run->id, RunEndState::StoppedEarly, $reason);
 
         app(ResumeEventLog::class)->record((string) $run->id, 'resume_refused_cancelled', null, null, ['cause' => $cause]);
+
+        app(RunCompletionHooks::class)->run((string) $run->id);
     }
 
     /**
@@ -289,8 +301,11 @@ class RunResumer
 
         // A helper's stop travels to the task that delegated to it; the user
         // hears about it from there.
-        $helper = app(LegacyRunAssessment::class)->isHelperRun($run);
+        $helper = $this->isHelper($run);
         $message = $conversation !== null && !$helper ? $this->postNotice($conversation, $run, 'could_not_resume', $report) : null;
+        if ($helper) {
+            app(DelegationService::class)->recordHelperStopped((string) $run->conversation_id);
+        }
 
         app(ResumeEventLog::class)->record($runId, 'stopped_unresumable', $openPosition !== null ? (int) $openPosition : null, (int) $run->consecutive_interruptions, [
             'reason_code' => $code,
@@ -300,6 +315,9 @@ class RunResumer
         if ($conversation !== null && !$helper && ($run->resume_mode ?? ($run->is_streamed ? 'stream' : 'sync')) === ResumeMode::Stream->value) {
             app(QueuedMessagePickup::class)->startIfAny($conversation, $run);
         }
+
+        // An unattended task's caller is gone: what it would have done next is done.
+        app(RunCompletionHooks::class)->run($runId);
 
         return ['status' => 'stopped', 'code' => 'unresumable', 'content' => $report, 'message_id' => $message?->id];
     }
@@ -474,11 +492,16 @@ class RunResumer
 
         $result = $loop->runLoop($state);
 
-        if ($caller === ResumeCaller::Background && $this->resultNeedsDelivery($result)) {
-            $content = (string) ($result['content'] ?? '');
-            if (trim($content) !== '') {
-                $this->deliver($conversation->fresh() ?? $conversation, $run, $content, $result['message_id'] ?? null);
+        if ($caller === ResumeCaller::Background) {
+            if ($this->resultNeedsDelivery($result) && !$this->isHelper($run)) {
+                $content = (string) ($result['content'] ?? '');
+                if (trim($content) !== '') {
+                    $this->deliver($conversation->fresh() ?? $conversation, $run, $content, $result['message_id'] ?? null);
+                }
             }
+
+            // The caller that would have done what follows the run is gone.
+            app(RunCompletionHooks::class)->run((string) $run->id);
         }
 
         return $result;
@@ -545,11 +568,15 @@ class RunResumer
         }
 
         $result = $loop->resumeSync($conversation, $paused, $approved, decisionRecorded: true);
-        if ($caller === ResumeCaller::Background && $this->resultNeedsDelivery($result)) {
-            $content = (string) ($result['content'] ?? '');
-            if (trim($content) !== '') {
-                $this->deliver($conversation->fresh() ?? $conversation, $run, $content, $result['message_id'] ?? null);
+        if ($caller === ResumeCaller::Background) {
+            if ($this->resultNeedsDelivery($result) && !$this->isHelper($run)) {
+                $content = (string) ($result['content'] ?? '');
+                if (trim($content) !== '') {
+                    $this->deliver($conversation->fresh() ?? $conversation, $run, $content, $result['message_id'] ?? null);
+                }
             }
+
+            app(RunCompletionHooks::class)->run((string) $run->id);
         }
 
         return $result;
@@ -659,7 +686,18 @@ class RunResumer
      */
     private function postNotice(Conversation $conversation, AgentRun $run, string $notice, string $text): ?Message
     {
+        // A helper's conversation is not one a user reads; the task that
+        // delegated to it hears of what happened through the helper's result.
+        if ($this->isHelper($run)) {
+            return null;
+        }
+
         return app(TaskNoticePoster::class)->post($conversation, $run, $notice, $text);
+    }
+
+    private function isHelper(AgentRun $run): bool
+    {
+        return app(LegacyRunAssessment::class)->isHelperRun($run);
     }
 
     private function deliver(Conversation $conversation, AgentRun $run, string $text, ?string $messageId): void

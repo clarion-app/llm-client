@@ -8,6 +8,7 @@ use ClarionApp\LlmClient\Exceptions\SequenceDefinitionValidationException;
 use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
 use ClarionApp\LlmClient\Models\AgentHelperAssignment;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\SequenceRun;
 use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageResult;
@@ -280,6 +281,61 @@ class SequenceService
 
         // failed / handoff_rejected / pending.
         return ['resumable' => true, 'resume_from' => $blockingResult];
+    }
+
+    /**
+     * The delegation a running stage made for its helper: the one the stage
+     * names, or (it is only named once the stage ends) the one the run's
+     * conversation made for this stage's helper and task since the stage
+     * began.
+     */
+    public function stageDelegation(SequenceRun $run, StageResult $stageResult, Stage $stage): ?Delegation
+    {
+        if ($stageResult->delegation_id !== null) {
+            $named = Delegation::find($stageResult->delegation_id);
+            if ($named !== null) {
+                return $named;
+            }
+        }
+
+        $query = Delegation::where('parent_conversation_id', $run->conversation_id)
+            ->where('helper_agent_id', $stage->helper_agent_id)
+            ->where('task', "Execute stage \"{$stage->name}\" of an automated sequence pipeline, using the input provided below.");
+        if ($stageResult->started_at !== null) {
+            $query->where('started_at', '>=', $stageResult->started_at);
+        }
+
+        return $query->orderByDesc('started_at')->first();
+    }
+
+    /**
+     * Whether the run's running stage has a helper whose run is checkpointed
+     * and not over: that helper is resumed (or about to be) by the resume
+     * mechanism, which owns the stage's recovery.
+     */
+    public function stageIsBeingResumed(SequenceRun $run): bool
+    {
+        $result = StageResult::with('stage')
+            ->where('sequence_run_id', $run->id)
+            ->where('status', '!=', 'completed')
+            ->get()
+            ->sortBy(fn (StageResult $r) => $r->stage->position)
+            ->first();
+        if ($result === null || $result->status !== 'running') {
+            return false;
+        }
+
+        $delegation = $this->stageDelegation($run, $result, $result->stage);
+        if ($delegation === null) {
+            return false;
+        }
+
+        $helperRun = DB::table('agent_runs')
+            ->where('conversation_id', $delegation->helper_conversation_id)
+            ->orderBy('created_at')
+            ->first(['checkpoint_version', 'end_state']);
+
+        return $helperRun !== null && (int) $helperRun->checkpoint_version === 1 && $helperRun->end_state === 'in_progress';
     }
 
     /**

@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 /**
@@ -33,6 +34,21 @@ class SchedulerTriggerFiring extends Model
         'fire_key',
         'run_id',
     ];
+
+    /**
+     * Records which run a firing produced, once: a firing that already names
+     * a run keeps it. Called by the trigger job when its run returns and by
+     * the completion hook when a resumed run ends, so the firing names the
+     * run whichever of the two gets there first.
+     */
+    public static function recordRunId(string $triggerId, string $fireKey, string $runId): void
+    {
+        DB::table('scheduler_trigger_firings')
+            ->where('trigger_id', $triggerId)
+            ->where('fire_key', $fireKey)
+            ->whereNull('run_id')
+            ->update(['run_id' => $runId]);
+    }
 
     protected static function booted(): void
     {

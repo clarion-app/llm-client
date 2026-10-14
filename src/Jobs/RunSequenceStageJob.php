@@ -4,6 +4,7 @@ namespace ClarionApp\LlmClient\Jobs;
 
 use ClarionApp\LlmClient\Exceptions\SchemaValidationError;
 use ClarionApp\LlmClient\Models\Conversation;
+use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\SequenceRun;
 use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageResult;
@@ -20,6 +21,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
 
 /**
  * 105-stage-pipeline (research.md D6/D7, Grounding note item 7). The
@@ -108,60 +110,71 @@ class RunSequenceStageJob implements ShouldQueue
 
         $stage = $stageResult->stage;
 
-        // Phase 6 (US4, T059): a resume point that is not 'pending' --
-        // 'failed'/'handoff_rejected' (an ordinary resume past a stopped
-        // run) or 'running' (a crashed, idempotent stage) -- is reset to a
-        // fresh unstarted state and re-invoked from scratch below, reusing
-        // this SAME row rather than creating a new one.
-        if ($stageResult->status !== 'pending') {
-            $stageResult->status = 'pending';
-            $stageResult->output = null;
-            $stageResult->delegation_id = null;
-            $stageResult->failure_reason = null;
-            $stageResult->started_at = null;
-            $stageResult->completed_at = null;
-            $stageResult->save();
-        }
+        // 134-resumable-long-tasks: a stage still marked running whose helper
+        // was interrupted is resumed in the helper's own run, not started
+        // over: what the helper already did is not repeated. A running stage
+        // with nothing to resume (no delegation, or one whose helper cannot be
+        // continued) restarts below, as it always did.
+        $resumable = $stageResult->status === 'running' ? $this->resumableDelegation($run, $stageResult, $stage) : null;
 
-        $inputPayload = $this->inputPayloadFor($run, $stage);
+        if ($resumable !== null) {
+            $result = $delegationService->resumeDelegation($resumable, ResumeDriver::SequenceStage->value);
+        } else {
+            // Phase 6 (US4, T059): a resume point that is not 'pending' --
+            // 'failed'/'handoff_rejected' (an ordinary resume past a stopped
+            // run) or 'running' (a crashed, idempotent stage) -- is reset to a
+            // fresh unstarted state and re-invoked from scratch below, reusing
+            // this SAME row rather than creating a new one.
+            if ($stageResult->status !== 'pending') {
+                $stageResult->status = 'pending';
+                $stageResult->output = null;
+                $stageResult->delegation_id = null;
+                $stageResult->failure_reason = null;
+                $stageResult->started_at = null;
+                $stageResult->completed_at = null;
+                $stageResult->save();
+            }
 
-        // Phase 5 (US3, T044, research.md D9, FR-006/FR-007): before this
-        // stage ever starts -- its own agent is NEVER invoked if this
-        // rejects.
-        if ($stage->input_schema !== null) {
-            try {
-                $schemaValidator->validate((string) $inputPayload, $stage->input_schema);
-            } catch (SchemaValidationError $e) {
-                $this->stopOnHandoffRejection($run, $stageResult, $stage, $inputPayload, $e, $contentSanitizer, $sequenceService);
+            $inputPayload = $this->inputPayloadFor($run, $stage);
+
+            // Phase 5 (US3, T044, research.md D9, FR-006/FR-007): before this
+            // stage ever starts -- its own agent is NEVER invoked if this
+            // rejects.
+            if ($stage->input_schema !== null) {
+                try {
+                    $schemaValidator->validate((string) $inputPayload, $stage->input_schema);
+                } catch (SchemaValidationError $e) {
+                    $this->stopOnHandoffRejection($run, $stageResult, $stage, $inputPayload, $e, $contentSanitizer, $sequenceService);
+
+                    return;
+                }
+            }
+
+            $conversation = Conversation::find($run->conversation_id);
+            if ($conversation !== null && app(TaskBudgetGate::class)->wouldStop($conversation) !== null) {
+                $this->stopAtTaskBudget($run, $stageResult, $stage, null, $sequenceService);
 
                 return;
             }
+
+            $stageResult->status = 'running';
+            $stageResult->input = $contentSanitizer->truncate((string) $inputPayload);
+            $stageResult->started_at = now();
+            $stageResult->save();
+
+            $run->current_stage_position = $stage->position;
+            $run->last_progress_at = now();
+            $run->save();
+
+            // research.md D8 (Phase 4/US2): a stage transitioning to running
+            // is one of the five named broadcast points.
+            $sequenceService->broadcastRunUpdated($run->id);
+
+            $conversation = Conversation::find($run->conversation_id);
+
+            $taskDescription = "Execute stage \"{$stage->name}\" of an automated sequence pipeline, using the input provided below.";
+            $result = $delegationService->delegate($conversation, $stage->helper_agent_id, $taskDescription, (string) $inputPayload, null, null, null, ResumeDriver::SequenceStage->value);
         }
-
-        $conversation = Conversation::find($run->conversation_id);
-        if ($conversation !== null && app(TaskBudgetGate::class)->wouldStop($conversation) !== null) {
-            $this->stopAtTaskBudget($run, $stageResult, $stage, null, $sequenceService);
-
-            return;
-        }
-
-        $stageResult->status = 'running';
-        $stageResult->input = $contentSanitizer->truncate((string) $inputPayload);
-        $stageResult->started_at = now();
-        $stageResult->save();
-
-        $run->current_stage_position = $stage->position;
-        $run->last_progress_at = now();
-        $run->save();
-
-        // research.md D8 (Phase 4/US2): a stage transitioning to running
-        // is one of the five named broadcast points.
-        $sequenceService->broadcastRunUpdated($run->id);
-
-        $conversation = Conversation::find($run->conversation_id);
-
-        $taskDescription = "Execute stage \"{$stage->name}\" of an automated sequence pipeline, using the input provided below.";
-        $result = $delegationService->delegate($conversation, $stage->helper_agent_id, $taskDescription, (string) $inputPayload, null, null, null, ResumeDriver::SequenceStage->value);
 
         // Phase 5 (US3, T046, FR-008): a refusal ({"error": ...}) never
         // carries a 'status' key -- checked first, before ever reading
@@ -226,6 +239,37 @@ class RunSequenceStageJob implements ShouldQueue
         }
 
         self::dispatch($run->id)->onQueue(config('llm-client.pipeline.queue', 'sequence-runs'));
+    }
+
+    /**
+     * The delegation of this stage's running attempt when it can be carried
+     * on instead of repeated: its helper's run is checkpointed and not over,
+     * or it finished (the worker died before the stage recorded it). The
+     * stage's own task text and helper tell its delegation from the run's
+     * other stages', and the attempt's start from an earlier one's.
+     */
+    private function resumableDelegation(SequenceRun $run, StageResult $stageResult, Stage $stage): ?Delegation
+    {
+        $delegation = app(SequenceService::class)->stageDelegation($run, $stageResult, $stage);
+        if ($delegation === null) {
+            return null;
+        }
+
+        if ($delegation->status === 'completed') {
+            return $delegation;
+        }
+        if (in_array($delegation->status, ['exhausted', 'failed'], true)) {
+            return null;
+        }
+
+        $helperRun = DB::table('agent_runs')
+            ->where('conversation_id', $delegation->helper_conversation_id)
+            ->orderBy('created_at')
+            ->first(['checkpoint_version', 'end_state']);
+
+        return $helperRun !== null && (int) $helperRun->checkpoint_version === 1 && $helperRun->end_state === 'in_progress'
+            ? $delegation
+            : null;
     }
 
     /**

@@ -50,6 +50,17 @@ class TaskNoticePoster
      */
     public function deliver(Conversation $conversation, AgentRun $run, string $text, ?string $messageId): void
     {
+        $options = is_array($run->resume_options) ? $run->resume_options : json_decode((string) $run->resume_options, true);
+
+        $this->deliverText($conversation, $text, $messageId, is_array($options) && !empty($options['unattended']), (string) $run->id);
+    }
+
+    /**
+     * The same delivery for a message that belongs to no run (a multi-opinion
+     * request's answer).
+     */
+    public function deliverText(Conversation $conversation, string $text, ?string $messageId, bool $unattended = false, ?string $subject = null): void
+    {
         if ((string) ($conversation->channel ?? 'web') === 'web') {
             if ($messageId !== null) {
                 event(new NewConversationMessageEvent($conversation->id, $messageId));
@@ -58,8 +69,6 @@ class TaskNoticePoster
             return;
         }
 
-        $options = is_array($run->resume_options) ? $run->resume_options : json_decode((string) $run->resume_options, true);
-        $unattended = is_array($options) && !empty($options['unattended']);
         if (app(UserReachability::class)->refusal($conversation, $unattended) !== null) {
             return;
         }
@@ -67,7 +76,7 @@ class TaskNoticePoster
         $delivery = app(AgentQuestionService::class)->deliver($conversation, $text);
         if (!$delivery->delivered) {
             Log::warning('TaskNoticePoster: a message could not be delivered on the conversation\'s channel', [
-                'run_id' => $run->id,
+                'run_id' => $subject,
                 'reason' => $delivery->failureReason,
             ]);
         }

@@ -197,6 +197,62 @@ class RunLease
         return $affected > 0 ? $nextDispatch : null;
     }
 
+    /**
+     * Mark an expired run interrupted: the compare-and-set the detection
+     * sweep and a delegating parent's wait both use. It mints the next
+     * dispatch id, counts the interruption and releases the lease holder.
+     * The eligibility predicate is
+     * re-evaluated in the WHERE, so a run that recovered in the gap, or that
+     * another process marked first, is left alone.
+     *
+     * Returns the new dispatch id when this call won, null otherwise.
+     */
+    public function interruptExpired(string $runId, ?string $seenDispatch, string $seenState): ?string
+    {
+        $this->assertOutsideTransaction();
+
+        $window = (int) config('llm-client.resume.detection_window_seconds', 300);
+        $nowStamp = now()->format('Y-m-d H:i:s.u');
+        $cutoffStamp = now()->subSeconds($window)->format('Y-m-d H:i:s.u');
+        $newDispatch = (string) Str::uuid();
+
+        // One placeholder per occurrence: the real engine (native prepares)
+        // rejects a named parameter used twice. The dispatch_id comparison
+        // is a null-safe equality written portably for SQLite.
+        $affected = DB::connection()->update(
+            "UPDATE agent_runs
+                SET resume_state = 'interrupted',
+                    interrupted_at = ?,
+                    dispatch_id = ?,
+                    lease_holder = NULL,
+                    consecutive_interruptions = consecutive_interruptions + 1
+              WHERE id = ?
+                AND (dispatch_id = ? OR (dispatch_id IS NULL AND ? = 1))
+                AND resume_state = ?
+                AND end_state = 'in_progress'
+                AND cancelled_at IS NULL
+                AND checkpoint_version = 1
+                AND (
+                      (resume_state IN ('working','resuming') AND lease_expires_at < ?)
+                   OR (resume_state = 'waiting_provider_retry' AND next_attempt_at < ?)
+                   OR (resume_state = 'interrupted' AND interrupted_at < ?)
+                )",
+            [
+                $nowStamp,
+                $newDispatch,
+                $runId,
+                $seenDispatch ?? '',
+                $seenDispatch === null ? 1 : 0,
+                $seenState,
+                $nowStamp,
+                $cutoffStamp,
+                $cutoffStamp,
+            ],
+        );
+
+        return $affected > 0 ? $newDispatch : null;
+    }
+
     /** The process nonce: one per process, stable across calls. */
     public function nonce(): string
     {

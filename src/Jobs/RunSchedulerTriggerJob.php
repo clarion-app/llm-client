@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Models\Agent;
 use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\SchedulerTrigger;
+use ClarionApp\LlmClient\Models\SchedulerTriggerFiring;
 use ClarionApp\LlmClient\Services\AgentLoopService;
 use ClarionApp\LlmClient\Services\RoleResolver;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
@@ -14,7 +15,6 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\DB;
 
 /**
  * Runs one already-latched trigger event: loads the SchedulerTrigger, gets or
@@ -61,6 +61,9 @@ final class RunSchedulerTriggerJob implements ShouldQueue
             $loop->run($conversation, $trigger->defined_work, [
                 'unattended' => true,
                 'retry_limit' => $trigger->retry_limit,
+                // What this job would do once the run returns, kept with the
+                // run so a resumed run (whose worker is gone) still does it.
+                'on_complete' => ['hook' => 'scheduler_firing', 'trigger_id' => $this->triggerId, 'fire_key' => $this->fireKey],
             ]);
         } finally {
             // run()'s own return value never carries the run id it opened
@@ -116,10 +119,6 @@ final class RunSchedulerTriggerJob implements ShouldQueue
             return;
         }
 
-        DB::table('scheduler_trigger_firings')
-            ->where('trigger_id', $this->triggerId)
-            ->where('fire_key', $this->fireKey)
-            ->whereNull('run_id')
-            ->update(['run_id' => $run->id]);
+        SchedulerTriggerFiring::recordRunId($this->triggerId, $this->fireKey, (string) $run->id);
     }
 }

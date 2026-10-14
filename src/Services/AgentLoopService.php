@@ -1998,7 +1998,12 @@ class AgentLoopService
         $presetSystemPrompt = '';
         if ($presetName !== null && $this->presetRegistry !== null) {
             try {
-                $this->presetRegistry->resolveSchema($presetName, $options['preset_params'] ?? null, $options['schema_overrides'] ?? null);
+                // As a fresh run does: the preset's schema is what the final
+                // answer is validated against, unless an explicit one was given.
+                $resolvedSchema = $this->presetRegistry->resolveSchema($presetName, $options['preset_params'] ?? null, $options['schema_overrides'] ?? null);
+                if (empty($options['schema'])) {
+                    $options['schema'] = $resolvedSchema;
+                }
                 $presetSystemPrompt = $this->presetRegistry->find($presetName)->getSystemPrompt();
             } catch (\Throwable) {
                 $presetSystemPrompt = '';
@@ -3021,7 +3026,12 @@ class AgentLoopService
                 // turn here would leave a fully-successful triggered run with
                 // no report at all -- not merely a report indistinguishable
                 // from success, but no report whatsoever.
-                if (!$unattended && $this->allExecuteOperationsSucceeded($toolCalls, $toolResults)) {
+                //
+                // A run whose final answer has to satisfy a result schema (a
+                // delegated helper's) is excluded for the same reason: the
+                // answer is the result, and stopping here would hand its
+                // delegator an empty one.
+                if (!$unattended && !$shouldValidate && $this->allExecuteOperationsSucceeded($toolCalls, $toolResults)) {
                     $agentId = $conversation->character ?? $conversation->id;
                     $conversation->update(['is_processing' => false]);
 

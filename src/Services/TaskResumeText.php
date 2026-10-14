@@ -142,6 +142,24 @@ class TaskResumeText
     }
 
     /**
+     * What the user is told when a request for several opinions was
+     * interrupted and, once finished, produced no combined answer.
+     */
+    public function consensusRequestNotAnswered(): string
+    {
+        return 'Your request for several opinions was interrupted and could not be turned into a combined answer. You are welcome to ask again.';
+    }
+
+    /**
+     * What a task is told when the helper it delegated to was interrupted
+     * and could not be continued.
+     */
+    public function helperCouldNotResume(): string
+    {
+        return 'The helper was interrupted and its work could not be continued safely, so it was stopped.';
+    }
+
+    /**
      * end_reason: the task was cancelled.
      */
     public function cancelledReason(): string
