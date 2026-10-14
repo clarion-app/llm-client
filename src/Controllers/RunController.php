@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use ClarionApp\LlmClient\Models\AgentRun;
 use ClarionApp\LlmClient\Services\ContentSanitizer;
 use ClarionApp\LlmClient\Services\DelegationQuery;
+use ClarionApp\LlmClient\Services\RunProgressQuery;
 use ClarionApp\LlmClient\Services\RunTraceQuery;
 use Auth;
 use Illuminate\Http\JsonResponse;
@@ -30,6 +31,7 @@ class RunController extends Controller
         private readonly RunTraceQuery $runTraceQuery,
         private readonly ContentSanitizer $contentSanitizer,
         private readonly DelegationQuery $delegationQuery,
+        private readonly RunProgressQuery $progressQuery,
     ) {}
 
     /**
@@ -58,6 +60,7 @@ class RunController extends Controller
         $awaitingUser = $this->runTraceQuery->runIdsAwaitingUser($runIds);
         $questionStopped = $this->runTraceQuery->runIdsStoppedOnQuestion($runIds);
         $taskBudgets = $this->runTraceQuery->taskBudgetSummariesForRuns($runIds, $awaitingUser, $questionStopped);
+        $cancelledByEvent = $this->runTraceQuery->runIdsRefusedResumeAsCancelled($runIds);
 
         $data = array_map(
             fn (AgentRun $run) => $this->runSummary(
@@ -66,6 +69,7 @@ class RunController extends Controller
                 isset($awaitingUser[$run->id]),
                 isset($questionStopped[$run->id]),
                 $taskBudgets,
+                $cancelledByEvent,
             ),
             $result['data'],
         );
@@ -216,6 +220,56 @@ class RunController extends Controller
     }
 
     /**
+     * GET /agent-runs/{runId}/progress — the derived progress view of the
+     * caller's own run: state, activity, steps completed, known structure and
+     * the resume facts. An absent and a foreign run answer alike.
+     */
+    public function progress(Request $request, string $runId): JsonResponse
+    {
+        $run = $this->runTraceQuery->findRun(Auth::user()->id, $runId);
+        if ($run === null) {
+            return $this->notFoundResponse();
+        }
+
+        return response()->json($this->progressQuery->forRun($run));
+    }
+
+    /**
+     * GET /agent-runs/{runId}/resume-events — the run's resume and retry
+     * events, oldest first (so the newest is last), fifty to a page. Payloads
+     * were bounded when they were written: labels only, never arguments or
+     * provider text.
+     */
+    public function resumeEvents(Request $request, string $runId): JsonResponse
+    {
+        $run = $this->runTraceQuery->findRun(Auth::user()->id, $runId);
+        if ($run === null) {
+            return $this->notFoundResponse();
+        }
+
+        [$page, $perPage] = $this->paginationParams($request, 50, 50);
+
+        $query = DB::table('agent_run_resume_events')->where('run_id', $run->id);
+        $total = (clone $query)->count();
+        $data = $query
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->forPage($page, $perPage)
+            ->get()
+            ->map(fn ($row) => [
+                'id' => $row->id,
+                'kind' => $row->kind,
+                'step_position' => $row->step_position === null ? null : (int) $row->step_position,
+                'attempt' => $row->attempt === null ? null : (int) $row->attempt,
+                'payload' => $row->payload === null ? null : json_decode($row->payload, true),
+                'created_at' => \Illuminate\Support\Carbon::parse($row->created_at)->toJSON(),
+            ])
+            ->all();
+
+        return response()->json($this->envelope($data, $total, $page, $perPage));
+    }
+
+    /**
      * GET /agent-runs/{runId}/arrangement — the full shape of the
      * multi-agent collaboration rooted at $runId (106-multi-agent-run-view,
      * US1, contracts/arrangement-api.md §1): the entry-point run, every
@@ -250,8 +304,9 @@ class RunController extends Controller
         ?bool $awaitingUser = null,
         ?bool $questionStopped = null,
         ?array $taskBudgets = null,
+        ?array $cancelledByEvent = null,
     ): array {
-        return $this->runTraceQuery->runSummaryRow($run, $actionCount, $awaitingUser, $questionStopped, $taskBudgets);
+        return $this->runTraceQuery->runSummaryRow($run, $actionCount, $awaitingUser, $questionStopped, $taskBudgets, $cancelledByEvent);
     }
 
     /**

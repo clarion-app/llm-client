@@ -364,6 +364,10 @@ class RunLeaseClaimConcurrencyTest extends RealDatabaseTestCase
             'with' => ['stream' => 'php://stderr'],
         ]);
         \$config->set('eloquent-multichain-bridge.disabled', true);
+        // A claim announces the run's changed state to its owner's screen.
+        // The worker has no broadcaster to announce to, and what it tests is
+        // the claim itself, so the run record's announcements are off.
+        \$config->set('llm-client.run_trace.enabled', false);
 
         \$app->register(Illuminate\\Database\\DatabaseServiceProvider::class);
         \$app->register(Illuminate\\Cache\\CacheServiceProvider::class);

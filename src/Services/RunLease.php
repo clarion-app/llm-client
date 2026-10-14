@@ -87,6 +87,10 @@ class RunLease
         $row = DB::table('agent_runs')->where('id', $runId)->first();
         $takeover = $row !== null && $row->resume_state === 'resuming';
 
+        // The state may have changed (interrupted -> resuming, or a fresh
+        // lease): the owner's view refreshes.
+        app(RunTraceRecorder::class)->announceRunChanged($runId);
+
         return ClaimResult::won(
             $this->nonce(),
             $takeover,
@@ -250,7 +254,14 @@ class RunLease
             ],
         );
 
-        return $affected > 0 ? $newDispatch : null;
+        if ($affected === 0) {
+            return null;
+        }
+
+        // working/resuming/waiting -> interrupted: the owner's view refreshes.
+        app(RunTraceRecorder::class)->announceRunChanged($runId);
+
+        return $newDispatch;
     }
 
     /** The process nonce: one per process, stable across calls. */

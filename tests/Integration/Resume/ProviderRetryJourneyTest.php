@@ -251,8 +251,18 @@ class ProviderRetryJourneyTest extends AssembledSystemTestCase
             Carbon::parse((string) $run->next_attempt_at, 'UTC')->format('Y-m-d H:i:s'),
             'the run row carries when the next attempt is due',
         );
-        // Phase 8: GET agent-runs/{id} summary `resume.state = waiting_provider_retry`
-        // and `resume.next_attempt_at` (the summary block lands with the progress API).
+
+        // The owner sees the wait, and when it ends, in the run summary and
+        // in the progress view.
+        $owner = $this->fixture()->user;
+        $nextAttempt = Carbon::parse((string) $run->next_attempt_at, 'UTC')->toJSON();
+        $summary = $this->actingAs($owner, 'api')->getJson("/api/clarion-app/llm-client/agent-runs/{$run->id}")->assertStatus(200)->json();
+        $this->assertSame('waiting_provider_retry', $summary['resume']['state']);
+        $this->assertSame($nextAttempt, $summary['resume']['next_attempt_at']);
+        $progress = $this->actingAs($owner, 'api')->getJson("/api/clarion-app/llm-client/agent-runs/{$run->id}/progress")->assertStatus(200)->json();
+        $this->assertSame('waiting_provider_retry', $progress['state']);
+        $this->assertSame('waiting_to_retry', $progress['activity']['kind']);
+        $this->assertSame($nextAttempt, $progress['next_attempt_at']);
     }
 
     // ---------------------------------------------------------------
