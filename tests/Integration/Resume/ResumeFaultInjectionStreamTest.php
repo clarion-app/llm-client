@@ -363,6 +363,28 @@ class ResumeFaultInjectionStreamTest extends AssembledSystemTestCase
     // rerun / outcome-unknown) the resume applies.
 
     #[Test]
+    public function a_streamed_resume_never_reopens_a_session_the_idle_sweep_ended(): void
+    {
+        $this->scenario = 'resume_stream_never_reopens_session';
+        $this->setupJourney();
+        $conversation = $this->conversationFor('stream');
+
+        $this->send('stream', $conversation, 'Write to the ledger.')->assertStatus(201);
+        $this->killAt('after_tool_recorded', 1, fn () => $this->playTurn(0, '', [
+            ['id' => 'call_search', 'name' => 'search_operations', 'arguments' => ['query' => 'notes']],
+        ], self::USAGE));
+
+        $endedAt = now()->format('Y-m-d H:i:s');
+        Conversation::whereKey($conversation->id)->update(['ended_at' => $endedAt]);
+
+        $this->resumeRun($conversation);
+
+        $actual = Conversation::whereKey($conversation->id)->value('ended_at');
+        $actual = $actual instanceof \Illuminate\Support\Carbon ? $actual->format('Y-m-d H:i:s') : (string) $actual;
+        $this->assertSame($endedAt, $actual, 'the streamed resume never reopens a session the idle sweep ended');
+    }
+
+    #[Test]
     public function killed_before_tool_started_resumes_and_executes_once(): void
     {
         $this->scenario = 'resume_stream_before_started';
