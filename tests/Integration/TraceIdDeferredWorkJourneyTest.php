@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Models\Message;
 use ClarionApp\LlmClient\Models\ToolInvocationRecord;
@@ -21,7 +21,7 @@ use Monolog\Handler\TestHandler;
 
 /**
  * US4 (FR-007/FR-008, SC-005): a run's deferred continuation — a
- * SendHttpStreamRequest job queued by AgentLoopService::start()/
+ * AgentStreamStepJob job queued by AgentLoopService::start()/
  * AgentLoopStreamHandler's own re-dispatch on the next iteration — carries
  * the originating run's run_id into every Message/ToolInvocationRecord/
  * UsageRecord and log line it produces, across a REAL queue-job boundary
@@ -29,7 +29,7 @@ use Monolog\Handler\TestHandler;
  *
  * Why this test does not use the suite's usual ScriptedStream harness:
  * every other stream-path journey test in this directory calls
- * `Queue::fake([SendHttpStreamRequest::class])` (set up in
+ * `Queue::fake([AgentStreamStepJob::class])` (set up in
  * AssembledSystemTestCase::setUp()) and then reads the captured job back out
  * of the fake queue with `Queue::pushed(...)`. That is the right tool for
  * asserting *what got dispatched*, but QueueFake never calls
@@ -44,21 +44,17 @@ use Monolog\Handler\TestHandler;
  *
  * This file undoes that fake and dispatches for real, against the
  * `database` queue connection (the `sync` connection was rejected: it
- * executes the job inline during dispatch, which would require
- * SendHttpStreamRequest::handle() to actually run — and that method
- * hard-codes `new Client(['timeout' => ...])` with no test seam
- * (http-queue/src/Jobs/SendHttpStreamRequest.php:40), unlike llm-client's
- * own sync HTTP call sites, which honour app('llm-client.http_handler')
- * (LlmClientServiceProvider::httpClientFor()). Real network is not
- * available to this suite, so the deferred job is popped off a real,
- * non-executing queue backend and its callback (AgentLoopStreamHandler,
- * the same class SendHttpStreamRequest::handle() would itself construct
- * and drive) is invoked directly with scripted content — exactly what
- * ScriptedStream already does elsewhere in this suite, except here the pop
- * is preceded by a genuine `Illuminate\Queue\Events\JobProcessing` dispatch
- * against a genuinely-queued, genuinely-serialized job payload, with
- * Context explicitly flushed beforehand so nothing can survive by process
- * accident.
+ * executes the job inline during dispatch, in the same process with the
+ * same Context, so there is no real queue-payload boundary for D2's
+ * rehydration to cross). Real network is not available to this suite, so
+ * the deferred job is popped off a real, non-executing queue backend and
+ * its callback (AgentLoopStreamHandler, the same class
+ * AgentStreamStepJob::handle() would itself construct and drive) is
+ * invoked directly with scripted content — exactly what ScriptedStream
+ * already does elsewhere in this suite, except here the pop is preceded by
+ * a genuine `Illuminate\Queue\Events\JobProcessing` dispatch against a
+ * genuinely-queued, genuinely-serialized job payload, with Context
+ * explicitly flushed beforehand so nothing can survive by process accident.
  */
 class TraceIdDeferredWorkJourneyTest extends AssembledSystemTestCase
 {
@@ -68,7 +64,7 @@ class TraceIdDeferredWorkJourneyTest extends AssembledSystemTestCase
 
         $this->app['config']->set('llm-client.run_trace.enabled', true);
 
-        // Undo AssembledSystemTestCase::setUp()'s Queue::fake([SendHttpStreamRequest::class])
+        // Undo AssembledSystemTestCase::setUp()'s Queue::fake([AgentStreamStepJob::class])
         // — see class docblock. Facade::clearResolvedInstance() is required in
         // addition to forgetInstance(): Queue::fake() calls Facade::swap(),
         // which caches the fake on the Facade's own static resolved-instance
@@ -128,28 +124,28 @@ class TraceIdDeferredWorkJourneyTest extends AssembledSystemTestCase
     }
 
     /**
-     * Pop the next SendHttpStreamRequest genuinely queued on the real
-     * `database` connection's `http` queue (SendHttpStreamRequest's own
-     * default — its constructor's fourth argument), fire the real
+     * Pop the next AgentStreamStepJob genuinely queued on the real
+     * `database` connection's `http` queue (AgentStreamStepJob's own
+     * default — its constructor's onQueue), fire the real
      * JobProcessing event (what a worker does immediately before invoking a
      * job — this is D2's rehydration hook), and hand back the job's
      * constructor arguments recovered via reflection off the unserialized
      * command — the same technique ScriptedStream::extractDispatchedJobs()
      * already uses for the faked-queue case.
      *
-     * @return array{job: QueueJobContract, command: SendHttpStreamRequest, data: array}
+     * @return array{job: QueueJobContract, command: AgentStreamStepJob, data: array}
      */
     private function popAndRehydrateStreamJob(): array
     {
         $job = Queue::connection('database')->pop('http');
-        $this->assertNotNull($job, 'Expected a genuinely queued SendHttpStreamRequest job on the database connection\'s "http" queue');
+        $this->assertNotNull($job, 'Expected a genuinely queued AgentStreamStepJob job on the database connection\'s "http" queue');
 
         $payload = $job->payload();
         $command = unserialize($payload['data']['command']);
         $this->assertInstanceOf(
-            SendHttpStreamRequest::class,
+            AgentStreamStepJob::class,
             $command,
-            'Sanity: the queued job is genuinely the production SendHttpStreamRequest class, not a stand-in'
+            'Sanity: the queued job is genuinely the production AgentStreamStepJob class, not a stand-in'
         );
 
         // The exact hook research.md D2 names: ContextServiceProvider's
@@ -169,7 +165,7 @@ class TraceIdDeferredWorkJourneyTest extends AssembledSystemTestCase
 
     /**
      * Drive the real AgentLoopStreamHandler — the same class
-     * SendHttpStreamRequest::handle() would itself instantiate as its
+     * AgentStreamStepJob::handle() would itself instantiate as its
      * callback — with scripted SSE content, exactly as if it were being fed
      * by a real streamed HTTP response inside the deferred job.
      */
@@ -243,7 +239,7 @@ class TraceIdDeferredWorkJourneyTest extends AssembledSystemTestCase
 
         // The real production entry point: opens the run (Context::add
         // fires inside RunTraceRecorder::openRun(), Phase 3) and genuinely
-        // dispatches SendHttpStreamRequest.
+        // dispatches AgentStreamStepJob.
         $this->app->make(AgentLoopService::class)->start($fixture->conversation);
 
         $run = DB::table('agent_runs')->where('conversation_id', $fixture->conversation->id)->first();
@@ -289,7 +285,7 @@ class TraceIdDeferredWorkJourneyTest extends AssembledSystemTestCase
 
     /**
      * US4 scenarios 1-2, multi-hop: a tool-call round dispatches its OWN
-     * second SendHttpStreamRequest from inside the first deferred job's
+     * second AgentStreamStepJob from inside the first deferred job's
      * finish() (AgentLoopStreamHandler::handleToolCalls() ->
      * AgentLoopService::start($conversation, $iteration + 1, $this->runId)).
      * That second dispatch happens while the first job's rehydrated Context
@@ -335,7 +331,7 @@ class TraceIdDeferredWorkJourneyTest extends AssembledSystemTestCase
         $this->assertNotNull($firstHopUsage);
         $this->assertSame($runId, $firstHopUsage->run_id);
 
-        // handleToolCalls() dispatched a SECOND SendHttpStreamRequest for
+        // handleToolCalls() dispatched a SECOND AgentStreamStepJob for
         // the continuation, from inside AgentLoopStreamHandler::finish()
         // above, while this test process's Context was the rehydrated one
         // from the first pop — flush it again before crossing the second time.

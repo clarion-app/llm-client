@@ -227,10 +227,14 @@ class TaskBudgetPauserTest extends TestCase
         $this->assertSame($prompt->id, $this->event($task, 'prompt_raised')['question_id'] ?? null);
 
         $this->assertFalse((bool) $conversation->fresh()->is_processing, 'waiting on the user is not processing');
-        $this->assertSame('stopped_early', $this->stepRow($stepId)->end_state, 'the open step is closed, never left in progress');
-        $this->assertSame('Task budget ceiling reached', $this->stepRow($stepId)->end_reason);
+        // The pause sits on the step boundary: the step is left open and
+        // marked paused (the run is resumable until its resumer claims it),
+        // never closed.
+        $this->assertSame('in_progress', $this->stepRow($stepId)->end_state, 'the open step is left open and marked paused, never closed');
+        $this->assertNull($this->stepRow($stepId)->end_reason);
+        $this->assertSame('paused', $this->stepRow($stepId)->checkpoint_state, 'the step is marked paused');
         $this->assertSame('in_progress', $this->runRow($runId)->end_state, 'the run stays open while the task is paused');
-        $this->assertSame(0, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count());
+        $this->assertSame(1, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count());
 
         $this->assertSame(
             app(TaskBudgetReport::class)->compose(TaskBudget::find($task->id), app(TaskBudgetService::class)->standing(TaskBudget::find($task->id)), TaskBudgetReport::OCCASION_PAUSED),

@@ -73,10 +73,22 @@ class RunDelegationBatchMemberJob implements ShouldQueue
      *  fixed point rather than perpetually sliding into the future. */
     private \DateTimeInterface $retryDeadline;
 
-    public function __construct(public readonly string $delegationId)
-    {
+    public function __construct(
+        public readonly string $delegationId,
+        public readonly ?string $resumeDispatchId = null,
+    ) {
         $this->timeout = (int) config('llm-client.delegation.max_seconds', 120);
         $this->retryDeadline = now()->addSeconds($this->timeout + DelegationService::JOIN_WAIT_GRACE_SECONDS);
+    }
+
+    /**
+     * A job that resumes a member whose worker died: the dispatch id the
+     * awaiting owner minted on the member's helper run is what entitles this
+     * job to continue it.
+     */
+    public static function forResume(string $delegationId, string $dispatchId): self
+    {
+        return new self($delegationId, $dispatchId);
     }
 
     /**
@@ -123,7 +135,22 @@ class RunDelegationBatchMemberJob implements ShouldQueue
             // some other path (the parent's own join-wait deadline, or the
             // stale-batch sweep), is a no-op -- tryAdmit() is never even
             // called for a row no longer 'queued'.
-            if ($delegation === null || $delegation->status !== 'queued') {
+            if ($delegation === null) {
+                return;
+            }
+
+            // A resume job continues a member that was already admitted and
+            // started: its helper's run is claimed on the dispatch id and
+            // resumed in place. Admission is not asked again.
+            if ($this->resumeDispatchId !== null) {
+                if ($delegation->status === 'in_progress') {
+                    $service->resumeBatchMember($delegation, $this->resumeDispatchId);
+                }
+
+                return;
+            }
+
+            if ($delegation->status !== 'queued') {
                 return;
             }
 

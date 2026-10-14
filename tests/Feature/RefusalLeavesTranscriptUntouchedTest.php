@@ -3,7 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\CostSummary;
 use ClarionApp\LlmClient\Models\Message;
@@ -85,7 +85,7 @@ class RefusalLeavesTranscriptUntouchedTest extends TestCase
         ]);
 
         \Illuminate\Support\Facades\Http::fake();
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
 
         $provider = Mockery::mock(\ClarionApp\LlmClient\Contracts\LlmProvider::class);
         $provider->shouldReceive('chat')->andReturn([

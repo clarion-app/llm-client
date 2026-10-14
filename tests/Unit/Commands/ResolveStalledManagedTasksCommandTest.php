@@ -40,6 +40,7 @@ class ResolveStalledManagedTasksCommandTest extends TestCase
     {
         DB::table('managed_task_parts')->delete();
         DB::table('managed_tasks')->delete();
+        DB::table('agent_runs')->delete();
 
         parent::tearDown();
     }
@@ -185,6 +186,105 @@ class ResolveStalledManagedTasksCommandTest extends TestCase
         Queue::assertNotPushed(RunManagedTaskStepJob::class);
         $row = $this->fresh($task);
         $this->assertSame('completed', $row->status, 'a terminal row must never be re-processed by this sweep');
+    }
+
+    // -----------------------------------------------------------------
+    // 134-resumable-long-tasks (lease contract section 8a): a round whose
+    // run is being resumed, or is waiting to retry the provider, belongs
+    // to that recovery. A fresh round queued beside it would race it for
+    // the same manager conversation.
+    // -----------------------------------------------------------------
+
+    private function makeRoundRun(ManagedTask $task, string $endState, ?int $checkpointVersion, ?string $resumeState): void
+    {
+        DB::table('agent_runs')->insert([
+            'id' => (string) Str::uuid(),
+            'kind' => 'system_initiated',
+            'user_id' => $task->owner_user_id,
+            'conversation_id' => $task->conversation_id,
+            'end_state' => $endState,
+            'started_at' => now()->subMinutes(20),
+            'checkpoint_version' => $checkpointVersion,
+            'resume_driver' => 'root',
+            'resume_state' => $resumeState,
+            'lease_expires_at' => now()->subMinutes(12),
+            'next_attempt_at' => $resumeState === 'waiting_provider_retry' ? now()->addMinutes(3) : null,
+        ]);
+    }
+
+    private function makeStaleTask(): ManagedTask
+    {
+        return $this->makeTask(
+            status: 'in_progress',
+            startedAt: now()->subMinutes(20),
+            lastProgressAt: now()->subMinutes(15),
+            maxSeconds: 1800,
+        );
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function ownedResumeStates(): array
+    {
+        return [
+            'interrupted' => ['interrupted'],
+            'resuming' => ['resuming'],
+            'waiting for the provider' => ['waiting_provider_retry'],
+        ];
+    }
+
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('ownedResumeStates')]
+    public function skips_task_whose_round_is_being_resumed(string $resumeState): void
+    {
+        $task = $this->makeStaleTask();
+        $this->makeRoundRun($task, 'in_progress', 1, $resumeState);
+
+        Queue::fake();
+        Artisan::call('llm-client:resolve-stalled-managed-tasks');
+
+        Queue::assertNotPushed(RunManagedTaskStepJob::class, null, 'the resume owns this round: no second round beside it');
+        $this->assertSame('in_progress', $this->fresh($task)->status);
+        $this->assertNull($this->fresh($task)->completed_at);
+    }
+
+    #[Test]
+    public function a_stale_task_whose_round_run_has_ended_is_re_dispatched_as_today(): void
+    {
+        $task = $this->makeStaleTask();
+        $this->makeRoundRun($task, 'completed', 1, null);
+
+        Queue::fake();
+        Artisan::call('llm-client:resolve-stalled-managed-tasks');
+
+        Queue::assertPushed(RunManagedTaskStepJob::class, fn (RunManagedTaskStepJob $job) => $job->managedTaskId === $task->id);
+    }
+
+    #[Test]
+    public function a_stale_task_whose_round_run_predates_checkpoints_is_re_dispatched_as_today(): void
+    {
+        $task = $this->makeStaleTask();
+        $this->makeRoundRun($task, 'in_progress', null, null);
+
+        Queue::fake();
+        Artisan::call('llm-client:resolve-stalled-managed-tasks');
+
+        Queue::assertPushed(RunManagedTaskStepJob::class, fn (RunManagedTaskStepJob $job) => $job->managedTaskId === $task->id);
+    }
+
+    #[Test]
+    public function only_the_newest_run_decides_whether_a_round_is_being_resumed(): void
+    {
+        $task = $this->makeStaleTask();
+        // An older run in the same conversation is still marked resumable,
+        // but a newer one has ended: the round is not being resumed.
+        $this->makeRoundRun($task, 'in_progress', 1, 'interrupted');
+        DB::table('agent_runs')->where('conversation_id', $task->conversation_id)->update(['started_at' => now()->subHours(2)]);
+        $this->makeRoundRun($task, 'completed', 1, null);
+
+        Queue::fake();
+        Artisan::call('llm-client:resolve-stalled-managed-tasks');
+
+        Queue::assertPushed(RunManagedTaskStepJob::class, fn (RunManagedTaskStepJob $job) => $job->managedTaskId === $task->id);
     }
 
     // -----------------------------------------------------------------

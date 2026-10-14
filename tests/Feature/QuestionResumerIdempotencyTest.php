@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
@@ -320,7 +320,7 @@ class QuestionResumerIdempotencyTest extends TestCase
 
         $resumer->resume($question->id, ResumeCaller::HttpRequest);
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         $firstClaim = $question->fresh()->resumed_at;
         $this->assertNotNull($firstClaim, 'the first resume takes the claim');
         $this->assertCount(1, $this->pausedResults($question), 'the paused ask_user call is answered');
@@ -328,7 +328,7 @@ class QuestionResumerIdempotencyTest extends TestCase
         $this->travel(5)->seconds();
         $this->assertNull($resumer->resume($question->id, ResumeCaller::Background), 'a second resume finds nothing to do');
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         $this->assertCount(1, $this->pausedResults($question), 'the paused call is answered exactly once');
         $this->assertEquals($firstClaim, $question->fresh()->resumed_at, 'the claim is taken once and never moved');
         $this->assertSame([], $this->web->deliveries, 'a streamed continuation delivers nothing through the adapter');
@@ -356,7 +356,7 @@ class QuestionResumerIdempotencyTest extends TestCase
         $this->assertSame('in_progress', $this->runRow($question)->end_state);
         $this->assertFalse((bool) $this->conversation->fresh()->is_processing);
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         $this->assertSame([], $this->web->deliveries);
     }
 
@@ -402,7 +402,7 @@ class QuestionResumerIdempotencyTest extends TestCase
         $this->runJob(new ResumeAfterQuestionJob($question->id));
         $this->runJob(new ResumeAfterQuestionJob($question->id));
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         $this->assertNotNull($question->fresh()->resumed_at);
         $this->assertCount(1, $this->pausedResults($question));
         $this->assertSame('answered', Message::findOrFail($question->display_message_id)->tool_data['state'] ?? null);
@@ -426,7 +426,7 @@ class QuestionResumerIdempotencyTest extends TestCase
         $this->assertSame(QuestionState::Answered, $question->state, 'the refusal does not undo the resolution');
         $this->assertNotNull($question->resumed_at, 'the claim stays taken, so a retry is a no-op');
         $this->assertNotEmpty($logged, 'the refusal is logged');
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     // ---------------------------------------------------------------
@@ -509,12 +509,12 @@ class QuestionResumerIdempotencyTest extends TestCase
         $this->assertSame('stopped_early', $step->end_state);
         $this->assertSame('question context deleted', $step->end_reason);
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         $this->assertSame([], $this->web->deliveries, 'nothing is delivered');
         $this->assertFalse((bool) $this->conversation->fresh()->is_processing, 'the conversation stays usable');
 
         $this->assertNull(app(QuestionResumer::class)->resume($question->id, ResumeCaller::Background));
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     #[Test]
@@ -535,11 +535,11 @@ class QuestionResumerIdempotencyTest extends TestCase
         $this->assertSame('question context deleted', $run->end_reason);
         $this->assertSame('stopped_early', $this->stepRow($question)->end_state);
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         $this->assertSame([], $this->web->deliveries, 'nothing is delivered to a conversation that no longer exists');
 
         $this->runJob(new ResumeAfterQuestionJob($question->id));
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
         $this->assertSame([], $this->web->deliveries);
     }
 }

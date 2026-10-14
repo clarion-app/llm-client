@@ -6,7 +6,7 @@ use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
 use ClarionApp\LlmClient\Events\UpdateOpenAIConversationResponseEvent;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
 use ClarionApp\LlmClient\Models\Message;
@@ -512,7 +512,7 @@ class AgentQuestionWebJourneyTest extends AssembledSystemTestCase
         $this->ledger()->expect('AgentQuestionService:*');
 
         // Resume jobs are held on the fake queue until a worker runs them.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         $this->fixture()->build();
         $web = (new RecordingChannelDelivery('web'))->throwWith('broadcaster unreachable');

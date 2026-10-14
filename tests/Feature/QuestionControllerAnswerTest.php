@@ -3,7 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -151,7 +151,7 @@ class QuestionControllerAnswerTest extends TestCase
             'messages' => DB::table('messages')->count(),
             'runs' => DB::table('agent_runs')->count(),
             'resumes' => Queue::pushed(ResumeAfterQuestionJob::class)->count(),
-            'streams' => Queue::pushed(SendHttpStreamRequest::class)->count(),
+            'streams' => Queue::pushed(AgentStreamStepJob::class)->count(),
         ];
     }
 
@@ -525,13 +525,13 @@ class QuestionControllerAnswerTest extends TestCase
     public function a_streamed_question_resumes_inline_over_the_conversations_broadcasts(): void
     {
         $question = $this->pending();
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
 
         $this->submit($question->id, ['selected' => [2]])->assertStatus(201);
 
         $question->refresh();
         $this->assertNotNull($question->resumed_at, 'the paused turn was consumed by this request');
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         Queue::assertNotPushed(ResumeAfterQuestionJob::class);
 
         $results = Message::findOrFail($question->paused_message_id)->tool_data['tool_results'] ?? null;
@@ -560,7 +560,7 @@ class QuestionControllerAnswerTest extends TestCase
             $this->telegram->textsFor($question->conversation_id),
             'the continuation\'s reply reaches the chat the conversation lives on',
         );
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     // ---------------------------------------------------------------
@@ -614,7 +614,7 @@ class QuestionControllerAnswerTest extends TestCase
             'stopped_at' => now()->subMinutes(5)->format('Y-m-d H:i:s'),
         ]);
         $stoppedAt = $this->row($question->id)['stopped_at'];
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
 
         $response = $this->submit($question->id, ['selected' => [2]]);
 
@@ -628,7 +628,7 @@ class QuestionControllerAnswerTest extends TestCase
         $this->assertSame(QuestionState::Answered, $question->state);
         $this->assertSame($stoppedAt, $this->row($question->id)['stopped_at'], 'when work stopped is kept');
         $this->assertNotNull($question->resumed_at, 'the stopped work resumed in this request');
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         Queue::assertNotPushed(ResumeAfterQuestionJob::class);
 
         $results = Message::findOrFail($question->paused_message_id)->tool_data['tool_results'] ?? null;

@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Controllers\ConversationController;
 use ClarionApp\LlmClient\Controllers\MessageController;
 use ClarionApp\LlmClient\Controllers\QuestionController;
@@ -126,7 +126,7 @@ class ExpiryPolicyRaceJourneyTest extends AssembledSystemTestCase
 
         config(['llm-client.run_trace.enabled' => true]);
 
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         // Ending a conversation also captures its episodic memory through a
         // model call of its own; that capture is not what these races are
@@ -552,7 +552,12 @@ class ExpiryPolicyRaceJourneyTest extends AssembledSystemTestCase
         ));
         $run = DB::table('agent_runs')->where('id', $fresh->run_id)->first();
 
-        if ($expect['continues']) {
+        if ($expect['continues'] && $run->cancelled_at !== null && $continuations === []) {
+            // The losing end still cancelled the run before its continuation
+            // started; cancellation wins over resuming.
+            $this->assertSame('stopped_early', $run->end_state, "{$label}: the cancelled run is closed, not continued");
+            $this->assertSame(app(\ClarionApp\LlmClient\Services\TaskResumeText::class)->cancelledReason(), $run->end_reason);
+        } elseif ($expect['continues']) {
             $this->assertCount(1, $continuations, "{$label}: the run is continued exactly once");
             $this->assertSame($stored, $this->toolResultIn($this->slotMessages($continuations[0]), $fresh->tool_call_id), "{$label}: the continuation carries that outcome");
             $this->assertCount(2, $slots, "{$label}: no second run starts beside the continuing one");

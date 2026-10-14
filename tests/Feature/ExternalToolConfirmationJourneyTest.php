@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\McpClientServer;
@@ -329,7 +329,7 @@ class ExternalToolConfirmationJourneyTest extends TestCase
 
         $service->resume($conversation, $message, true);
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
 
         $message->refresh();
         $this->assertNull($message->tool_data['pending_confirmation']);

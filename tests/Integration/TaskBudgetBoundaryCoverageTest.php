@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Jobs\RunEvalCaseJob;
 use ClarionApp\LlmClient\Jobs\RunManagedTaskStepJob;
@@ -255,10 +255,14 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
     // B2 — a synchronous continuation
     // ---------------------------------------------------------------
 
-    private function assertNoStepLeftOpen(?string $runId): void
+    private function assertPausedStepLeftOpen(?string $runId): void
     {
         $this->assertNotNull($runId);
-        $this->assertSame(0, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count(), 'no step is left open');
+        // The pause sits on the step boundary: the step is left open and
+        // marked paused (the run is resumable until its resumer claims it),
+        // never closed.
+        $this->assertSame(1, DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->count(), 'the open step is left open');
+        $this->assertSame('paused', DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', 'in_progress')->value('checkpoint_state'), 'the step is marked paused');
     }
 
     private function row8(): void
@@ -281,7 +285,11 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(2, $this->modelRequests('sync'));
         $this->assertSame(2, (int) $task->steps_used, 'the continuation\'s request was claimed');
         $this->assertSame('paused', $task->state, 'and at the ceiling it made no further request');
-        $this->assertNoStepLeftOpen($this->latestRunIdOf($conversation));
+        $this->assertPausedStepLeftOpen($this->latestRunIdOf($conversation));
+        // The cap on a lazily opened task's seed is for a run with no task;
+        // this run has one, so nothing is left in the ambient Context (where
+        // it would ride into every log line and queued job after it).
+        $this->assertSame([], array_values(array_filter(array_keys(\Illuminate\Support\Facades\Context::all()), fn ($key) => str_starts_with((string) $key, 'resume_seed_step_cap:'))), 'no seed cap is left in the Context');
     }
 
     private function row9(): void
@@ -302,7 +310,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(2, (int) $task->steps_used);
         $this->assertSame('paused', $task->state);
         $this->assertNotNull($this->promptOf($conversation), 'the ceiling prompt is what the answer\'s reply waits on');
-        $this->assertNoStepLeftOpen($question->run_id);
+        $this->assertPausedStepLeftOpen($question->run_id);
     }
 
     private function row10(): void
@@ -328,7 +336,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertNotSame($first->id, $second->id);
         $this->assertSame(QuestionState::Pending, $second->state);
         $this->assertSame($runId, $second->run_id, 'still the same run');
-        $this->assertNoStepLeftOpen($runId);
+        $this->assertPausedStepLeftOpen($runId);
     }
 
     // ---------------------------------------------------------------
@@ -380,7 +388,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->travel(1)->seconds();
         $this->send('stream', $conversation, 'Second request.')->assertStatus(201);
         // Counted without re-reading the stream harness, which would discard the handler mid-reply.
-        $this->assertSame(1, Queue::pushed(SendHttpStreamRequest::class)->count(), 'precondition: the second message waits while the first is processing');
+        $this->assertSame(1, Queue::pushed(AgentStreamStepJob::class)->count(), 'precondition: the second message waits while the first is processing');
         $stream->finish();
 
         // Picked up as a new request: a new task, claimed before it was dispatched.
@@ -418,7 +426,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(1, $this->modelRequests('stream'), 'the continuation was refused at the ceiling, not dispatched');
         $this->assertSame(1, (int) $task->steps_used);
         $this->assertSame('paused', $task->state);
-        $this->assertNoStepLeftOpen($this->latestRunIdOf($conversation));
+        $this->assertPausedStepLeftOpen($this->latestRunIdOf($conversation));
     }
 
     private function row15(): void
@@ -438,7 +446,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $this->assertSame(1, (int) $task->steps_used);
         $this->assertSame('paused', $task->state);
         $this->assertNotNull($this->promptOf($conversation));
-        $this->assertNoStepLeftOpen($question->run_id);
+        $this->assertPausedStepLeftOpen($question->run_id);
     }
 
     private function row16(): void
@@ -467,7 +475,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
         $second = $this->promptOf($conversation);
         $this->assertNotSame($first->id, $second->id);
         $this->assertSame($runId, $second->run_id, 'still the same run');
-        $this->assertNoStepLeftOpen($runId);
+        $this->assertPausedStepLeftOpen($runId);
     }
 
     // ---------------------------------------------------------------
@@ -569,7 +577,7 @@ class TaskBudgetBoundaryCoverageTest extends AssembledSystemTestCase
     private function row6(): void
     {
         config(['llm-client.agent_loop.max_iterations' => 3]);
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
         [, $manager, $helpers] = $this->delegatingRoot(['part-helper']);
         $response = $this->actingAs($this->fixture()->user, 'api')->postJson('/api/clarion-app/llm-client/managed-tasks', [
             'agent_id' => $manager->id,

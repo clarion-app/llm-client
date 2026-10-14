@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
@@ -329,7 +329,7 @@ class QuestionWithdrawalTest extends TestCase
 
     private function streamRequestCount(): int
     {
-        return Queue::pushed(SendHttpStreamRequest::class)->count();
+        return Queue::pushed(AgentStreamStepJob::class)->count();
     }
 
     /**
@@ -531,7 +531,7 @@ class QuestionWithdrawalTest extends TestCase
     // ---------------------------------------------------------------
 
     #[Test]
-    public function a_withdrawal_after_the_answer_was_accepted_leaves_the_run_continuing(): void
+    public function a_withdrawal_after_the_answer_was_accepted_keeps_the_answer_but_the_end_cancels_the_run(): void
     {
         $conversation = $this->conversation('telegram');
         $question = $this->askIn($conversation);
@@ -560,14 +560,18 @@ class QuestionWithdrawalTest extends TestCase
         );
         $this->assertTrue((bool) $conversation->fresh()->is_processing, 'the answered run is still about to continue');
 
-        // The continuation goes ahead with the answer.
+        // Ending the conversation cancelled the run, and cancellation wins
+        // over the continuation: the answer is recorded with the
+        // paused call, but the run is closed instead of continuing.
         $chatCallsBefore = $this->chatCalls;
         $this->replies = [$this->textReply('Starting with the backend.')];
         app(QuestionResumer::class)->resume($question->id, ResumeCaller::Background);
 
-        $this->assertSame($chatCallsBefore + 1, $this->chatCalls, 'the run continues with the answer');
-        $this->assertSame('completed', DB::table('agent_runs')->where('id', $question->run_id)->value('end_state'));
-        $this->assertSame('success', DB::table('agent_run_actions')->where('id', $question->action_id)->value('outcome'));
+        $this->assertSame($chatCallsBefore, $this->chatCalls, 'no model call after the cancellation');
+        $run = DB::table('agent_runs')->where('id', $question->run_id)->first();
+        $this->assertSame('stopped_early', $run->end_state);
+        $this->assertSame(app(\ClarionApp\LlmClient\Services\TaskResumeText::class)->cancelledReason(), $run->end_reason);
+        $this->assertFalse((bool) $conversation->fresh()->is_processing, 'the conversation is released');
         $this->assertSame('answered', $this->storedResult(Message::findOrFail($question->paused_message_id), $question->tool_call_id)['outcome'] ?? null);
     }
 }

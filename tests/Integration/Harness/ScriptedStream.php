@@ -3,15 +3,15 @@
 namespace Tests\Integration\Harness;
 
 use ClarionApp\HttpQueue\HttpRequest;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use Illuminate\Support\Facades\Queue;
 
 /**
- * Captures HttpRequest objects from dispatched SendHttpStreamRequest jobs
+ * Captures HttpRequest objects from dispatched AgentStreamStepJob jobs
  * and drives a container-resolved AgentLoopStreamHandler with scripted SSE chunks.
  *
- * When Queue::fake([SendHttpStreamRequest::class]) is active, this adapter:
+ * When Queue::fake([AgentStreamStepJob::class]) is active, this adapter:
  * 1. Captures the HttpRequest from each dispatched job.
  * 2. Provides emit() to drive SSE chunks into the real handler.
  * 3. Provides finish() to complete the stream.
@@ -38,7 +38,7 @@ class ScriptedStream
     private float $elapsed = 0.0;
 
     /**
-     * Extract dispatched SendHttpStreamRequest jobs from the fake queue.
+     * Extract dispatched AgentStreamStepJob jobs from the fake queue.
      *
      * Call this after Queue::fake() and after the dispatch has occurred.
      * Uses Queue::pushed() which iterates over the fake queue's stored jobs.
@@ -53,7 +53,7 @@ class ScriptedStream
         $this->capturedData = [];
         $this->handlers = []; // Clear handlers cache as slot indices change
 
-        Queue::pushed(SendHttpStreamRequest::class, function (SendHttpStreamRequest $job) {
+        Queue::pushed(AgentStreamStepJob::class, function (AgentStreamStepJob $job) {
             $reflector = new \ReflectionClass($job);
 
             // Capture the HttpRequest from the job's protected $request property.

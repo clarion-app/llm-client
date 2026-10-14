@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
@@ -475,7 +475,7 @@ class AskUserRefusalTest extends TestCase
             $this->refusal('question_already_pending', "A question is already waiting for the user's answer in this conversation. Wait for it to be resolved before asking another."),
             json_decode((string) ($message->tool_data['tool_results'][0]['content'] ?? ''), true),
         );
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
 
         $this->assertSame(1, AgentQuestion::count());
         $this->assertSame($before, (array) DB::table('agent_questions')->where('id', $original->id)->first());
@@ -557,7 +557,7 @@ class AskUserRefusalTest extends TestCase
             $this->refusal('no_reachable_user', self::NO_USER_REASON),
             json_decode((string) ($message->tool_data['tool_results'][0]['content'] ?? ''), true),
         );
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         $this->assertSame(0, AgentQuestion::count());
         $this->assertSame([], $this->web->deliveries);
     }
@@ -748,7 +748,7 @@ class AskUserRefusalTest extends TestCase
             json_decode((string) ($message->tool_data['tool_results'][0]['content'] ?? ''), true),
             'the refusal is the call\'s result in the same iteration',
         );
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
         $this->assertSame(0, AgentQuestion::count(), 'a refused ask writes no question');
         $this->assertSame(
             1,

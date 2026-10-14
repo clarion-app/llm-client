@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\InteractiveQuestionAnswers;
 use ClarionApp\LlmClient\Events\ConversationEnded;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
@@ -124,7 +124,7 @@ class LateAnswerJourneyTest extends AssembledSystemTestCase
 
         // Resume jobs are held on the queue until a worker picks them up, so
         // the test sees exactly what each step queued.
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         // Ending a conversation also captures its episodic memory through a
         // model call of its own; that capture is not what these journeys are

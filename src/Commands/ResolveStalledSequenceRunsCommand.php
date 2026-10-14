@@ -73,6 +73,16 @@ class ResolveStalledSequenceRunsCommand extends Command
         $failed = 0;
 
         foreach ($staleRuns as $run) {
+            // A stage whose helper is being resumed belongs to that recovery:
+            // neither a second stage job nor a forced failure, since the stage
+            // is not being repeated. Once the helper's run ends, the stage job
+            // continues and this sweep applies again as the backstop.
+            if ($sequenceService->stageIsBeingResumed($run)) {
+                $this->line("Run {$run->id}: its stage is being resumed, so it is left to that");
+
+                continue;
+            }
+
             $safety = $sequenceService->resumeSafety($run);
 
             if ($dryRun) {

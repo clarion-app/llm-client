@@ -6,6 +6,7 @@ use ClarionApp\LlmClient\Jobs\RunManagedTaskStepJob;
 use ClarionApp\LlmClient\Models\ManagedTask;
 use ClarionApp\LlmClient\Services\ManagerService;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 
 /**
  * 103-manager-agent (US4, research.md D7, contracts/manager-agent-meta-tools.md
@@ -69,6 +70,16 @@ class ResolveStalledManagedTasksCommand extends Command
         $forceFinalized = 0;
 
         foreach ($staleTasks as $task) {
+            // A round whose run is being resumed (or waits to retry the
+            // provider) belongs to that recovery: a fresh round beside it
+            // would race it for the same conversation. The round's
+            // completion continues the task once that run ends.
+            if ($this->roundIsBeingResumed($task)) {
+                $this->line("Task {$task->id}: its round is being resumed, so it is left to that");
+
+                continue;
+            }
+
             $wallClockCeilingReached = $task->started_at->diffInSeconds(now(), false) >= $task->max_seconds;
 
             if ($dryRun) {
@@ -103,5 +114,16 @@ class ResolveStalledManagedTasksCommand extends Command
         $this->info("Force-finalized with shortfall (max_seconds exceeded): {$forceFinalized}");
 
         return self::SUCCESS;
+    }
+
+    /** Whether the task's newest run is checkpointed and still going. */
+    private function roundIsBeingResumed(ManagedTask $task): bool
+    {
+        $newest = DB::table('agent_runs')
+            ->where('conversation_id', $task->conversation_id)
+            ->orderByDesc('started_at')
+            ->first(['end_state', 'checkpoint_version']);
+
+        return $newest !== null && $newest->end_state === 'in_progress' && (int) $newest->checkpoint_version === 1;
     }
 }

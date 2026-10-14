@@ -124,7 +124,7 @@ class ContextManagementJourneyTest extends AssembledSystemTestCase
             AgentTurnCompleted::class,
         ]);
 
-        // Drive start() — this dispatches a SendHttpStreamRequest
+        // Drive start() — this dispatches an AgentStreamStepJob
         $this->app->make(AgentLoopService::class)->start($fixture->conversation);
 
         // Capture the dispatched stream request via ScriptedStream

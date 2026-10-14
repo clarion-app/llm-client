@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\ValueObjects\EvalCaseOutcome;
 use ClarionApp\LlmClient\ValueObjects\EvalRunCaseStatus;
 use ClarionApp\LlmClient\ValueObjects\EvalRunStatus;
 use ClarionApp\LlmClient\ValueObjects\ExpectationKind;
+use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -57,7 +58,10 @@ class EvalCaseExecutor
             // until US2 (Phase 4) wires the branches that check it.
             try {
                 Context::add('eval_run_simulating_tools', true);
-                $this->agentLoop->run($conversation, $version->given);
+                // An eval case is not resumable: its run is driven by
+                // nobody (the eval reads the transcript back, it never
+                // resumes the run).
+                $this->agentLoop->run($conversation, $version->given, ['_resume_driver' => ResumeDriver::None->value]);
             } finally {
                 Context::forget('eval_run_simulating_tools');
             }

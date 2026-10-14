@@ -250,7 +250,7 @@ class AgentLoopStreamHandlerTest extends TestCase
             ToolExecutionEvent::class,
             \ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent::class,
         ]);
-        \Illuminate\Support\Facades\Queue::fake([\ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest::class]);
+        \Illuminate\Support\Facades\Queue::fake([\ClarionApp\LlmClient\Jobs\AgentStreamStepJob::class]);
 
         $server = \ClarionApp\LlmClient\Models\Server::create(['name' => 'test', 'server_url' => 'https://api.openai.com/v1/chat/completions', 'token' => 'sk-test']);
         $conversation = Conversation::factory()->create(['is_processing' => true, 'server_id' => $server->id]);
@@ -294,7 +294,7 @@ class AgentLoopStreamHandlerTest extends TestCase
         $this->assertFalse($conversation->is_processing);
 
         Event::assertNotDispatched(FinishOpenAIConversationResponseEvent::class);
-        \Illuminate\Support\Facades\Queue::assertNotPushed(\ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest::class);
+        \Illuminate\Support\Facades\Queue::assertNotPushed(\ClarionApp\LlmClient\Jobs\AgentStreamStepJob::class);
     }
 
     protected function mockToolExecution(string $toolName, string $result)

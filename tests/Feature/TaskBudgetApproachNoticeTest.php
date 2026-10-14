@@ -431,7 +431,7 @@ class TaskBudgetApproachNoticeTest extends TestCase
     public function every_system_written_notice_kind_is_a_system_notice_kind(): void
     {
         $this->assertSame(
-            [AgentQuestionService::KIND_NOTICE, AgentQuestionService::KIND_TASK_BUDGET_NOTICE, AgentQuestionService::KIND_TASK_BUDGET_REPORT],
+            [AgentQuestionService::KIND_NOTICE, AgentQuestionService::KIND_TASK_BUDGET_NOTICE, AgentQuestionService::KIND_TASK_BUDGET_REPORT, AgentQuestionService::KIND_TASK_RESUME_NOTICE],
             AgentQuestionService::SYSTEM_NOTICE_KINDS,
         );
     }
@@ -441,6 +441,7 @@ class TaskBudgetApproachNoticeTest extends TestCase
         return [
             'an approach notice' => [['kind' => 'task_budget_notice', 'task_budget_id' => 'b6f3a0de-1111-4f1f-9c2e-000000000001', 'notice' => 'approach']],
             'a task budget report' => [['kind' => 'task_budget_report', 'task_budget_id' => 'b6f3a0de-1111-4f1f-9c2e-000000000001', 'occasion' => 'halted']],
+            'a task resume notice' => [['kind' => 'task_resume_notice', 'notice' => 'resumed', 'run_id' => 'b6f3a0de-1111-4f1f-9c2e-000000000002']],
         ];
     }
 

@@ -258,7 +258,7 @@ class ConversationDriver
             'content' => $userMessage,
         ]);
 
-        // Start the stream — this dispatches a SendHttpStreamRequest
+        // Start the stream — this dispatches an AgentStreamStepJob
         $agentLoop->start($conversation);
 
         // Extract dispatched jobs from the fake queue.

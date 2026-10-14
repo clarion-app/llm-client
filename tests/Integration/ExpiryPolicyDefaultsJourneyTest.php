@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Events\ToolExecutionEvent;
@@ -350,7 +350,7 @@ class ExpiryPolicyDefaultsJourneyTest extends AssembledSystemTestCase
         $this->scenario = 'expiry_policy_three_expiries_in_turn';
         $this->entryPath = 'sync';
         $this->travelTo(Carbon::parse('2026-10-12 09:00:00', 'UTC'));
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
         $conversation = $this->telegramConversation();
 
         $this->script()

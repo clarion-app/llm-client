@@ -614,6 +614,33 @@ class ManagerService
     }
 
     /**
+     * What follows a round once its run has returned: the task's progress is
+     * stamped, its task budget ended when it is over, and the next round
+     * queued when it is not. The round's job does this when its run returns,
+     * and the completion hook does it for a round that was resumed after its
+     * worker was lost, so the task moves on exactly once either way.
+     */
+    public function afterRound(string $managedTaskId): void
+    {
+        $task = ManagedTask::find($managedTaskId);
+        if ($task === null) {
+            return;
+        }
+
+        $task->last_progress_at = now();
+        $task->save();
+
+        $terminal = ['completed', 'completed_with_shortfalls', 'failed'];
+        if (in_array($task->status, $terminal, true)) {
+            $this->endTaskBudget($task, $task->status !== 'failed', $task->status);
+
+            return;
+        }
+
+        \ClarionApp\LlmClient\Jobs\RunManagedTaskStepJob::dispatch($managedTaskId)->onQueue(config('llm-client.manager.queue', 'managed-tasks'));
+    }
+
+    /**
      * Ends the managed task's task budget with it: completed, or ended with
      * the given reason. A budget that already halted keeps its halt.
      */

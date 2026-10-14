@@ -26,6 +26,7 @@ class Delegation extends Model
         'batch_id',
         'parent_run_id',
         'parent_action_id',
+        'parent_tool_call_id',
         'helper_run_id',
         'outcome_summary',
         'started_at',

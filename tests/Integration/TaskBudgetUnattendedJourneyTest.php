@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Jobs\ResumeAfterQuestionJob;
 use ClarionApp\LlmClient\Jobs\RunEvalCaseJob;
 use ClarionApp\LlmClient\Jobs\RunManagedTaskStepJob;
@@ -194,7 +194,7 @@ class TaskBudgetUnattendedJourneyTest extends AssembledSystemTestCase
     {
         $this->scenario = 'task_budget_unattended_managed';
         $this->entryPath = 'sync';
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class, RunManagedTaskStepJob::class]);
         $this->enableHelpers();
         $this->fixtureWithModel();
         $manager = $this->agent('manager-agent');

@@ -3,7 +3,7 @@
 namespace Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Events\NewConversationMessageEvent;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -283,7 +283,7 @@ class CeilingPromptAnswersTest extends TestCase
     {
         $this->assertSame($runsBefore, DB::table('agent_runs')->count(), 'no run starts');
         $this->assertSame(0, $this->modelCalls, 'no model request is made');
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     // ---------------------------------------------------------------

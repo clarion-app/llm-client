@@ -3,7 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\CostSummary;
@@ -95,7 +95,7 @@ class PredictiveDeclineJourneyTest extends TestCase
         ]);
 
         \Illuminate\Support\Facades\Http::fake();
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
     }
 
     protected function tearDown(): void
@@ -289,7 +289,7 @@ class PredictiveDeclineJourneyTest extends TestCase
 
         $this->requestStreamedWork()->assertStatus(201);
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
     }
 
     // =================================================================
@@ -332,7 +332,7 @@ class PredictiveDeclineJourneyTest extends TestCase
         $response->assertStatus(402);
         $this->assertSame('budget_ceiling_reached', $response->json('code'));
 
-        Queue::assertNotPushed(SendHttpStreamRequest::class);
+        Queue::assertNotPushed(AgentStreamStepJob::class);
     }
 
     // =================================================================

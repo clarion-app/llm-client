@@ -15,6 +15,7 @@ use ClarionApp\LlmClient\ValueObjects\StatedCeilings;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetStanding;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
 use ClarionApp\LlmClient\Support\Decimal;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -125,8 +126,19 @@ class TaskBudgetService
             DB::table('usage_records')->where('run_id', $runId)->whereNull('task_budget_id')->update(['task_budget_id' => $task->id]);
             // Only finished steps count: a step still open here is the one
             // about to claim (a synchronous continuation opens its step
-            // before the boundary), and it claims for itself.
-            $steps = DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', '!=', 'in_progress')->count();
+            // before the boundary), and it claims for itself. A resumed
+            // confirmation caps the count at the paused step's position:
+            // the continuation's own approved-call step is finished by the
+            // boundary too, but it is the continuation's work, not earlier
+            // work (keyed by run id, so a later, different run's lazy open
+            // never sees it; one-shot, consumed here).
+            $cap = Context::get('resume_seed_step_cap:'.$runId);
+            $query = DB::table('agent_run_steps')->where('run_id', $runId)->where('end_state', '!=', 'in_progress');
+            if ($cap !== null) {
+                Context::forget('resume_seed_step_cap:'.$runId);
+                $query->where('position', '<=', (int) $cap);
+            }
+            $steps = $query->count();
             if ($steps > 0) {
                 DB::table('task_budgets')->where('id', $task->id)->update(['steps_used' => $steps]);
                 $task->steps_used = $steps;

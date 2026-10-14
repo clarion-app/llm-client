@@ -2,6 +2,7 @@
 
 namespace ClarionApp\LlmClient\Services;
 
+use ClarionApp\LlmClient\Contracts\FaultInjector;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Exceptions\RateLimitExceededException;
 use ClarionApp\LlmClient\Models\AgentQuestion;
@@ -78,6 +79,29 @@ class QuestionResumer
             $recorder->closeRun($question->run_id, RunEndState::StoppedEarly, $reason);
 
             return null;
+        }
+
+        // The continuation runs under a fresh claim: mint the next dispatch
+        // id while the run is paused, then claim the lease. A lost claim
+        // means another resumer already took the run; return as if the
+        // one-time claim were already consumed. With run tracing off there
+        // is no run row to claim — the continuation simply runs.
+        if ($question->run_id !== null) {
+            $dispatch = app(RunLease::class)->mintDispatch($question->run_id, ['paused']);
+            if ($dispatch !== null) {
+                $claim = app(RunLease::class)->claim($question->run_id, $dispatch);
+                if (!$claim->won) {
+                    // Cancellation wins: a run the user cancelled meanwhile
+                    // is closed, never left waiting on a continuation.
+                    if ($claim->reason === 'cancelled') {
+                        app(RunResumer::class)->refuseIfCancelled($question->run_id);
+                    }
+
+                    return null;
+                }
+
+                app(FaultInjector::class)->reach('during_pause_resume');
+            }
         }
 
         try {

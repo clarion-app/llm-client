@@ -698,11 +698,31 @@ abstract class TestCase extends BaseTestCase
                 $table->unsignedBigInteger('confirm_wait_ms')->nullable();
                 $table->unsignedBigInteger('product_ms')->nullable();
 
+                // Resumable long tasks (spec 134, data-model.md §1).
+                $table->unsignedTinyInteger('checkpoint_version')->nullable();
+                $table->string('resume_mode', 8)->nullable();
+                $table->string('resume_driver', 16)->nullable();
+                $table->text('resume_options')->nullable();
+                $table->string('resume_state', 24)->nullable();
+                $table->uuid('dispatch_id')->nullable();
+                $table->uuid('lease_holder')->nullable();
+                $table->timestamp('lease_expires_at', 6)->nullable();
+                $table->timestamp('last_progress_at', 6)->nullable();
+                $table->timestamp('interrupted_at', 6)->nullable();
+                $table->unsignedSmallInteger('consecutive_interruptions')->default(0);
+                $table->unsignedInteger('resume_count')->default(0);
+                $table->unsignedTinyInteger('provider_attempts')->default(0);
+                $table->timestamp('provider_first_failure_at', 6)->nullable();
+                $table->timestamp('next_attempt_at', 6)->nullable();
+                $table->timestamp('cancelled_at', 6)->nullable();
+
                 $table->index('conversation_id');
                 $table->index(['user_id', 'started_at']);
                 $table->index(['end_state', 'started_at']);
                 $table->index(['model', 'started_at']);
                 $table->index(['agent_id', 'started_at']);
+                $table->index(['end_state', 'resume_state', 'lease_expires_at']);
+                $table->index(['end_state', 'next_attempt_at']);
             });
         }
 
@@ -720,6 +740,12 @@ abstract class TestCase extends BaseTestCase
                 $table->unsignedBigInteger('duration_ms')->nullable();
                 $table->unsignedBigInteger('wait_ms')->nullable();
                 $table->unsignedSmallInteger('attempt_count')->default(1);
+
+                // Resumable long tasks (spec 134, data-model.md §2).
+                $table->unsignedInteger('iteration')->nullable();
+                $table->string('checkpoint_state', 16)->nullable();
+                $table->text('checkpoint')->nullable();
+                $table->uuid('message_id')->nullable();
 
                 $table->unique(['run_id', 'position']);
                 $table->index('attempt_group_id');
@@ -813,6 +839,9 @@ abstract class TestCase extends BaseTestCase
                 $table->text('content')->nullable();
                 $table->timestamp('created_at')->useCurrent();
 
+                // Resumable long tasks (spec 134, data-model.md §3).
+                $table->string('tool_call_id', 255)->nullable();
+
                 $table->index(['run_id', 'started_at']);
                 $table->index(['step_id', 'started_at']);
                 $table->index('attempt_group_id');
@@ -820,6 +849,22 @@ abstract class TestCase extends BaseTestCase
                 $table->index(['run_id', 'outcome']);
                 $table->index(['action_type', 'started_at']);
                 $table->index(['attempt_group_id', 'target']);
+                $table->index(['run_id', 'tool_call_id']);
+            });
+        }
+
+        // agent_run_resume_events table (for the resume/retry event log, spec 134).
+        if (!Schema::hasTable('agent_run_resume_events')) {
+            Schema::create('agent_run_resume_events', function (Blueprint $table) {
+                $table->uuid('id')->primary();
+                $table->uuid('run_id');
+                $table->string('kind', 32);
+                $table->unsignedInteger('step_position')->nullable();
+                $table->unsignedInteger('attempt')->nullable();
+                $table->text('payload');
+                $table->timestamp('created_at', 6);
+
+                $table->index(['run_id', 'created_at']);
             });
         }
 
@@ -1434,6 +1479,8 @@ abstract class TestCase extends BaseTestCase
                 $table->uuid('batch_id')->nullable()->index();
                 $table->uuid('parent_run_id')->nullable();
                 $table->uuid('parent_action_id')->nullable();
+                // Resumable long tasks (spec 134, data-model.md §4).
+                $table->string('parent_tool_call_id', 255)->nullable();
                 $table->uuid('helper_run_id')->nullable();
                 $table->text('outcome_summary')->nullable();
                 $table->timestamp('started_at', 6);
@@ -1444,6 +1491,7 @@ abstract class TestCase extends BaseTestCase
                 $table->index('owner_user_id');
                 $table->index('parent_run_id');
                 $table->index('helper_run_id');
+                $table->index(['parent_run_id', 'parent_tool_call_id']);
             });
         }
 

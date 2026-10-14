@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use Tests\TestCase;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\Message;
@@ -68,7 +68,7 @@ class RateLimitEntryPathCoverageJourneyTest extends TestCase
         ]);
 
         \Illuminate\Support\Facades\Http::fake();
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
 
         $provider = Mockery::mock(LlmProvider::class);
         $provider->shouldReceive('chat')->andReturn([
@@ -211,7 +211,7 @@ class RateLimitEntryPathCoverageJourneyTest extends TestCase
             'conversation_id' => $conversation->id,
         ])->assertStatus(429);
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 1);
+        Queue::assertPushed(AgentStreamStepJob::class, 1);
     }
 
     // ---------------------------------------------------------------

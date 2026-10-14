@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Database\Schema\Blueprint;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use Tests\Integration\Harness\ResponseScript;
 use Tests\Integration\Harness\ScriptedTransport;
 use Tests\Integration\Harness\ScriptedStream;
@@ -24,6 +24,14 @@ abstract class AssembledSystemTestCase extends TestCase
     protected ?ConversationFixture $fixture = null;
     protected string $scenario = 'unnamed';
     protected string $entryPath = 'sync';
+
+    /**
+     * Set by a test that intentionally interrupts a run (e.g. a fault-injection
+     * kill at a checkpoint point). When true, the unconsumed-steps check in
+     * tearDown() is skipped: the run was killed before it could consume its
+     * remaining scripted steps, so a leftover is expected, not a defect.
+     */
+    protected bool $expectInterruptedRun = false;
 
     protected function setUp(): void
     {
@@ -58,7 +66,7 @@ abstract class AssembledSystemTestCase extends TestCase
         $this->app->bind('llm-client.http_handler', fn () => $this->transport->handlerStack());
 
         // Fake queue for stream jobs
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
 
         $this->stream = new ScriptedStream();
     }
@@ -70,8 +78,9 @@ abstract class AssembledSystemTestCase extends TestCase
             $this->ledger->reconcile($this->scenario, $this->entryPath);
         }
 
-        // Assert no unconsumed steps
-        if ($this->script && $this->script->hasUnconsumedSteps()) {
+        // Assert no unconsumed steps (skipped when the run was intentionally
+        // interrupted, where a leftover is expected).
+        if (!$this->expectInterruptedRun && $this->script && $this->script->hasUnconsumedSteps()) {
             $unconsumedCount = $this->script->unconsumedSteps();
             $this->fail(sprintf(
                 'Unconsumed script steps in [%s/%s]: %d steps remaining.',
@@ -197,11 +206,32 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->unsignedBigInteger('confirm_wait_ms')->nullable();
                 $table->unsignedBigInteger('product_ms')->nullable();
 
+                // Resumable long tasks (spec 134, data-model.md §1). Kept
+                // identical to tests/TestCase.php's agent_runs copy.
+                $table->unsignedTinyInteger('checkpoint_version')->nullable();
+                $table->string('resume_mode', 8)->nullable();
+                $table->string('resume_driver', 16)->nullable();
+                $table->text('resume_options')->nullable();
+                $table->string('resume_state', 24)->nullable();
+                $table->uuid('dispatch_id')->nullable();
+                $table->uuid('lease_holder')->nullable();
+                $table->timestamp('lease_expires_at', 6)->nullable();
+                $table->timestamp('last_progress_at', 6)->nullable();
+                $table->timestamp('interrupted_at', 6)->nullable();
+                $table->unsignedSmallInteger('consecutive_interruptions')->default(0);
+                $table->unsignedInteger('resume_count')->default(0);
+                $table->unsignedTinyInteger('provider_attempts')->default(0);
+                $table->timestamp('provider_first_failure_at', 6)->nullable();
+                $table->timestamp('next_attempt_at', 6)->nullable();
+                $table->timestamp('cancelled_at', 6)->nullable();
+
                 $table->index('conversation_id');
                 $table->index(['user_id', 'started_at']);
                 $table->index(['end_state', 'started_at']);
                 $table->index(['model', 'started_at']);
                 $table->index(['agent_id', 'started_at']);
+                $table->index(['end_state', 'resume_state', 'lease_expires_at']);
+                $table->index(['end_state', 'next_attempt_at']);
             });
         }
 
@@ -219,6 +249,13 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->unsignedBigInteger('duration_ms')->nullable();
                 $table->unsignedBigInteger('wait_ms')->nullable();
                 $table->unsignedSmallInteger('attempt_count')->default(1);
+
+                // Resumable long tasks (spec 134, data-model.md §2). Kept
+                // identical to tests/TestCase.php's agent_run_steps copy.
+                $table->unsignedInteger('iteration')->nullable();
+                $table->string('checkpoint_state', 16)->nullable();
+                $table->text('checkpoint')->nullable();
+                $table->uuid('message_id')->nullable();
 
                 $table->unique(['run_id', 'position']);
                 $table->index('attempt_group_id');
@@ -269,6 +306,10 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->text('content')->nullable();
                 $table->timestamp('created_at')->useCurrent();
 
+                // Resumable long tasks (spec 134, data-model.md §3). Kept
+                // identical to tests/TestCase.php's agent_run_actions copy.
+                $table->string('tool_call_id', 255)->nullable();
+
                 $table->index(['run_id', 'started_at']);
                 $table->index(['step_id', 'started_at']);
                 $table->index('attempt_group_id');
@@ -276,6 +317,7 @@ abstract class AssembledSystemTestCase extends TestCase
                 $table->index(['run_id', 'outcome']);
                 $table->index(['action_type', 'started_at']);
                 $table->index(['attempt_group_id', 'target']);
+                $table->index(['run_id', 'tool_call_id']);
             });
         }
 

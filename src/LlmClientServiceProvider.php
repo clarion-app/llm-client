@@ -63,6 +63,14 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
     {
         parent::boot();
 
+        // The run checkpoint writes to the run's own row, which the run
+        // trace mints. With run tracing disabled there is no run row, so a
+        // run that resume is enabled to resume has nowhere to be written —
+        // the feature is silently inert. Say so once at boot.
+        if (!config('llm-client.run_trace.enabled', true) && config('llm-client.resume.enabled', true)) {
+            \Illuminate\Support\Facades\Log::warning('llm-client: resume is enabled but run tracing is disabled; runs cannot be checkpointed and will not be resumable.');
+        }
+
         $this->loadMigrationsFrom(__DIR__.'/Migrations');
 
         $this->app->booted(function () {
@@ -118,6 +126,7 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
                 \ClarionApp\LlmClient\Commands\EndIdleConversationsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredContextManagementMetricsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveAbandonedRunsCommand::class,
+                \ClarionApp\LlmClient\Commands\ResumeInterruptedRunsCommand::class,
                 \ClarionApp\LlmClient\Commands\ResolveExpiredQuestionsCommand::class,
                 \ClarionApp\LlmClient\Commands\ReleaseAbandonedReservationsCommand::class,
                 \ClarionApp\LlmClient\Commands\PurgeExpiredRunTracesCommand::class,
@@ -172,6 +181,12 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
             // Resolve abandoned (stale in_progress) agent runs every five minutes.
             $schedule->command('llm-client:resolve-abandoned-runs')
                 ->everyFiveMinutes()
+                ->withoutOverlapping();
+
+            // Detect interrupted (lease-expired) agent runs every minute and
+            // resume them in their own run, from their newest checkpoint.
+            $schedule->command('llm-client:resume-interrupted-runs')
+                ->everyMinute()
                 ->withoutOverlapping();
 
             // Re-drive agent questions that were resolved but whose run never
@@ -499,6 +514,43 @@ class LlmClientServiceProvider extends ClarionPackageServiceProvider
         $this->app->singleton(\ClarionApp\LlmClient\Services\RunTraceQuery::class, function () {
             return new \ClarionApp\LlmClient\Services\RunTraceQuery();
         });
+
+        // Fault-injection seam (spec 134, research D21): production binds
+        // the no-op (one method call per named point); tests swap in
+        // SnapshotFaultInjector to stage a dead worker.
+        $this->app->singleton(\ClarionApp\LlmClient\Contracts\FaultInjector::class, function () {
+            return new \ClarionApp\LlmClient\Services\NullFaultInjector();
+        });
+
+        // The execution lease (spec 134, lease contract §1): one per
+        // process — the nonce is per process, shared by every instance, so
+        // a singleton keeps every write in this process under one nonce.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\RunLease::class);
+
+        // The strict checkpoint writer (spec 134, checkpoint-ledger
+        // contract §1): scoped, depends on the lease.
+        $this->app->scoped(\ClarionApp\LlmClient\Services\RunCheckpoint::class);
+
+        // The effect classifier and the liveness bound: stateless, resolved
+        // on demand.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ToolEffectClassifier::class);
+        $this->app->singleton(\ClarionApp\LlmClient\Services\ToolLivenessBound::class);
+
+        // The tool funnel: brackets every tool execution with the start and
+        // completion markers; stateless, depends on the checkpoint writer.
+        $this->app->singleton(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class);
+
+        // The resume: the planner, the resumer, cancellation, the event log,
+        // the user-facing words, and the paused-run exemptions both sweeps
+        // share. All stateless.
+        $this->app->bind(\ClarionApp\LlmClient\Services\ResumePlanner::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\RunResumer::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\RunCancellation::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\ProviderRetryScheduler::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\TaskNoticePoster::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\ResumeEventLog::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\TaskResumeText::class);
+        $this->app->bind(\ClarionApp\LlmClient\Services\PausedRunQuery::class);
 
         // Register role resolution services
         $this->app->singleton(\ClarionApp\LlmClient\Services\RoleResolver::class, function ($app) {

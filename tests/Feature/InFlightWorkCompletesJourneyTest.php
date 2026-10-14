@@ -3,7 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\Exceptions\BudgetExceededException;
 use ClarionApp\LlmClient\Models\Conversation;
 use ClarionApp\LlmClient\Models\CostSummary;
@@ -94,7 +94,7 @@ class InFlightWorkCompletesJourneyTest extends TestCase
         ]);
 
         \Illuminate\Support\Facades\Http::fake();
-        Queue::fake([SendHttpStreamRequest::class]);
+        Queue::fake([AgentStreamStepJob::class]);
 
         $this->seedZeroRatePrice();
     }
@@ -265,7 +265,7 @@ class InFlightWorkCompletesJourneyTest extends TestCase
             $agentLoop->start($this->conversation, $iteration, $runId);
         }
 
-        Queue::assertPushed(SendHttpStreamRequest::class, 5);
+        Queue::assertPushed(AgentStreamStepJob::class, 5);
 
         $this->assertSame(
             0,
@@ -301,7 +301,7 @@ class InFlightWorkCompletesJourneyTest extends TestCase
             );
         }
 
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
     }
 
     /**

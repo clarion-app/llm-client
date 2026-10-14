@@ -14,6 +14,7 @@ use ClarionApp\LlmClient\Models\TaskBudget;
 use ClarionApp\LlmClient\Models\UsageRecord;
 use ClarionApp\LlmClient\Support\Decimal;
 use ClarionApp\LlmClient\ValueObjects\ModelRole;
+use ClarionApp\LlmClient\ValueObjects\ResumeDriver;
 use ClarionApp\LlmClient\ValueObjects\RoleResolution;
 
 /**
@@ -301,8 +302,24 @@ class ConsensusService
         ]);
 
         // 098's solo path -- deliberately NOT delegateBatch() (FR-016).
-        $result = $this->delegationService->delegate($conversation, $assignment->helper_agent_id, $question, null, null, null, $taskBudgetId);
+        // 134-resumable-long-tasks: a single consensus contributor is
+        // resumed by the consensus mechanism, not a plain parent hop.
+        $result = $this->delegationService->delegate($conversation, $assignment->helper_agent_id, $question, null, null, null, $taskBudgetId, ResumeDriver::Consensus->value);
 
+        $this->completeSingleContributor($conversation, $request, $result, $taskBudgetId);
+
+        return $request;
+    }
+
+    /**
+     * What follows a single contributor's result: its answer is posted to the
+     * conversation, and the request and its task end. Shared by the request
+     * that ran straight through and one finished after an interruption.
+     *
+     * @param array<string, mixed> $result
+     */
+    private function completeSingleContributor(Conversation $conversation, ConsensusRequest $request, array $result, string $taskBudgetId): void
+    {
         // A contributor stopped by the request's task budget is reported as
         // such, as finalize() reports one of a batch: its partial answer is
         // kept and marked, and the request's task did not complete.
@@ -328,8 +345,6 @@ class ConsensusService
         $request->successful_count = $successfulCount;
         $request->completed_at = now();
         $request->save();
-
-        return $request;
     }
 
     private function dispatchBatch(
@@ -387,6 +402,144 @@ class ConsensusService
         $this->finalize($request, $batchResults, $taskBudgetId);
 
         return $request->fresh();
+    }
+
+    // -----------------------------------------------------------------
+    // Finishing a request whose process was lost
+    // -----------------------------------------------------------------
+
+    /**
+     * The request a contributor's run belongs to, when that request's own
+     * process is gone: found from the contributor's delegation (the request
+     * made it in the conversation, after the request began, with no run of
+     * its own around it). A request is still waiting on its contributors for
+     * the join's own bound, so it is not taken over before that has passed.
+     */
+    public function requestOfContributorRun(string $helperRunId): ?string
+    {
+        $conversationId = \Illuminate\Support\Facades\DB::table('agent_runs')->where('id', $helperRunId)->value('conversation_id');
+        $delegation = Delegation::where('helper_conversation_id', $conversationId)->first();
+        if ($delegation === null) {
+            return null;
+        }
+
+        $request = ConsensusRequest::where('conversation_id', $delegation->parent_conversation_id)
+            ->whereIn('status', ['in_progress', 'single_contributor_fallback'])
+            ->whereNull('completed_at')
+            ->where('started_at', '<=', $delegation->started_at)
+            ->orderByDesc('started_at')
+            ->first();
+        if ($request === null) {
+            return null;
+        }
+
+        $waiting = (int) config('llm-client.delegation.max_seconds', 120) + DelegationService::JOIN_WAIT_GRACE_SECONDS;
+        if ($request->started_at->gt(now()->subSeconds($waiting))) {
+            return null;
+        }
+
+        return (string) $request->id;
+    }
+
+    /**
+     * Finish a request whose process was lost with its contributors still
+     * working: finished contributors are reused, interrupted ones resumed,
+     * unstarted ones run, and the request is reconciled and its answer posted
+     * to the conversation and delivered on its channel, once. Running it
+     * again changes nothing.
+     */
+    public function continueRequest(ConsensusRequest $request): void
+    {
+        $request = ConsensusRequest::find($request->id);
+        if ($request === null || $request->completed_at !== null
+            || !in_array($request->status, ['in_progress', 'single_contributor_fallback'], true)) {
+            return;
+        }
+
+        $conversation = Conversation::find($request->conversation_id);
+        $contributors = $this->contributorsOf($request);
+        if ($conversation === null || $contributors->isEmpty()) {
+            return;
+        }
+
+        $taskBudgetId = Conversation::where('id', $contributors->first()->helper_conversation_id)->value('active_task_budget_id');
+
+        if ($request->status === 'single_contributor_fallback') {
+            $result = $this->delegationService->resumeDelegation($contributors->first(), ResumeDriver::Consensus->value);
+            $claimed = ConsensusRequest::where('id', $request->id)->whereNull('completed_at')->update(['completed_at' => now()]);
+            if ($claimed === 0) {
+                return;
+            }
+
+            $this->completeSingleContributor($conversation, $request->fresh(), $result, (string) $taskBudgetId);
+            $this->deliverResumedAnswer($conversation, $request->fresh());
+
+            return;
+        }
+
+        $results = $this->delegationService->rejoin($contributors->all());
+
+        // Only the process that wins this claim reconciles and posts. The
+        // request names its batch only once its process has seen the batch
+        // through, so naming it here is the claim: a request already naming
+        // one is being (or has been) finished by someone.
+        $claimed = ConsensusRequest::where('id', $request->id)
+            ->where('status', 'in_progress')
+            ->whereNull('batch_id')
+            ->update(['batch_id' => $contributors->first()->batch_id]);
+        if ($claimed === 0) {
+            return;
+        }
+
+        $request = $request->fresh();
+
+        $this->finalize($request, $results, $taskBudgetId !== null ? (string) $taskBudgetId : null);
+        $this->deliverResumedAnswer($conversation, $request->fresh());
+    }
+
+    /** The request's contributor delegations, oldest first. */
+    private function contributorsOf(ConsensusRequest $request): \Illuminate\Support\Collection
+    {
+        $query = Delegation::where('parent_conversation_id', $request->conversation_id)
+            ->where('started_at', '>=', $request->started_at)
+            ->where('origin', 'delegate_to_helper');
+
+        if ($request->status === 'single_contributor_fallback') {
+            return $query->whereNull('batch_id')->where('task', $request->question)->orderBy('started_at')->limit(1)->get();
+        }
+
+        $batchId = (clone $query)->where('parent_tool_call_id', 'like', 'consensus_%')->whereNotNull('batch_id')->orderBy('started_at')->value('batch_id');
+        if ($batchId === null) {
+            return collect();
+        }
+
+        return $query->where('batch_id', $batchId)->orderBy('started_at')->get();
+    }
+
+    /**
+     * The answer of a request finished after an interruption reaches the
+     * user: no request is waiting for it, so it is put on the conversation's
+     * channel; a request that could not be answered says so.
+     */
+    private function deliverResumedAnswer(Conversation $conversation, ConsensusRequest $request): void
+    {
+        $poster = app(TaskNoticePoster::class);
+
+        if ($request->answer_message_id !== null) {
+            $poster->deliverText($conversation, (string) $request->reconciled_answer, (string) $request->answer_message_id);
+
+            return;
+        }
+
+        $text = app(TaskResumeText::class)->consensusRequestNotAnswered();
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $text,
+            'role' => 'assistant',
+            'user' => 'Clarion',
+            'responseTime' => 0,
+        ]);
+        $poster->deliverText($conversation, $text, (string) $message->id);
     }
 
     // -----------------------------------------------------------------

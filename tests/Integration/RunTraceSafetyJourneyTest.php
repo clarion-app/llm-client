@@ -251,6 +251,13 @@ class RunTraceSafetyJourneyTest extends AssembledSystemTestCase
         $fixture = $this->fixture()->build();
         $iterations = 5;
 
+        // This bound is for the run record's own writes. Checkpointing rides
+        // on the run record (it needs its run id), so with it on the
+        // recording arm would also pay for the checkpoint writes, whose cost
+        // has its own bound (the real-database overhead benchmark, at most
+        // 5 % of a step). Both arms run with checkpointing off.
+        $this->app['config']->set('llm-client.resume.enabled', false);
+
         // ---- Control timings: tracing disabled ----
         $this->app['config']->set('llm-client.run_trace.enabled', false);
         $controlTimes = [];
@@ -324,6 +331,13 @@ class RunTraceSafetyJourneyTest extends AssembledSystemTestCase
 
         $fixture = $this->fixture()->build();
         $iterations = 5;
+
+        // This bound is for the run record's own writes. Checkpointing rides
+        // on the run record (it needs its run id), so with it on the
+        // recording arm would also pay for the checkpoint writes, whose cost
+        // has its own bound (the real-database overhead benchmark, at most
+        // 5 % of a step). Both arms run with checkpointing off.
+        $this->app['config']->set('llm-client.resume.enabled', false);
 
         // ---- Control timings: tracing disabled ----
         $this->app['config']->set('llm-client.run_trace.enabled', false);

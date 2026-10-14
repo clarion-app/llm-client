@@ -796,9 +796,12 @@ class RunTraceQuery
         ?bool $awaitingUser = null,
         ?bool $questionStopped = null,
         ?array $taskBudgets = null,
+        ?array $cancelledByEvent = null,
     ): array {
-        // Callers projecting many runs pass the flags and the task budgets
-        // from one batched lookup each; a single summary looks them up itself.
+        // Callers projecting many runs pass the flags, the task budgets and
+        // the cancellations from one batched lookup each; a single summary
+        // looks them up itself.
+        $cancelledByEvent ??= $this->runIdsRefusedResumeAsCancelled([$run->id]);
         $awaitingUser ??= isset($this->runIdsAwaitingUser([$run->id])[$run->id]);
         $questionStopped ??= isset($this->runIdsStoppedOnQuestion([$run->id])[$run->id]);
         $taskBudgets ??= $this->taskBudgetSummariesForRuns(
@@ -829,7 +832,51 @@ class RunTraceQuery
             'awaiting_user' => $awaitingUser,
             'question_stopped' => $questionStopped,
             'task_budget' => $taskBudgets[$run->id] ?? null,
+            'resume' => $this->resumeBlock($run, isset($cancelledByEvent[$run->id])),
         ];
+    }
+
+    /**
+     * What a summary says about the run's resumability, or null for a run
+     * that never adopted checkpointing.
+     *
+     * @return array{state: ?string, resume_count: int, interrupted_at: ?string, next_attempt_at: ?string, cancelled: bool}|null
+     */
+    private function resumeBlock(AgentRun $run, bool $refusedAsCancelled): ?array
+    {
+        if ($run->checkpoint_version === null) {
+            return null;
+        }
+
+        return [
+            'state' => $run->resume_state,
+            'resume_count' => (int) $run->resume_count,
+            'interrupted_at' => $run->interrupted_at?->toJSON(),
+            'next_attempt_at' => $run->next_attempt_at?->toJSON(),
+            'cancelled' => $run->cancelled_at !== null || $refusedAsCancelled,
+        ];
+    }
+
+    /**
+     * The subset of $runIds whose resume was refused because the task was
+     * cancelled, in one query however many runs are asked about.
+     *
+     * @param  list<string>  $runIds
+     * @return array<string, true> keyed by run id
+     */
+    public function runIdsRefusedResumeAsCancelled(array $runIds): array
+    {
+        if ($runIds === []) {
+            return [];
+        }
+
+        return DB::table('agent_run_resume_events')
+            ->whereIn('run_id', $runIds)
+            ->where('kind', 'resume_refused_cancelled')
+            ->distinct()
+            ->pluck('run_id')
+            ->mapWithKeys(fn ($id) => [(string) $id => true])
+            ->all();
     }
 
     /**

@@ -694,4 +694,26 @@ class DelegationServiceResultMappingTest extends TestCase
             (string) $rowUnderCap->result_output,
         );
     }
+
+    /**
+     * The helper's run was taken over by another worker while this one was
+     * slow (a parent's wait re-drove the member): this worker's run comes
+     * back superseded. The delegation belongs to the worker that took the
+     * run over; this one writes no outcome onto it.
+     */
+    #[Test]
+    public function a_superseded_helper_run_leaves_the_delegation_to_the_worker_that_took_it_over(): void
+    {
+        [$helper, $conversation] = $this->makeDelegationFixture('superseded');
+        $this->mockRunReturning(['status' => 'superseded']);
+
+        $result = app(DelegationService::class)->delegate($conversation, $helper->id, 'Do the task.', null);
+
+        $row = Delegation::where('parent_conversation_id', $conversation->id)->first();
+        $this->assertNotNull($row);
+        $this->assertSame('in_progress', $row->status, 'no outcome is written by the superseded worker');
+        $this->assertNull($row->result_status);
+        $this->assertNull($row->completed_at);
+        $this->assertSame('superseded', $result['status'] ?? null, 'the superseded worker is told so, and stops');
+    }
 }

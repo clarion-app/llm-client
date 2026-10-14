@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Events\ApiCallConfirmationRequiredEvent;
 use ClarionApp\LlmClient\Events\FinishOpenAIConversationResponseEvent;
@@ -253,6 +253,6 @@ class ConversationBindingSurvivesQueueContinuationTest extends TestCase
         // successful terminal execute_operation) — proving the continuation
         // itself (the next call AgentLoopService::start($conversation,
         // $iteration + 1, $runId) would make) is reached at all.
-        Queue::assertPushed(SendHttpStreamRequest::class);
+        Queue::assertPushed(AgentStreamStepJob::class);
     }
 }

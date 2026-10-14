@@ -145,20 +145,21 @@ class RunManagedTaskStepJob implements ShouldQueue
             ? 'Continue working on the managed task.'
             : $task->original_request;
 
-        $agentLoopService->run($conversation, $seedMessage, [
+        $result = $agentLoopService->run($conversation, $seedMessage, [
             'max_iterations' => config('llm-client.manager.step_max_iterations', 4),
+            // What the rest of this job does once the round returns, kept with
+            // the run so a resumed round (whose worker is gone) still does it.
+            'on_complete' => ['hook' => 'managed_task_step', 'managed_task_id' => $this->managedTaskId],
         ]);
 
-        $task->refresh();
-        $task->last_progress_at = now();
-        $task->save();
-
-        if (in_array($task->status, self::TERMINAL_STATUSES, true)) {
-            app(ManagerService::class)->endTaskBudget($task, $task->status !== 'failed', $task->status);
+        // A round whose model call is waiting on a provider retry has not
+        // finished: its work is carried by the delayed retry, so the next
+        // round must not be queued behind it and race it for the same
+        // manager conversation.
+        if (($result['status'] ?? null) === 'continuing') {
+            return;
         }
 
-        if (!in_array($task->status, self::TERMINAL_STATUSES, true)) {
-            self::dispatch($this->managedTaskId)->onQueue(config('llm-client.manager.queue', 'managed-tasks'));
-        }
+        app(ManagerService::class)->afterRound($this->managedTaskId);
     }
 }

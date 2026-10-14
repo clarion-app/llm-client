@@ -19,6 +19,7 @@ use ClarionApp\LlmClient\Services\ToolResultCondenser;
 use ClarionApp\LlmClient\Services\MetricsRecorder;
 use ClarionApp\LlmClient\Services\DegradationGate;
 use ClarionApp\LlmClient\ValueObjects\DegradationDecision;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class AgentLoopStreamHandler extends HandleHttpStreamResponse
@@ -46,6 +47,76 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         $this->runTraceRecorder = $runTraceRecorder;
     }
 
+    /**
+     * Reuse the step's partial row:
+     * load the row the step already named and reset its content to empty
+     * before the first delta, so the re-streamed reply updates that row
+     * rather than creating a duplicate.
+     */
+    public function reusePartialMessage(string $messageId): void
+    {
+        $this->partialMessageChecked = true;
+
+        $message = Message::find($messageId);
+        if ($message === null) {
+            return;
+        }
+
+        $this->message = $message;
+        $this->message->update(['content' => '']);
+    }
+
+    /** Whether the payload's partial reply row has been looked up yet. */
+    private bool $partialMessageChecked = false;
+
+    /** Whether the stream carried its end marker (a finish reason or [DONE]). */
+    private bool $streamCompleted = false;
+
+    /**
+     * Whether the stream handled so far ended properly: a stream cut off
+     * without a finish reason or `[DONE]` is incomplete and must not be
+     * finished as if the model's response were whole.
+     */
+    public function streamCompleted(): bool
+    {
+        return $this->streamCompleted;
+    }
+
+    /**
+     * Prepare the handler for a resume:
+     * set the run and step the resume continues and the attempt group, so
+     * resumeToolCalls() can bracket its checkpoint writes and reuse the
+     * step's own message row. The run id is read from the run's durable
+     * state (the claim), never minted — a resume continues the same run.
+     */
+    public function resumeState(string $runId, string $stepId, string $attemptGroupId): void
+    {
+        $this->runId = $runId;
+        $this->stepId = $stepId;
+        $this->attemptGroupId = $attemptGroupId;
+    }
+
+    /**
+     * Run a checkpoint or lease write. A checkpoint write cannot happen
+     * inside a transaction, so when this handler runs inside one the write
+     * is a no-op. In production these paths never run inside a transaction
+     * (a queue job or request, transactionLevel 0), so the write runs; the
+     * only in-transaction callers are a test's RefreshDatabase wrapping
+     * transaction, for which the checkpoint is a no-op — those are
+     * pre-checkpoint tests that never assert checkpoint state. (Deferring to
+     * afterCommit does not work here: RefreshDatabase's transaction manager
+     * runs an afterCommit callback immediately when only its own wrapping
+     * transaction is open, so the write would still throw.)
+     */
+    private function checkpoint(callable $write): void
+    {
+        if (DB::transactionLevel() > 0) {
+            return;
+        }
+
+        $write();
+    }
+
     public function handle($content, $data, $seconds)
     {
         $parsedData = is_string($data) ? json_decode($data, true) : $data;
@@ -53,6 +124,16 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
 
         $conversation = Conversation::find($conversationId);
         if (!$conversation) return;
+
+        // A repeated call of a lost stream step reuses the step's partial
+        // reply row: loaded once, its content reset before the
+        // first delta, so the step never ends with a second row.
+        if ($this->message === null && !$this->partialMessageChecked) {
+            $this->partialMessageChecked = true;
+            if (($parsedData['partial_message_id'] ?? null) !== null) {
+                $this->reusePartialMessage((string) $parsedData['partial_message_id']);
+            }
+        }
 
         $this->buffer .= $content;
 
@@ -66,7 +147,10 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         foreach ($parts as $chunk) {
             $chunk = trim($chunk);
             if ($chunk === '') continue;
-            if ($chunk === '[DONE]') continue;
+            if ($chunk === '[DONE]' || $chunk === 'data: [DONE]') {
+                $this->streamCompleted = true;
+                continue;
+            }
 
             // Strip "data: " prefix if present
             if (str_starts_with($chunk, 'data: ')) {
@@ -83,6 +167,9 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
             }
 
             foreach ($json['choices'] ?? [] as $choice) {
+                if (($choice['finish_reason'] ?? null) !== null) {
+                    $this->streamCompleted = true;
+                }
                 $delta = $choice['delta'] ?? [];
 
                 // Handle text content deltas
@@ -113,6 +200,17 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         }
                         if ($this->runTraceRecorder !== null) {
                             $this->runTraceRecorder->recordFirstOutput($parsedData['run_id'] ?? $this->runId);
+                        }
+
+                        // The step names this partial row as soon as the
+                        // first content delta arrives, so its final write
+                        // updates this row rather than creating a duplicate.
+                        // No lease guard, no state change — a partial row
+                        // is progress.
+                        if (($parsedData['step_id'] ?? null) !== null) {
+                            $stepId = $parsedData['step_id'];
+                            $messageId = $this->message->id;
+                            $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->recordPartialMessage($stepId, $messageId));
                         }
                     }
 
@@ -210,6 +308,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                 model: $conversation->model,
                 agentId: $conversation->character ?? $conversation->id,
             );
+            // C0: the freshly-minted run is checkpointed (stream, driven by
+            // root — the payload had no run id, so this is a plain
+            // interactive stream whose run the handler itself opened).
+            if ($this->runId !== null) {
+                $runId = $this->runId;
+                $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->openRun($runId, \ClarionApp\LlmClient\ValueObjects\ResumeMode::Stream, \ClarionApp\LlmClient\ValueObjects\ResumeDriver::Root, []));
+            }
             // If we minted a run but have no step_id, open one now.
             if ($this->runId !== null && $this->stepId === null) {
                 $this->stepId = $this->runTraceRecorder->openStep(
@@ -217,6 +322,13 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     null,
                     $this->attemptGroupId,
                 );
+                // C1: the step is checkpointed (its loop iteration, its
+                // fresh checkpoint).
+                if ($this->stepId !== null) {
+                    $runId = $this->runId;
+                    $stepId = $this->stepId;
+                    $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->openStep($runId, $stepId, $iteration));
+                }
             }
         }
 
@@ -289,6 +401,18 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     'error' => $e->getMessage(),
                 ]);
             }
+        }
+
+        // C2: the model response is recorded — its content, every call
+        // marked not started with its label, the provider-attempt count
+        // reset, and the lease renewed. Done before the tool calls are
+        // handled and before the final reply is persisted, so the
+        // checkpoint names what the model said either way.
+        if ($this->stepId !== null) {
+            $stepId = $this->stepId;
+            $reply = $this->reply;
+            $calls = array_values($this->toolCalls);
+            $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->recordModelResponse($stepId, $reply, $calls));
         }
 
         // If we have tool calls to execute
@@ -582,8 +706,16 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     \ClarionApp\LlmClient\ValueObjects\ActionType::ToolInvocation,
                     $toolName,
                     $this->attemptGroupId,
+                    null,
+                    $toolCallId,
                 );
             }
+
+            // The step the funnel brackets this call in; null when the run
+            // is not checkpointed (the tool still runs, unbracketed).
+            $checkpointStepRef = ($this->runId !== null && $this->stepId !== null)
+                ? new \ClarionApp\LlmClient\ValueObjects\StepRef($this->runId, $this->stepId, $iteration)
+                : null;
 
             Log::info('AgentLoopStreamHandler: executing tool', [
                 'tool' => $toolName,
@@ -650,14 +782,35 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                             'protocol_version' => '2025-03-26',
                         ]);
                     }
-                    $execResult = $toolExecutor->executeTool($toolName, $arguments, $session);
-                    $result = json_encode($execResult);
+                    if ($checkpointStepRef !== null) {
+                        $result = app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->execute(
+                            $checkpointStepRef,
+                            $toolCall,
+                            fn () => json_encode($toolExecutor->executeTool($toolName, $arguments, $session)),
+                            $toolActionId,
+                            $conversation,
+                        );
+                        app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordCompleted($checkpointStepRef, $toolCallId, json_decode($result, true));
+                    } else {
+                        $execResult = $toolExecutor->executeTool($toolName, $arguments, $session);
+                        $result = json_encode($execResult);
+                    }
                 }
             }
 
             // Meta tools or unresolved non-meta tools: fall through to executeMetaTool
             if ($result === null) {
-                $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId);
+                if ($checkpointStepRef !== null) {
+                    $result = app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->execute(
+                        $checkpointStepRef,
+                        $toolCall,
+                        fn () => $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId),
+                        $toolActionId,
+                        $conversation,
+                    );
+                } else {
+                    $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId);
+                }
 
                 // Check if execute_operation needs confirmation
                 $decoded = json_decode($result, true);
@@ -669,6 +822,12 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     $refusal = $this->openQuestion($conversation, $decoded, $toolCallId, $toolActionId, $toolResults, $iteration);
 
                     if ($refusal === null) {
+                        // The question was opened: the call is paused (C6),
+                        // not completed with the marker as its result.
+                        if ($checkpointStepRef !== null) {
+                            app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordPaused($checkpointStepRef, $toolCallId);
+                        }
+
                         return; // Suspended until the question is resolved
                     }
 
@@ -683,11 +842,11 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                     $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
 
                     $pendingConfirmation = [
-                        'tool_name' => 'execute_operation',
+                        'tool_name' => $confirmationType === 'declarative_memory' ? 'propose_declarative_memory' : 'execute_operation',
                         'confirmation_type' => $confirmationType,
-                        'operationId' => $decoded['operationId'],
-                        'method' => $decoded['method'],
-                        'path' => $decoded['path'],
+                        'operationId' => $decoded['operationId'] ?? null,
+                        'method' => $decoded['method'] ?? null,
+                        'path' => $decoded['path'] ?? null,
                         'arguments' => $decoded['parameters'] ?? [],
                         'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
                         // 112-coding-agent (US1, data-model.md §6): lets
@@ -706,16 +865,33 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
                     }
 
+                    if ($confirmationType === 'declarative_memory') {
+                        // The declarative-memory proposal carries no
+                        // operationId/method/path — resume()'s
+                        // declarative_memory branch reads type/content/
+                        // existingId, so carry them the same way the
+                        // synchronous pause-construction does.
+                        $pendingConfirmation['type'] = $decoded['type'] ?? '';
+                        $pendingConfirmation['content'] = $decoded['content'] ?? '';
+                        $pendingConfirmation['existingId'] = $decoded['existingId'] ?? null;
+                    }
+
                     $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
 
-                    event(new ApiCallConfirmationRequiredEvent(
-                        $conversationId,
-                        $this->message->id,
-                        $decoded['method'],
-                        $decoded['path'],
-                        $decoded['parameters'] ?? [],
-                        'execute_operation'
-                    ));
+                    // The api_call confirmation event is specific to the
+                    // operation confirmations (which carry method/path); a
+                    // declarative-memory pause has neither, so fire only
+                    // when the method is present.
+                    if (($decoded['method'] ?? null) !== null) {
+                        event(new ApiCallConfirmationRequiredEvent(
+                            $conversationId,
+                            $this->message->id,
+                            $decoded['method'],
+                            $decoded['path'] ?? null,
+                            $decoded['parameters'] ?? [],
+                            'execute_operation'
+                        ));
+                    }
 
                     // Close tool action as awaiting_confirmation before suspend.
                     if ($toolActionId !== null && $this->runTraceRecorder !== null) {
@@ -732,7 +908,20 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
                         }
                     }
 
+                    // The confirmation pauses the call (C6), not completes
+                    // it with the marker as its result.
+                    if ($checkpointStepRef !== null) {
+                        app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordPaused($checkpointStepRef, $toolCallId);
+                    }
+
                     return; // Suspend for confirmation
+                }
+
+                // C4: only a call that actually ran is completed (a pause
+                // marker returned above, so this is reached only for an
+                // executed call).
+                if ($checkpointStepRef !== null) {
+                    app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordCompleted($checkpointStepRef, $toolCallId, $decoded);
                 }
             }
 
@@ -875,7 +1064,539 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         // Dispatch next iteration (requires a server for the LLM API call).
         // Carry the run_id forward so the same run continues across iterations.
         if ($conversation->server_id !== null) {
+            // The hand-off: mint the next dispatch id and release the lease
+            // so the next worker's claim is the only way to take the run
+            // over. A LeaseLost means this process no longer holds the lease
+            // (another worker took the run over): it stops here, starting
+            // nothing more. With run tracing off there is no run row to hand
+            // off.
+            if ($this->runId !== null) {
+                $runId = $this->runId;
+                $superseded = false;
+                $this->checkpoint(function () use ($runId, &$superseded) {
+                    try {
+                        app(\ClarionApp\LlmClient\Services\RunLease::class)->handOff($runId);
+                    } catch (\ClarionApp\LlmClient\Exceptions\LeaseLost $e) {
+                        $superseded = true;
+                        Log::warning('AgentLoopStreamHandler: hand-off failed (lease lost); this worker stops', [
+                            'run_id' => $runId,
+                        ]);
+                    }
+                });
+                if ($superseded) {
+                    return;
+                }
+            }
             $agentLoopService->start($conversation, $iteration + 1, $this->runId);
+        } else {
+            // No server to continue against: the run stops here rather than
+            // staying in progress until the abandonment sweep finds it.
+            $this->closeRun(
+                \ClarionApp\LlmClient\ValueObjects\RunEndState::StoppedEarly,
+                null,
+                'No server configured to continue the agent loop',
+            );
+            $conversation->update(['is_processing' => false]);
+        }
+    }
+
+    /**
+     * Resume the open step's tool batch from a plan. Built from
+     * handleToolCalls()'s body:
+     * each recorded call is answered by its disposition — a completed call
+     * reuses its result (never re-run), a not-started or effect-free call
+     * runs again through the funnel (site T9), and a started effectful
+     * call with no outcome is given the outcome-unknown result and marked
+     * outcome_unknown in the checkpoint. The step's assistant message is
+     * written reusing the step's own row,
+     * the step is committed (C5) and closed, and the run hands off to the
+     * next iteration exactly like finish().
+     *
+     * The handler must be prepared first (resumeState()); the run id is
+     * read from the run's durable state, never minted — a resume
+     * continues the same run.
+     *
+     * @param array<string, \ClarionApp\LlmClient\ValueObjects\CallDisposition> $dispositions
+     * @param array{content: ?string, tool_calls: list<array<string, mixed>>} $assistant
+     */
+    public function resumeToolCalls(Conversation $conversation, int $iteration, array $dispositions, array $assistant): void
+    {
+        $conversationId = $conversation->id;
+        $agentLoopService = app(AgentLoopService::class);
+
+        // Ensure we have a runTraceRecorder (resolve from container if not injected).
+        if ($this->runTraceRecorder === null) {
+            try {
+                $this->runTraceRecorder = app(\ClarionApp\LlmClient\Services\RunTraceRecorder::class);
+            } catch (\Throwable $e) {
+                $this->runTraceRecorder = null;
+            }
+        }
+
+        // The ambient Context 'run_id' slot must be correct for this
+        // resume's own tool execution (the same reason finishIteration()
+        // sets it unconditionally).
+        if ($this->runId !== null) {
+            \Illuminate\Support\Facades\Context::add('run_id', $this->runId);
+        }
+        if ($conversation->active_task_budget_id !== null) {
+            \Illuminate\Support\Facades\Context::add('task_budget_id', $conversation->active_task_budget_id);
+        }
+
+        // The batch the resume answers is the checkpointed model response;
+        // the pause/ceiling helpers below read $this->toolCalls, so set it
+        // to the same calls.
+        $this->toolCalls = array_values($assistant['tool_calls'] ?? []);
+
+        // Reuse the step's own message row: the step's message_id
+        // names the partial row the interrupted stream opened. Never a
+        // second row. A FinishToolBatch resume always has one (C2 recorded
+        // the model response, which means the stream opened a row), but a
+        // missing row is created, matching handleToolCalls()'s own
+        // create-or-reuse.
+        if ($this->message === null) {
+            $messageId = null;
+            if ($this->runId !== null && $this->stepId !== null) {
+                $messageId = DB::table('agent_run_steps')
+                    ->where('run_id', $this->runId)
+                    ->where('id', $this->stepId)
+                    ->value('message_id');
+            }
+            if ($messageId !== null) {
+                $this->message = Message::find($messageId);
+            }
+        }
+        if ($this->message === null) {
+            // Placed at the moment the model's response was recorded, so a
+            // message the user posted during the interruption stays after
+            // the turn it followed and is still picked up as unprocessed.
+            $this->message = Message::create(array_filter([
+                'conversation_id' => $conversationId,
+                'responseTime' => 0,
+                'user' => $conversation->character,
+                'role' => 'assistant',
+                'content' => $assistant['content'] ?? '',
+                'created_at' => !empty($assistant['recorded_at']) ? \Illuminate\Support\Carbon::parse($assistant['recorded_at']) : null,
+            ], fn ($value) => $value !== null));
+            event(new NewConversationMessageEvent($conversationId, $this->message->id));
+        }
+
+        // The model content the checkpoint recorded is the step's visible
+        // reply (the streamed partial, if any, was already written to this
+        // row by the interrupted stream).
+        if (($assistant['content'] ?? null) !== null) {
+            $this->reply = (string) $assistant['content'];
+        }
+
+        $toolResults = [];
+        // Named explicitly so a registry tool can never shadow them; ask_user
+        // in particular must always reach the loop's own handler.
+        $metaToolNames = ['list_applications', 'execute_operation', 'search_operations', 'ask_user'];
+        $registry = app(\ClarionApp\LlmClient\Services\McpToolRegistry::class);
+        $taskResumeText = app(\ClarionApp\LlmClient\Services\TaskResumeText::class);
+
+        // Resolved once, before the loop below — the whole batch uses one
+        // frozen decision, never re-evaluated per tool call.
+        $degradationDecision = app(DegradationGate::class)->forRun($this->runId);
+
+        // The step the funnel brackets each (re)run call in; null when the
+        // run is not checkpointed (the tool still runs, unbracketed).
+        $checkpointStepRef = ($this->runId !== null && $this->stepId !== null)
+            ? new \ClarionApp\LlmClient\ValueObjects\StepRef($this->runId, $this->stepId, $iteration)
+            : null;
+
+        foreach (array_values($this->toolCalls) as $tcIndex => $toolCall) {
+            $toolName = $toolCall['function']['name'] ?? '';
+            $arguments = json_decode($toolCall['function']['arguments'] ?? '{}', true) ?: [];
+            $toolCallId = $toolCall['id'] ?? '';
+
+            // Checked before every individual tool-call execution, not just
+            // between iterations, so a single LLM turn requesting a large
+            // batch of tool calls can be stopped mid-batch. Every tool call
+            // from this point on — including the current one — is given a
+            // synthesized tool_result rather than left unanswered.
+            $workDecision = app(\ClarionApp\LlmClient\Services\ConversationWorkGate::class)->evaluate($conversationId);
+            if ($workDecision->isStop()) {
+                foreach (array_slice($this->toolCalls, $tcIndex) as $unexecutedCall) {
+                    $toolResults[] = [
+                        'tool_call_id' => $unexecutedCall['id'] ?? '',
+                        'content' => \ClarionApp\LlmClient\ValueObjects\ConversationWorkDecision::UNEXECUTED_TOOL_RESULT,
+                    ];
+                }
+
+                $this->handleWorkCeilingReached($conversation, $workDecision, $toolResults);
+
+                return;
+            }
+
+            // See the identical check in AgentLoopService::run()'s own
+            // tool-call loop: beside, never inside, the ConversationWorkGate check above.
+            if (in_array($toolName, $degradationDecision->withheldTools, true)) {
+                foreach (array_slice($this->toolCalls, $tcIndex) as $unexecutedCall) {
+                    $toolResults[] = [
+                        'tool_call_id' => $unexecutedCall['id'] ?? '',
+                        'content' => DegradationDecision::UNEXECUTED_TOOL_RESULT,
+                    ];
+                }
+
+                $this->handleWithheldToolRefusal($conversation, $degradationDecision, $toolResults);
+
+                return;
+            }
+
+            $disposition = $dispositions[$toolCallId]
+                ?? new \ClarionApp\LlmClient\ValueObjects\CallDisposition(\ClarionApp\LlmClient\ValueObjects\CallDispositionKind::Execute);
+
+            // Open a ToolInvocation action for the calls this resume runs
+            // (Execute/Rerun). A Reuse or OutcomeUnknown call's action was
+            // already closed by the interrupted attempt — the resume records
+            // only what it does now.
+            $toolActionId = null;
+            if (in_array($disposition->kind, [
+                \ClarionApp\LlmClient\ValueObjects\CallDispositionKind::Execute,
+                \ClarionApp\LlmClient\ValueObjects\CallDispositionKind::Rerun,
+            ], true) && $this->runTraceRecorder !== null && $this->stepId !== null) {
+                $toolActionId = $this->runTraceRecorder->openAction(
+                    $this->stepId,
+                    \ClarionApp\LlmClient\ValueObjects\ActionType::ToolInvocation,
+                    $toolName,
+                    $this->attemptGroupId,
+                    null,
+                    $toolCallId,
+                );
+            }
+
+            $result = null;
+
+            switch ($disposition->kind) {
+                case \ClarionApp\LlmClient\ValueObjects\CallDispositionKind::Reuse:
+                    // The call already ran before the interruption; its
+                    // result is reused as-is (the exact entry the step's
+                    // message or checkpoint holds), never re-run.
+                    $entry = $disposition->result;
+                    if (!is_array($entry) || !isset($entry['tool_call_id'])) {
+                        $entry = ['tool_call_id' => $toolCallId, 'content' => ''];
+                    }
+                    $toolResults[] = $entry;
+                    break;
+
+                case \ClarionApp\LlmClient\ValueObjects\CallDispositionKind::Execute:
+                case \ClarionApp\LlmClient\ValueObjects\CallDispositionKind::Rerun:
+                    Log::info('AgentLoopStreamHandler: executing tool (resumed)', [
+                        'tool' => $toolName,
+                        'arguments' => $arguments,
+                        'iteration' => $iteration,
+                    ]);
+
+                    event(new ToolExecutionEvent($conversationId, $toolName, 'executing'));
+
+                    // Non-meta tools: resolve via McpToolRegistry and check
+                    // for confirmation.
+                    if (!in_array($toolName, $metaToolNames, true)) {
+                        $toolDef = $registry->findTool($toolName);
+                        if ($toolDef && !empty($toolDef['_meta'])) {
+                            $meta = $toolDef['_meta'];
+                            $method = $meta['method'] ?? '';
+
+                            // destructive operations require user confirmation
+                            if (strtoupper($method) === 'DELETE' || strtoupper($method) === 'PUT' || strtoupper($method) === 'PATCH') {
+                                $pendingConfirmation = [
+                                    'tool_name' => $toolName,
+                                    'operationId' => $meta['operationId'] ?? null,
+                                    'method' => $method,
+                                    'path' => $meta['path'] ?? null,
+                                    'arguments' => $arguments,
+                                    'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                                ];
+
+                                $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
+
+                                event(new ApiCallConfirmationRequiredEvent(
+                                    $conversationId,
+                                    $this->message->id,
+                                    $method,
+                                    $meta['path'] ?? '',
+                                    $arguments,
+                                    $toolName
+                                ));
+
+                                // Close tool action as awaiting_confirmation before suspend.
+                                if ($toolActionId !== null && $this->runTraceRecorder !== null) {
+                                    try {
+                                        $this->runTraceRecorder->closeAction(
+                                            $toolActionId,
+                                            \ClarionApp\LlmClient\ValueObjects\ActionOutcome::AwaitingConfirmation,
+                                        );
+                                    } catch (\Throwable $e) {
+                                        Log::warning('Failed to mark resumed tool action as awaiting_confirmation', [
+                                            'action_id' => $toolActionId,
+                                            'error' => $e->getMessage(),
+                                        ]);
+                                    }
+                                }
+
+                                // The confirmation pauses the call (C6), not
+                                // completes it with the marker as its result.
+                                if ($checkpointStepRef !== null) {
+                                    app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordPaused($checkpointStepRef, $toolCallId);
+                                }
+
+                                return; // Suspend for confirmation
+                            }
+
+                            // Safe read operations — execute via McpToolExecutor
+                            $toolExecutor = app(\ClarionApp\LlmClient\Services\McpToolExecutor::class);
+                            $session = \ClarionApp\LlmClient\Models\McpSession::where('user_id', $conversation->user_id)->first();
+                            if (!$session) {
+                                $session = \ClarionApp\LlmClient\Models\McpSession::create([
+                                    'user_id' => $conversation->user_id,
+                                    'protocol_version' => '2025-03-26',
+                                ]);
+                            }
+                            if ($checkpointStepRef !== null) {
+                                $result = app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->execute(
+                                    $checkpointStepRef,
+                                    $toolCall,
+                                    fn () => json_encode($toolExecutor->executeTool($toolName, $arguments, $session)),
+                                    $toolActionId,
+                                    $conversation,
+                                );
+                                app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordCompleted($checkpointStepRef, $toolCallId, json_decode($result, true));
+                            } else {
+                                $execResult = $toolExecutor->executeTool($toolName, $arguments, $session);
+                                $result = json_encode($execResult);
+                            }
+                        }
+                    }
+
+                    // Meta tools or unresolved non-meta tools: fall through
+                    // to executeMetaTool.
+                    if ($result === null) {
+                        if ($checkpointStepRef !== null) {
+                            $result = app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->execute(
+                                $checkpointStepRef,
+                                $toolCall,
+                                fn () => $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId),
+                                $toolActionId,
+                                $conversation,
+                            );
+                        } else {
+                            $result = $agentLoopService->executeMetaTool($toolName, $arguments, $conversation, $this->runId);
+                        }
+
+                        // Check if execute_operation needs confirmation
+                        $decoded = json_decode($result, true);
+
+                        // A valid ask_user call: open the question and
+                        // suspend. A refused one gives its refusal as this
+                        // call's result and the batch continues.
+                        if (is_array($decoded) && !empty($decoded[AgentLoopService::REQUIRES_USER_INPUT])) {
+                            $refusal = $this->openQuestion($conversation, $decoded, $toolCallId, $toolActionId, $toolResults, $iteration);
+
+                            if ($refusal === null) {
+                                // The question was opened: the call is paused
+                                // (C6), not completed with the marker as its
+                                // result.
+                                if ($checkpointStepRef !== null) {
+                                    app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordPaused($checkpointStepRef, $toolCallId);
+                                }
+
+                                return; // Suspended until the question is resolved
+                            }
+
+                            $result = $refusal;
+                            $decoded = json_decode($result, true);
+                        }
+                        if (is_array($decoded) && !empty($decoded['__requires_confirmation'])) {
+                            // Read back the same way the synchronous
+                            // run()/resumeSync() pause-construction does —
+                            // 'api_call' is the existing default fallback,
+                            // 'scope_surface' a new value alongside it.
+                            $confirmationType = $decoded['confirmation_type'] ?? 'api_call';
+
+                            $pendingConfirmation = [
+                                'tool_name' => $confirmationType === 'declarative_memory' ? 'propose_declarative_memory' : 'execute_operation',
+                                'confirmation_type' => $confirmationType,
+                                'operationId' => $decoded['operationId'] ?? null,
+                                'method' => $decoded['method'] ?? null,
+                                'path' => $decoded['path'] ?? null,
+                                'arguments' => $decoded['parameters'] ?? [],
+                                'expires_at' => now()->addSeconds(config('llm-client.agent_loop.confirmation_timeout', 300))->toIso8601String(),
+                                'action_id' => $toolActionId,
+                            ];
+
+                            if ($confirmationType === 'scope_surface') {
+                                $pendingConfirmation['files_touched_so_far'] = $decoded['files_touched_so_far'] ?? [];
+                                $pendingConfirmation['would_add'] = $decoded['would_add'] ?? null;
+                                $pendingConfirmation['threshold'] = $decoded['threshold'] ?? null;
+                            }
+
+                            if ($confirmationType === 'declarative_memory') {
+                                $pendingConfirmation['type'] = $decoded['type'] ?? '';
+                                $pendingConfirmation['content'] = $decoded['content'] ?? '';
+                                $pendingConfirmation['existingId'] = $decoded['existingId'] ?? null;
+                            }
+
+                            $this->storePausedTurn($pendingConfirmation, $toolCallId, $toolResults, $iteration);
+
+                            // The api_call confirmation event is specific to
+                            // the operation confirmations (which carry
+                            // method/path); a declarative-memory pause has
+                            // neither, so fire only when the method is
+                            // present.
+                            if (($decoded['method'] ?? null) !== null) {
+                                event(new ApiCallConfirmationRequiredEvent(
+                                    $conversationId,
+                                    $this->message->id,
+                                    $decoded['method'],
+                                    $decoded['path'] ?? null,
+                                    $decoded['parameters'] ?? [],
+                                    'execute_operation'
+                                ));
+                            }
+
+                            // Close tool action as awaiting_confirmation before suspend.
+                            if ($toolActionId !== null && $this->runTraceRecorder !== null) {
+                                try {
+                                    $this->runTraceRecorder->closeAction(
+                                        $toolActionId,
+                                        \ClarionApp\LlmClient\ValueObjects\ActionOutcome::AwaitingConfirmation,
+                                    );
+                                } catch (\Throwable $e) {
+                                    Log::warning('Failed to mark resumed tool action as awaiting_confirmation', [
+                                        'action_id' => $toolActionId,
+                                        'error' => $e->getMessage(),
+                                    ]);
+                                }
+                            }
+
+                            // The confirmation pauses the call (C6), not
+                            // completes it with the marker as its result.
+                            if ($checkpointStepRef !== null) {
+                                app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordPaused($checkpointStepRef, $toolCallId);
+                            }
+
+                            return; // Suspend for confirmation
+                        }
+
+                        // C4: only a call that actually ran is completed (a
+                        // pause marker returned above, so this is reached
+                        // only for an executed call).
+                        if ($checkpointStepRef !== null) {
+                            app(\ClarionApp\LlmClient\Services\CheckpointedToolExecutor::class)->recordCompleted($checkpointStepRef, $toolCallId, $decoded);
+                        }
+                    }
+
+                    // Condense the (re)run result, exactly as
+                    // handleToolCalls() does.
+                    $toolResultEntry = $this->condenseToolResult($result, $conversationId, $toolName);
+                    $toolResults[] = [
+                        'tool_call_id' => $toolCallId,
+                        'content' => $toolResultEntry['content'],
+                    ] + array_filter($toolResultEntry, fn ($k) => in_array($k, ['reference_id', 'original_tokens', 'condensed_tokens', 'method', 'condensed'], ARRAY_FILTER_USE_KEY));
+
+                    event(new ToolExecutionEvent($conversationId, $toolName, 'completed'));
+                    break;
+
+                case \ClarionApp\LlmClient\ValueObjects\CallDispositionKind::OutcomeUnknown:
+                case \ClarionApp\LlmClient\ValueObjects\CallDispositionKind::ResolveDurable:
+                    // A started call with no outcome (effectful, or a
+                    // durable call not yet resolved from its own record):
+                    // it was not run again. The agent is told the outcome
+                    // is unknown and will check before repeating it; the
+                    // checkpoint records the call outcome_unknown. A durable
+                    // call is never repeated blindly — the same safe
+                    // default.
+                    $label = $taskResumeText->actionLabel($toolName, $arguments);
+                    $toolResults[] = [
+                        'tool_call_id' => $toolCallId,
+                        'content' => $taskResumeText->outcomeUnknownToolResult($label),
+                        'outcome_unknown' => true,
+                    ];
+                    if ($checkpointStepRef !== null) {
+                        $stepId = $checkpointStepRef->stepId;
+                        $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->markOutcomeUnknown($stepId, $toolCallId));
+                    }
+                    break;
+            }
+
+            // Close the ToolInvocation action for a (re)run call.
+            if ($toolActionId !== null && $this->runTraceRecorder !== null) {
+                try {
+                    $this->runTraceRecorder->closeAction(
+                        $toolActionId,
+                        \ClarionApp\LlmClient\ValueObjects\ActionOutcome::Success,
+                    );
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to close resumed tool action', [
+                        'action_id' => $toolActionId,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+        }
+
+        // Store tool calls and results in message tool_data — the step's
+        // assistant message, reusing the step's own row.
+        $toolData = [
+            'tool_calls' => $this->toolCalls,
+            'tool_results' => $toolResults,
+            'iteration' => $iteration,
+            'pending_confirmation' => null,
+        ];
+
+        $this->message->update([
+            'content' => $this->reply ?: '',
+            'tool_data' => $toolData,
+        ]);
+
+        // The round resolved without suspending — close its step. The next
+        // iteration's step is opened by dispatchStreamRequest().
+        $this->closeCurrentStep(\ClarionApp\LlmClient\ValueObjects\RunEndState::Completed);
+
+        // If all tool calls were successful execute_operation calls, finish
+        // the conversation — no need for a summary response from the LLM.
+        if ($agentLoopService->allExecuteOperationsSucceeded($this->toolCalls, $toolResults)) {
+            // The response ends here, so the run ends here too — matching the
+            // synchronous path's equivalent exit.
+            $this->closeRun(
+                \ClarionApp\LlmClient\ValueObjects\RunEndState::Completed,
+                $this->message->id,
+            );
+
+            event(new FinishOpenAIConversationResponseEvent($conversationId, ''));
+            $conversation->update(['is_processing' => false]);
+            $this->checkForUnprocessedMessages($conversation);
+            return;
+        }
+
+        // Dispatch next iteration (requires a server for the LLM API call).
+        // Carry the run_id forward so the same run continues across iterations.
+        if ($conversation->server_id !== null) {
+            // The hand-off: mint the next dispatch id and release the lease
+            // so the next worker's claim is the only way to take the run
+            // over. A LeaseLost means this process no longer holds the lease
+            // (another worker took the run over): it stops here, starting
+            // nothing more. With run tracing off there is no run row to hand
+            // off.
+            if ($this->runId !== null) {
+                $runId = $this->runId;
+                $superseded = false;
+                $this->checkpoint(function () use ($runId, &$superseded) {
+                    try {
+                        app(\ClarionApp\LlmClient\Services\RunLease::class)->handOff($runId);
+                    } catch (\ClarionApp\LlmClient\Exceptions\LeaseLost $e) {
+                        $superseded = true;
+                        Log::warning('AgentLoopStreamHandler: hand-off failed (lease lost); this worker stops', [
+                            'run_id' => $runId,
+                        ]);
+                    }
+                });
+                if ($superseded) {
+                    return;
+                }
+            }
+            $agentLoopService->start($conversation, $iteration + 1, $this->runId, resumed: true);
         } else {
             // No server to continue against: the run stops here rather than
             // staying in progress until the abandonment sweep finds it.
@@ -1072,6 +1793,19 @@ class AgentLoopStreamHandler extends HandleHttpStreamResponse
         \ClarionApp\LlmClient\ValueObjects\RunEndState $endState,
         ?string $reason = null,
     ): void {
+        // C5: a completed step is committed — its message id, its results
+        // stripped (they live on the message), and the consecutive
+        // interruption count reset. A stopped/failed step is not
+        // committed: it is not progress a resume skips over.
+        if ($endState === \ClarionApp\LlmClient\ValueObjects\RunEndState::Completed
+            && $this->stepId !== null
+            && $this->message !== null) {
+            $runId = $this->runId;
+            $stepId = $this->stepId;
+            $messageId = $this->message->id;
+            $this->checkpoint(fn () => app(\ClarionApp\LlmClient\Services\RunCheckpoint::class)->commitStep($runId, $stepId, $messageId));
+        }
+
         if ($this->runTraceRecorder !== null && $this->stepId !== null) {
             $this->runTraceRecorder->closeStep($this->stepId, $endState, $reason);
         }

@@ -65,6 +65,16 @@ class RunTraceRecorder
     }
 
     /**
+     * Cut an end_reason to the 256 characters its varchar(256) column holds,
+     * multibyte-safe (research F7). Null stays null: a state that carries no
+     * reason must not gain one.
+     */
+    private static function cutReason(?string $reason): ?string
+    {
+        return $reason === null ? null : mb_substr($reason, 0, 256);
+    }
+
+    /**
      * Enqueue this run for external forwarding (Phase 4, US2), in its own
      * inner try/catch mirroring broadcast()'s isolation pattern immediately
      * above: a failure here must never undo or mask the caller's own write,
@@ -399,6 +409,10 @@ class RunTraceRecorder
                 ]);
             }
 
+            // end_reason is varchar(256); cut multibyte-safely before the terminal
+            // UPDATE so strict MySQL/MariaDB cannot refuse the write (research F7).
+            $reason = self::cutReason($reason);
+
             // Compute duration from started_at, clamped to >= 0 (contract C5)
             $endedAt = now();
             $startedAt = DB::table('agent_run_steps')
@@ -611,6 +625,10 @@ class RunTraceRecorder
                 ]);
             }
 
+            // end_reason is varchar(256); cut multibyte-safely before the terminal
+            // UPDATE so strict MySQL/MariaDB cannot refuse the write (research F7).
+            $reason = self::cutReason($reason);
+
             // Compute step_count from current steps
             $stepCount = (int) DB::table('agent_run_steps')
                 ->where('run_id', $runId)
@@ -664,6 +682,11 @@ class RunTraceRecorder
                         'tool_exec_ms' => $breakdown['tool_exec_ms'],
                         'confirm_wait_ms' => $breakdown['confirm_wait_ms'],
                         'product_ms' => $breakdown['product_ms'],
+                        // A terminal run is over: nothing may still claim it
+                        // (data-model §1 invariant).
+                        'resume_state' => null,
+                        'dispatch_id' => null,
+                        'lease_holder' => null,
                     ]);
             } catch (\Throwable $e) {
                 Log::warning('RunTraceRecorder: failed to update run terminal state', [
@@ -1021,6 +1044,7 @@ class RunTraceRecorder
         ?string $target = null,
         ?string $attemptGroupId = null,
         ?string $parentActionId = null,
+        ?string $toolCallId = null,
     ): ?string {
         if ($stepId === null || !$this->enabled()) {
             return null;
@@ -1064,6 +1088,7 @@ class RunTraceRecorder
                 'target' => $target,
                 'attempt_group_id' => $attemptGroupId,
                 'parent_action_id' => $parentActionId,
+                'tool_call_id' => $toolCallId === null ? null : mb_substr($toolCallId, 0, 255),
                 'outcome' => ActionOutcome::InProgress->value,
                 'failure_reason' => null,
                 'paused_at' => null,

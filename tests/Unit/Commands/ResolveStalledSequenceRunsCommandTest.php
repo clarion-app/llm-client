@@ -3,6 +3,7 @@
 namespace ClarionApp\LlmClient\Tests\Unit\Commands;
 
 use ClarionApp\LlmClient\Jobs\RunSequenceStageJob;
+use ClarionApp\LlmClient\Models\Delegation;
 use ClarionApp\LlmClient\Models\SequenceRun;
 use ClarionApp\LlmClient\Models\Stage;
 use ClarionApp\LlmClient\Models\StageResult;
@@ -38,11 +39,15 @@ class ResolveStalledSequenceRunsCommandTest extends TestCase
     {
         parent::setUp();
 
+        $this->defineAgentDelegationSchema();
+
         config(['llm-client.pipeline.stale_after_minutes' => 10]);
     }
 
     protected function tearDown(): void
     {
+        DB::table('agent_runs')->delete();
+        DB::table('agent_delegations')->delete();
         DB::table('stage_results')->delete();
         DB::table('sequence_runs')->delete();
         DB::table('stages')->delete();
@@ -200,6 +205,109 @@ class ResolveStalledSequenceRunsCommandTest extends TestCase
 
         Queue::fake();
 
+        Artisan::call('llm-client:resolve-stalled-sequence-runs');
+
+        Queue::assertPushed(RunSequenceStageJob::class, fn (RunSequenceStageJob $job) => $job->sequenceRunId === $run->id);
+    }
+
+    // -----------------------------------------------------------------
+    // 134-resumable-long-tasks (lease contract section 8a): a stage whose
+    // helper run is being resumed is not crashed work. The sweep neither
+    // re-dispatches it (a second stage job beside the resume) nor
+    // force-fails the run (the stage is not unsafe to repeat: it is not
+    // being repeated).
+    // -----------------------------------------------------------------
+
+    /** The blocking stage's helper: a delegation of the run's conversation plus its helper run. */
+    private function giveStageAHelperRun(SequenceRun $run, Stage $stage, StageResult $blocking, string $endState, ?int $checkpointVersion): void
+    {
+        $helperConversationId = (string) Str::uuid();
+        $delegation = Delegation::create([
+            'parent_conversation_id' => $run->conversation_id,
+            'helper_agent_id' => $stage->helper_agent_id,
+            'helper_conversation_id' => $helperConversationId,
+            'owner_user_id' => $run->owner_user_id,
+            'task' => 'Execute the stage.',
+            'depth' => 1,
+            'status' => 'in_progress',
+            'started_at' => now()->subMinutes(20),
+        ]);
+        $blocking->delegation_id = $delegation->id;
+        $blocking->save();
+
+        DB::table('agent_runs')->insert([
+            'id' => (string) Str::uuid(),
+            'kind' => 'interactive',
+            'user_id' => $run->owner_user_id,
+            'conversation_id' => $helperConversationId,
+            'end_state' => $endState,
+            'started_at' => now()->subMinutes(20),
+            'checkpoint_version' => $checkpointVersion,
+            'resume_driver' => 'sequence_stage',
+            'resume_state' => $endState === 'in_progress' ? 'resuming' : null,
+            'lease_expires_at' => now()->addSeconds(30),
+        ]);
+    }
+
+    /** @return array<string, array{0: bool}> */
+    public static function stageIdempotence(): array
+    {
+        return ['idempotent stage' => [true], 'non-idempotent stage' => [false]];
+    }
+
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('stageIdempotence')]
+    public function skips_run_whose_stage_is_being_resumed(bool $idempotent): void
+    {
+        [$run, $stages, $blocking] = $this->makeStalledRunFixture('in_progress', $idempotent, now()->subMinutes(15));
+        $this->giveStageAHelperRun($run, $stages[1], $blocking, 'in_progress', 1);
+
+        Queue::fake();
+        Artisan::call('llm-client:resolve-stalled-sequence-runs');
+
+        Queue::assertNotPushed(RunSequenceStageJob::class, null, 'the resume owns this stage: no second stage job beside it');
+        $row = $this->fresh($run);
+        $this->assertSame('in_progress', $row->status, 'the run is neither failed nor otherwise touched');
+        $this->assertNull($row->failure_reason);
+        $this->assertNull($row->completed_at);
+        $this->assertSame('running', StageResult::find($blocking->id)->status);
+    }
+
+    #[Test]
+    public function a_resumed_run_status_is_exempt_too(): void
+    {
+        [$run, $stages, $blocking] = $this->makeStalledRunFixture('resumed', false, now()->subMinutes(15));
+        $this->giveStageAHelperRun($run, $stages[1], $blocking, 'in_progress', 1);
+
+        Queue::fake();
+        Artisan::call('llm-client:resolve-stalled-sequence-runs');
+
+        Queue::assertNotPushed(RunSequenceStageJob::class);
+        $this->assertSame('resumed', $this->fresh($run)->status);
+    }
+
+    #[Test]
+    public function a_stale_run_whose_stage_helper_run_has_ended_is_swept_as_today(): void
+    {
+        [$run, $stages, $blocking] = $this->makeStalledRunFixture('in_progress', false, now()->subMinutes(15));
+        $this->giveStageAHelperRun($run, $stages[1], $blocking, 'failed', 1);
+
+        Queue::fake();
+        Artisan::call('llm-client:resolve-stalled-sequence-runs');
+
+        Queue::assertNotPushed(RunSequenceStageJob::class);
+        $row = $this->fresh($run);
+        $this->assertSame('failed', $row->status, 'a non-idempotent stage whose helper is gone is still unsafe to repeat');
+        $this->assertStringContainsString('Send notification', (string) $row->failure_reason);
+    }
+
+    #[Test]
+    public function a_stale_run_whose_stage_helper_run_predates_checkpoints_is_swept_as_today(): void
+    {
+        [$run, $stages, $blocking] = $this->makeStalledRunFixture('in_progress', true, now()->subMinutes(15));
+        $this->giveStageAHelperRun($run, $stages[1], $blocking, 'in_progress', null);
+
+        Queue::fake();
         Artisan::call('llm-client:resolve-stalled-sequence-runs');
 
         Queue::assertPushed(RunSequenceStageJob::class, fn (RunSequenceStageJob $job) => $job->sequenceRunId === $run->id);

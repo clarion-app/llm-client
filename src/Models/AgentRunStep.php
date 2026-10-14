@@ -25,6 +25,10 @@ class AgentRunStep extends Model
         'duration_ms',
         'wait_ms',
         'attempt_count',
+        'iteration',
+        'checkpoint_state',
+        'checkpoint',
+        'message_id',
     ];
 
     protected $casts = [
@@ -34,6 +38,8 @@ class AgentRunStep extends Model
         'duration_ms' => 'integer',
         'wait_ms' => 'integer',
         'attempt_count' => 'integer',
+        'iteration' => 'integer',
+        'checkpoint' => 'array',
     ];
 
     protected static function booted(): void

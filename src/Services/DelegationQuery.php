@@ -205,6 +205,7 @@ class DelegationQuery
         $awaitingUser = $this->runTraceQuery->runIdsAwaitingUser($referencedRunIds);
         $questionStopped = $this->runTraceQuery->runIdsStoppedOnQuestion($referencedRunIds);
         $taskBudgets = $this->runTraceQuery->taskBudgetSummariesForRuns($referencedRunIds, $awaitingUser, $questionStopped);
+        $cancelledByEvent = $this->runTraceQuery->runIdsRefusedResumeAsCancelled($referencedRunIds);
 
         $runsMap = [];
         foreach ($runs as $id => $runRow) {
@@ -214,6 +215,7 @@ class DelegationQuery
                 isset($awaitingUser[$id]),
                 isset($questionStopped[$id]),
                 $taskBudgets,
+                $cancelledByEvent,
             );
         }
 

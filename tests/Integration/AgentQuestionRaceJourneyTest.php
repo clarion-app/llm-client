@@ -2,7 +2,7 @@
 
 namespace Tests\Integration;
 
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Controllers\ConversationController;
 use ClarionApp\LlmClient\Controllers\MessageController;
@@ -107,7 +107,7 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
         // The period under test is shorter than the shipped minimum.
         config(['llm-client.agent_questions.min_expiry_minutes' => 1]);
 
-        Queue::fake([SendHttpStreamRequest::class, ResumeAfterQuestionJob::class]);
+        Queue::fake([AgentStreamStepJob::class, ResumeAfterQuestionJob::class]);
 
         // Ending a conversation also captures its episodic memory through a
         // model call of its own; that capture is not what these races are
@@ -407,6 +407,11 @@ class AgentQuestionRaceJourneyTest extends AssembledSystemTestCase
             $this->assertCount(0, $continuations, "{$label}: a withdrawn run is never continued");
             $this->assertSame('stopped_early', $run->end_state, "{$label}: the withdrawn run is closed");
             $this->assertSame('question withdrawn', $run->end_reason);
+        } elseif (in_array('withdraw', $operations, true) && $run->cancelled_at !== null && $continuations === []) {
+            // The losing end still cancelled the run before its continuation
+            // started, and cancellation wins over resuming.
+            $this->assertSame('stopped_early', $run->end_state, "{$label}: the cancelled run is closed, not continued");
+            $this->assertSame(app(\ClarionApp\LlmClient\Services\TaskResumeText::class)->cancelledReason(), $run->end_reason);
         } else {
             $this->assertCount(1, $continuations, "{$label}: the run is resumed exactly once");
             $this->assertSame($stored, $this->toolResultIn($this->slotMessages($continuations[0]), $fresh->tool_call_id), "{$label}: the continuation carries the stored outcome");

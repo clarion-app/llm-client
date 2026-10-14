@@ -13,7 +13,7 @@ use RegexIterator;
  *
  * "No way of starting model-consuming work skips the spending evaluation"
  * is only true on the day it ships unless something keeps it true. This
- * test is that something: it scans every .php file under src/ for the four
+ * test is that something: it scans every .php file under src/ for the five
  * constructs that actually reach a model and asserts the set of files
  * containing them is *equal* to a fixed allowlist, every member of which is
  * either one of the two funnels or is reached only through one.
@@ -45,7 +45,7 @@ use RegexIterator;
 class BudgetEnforcementGuardTest extends TestCase
 {
     /**
-     * The four constructs that actually reach a model. Anything in src/
+     * The five constructs that actually reach a model. Anything in src/
      * containing one of these either is a funnel or is reached only through
      * one; there is no third category.
      */
@@ -53,6 +53,7 @@ class BudgetEnforcementGuardTest extends TestCase
         '->chat(',
         '->embed(',
         'SendHttpStreamRequest::dispatch(',
+        'AgentStreamStepJob::dispatch(',
         'SendHttpRequest::dispatch(',
     ];
 

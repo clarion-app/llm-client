@@ -4,7 +4,7 @@ namespace ClarionApp\LlmClient\Tests\Feature;
 
 use ClarionApp\Backend\ApiManager;
 use ClarionApp\Backend\Models\User;
-use ClarionApp\HttpQueue\Jobs\SendHttpStreamRequest;
+use ClarionApp\LlmClient\Jobs\AgentStreamStepJob;
 use ClarionApp\LlmClient\AgentLoopStreamHandler;
 use ClarionApp\LlmClient\Contracts\LlmProvider;
 use ClarionApp\LlmClient\Models\Agent;
@@ -553,12 +553,12 @@ class AgentActivationJourneyTest extends TestCase
         );
 
         $streamRequestSource = file_get_contents(
-            (new \ReflectionClass(SendHttpStreamRequest::class))->getFileName()
+            (new \ReflectionClass(AgentStreamStepJob::class))->getFileName()
         );
         $this->assertStringNotContainsString(
             'is_active',
             $streamRequestSource,
-            'SendHttpStreamRequest is a generic, cross-package job and must never gain an llm-client-specific is_active check'
+            'AgentStreamStepJob must never gain its own is_active check (research.md D3) — the queue path re-checks nothing about admission'
         );
     }
 

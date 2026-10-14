@@ -13,14 +13,17 @@ use ClarionApp\LlmClient\ValueObjects\TaskBudgetDecision;
 use ClarionApp\LlmClient\ValueObjects\TaskBudgetState;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 /**
  * What a root agent does when the gate refuses its next step: pause the task
  * at that boundary and ask the user what to do, or — when nobody can be
  * asked — halt it with its report. The pause is one conditional UPDATE on
  * the task's state, so of two racing pausers exactly one pauses the task;
- * the other writes nothing to it and only closes its own open step. No step
- * is ever left open, and the conversation is no longer processing on any
+ * the other writes nothing to it and only closes its own open step. The
+ * winning pauser leaves the run's step open and marked paused (the run is
+ * resumable until its resumer claims it); every terminal branch closes its
+ * step and the run, and the conversation is no longer processing on any
  * branch.
  */
 class TaskBudgetPauser
@@ -46,18 +49,21 @@ class TaskBudgetPauser
         string $resumeMode,
     ): ?array {
         $reason = $this->text->ceilingReachedReason();
-        $this->closeStep($openStepId, $reason);
 
         if ($task === null) {
+            $this->closeStep($openStepId, $reason);
+
             return $this->stopWithoutTask($conversation, $runId, $resumeMode);
         }
 
         try {
-            return $this->pauseTask($conversation, $task, $decision, $runId, $nextIteration, $resumeMode);
+            return $this->pauseTask($conversation, $task, $decision, $runId, $openStepId, $nextIteration, $resumeMode);
         } catch (\Throwable $e) {
             // The task could not be paused or halted: nothing more runs, and
             // the run says why.
             Log::error("Task budget could not pause task {$task->id}", ['task_budget_id' => $task->id, 'conversation_id' => $conversation->id, 'error' => $e->getMessage()]);
+
+            $this->closeStep($openStepId, $reason);
 
             return $this->stopWithoutTask($conversation, $runId, $resumeMode);
         }
@@ -71,7 +77,7 @@ class TaskBudgetPauser
         return $resumeMode === 'sync' ? $this->stopped($this->text->unavailable()) : null;
     }
 
-    private function pauseTask(Conversation $conversation, TaskBudget $task, TaskBudgetDecision $decision, ?string $runId, int $nextIteration, string $resumeMode): ?array
+    private function pauseTask(Conversation $conversation, TaskBudget $task, TaskBudgetDecision $decision, ?string $runId, ?string $openStepId, int $nextIteration, string $resumeMode): ?array
     {
         $standing = $this->tasks->standing($task);
         $now = now()->format('Y-m-d H:i:s.u');
@@ -91,17 +97,30 @@ class TaskBudgetPauser
             ]);
 
         if ($won !== 1) {
-            return $this->lostThePause($conversation, $task, $runId, $resumeMode);
+            return $this->lostThePause($conversation, $task, $runId, $openStepId, $resumeMode);
         }
 
         $task = TaskBudget::find($task->id);
         $this->tasks->appendEvent($task, 'ceiling_reached', ['reason' => $decision->reason, 'standing' => $standing->toArray()]);
 
         if (app(UserReachability::class)->refusal($conversation, (bool) $task->unattended) !== null) {
-            return $this->halt($conversation, $task, $runId, $resumeMode);
+            return $this->halt($conversation, $task, $runId, $openStepId, $resumeMode);
         }
 
-        return $this->raisePrompt($conversation, $task, $resumeMode);
+        $result = $this->raisePrompt($conversation, $task, $resumeMode);
+
+        // The task is paused and the run continues: the step the pause sits
+        // on stays open and is marked paused, and the run's lease is
+        // released — a paused run is worked by nobody until its resumer
+        // claims it. When the gate fired before this iteration's step was
+        // opened, open it first so the pause has a step to mark.
+        $stepId = $openStepId;
+        if ($stepId === null && $runId !== null) {
+            $stepId = app(RunTraceRecorder::class)->openStep($runId, null, (string) Str::uuid());
+        }
+        app(RunCheckpoint::class)->markPaused($runId, $stepId, null);
+
+        return $result;
     }
 
     /**
@@ -146,8 +165,11 @@ class TaskBudgetPauser
         return $resumeMode === 'sync' ? $this->awaiting($conversation, $opened->question) : null;
     }
 
-    private function lostThePause(Conversation $conversation, TaskBudget $task, ?string $runId, string $resumeMode): ?array
+    private function lostThePause(Conversation $conversation, TaskBudget $task, ?string $runId, ?string $openStepId, string $resumeMode): ?array
     {
+        // The losing pauser closes its own open step; the run is the
+        // winner's to pause or close.
+        $this->closeStep($openStepId, $this->text->ceilingReachedReason());
         $current = TaskBudget::find($task->id);
 
         if ($current !== null && $current->state === TaskBudgetState::Paused) {
@@ -166,7 +188,7 @@ class TaskBudgetPauser
         return $resumeMode === 'sync' ? $this->stopped($this->text->unavailable()) : null;
     }
 
-    private function halt(Conversation $conversation, TaskBudget $task, ?string $runId, string $resumeMode): ?array
+    private function halt(Conversation $conversation, TaskBudget $task, ?string $runId, ?string $openStepId, string $resumeMode): ?array
     {
         $reason = $this->text->ceilingReachedReason();
         $now = now()->format('Y-m-d H:i:s.u');
@@ -189,6 +211,7 @@ class TaskBudgetPauser
         ]);
         app(AgentQuestionService::class)->deliver($conversation, $report);
 
+        $this->closeStep($openStepId, $reason);
         $this->closeRun($runId, $reason);
         $this->notProcessing($conversation);
         $this->tasks->appendEvent($task, 'halted', ['reason' => $reason, 'report_message_id' => $message->id]);

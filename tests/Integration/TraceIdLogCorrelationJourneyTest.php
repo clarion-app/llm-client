@@ -208,7 +208,7 @@ class TraceIdLogCorrelationJourneyTest extends AssembledSystemTestCase
      * filtering by run_id includes log lines from both the originating
      * request and the later continuation.
      *
-     * Phase 5 (US4) drives a real SendHttpStreamRequest across an actual
+     * Phase 5 (US4) drives a real AgentStreamStepJob across an actual
      * queue-job process boundary and proves run_id survives it (research.md
      * D2). This test proves the narrower claim Phase 4 owns: once ANY
      * second Context scope carries the same run_id — which is exactly what
